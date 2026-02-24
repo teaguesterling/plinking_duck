@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "third_party/plink-ng"]
+	path = third_party/plink-ng
+	url = https://github.com/chrchang/plink-ng.git
