@@ -1,23 +1,9 @@
 # name: test/sql/plinking_duck.test
-# description: test plinking_duck extension
-# group: [sql]
+# description: Verify plinking_duck extension loads
+# group: [plinking_duck]
 
-# Before we load the extension, this will fail
-statement error
-SELECT plinking_duck('Sam');
-----
-Catalog Error: Scalar Function with name plinking_duck does not exist!
-
-# Require statement will ensure this test is run with this extension loaded
 require plinking_duck
 
-# Confirm the extension works
-query I
-SELECT plinking_duck('Sam');
-----
-PlinkingDuck Sam 🐥
-
-query I
-SELECT plinking_duck_openssl_version('Michael') ILIKE 'PlinkingDuck Michael, my linked OpenSSL version is OpenSSL%';
-----
-true
+# Extension loads without error
+statement ok
+SELECT 1;
