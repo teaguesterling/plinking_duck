@@ -1,0 +1,411 @@
+# Lessons from duckhts: Patterns, Gotchas, and Recommendations
+
+Observations from a deep code review of the `duckhts` DuckDB extension
+(~5,700 lines of C across 7 readers). These complement the P0-001 implementation
+plan with concrete, battle-tested patterns from a working genomics DuckDB extension.
+
+---
+
+## 1. What the P0-001 Plan Gets Right
+
+The existing plan correctly identifies the core architectural mapping:
+
+| pgenlib concept | DuckDB concept | duckhts evidence |
+|----------------|---------------|-----------------|
+| `PgenFileInfo` (shared, immutable) | `GlobalTableFunctionState` | duckhts stores shared `htsFile*`, `bcf_hdr_t*`, contig lists in global state |
+| `PgenReader` (per-thread) | `LocalTableFunctionState` | duckhts creates per-thread `htsFile*`, iterators, buffers in local init |
+| variant index → random access | atomic work-stealing counter | duckhts uses `__sync_fetch_and_add` on a contig counter |
+| projection pushdown | `column_ids` filtering | duckhts checks `col_id >= bind->info_col_start` to skip INFO/FORMAT parsing |
+
+The two-phase pgenlib initialization maps cleanly to DuckDB's bind → init
+lifecycle, and the plan's genotype output design (LIST(TINYINT) with tidy mode)
+is sound.
+
+---
+
+## 2. Patterns That Transfer Directly
+
+### 2.1 Column Index Math for Dynamic Schemas
+
+duckhts solves the dynamic-schema problem in `bcf_reader.c` with offset markers:
+
+```
+columns: [CHROM, POS, ID, REF, ALT, QUAL, FILTER, ...]  ← core (fixed)
+          [VEP_Allele, VEP_Consequence, ...]              ← VEP (file-dependent)
+          [INFO_DP, INFO_AF, ...]                          ← INFO (file-dependent)
+          [FORMAT_GT, FORMAT_DP, ...]                      ← FORMAT (file-dependent)
+```
+
+Tracked via `bind->vep_col_start`, `bind->info_col_start`, `bind->format_col_start`.
+The scan function then uses range checks on `col_id` to determine what category
+each projected column falls into.
+
+**For plinking_duck:** `read_pgen` has a similar split:
+- Fixed columns: CHROM, POS, ID, REF, ALT (from .pvar)
+- Genotype column: LIST(TINYINT) (from .pgen, expensive)
+- Optional columns: dosages, phased (from .pgen, even more expensive)
+
+Use the same offset-based approach. The critical optimization is: if no column
+from the "genotype group" appears in the projection, skip `PgrGet()` entirely.
+This turns `read_pgen` into a fast metadata-only scan when used as
+`SELECT chrom, pos, id FROM read_pgen(...)`.
+
+### 2.2 Tidy Mode State Machine
+
+duckhts implements tidy mode in `bcf_reader.c` with two state variables in
+local init data:
+
+```c
+init->tidy_current_sample   // which sample we're on for the current record
+init->tidy_record_valid     // whether we have a record loaded
+```
+
+The scan loop:
+1. If `!tidy_record_valid`: read next VCF record from file, set valid=1, sample=0
+2. Emit one row for current sample
+3. Increment `tidy_current_sample`
+4. If `tidy_current_sample >= n_samples`: set valid=0 (triggers step 1 next iteration)
+5. If chunk is full, return (resume at current sample on next call)
+
+**For plinking_duck:** The same pattern applies to `read_pfile(tidy := true)`.
+One critical difference: in duckhts, the genotype data for all samples is
+already in memory (FORMAT fields are per-record). In plinking_duck, `PgrGet()`
+also returns all samples at once (the genovec buffer), so the pattern maps
+directly — decode once per variant, iterate samples to emit rows.
+
+**Caution from duckhts:** The tidy expansion factor is `n_variants * n_samples`.
+For UK Biobank scale (800K variants * 500K samples), this is 400 billion rows.
+The plan's sample-subsetting parameter (`samples := [...]`) is essential. Consider
+also a `variants := 'chr:start-end'` filter that can be pushed down to variant
+index seeking, not just post-filter.
+
+### 2.3 Parallel Scan via Atomic Work-Stealing
+
+duckhts uses contig-level parallelism (each thread claims the next unprocessed
+contig via atomic increment). This works because BAM/BCF index files organize
+data by contig.
+
+**For plinking_duck:** The plan's variant-level parallelism (atomic counter over
+variant indices) is correct and actually superior to duckhts's approach because:
+- .pgen supports true random access by variant index (no need for index files)
+- Variants are independently decodable
+- Work units are more uniform in size than contigs
+
+One refinement: claim batches, not individual variants. `fetch_add(BATCH_SIZE)`
+where BATCH_SIZE=64-256 reduces atomic contention. duckhts doesn't do this
+because its contigs are already natural batches.
+
+### 2.4 Error Handling Pattern
+
+duckhts consistently follows this pattern in bind:
+```c
+// 1. Validate input
+if (!file_path || strlen(file_path) == 0) {
+    duckdb_bind_set_error(info, "read_bcf requires a file path");
+    duckdb_free(file_path);
+    return;
+}
+// 2. Open file, validate
+htsFile* fp = hts_open(file_path, "r");
+if (!fp) {
+    char err[512];
+    snprintf(err, sizeof(err), "Failed to open BCF/VCF file: %s", file_path);
+    duckdb_bind_set_error(info, err);
+    // ... cleanup allocated resources ...
+    return;
+}
+```
+
+**For plinking_duck (C++ API):** Use DuckDB exceptions instead:
+```cpp
+if (file_path.empty()) {
+    throw BinderException("read_pgen requires a file path");
+}
+```
+
+But pgenlib reports errors via `PglErr` return codes + `errstr_buf`. Wrap these
+at the boundary:
+```cpp
+PglErr err = PgfiInitPhase1(..., errstr_buf);
+if (err != kPglRetSuccess) {
+    throw IOException("read_pgen: failed to open %s: %s", path, errstr_buf);
+}
+```
+
+Don't let pgenlib error strings propagate raw — prefix with the function name
+so users know which reader produced the error.
+
+---
+
+## 3. Gotchas Discovered in duckhts Review
+
+### 3.1 Resource Cleanup in Early Returns
+
+The single most common pattern in duckhts that introduces risk is cascading
+cleanup on error paths. The bind function in `bcf_reader.c` has ~20 early
+return points, each needing to free previously allocated resources (file_path,
+region, index_path, hdr, fp, bind struct, etc.).
+
+**For plinking_duck:** C++ destructors and RAII solve this. Use `unique_ptr`
+with custom deleters for pgenlib resources:
+
+```cpp
+struct PgfiDeleter {
+    void operator()(plink2::PgenFileInfo* p) {
+        PglErr reterr = kPglRetSuccess;
+        CleanupPgfi(p, &reterr);
+    }
+};
+using UniquePgfi = std::unique_ptr<plink2::PgenFileInfo, PgfiDeleter>;
+```
+
+The plan's code snippets use raw `CleanupPgr`/`CleanupPgfi`/`aligned_free`
+calls. Wrapping these in RAII types avoids the cleanup cascade problem entirely.
+This is one of the clear wins of the C++ API over duckhts's C approach.
+
+### 3.2 Global Mutable State
+
+duckhts has a thread-safety issue in `vcf_types.h`:
+
+```c
+static vcf_warning_callback_t vcf_warning_callback = NULL;
+static void* vcf_warning_user_data = NULL;
+```
+
+These are process-global. If two queries run concurrently with different
+warning callbacks, they'll race.
+
+**For plinking_duck:** Avoid any global mutable state. pgenlib itself should be
+stateless at the global level (all state is in PgenFileInfo/PgenReader), but
+verify that nothing in `plink2_base.cc` or `plink2_thread.cc` uses globals that
+would conflict. In particular, `plink2_thread.cc` has thread-pool globals that
+we explicitly don't use — but make sure compiling it doesn't initialize them
+at load time.
+
+### 3.3 Recursive Contig Claiming
+
+duckhts's `claim_next_contig()` in `bcf_reader.c` line 1020 recurses when a
+contig has no records:
+
+```c
+if (!init->itr) {
+    // This contig might not have any records - try next
+    return claim_next_contig(init, global);
+}
+```
+
+With many empty contigs this could stack-overflow. Unlikely in practice for VCF
+(a few thousand contigs at most), but it's a code smell.
+
+**For plinking_duck:** .pgen files have dense variant indices (no "empty contig"
+equivalent), so this won't arise. But if you implement region filtering that
+skips variant ranges, use a loop not recursion:
+
+```cpp
+while (true) {
+    uint32_t vidx = global.next_variant_idx.fetch_add(BATCH_SIZE);
+    if (vidx >= global.total_variants) return false;
+    if (variant_in_region(vidx, region)) return true;
+    // otherwise keep claiming
+}
+```
+
+### 3.4 Vector Cache Allocation per Scan Call
+
+duckhts allocates and frees a vector pointer cache on every scan call:
+
+```c
+duckdb_vector* vectors = (duckdb_vector*)duckdb_malloc(
+    init->column_count * sizeof(duckdb_vector));
+// ... use vectors ...
+duckdb_free(vectors);
+```
+
+This is a per-chunk allocation in a hot loop. Harmless for small column counts
+but unnecessary overhead.
+
+**For plinking_duck:** Allocate all scan-local buffers in `InitLocal`, not in
+the scan function. The `genovec`, `genotype_buf`, and any dosage buffers should
+all be pre-allocated in `PgenLocalState` — the plan already shows this correctly.
+Just make sure not to add per-scan allocations during implementation.
+
+---
+
+## 4. Design Recommendations Specific to plinking_duck
+
+### 4.1 Don't Parse .pvar/.psam Yourself for read_pgen
+
+The plan shows `read_pvar` and `read_psam` as separate table functions with
+their own text parsing. For `read_pgen`, reuse pgenlib's `LoadMinimalPvar()`
+from `pvar_ffi_support.h` instead of writing a second .pvar parser:
+
+```cpp
+plink2::MinimalPvar mpvar;
+plink2::PreinitMinimalPvar(&mpvar);
+char errstr_buf[plink2::kPglErrstrBufBlen];
+PglErr err = plink2::LoadMinimalPvarEx(
+    pvar_path.c_str(),
+    kfLoadMinimalPvar0,  // include CHROM + POS
+    &mpvar,
+    errstr_buf
+);
+// mpvar.variant_ids, mpvar.chr_names, mpvar.variant_bps now available
+```
+
+This gives variant IDs, chromosome names, positions, alleles, and allele index
+offsets (for multiallelic handling) with zero custom parsing code.
+
+For `read_pvar` and `read_psam` as standalone functions, custom parsing is
+appropriate (users may want .bim/.fam support, phenotype columns, INFO fields).
+But `read_pgen`'s bind phase should use `LoadMinimalPvar` since it only needs
+the core variant metadata.
+
+### 4.2 Multiallelic Variants Need Early Design Decisions
+
+duckhts handles multiallelic ALT as `LIST(VARCHAR)` in VCF (where ALT is
+comma-separated). In the plan, .pvar ALT handling is mentioned but the genotype
+implications aren't fully addressed.
+
+For biallelic variants, genotypes are 0/1/2/missing — simple.
+For multiallelic variants:
+- pgenlib uses patch sets (`patch_01_set`/`patch_01_vals` for ref/alt1 hets that
+  are actually ref/altN, and `patch_10_set`/`patch_10_vals` for alt1/alt1 homs
+  that are actually altN/altM)
+- The FFI function `ConvertMultiAlleleCodesUnsafe` handles this
+
+**Recommendation:** Start with biallelic-only in Phase 3. Use `PgrGet()` (which
+returns the biallelic-compatible 2-bit encoding) and emit a warning or error for
+multiallelic variants. Add multiallelic support via `PgrGetM()`/`PgrGetMP()` in
+a follow-up phase. The `allele_idx_offsetsp` from MinimalPvar tells you whether
+any variants are multiallelic.
+
+### 4.3 Sample Subsetting Architecture
+
+The plan mentions `PgrSetSampleSubsetIndex()` for sample filtering. This is
+the right approach, but note the interaction with output:
+
+- When subsetting, the output genotype array length changes from
+  `raw_sample_ct` to the subset count
+- The sample order in the output matches the subset order
+- The LIST(TINYINT) column length becomes variable per query, not per variant
+
+This means sample metadata (IID, SEX, etc.) must be filtered and reindexed to
+match. Precompute the sample-index-to-subset-index mapping in bind, store it in
+bind data, and use it in both genotype output and tidy-mode sample iteration.
+
+### 4.4 Progress Reporting
+
+duckhts has a `print_progress()` function that emits progress every N records
+to stderr. This is helpful for large files but is done at the reader level with
+no DuckDB integration.
+
+**For plinking_duck:** DuckDB's C++ API has `context.SetProgress(pct)` for
+progress bars in the CLI. Hook this into the scan function:
+
+```cpp
+if (global.total_variants > 0) {
+    double pct = (double)vidx / global.total_variants;
+    context.SetProgress(pct);
+}
+```
+
+This is a small quality-of-life improvement that duckhts can't easily do from
+the C API.
+
+### 4.5 Test Data Strategy
+
+duckhts uses a `test/scripts/prepare_test_data.sh` that copies files from
+vendored htslib test data and builds indexes. This is a good pattern — test
+data should be deterministic and checked in (or reproducibly generated).
+
+**For plinking_duck:**
+- Create synthetic .pgen/.pvar/.psam with known contents using plink2 CLI
+  (e.g., convert a small VCF to plink2 format)
+- Include edge cases: multiallelic variants, missing genotypes, dosage data,
+  phased data, .bim/.fam legacy formats
+- Check in the test files (they're small) rather than generating at test time
+- Consider including a file from the plink2 test suite if the license permits
+
+---
+
+## 5. Build System Notes from duckhts
+
+### What duckhts does
+- Uses `ExternalProject_Add` to build htslib as a separate project with its own
+  configure/make cycle
+- Detects vcpkg dependencies (zlib, bzip2, liblzma, curl, openssl, libdeflate)
+- Links htslib statically into the extension
+
+### What plinking_duck should do differently
+- pgenlib is not a standalone build system — it's just .cc files. The plan's
+  approach of `add_library(pgenlib STATIC ...)` with explicit file lists is
+  correct and simpler than duckhts's ExternalProject approach.
+- The vendored zstd with `-fvisibility=hidden` strategy is sound. If symbol
+  conflicts still occur at runtime (some platforms resolve hidden symbols
+  differently in shared libraries), fall back to `objcopy --prefix-symbols=plink2_`
+  on the zstd object files before linking.
+- One build risk not in the plan: pgenlib's .cc files may have `#include`
+  dependencies on each other that aren't obvious. If compilation fails with
+  missing headers, check `plink2_base.h` → `plink2_bits.h` → etc. chain.
+  The include directory setup in the plan looks complete, but test early.
+
+---
+
+## 6. Mapping: duckhts Functions → plinking_duck Equivalents
+
+| duckhts | plinking_duck | Notes |
+|---------|--------------|-------|
+| `read_bcf(file, region)` | `read_pgen(file, region)` | Region filtering: duckhts uses htslib index; plinking_duck uses variant index range |
+| `read_bcf(file, tidy_format)` | `read_pfile(prefix, tidy)` | Tidy expansion pattern is identical |
+| `read_bam(file, region)` | — | No equivalent (alignment is HTS-specific) |
+| `read_fasta` / `read_fastq` | — | No equivalent (sequence is HTS-specific) |
+| `read_gff` / `read_tabix` | `read_pvar` / `read_psam` | Tab-delimited text with optional headers — same parsing problem |
+| `read_hts_header` | — | Could add `read_pvar_header` for .pvar metadata lines |
+| `read_hts_index` | — | .pgen doesn't have external index files |
+
+---
+
+## 7. Interoperability: duckhts + plinking_duck
+
+One of the most powerful use cases is joining VCF and PLINK2 data:
+
+```sql
+-- Join variant annotations from VCF with genotypes from PLINK2
+SELECT v.CHROM, v.POS, v.ID, v.INFO_AF, g.genotypes
+FROM read_bcf('annotations.vcf.gz') v
+JOIN read_pgen('study.pgen') g
+ON v.CHROM = g.CHROM AND v.POS = g.POS;
+
+-- Compare allele frequencies between VCF and PLINK2
+SELECT v.ID, v.INFO_AF as vcf_af, plink_freq('study') p
+...
+```
+
+This works automatically since both extensions produce standard DuckDB tables.
+No special integration code needed. This is a strong argument for keeping the
+extensions separate — users can compose them freely.
+
+---
+
+## Summary: Priority Action Items
+
+1. **Phase 0**: Start with the build system exactly as planned. Getting pgenlib
+   to compile and link is the highest-risk, lowest-glamour work. Do it first.
+
+2. **RAII wrappers**: Before writing any reader code, create RAII wrappers for
+   `PgenFileInfo`, `PgenReader`, and `cachealigned_malloc` buffers. This
+   eliminates the entire class of cleanup bugs that duckhts's C code has to
+   manage manually.
+
+3. **read_pvar first**: The text-parsing readers are the simplest. They validate
+   the build, test infrastructure, and DuckDB table function pattern without
+   touching pgenlib's binary format. Same strategy duckhts used (simple readers
+   first, complex readers later).
+
+4. **Projection pushdown from day one**: Even for `read_pvar`, wire up
+   `projection_pushdown = true` and only fill projected columns. This is cheap
+   to implement and sets the right pattern for when it matters in `read_pgen`.
+
+5. **Batch variant claiming**: When implementing `read_pgen`, use
+   `fetch_add(BATCH_SIZE)` not `fetch_add(1)`. The per-variant overhead of
+   atomic operations is negligible for small files but matters for biobank scale.
