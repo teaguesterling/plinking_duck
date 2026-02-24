@@ -1,0 +1,338 @@
+# P1-002: read_psam Table Function
+
+## Goal
+
+Implement `read_psam(path)` — a DuckDB table function that reads PLINK2 .psam
+(sample information) and legacy .fam files into SQL-queryable tables.
+
+## Prerequisites
+
+- P0-004 completed (pgenlib linked, build validated)
+
+## Depends On
+
+P0-004
+
+## Parallel Group
+
+**A** — Can execute in parallel with P1-001 (read_pvar) in a separate worktree.
+
+## Branch
+
+`feature/P1-002-read-psam`
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/psam_reader.cpp` | Bind, init, scan implementations |
+| `src/include/psam_reader.hpp` | Public interface: `RegisterPsamReader()` + reusable parsing types |
+| `test/sql/read_psam.test` | Positive tests |
+| `test/sql/read_psam_negative.test` | Negative and edge case tests |
+| `test/data/example.psam` | Standard .psam with header |
+| `test/data/example.fam` | Legacy 6-column .fam format |
+| `test/data/minimal.psam` | Minimal valid .psam (header + 1 sample) |
+| `test/data/phenotypes.psam` | .psam with multiple phenotype/covariate columns |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "psam_reader.hpp"`, call `RegisterPsamReader(loader)` in `LoadInternal()` |
+
+---
+
+## Schema
+
+### .psam format (with `#FID` or `#IID` header)
+
+| Column | DuckDB Type | Notes |
+|--------|-------------|-------|
+| FID | VARCHAR | Family ID (optional — header may start with `#IID` instead of `#FID`) |
+| IID | VARCHAR | Individual/sample ID (always present) |
+| SID | VARCHAR | Source ID (optional) |
+| PAT | VARCHAR | Paternal ID (optional) |
+| MAT | VARCHAR | Maternal ID (optional) |
+| SEX | INTEGER | 1=male, 2=female, 0/NA=unknown |
+| *additional columns* | VARCHAR | Phenotypes and covariates (dynamic from header) |
+
+The header determines which columns exist. If the header starts with `#FID`,
+FID is present. If it starts with `#IID`, FID is absent and IID is the first
+column.
+
+### .fam format (no header, 6 fixed columns)
+
+| Column | DuckDB Type | .fam column position |
+|--------|-------------|---------------------|
+| FID | VARCHAR | 1 |
+| IID | VARCHAR | 2 |
+| PAT | VARCHAR | 3 |
+| MAT | VARCHAR | 4 |
+| SEX | INTEGER | 5 |
+| PHENO1 | VARCHAR | 6 |
+
+---
+
+## Implementation
+
+### Architecture
+
+```
+psam_reader.hpp
+├── RegisterPsamReader(ExtensionLoader &)  // public: called from extension entry point
+├── PsamBindData : TableFunctionData       // schema + file metadata
+├── PsamGlobalState : GlobalTableFunctionState
+├── PsamLocalState : LocalTableFunctionState
+├── ParsePsamHeader(...)                   // reusable: called by read_pgen bind phase
+└── SampleInfo struct                      // reusable: sample metadata for read_pgen
+```
+
+Like `read_pvar`, the header parsing and sample metadata loading must be
+factored as reusable functions so that `read_pgen` (P1-003) and `read_pfile`
+(P1-004) can access sample information without duplicating parsing logic.
+
+### Bind function
+
+1. Accept file path as first positional VARCHAR argument
+2. Open file, read first line:
+   - Starts with `#FID` → .psam format, FID column present
+   - Starts with `#IID` → .psam format, no FID column
+   - No `#` prefix → .fam format, use default 6-column schema
+3. Parse header for dynamic phenotype/covariate columns
+4. Map column types:
+   - SEX → INTEGER
+   - All other columns → VARCHAR (safest default for phenotypes)
+5. Populate `return_types` and `names`
+6. Store format flag and file path in bind data
+7. Support projection pushdown
+
+### Scan function
+
+1. Read lines in batches (up to `STANDARD_VECTOR_SIZE`)
+2. Split on tab characters
+3. Map fields to output columns
+4. Type conversion:
+   - SEX: `1`, `2` → INTEGER; `0`, `NA`, `.` → NULL
+   - Missing values (`.`, `0` for PAT/MAT) → NULL where appropriate
+5. Fill output vectors, set cardinality
+6. Return empty chunk at EOF
+
+### SampleInfo utility struct
+
+```cpp
+struct SampleInfo {
+    vector<string> iids;          // sample IDs in file order
+    vector<string> fids;          // family IDs (empty if no FID column)
+    idx_t sample_ct;              // total sample count
+    // Optional: map from IID to index for subset lookups
+    unordered_map<string, idx_t> iid_to_idx;
+};
+
+// Parse .psam/.fam and return sample info (reused by read_pgen, read_pfile)
+SampleInfo LoadSampleInfo(const string &path);
+```
+
+### Registration
+
+```cpp
+void RegisterPsamReader(ExtensionLoader &loader) {
+    TableFunction read_psam("read_psam", {LogicalType::VARCHAR},
+                            PsamScan, PsamBind, PsamInitGlobal, PsamInitLocal);
+    read_psam.projection_pushdown = true;
+    loader.RegisterFunction(read_psam);
+}
+```
+
+---
+
+## Test Data
+
+### example.psam
+```
+#FID	IID	SEX
+FAM001	SAMPLE1	1
+FAM001	SAMPLE2	2
+FAM002	SAMPLE3	0
+FAM002	SAMPLE4	1
+```
+
+### example.fam
+```
+FAM001	SAMPLE1	0	0	1	-9
+FAM001	SAMPLE2	0	0	2	1
+FAM002	SAMPLE3	0	0	0	2
+```
+
+### minimal.psam
+```
+#IID
+SAMPLE1
+```
+
+### phenotypes.psam
+```
+#FID	IID	PAT	MAT	SEX	PHENO1	AGE	BMI
+FAM001	S1	0	0	1	2	45	25.3
+FAM001	S2	S1	S3	2	1	38	22.1
+FAM002	S3	0	0	2	NA	52	28.7
+```
+
+---
+
+## Testing
+
+### Positive tests (read_psam.test)
+
+```sql
+require plinking_duck
+
+# Basic .psam reading
+query III
+SELECT FID, IID, SEX FROM read_psam('test/data/example.psam');
+----
+(expected rows)
+
+# .fam format auto-detection
+query IIIIII
+SELECT FID, IID, PAT, MAT, SEX, PHENO1 FROM read_psam('test/data/example.fam');
+----
+(expected rows)
+
+# No FID column (header starts with #IID)
+query I
+SELECT IID FROM read_psam('test/data/minimal.psam');
+----
+SAMPLE1
+
+# Phenotype/covariate columns
+query IIII
+SELECT IID, SEX, PHENO1, AGE FROM read_psam('test/data/phenotypes.psam');
+----
+(expected rows)
+
+# SEX encoding: 0 → NULL or 0 (document chosen behavior)
+query I
+SELECT SEX FROM read_psam('test/data/example.psam') WHERE IID = 'SAMPLE3';
+----
+0
+
+# Missing phenotype values (NA → NULL)
+query I
+SELECT PHENO1 FROM read_psam('test/data/phenotypes.psam') WHERE IID = 'S3';
+----
+NULL
+
+# Projection pushdown
+query I
+SELECT IID FROM read_psam('test/data/example.psam');
+----
+(only IID column)
+
+# Row count
+query I
+SELECT COUNT(*) FROM read_psam('test/data/example.psam');
+----
+4
+
+# Filter pushdown
+query I
+SELECT COUNT(*) FROM read_psam('test/data/example.psam') WHERE SEX = 1;
+----
+2
+```
+
+### Negative tests (read_psam_negative.test)
+
+```sql
+require plinking_duck
+
+# File not found
+statement error
+SELECT * FROM read_psam('nonexistent.psam');
+----
+(error containing file path)
+
+# Empty file
+statement error
+SELECT * FROM read_psam('test/data/empty.psam');
+----
+(meaningful error)
+
+# Wrong number of arguments
+statement error
+SELECT * FROM read_psam();
+----
+(missing argument error)
+
+# Non-string argument
+statement error
+SELECT * FROM read_psam(123);
+----
+(type error)
+```
+
+### Edge case test data to create
+
+| File | Content | Tests |
+|------|---------|-------|
+| `test/data/empty.psam` | Empty file (0 bytes) | Error handling |
+| `test/data/header_only.psam` | `#FID IID SEX` with no data rows | Returns 0 rows |
+| `test/data/no_fid.psam` | Header starting with `#IID` (no FID column) | Correct schema detection |
+| `test/data/duplicate_iids.psam` | Two samples with same IID | Documents behavior (warn? allow?) |
+
+---
+
+## Documentation
+
+### Update README.md
+
+Add usage section for `read_psam`:
+```
+### read_psam(path)
+Read PLINK2 .psam or legacy .fam sample information files.
+
+SELECT * FROM read_psam('path/to/file.psam');
+SELECT * FROM read_psam('path/to/file.fam');
+```
+
+### Code comments
+
+- Document `#FID` vs `#IID` header detection
+- Document .fam column order
+- Document SEX encoding (1=male, 2=female, 0=unknown)
+
+---
+
+## Merge Coordination with P1-001
+
+Both P1-001 and P1-002 modify `plinking_duck_extension.cpp` to add their
+registration call. To minimize merge conflicts:
+
+1. Each reader exposes `RegisterXxxReader(ExtensionLoader &loader)`
+2. Each adds one line to `LoadInternal()`:
+   ```cpp
+   RegisterPvarReader(loader);  // P1-001 adds this
+   RegisterPsamReader(loader);  // P1-002 adds this
+   ```
+3. Whichever merges second resolves the trivial conflict (adding their line)
+
+---
+
+## Acceptance Criteria
+
+1. [ ] `read_psam('file.psam')` returns correct data for standard .psam files
+2. [ ] `read_psam('file.fam')` auto-detects and reads legacy .fam format
+3. [ ] `#FID` vs `#IID` header detection works correctly
+4. [ ] Dynamic phenotype/covariate columns discovered from header
+5. [ ] SEX column correctly typed as INTEGER
+6. [ ] Missing values (`.`, `NA`, `0` for PAT/MAT) produce NULL
+7. [ ] Projection pushdown works
+8. [ ] All positive tests pass
+9. [ ] All negative tests pass
+10. [ ] `LoadSampleInfo()` / `ParsePsamHeader()` exposed for reuse by P1-003
+11. [ ] `make test` passes
+12. [ ] README updated with read_psam usage

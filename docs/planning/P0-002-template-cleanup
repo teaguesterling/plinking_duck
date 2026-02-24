@@ -1,0 +1,148 @@
+# P0-002: Template Cleanup
+
+## Goal
+
+Remove the OpenSSL example dependency and template scalar functions, leaving a
+clean extension skeleton ready for pgenlib integration.
+
+## Prerequisites
+
+- cmake >= 3.5 installed (`sudo apt-get install cmake` or equivalent)
+- DuckDB submodule initialized (`make` handles this via extension-ci-tools)
+
+## Depends On
+
+None. This is the first actionable step.
+
+## Branch
+
+`feature/P0-002-template-cleanup`
+
+---
+
+## File Manifest
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `CMakeLists.txt` | Remove `find_package(OpenSSL REQUIRED)`, remove OpenSSL link targets |
+| `vcpkg.json` | Remove `"openssl"` from dependencies array |
+| `src/plinking_duck_extension.cpp` | Remove `#include <openssl/opensslv.h>`, remove `PlinkingDuckOpenSSLVersionFunction`, remove `PlinkingDuckScalarFun`, update `LoadInternal()` to register nothing (or a minimal version function) |
+| `test/sql/plinking_duck.test` | Remove openssl version test, remove scalar function test, replace with basic extension load test |
+
+### No changes
+
+| File | Reason |
+|------|--------|
+| `src/include/plinking_duck_extension.hpp` | Extension class declaration is correct as-is |
+| `Makefile` | No changes needed |
+| `extension_config.cmake` | No changes needed |
+
+---
+
+## Implementation
+
+### 1. CMakeLists.txt
+
+Remove these lines (or equivalent):
+```cmake
+find_package(OpenSSL REQUIRED)
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+```
+
+### 2. vcpkg.json
+
+Change dependencies from `["openssl"]` to `[]`.
+
+### 3. src/plinking_duck_extension.cpp
+
+Strip to minimal skeleton:
+```cpp
+#define DUCKDB_EXTENSION_MAIN
+#include "plinking_duck_extension.hpp"
+#include "duckdb.hpp"
+
+namespace duckdb {
+
+void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
+    // Reader functions will be registered here in P1 phases
+}
+
+std::string PlinkingDuckExtension::Name() {
+    return "plinking_duck";
+}
+
+std::string PlinkingDuckExtension::Version() const {
+#ifdef EXT_VERSION_PLINKING_DUCK
+    return EXT_VERSION_PLINKING_DUCK;
+#else
+    return "";
+#endif
+}
+
+} // namespace duckdb
+
+extern "C" {
+DUCKDB_EXTENSION_API void plinking_duck_init(duckdb::DatabaseInstance &db) {
+    duckdb::DuckDB db_wrapper(db);
+    db_wrapper.LoadExtension<duckdb::PlinkingDuckExtension>();
+}
+DUCKDB_EXTENSION_API const char *plinking_duck_version() {
+    return duckdb::DuckDB::LibraryVersion();
+}
+}
+```
+
+### 4. test/sql/plinking_duck.test
+
+```sql
+# name: test/sql/plinking_duck.test
+# description: Verify plinking_duck extension loads
+# group: [plinking_duck]
+
+require plinking_duck
+
+# Extension loads without error
+statement ok
+SELECT 1;
+```
+
+---
+
+## Testing
+
+### Positive tests
+- Extension loads successfully in DuckDB
+- `make` completes without errors
+- `make test` passes
+
+### Negative tests
+- Verify OpenSSL symbols are no longer referenced:
+  `nm` or `objdump` on the built extension should show no OpenSSL symbols
+- Verify removed scalar functions are no longer callable:
+  `SELECT plinking_duck('test')` should error
+
+### Build verification
+```bash
+make clean && make
+make test
+```
+
+---
+
+## Documentation
+
+- No README changes needed yet (template README will be rewritten in P1-005)
+- Commit message should note removal of template scaffolding
+
+---
+
+## Acceptance Criteria
+
+1. [ ] `make clean && make` succeeds with no OpenSSL dependency
+2. [ ] `make test` passes
+3. [ ] No OpenSSL references remain in source files
+4. [ ] Extension loads in DuckDB shell
+5. [ ] Template scalar functions are removed

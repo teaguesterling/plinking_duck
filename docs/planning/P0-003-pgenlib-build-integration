@@ -1,0 +1,182 @@
+# P0-003: pgenlib Build Integration
+
+## Goal
+
+Get pgenlib, libdeflate, and vendored zstd compiling as static libraries and
+linked into the extension. This is the most complex build step — establishing
+the foundation all reader functions depend on.
+
+## Prerequisites
+
+- P0-002 completed (clean template, no OpenSSL)
+- System packages: `cmake >= 3.5`, `zlib1g-dev`, `libpthread-stubs0-dev`
+
+## Depends On
+
+P0-002
+
+## Branch
+
+`feature/P0-003-pgenlib-build`
+
+---
+
+## File Manifest
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `CMakeLists.txt` | Add three static library targets (libdeflate, zstd, pgenlib) and link to extension |
+
+### Initialize
+
+| Item | Action |
+|------|--------|
+| `third_party/plink-ng/` | `git submodule update --init` (pinned at commit `4ce97faa`) |
+
+### No changes
+
+| File | Reason |
+|------|--------|
+| `src/plinking_duck_extension.cpp` | No code changes — just build integration |
+| `vcpkg.json` | System libraries used via find_package, not vcpkg |
+
+---
+
+## Implementation
+
+### 1. Initialize submodule
+
+```bash
+git submodule update --init third_party/plink-ng
+```
+
+Verify expected paths exist:
+- `third_party/plink-ng/2.0/include/pgenlib_read.cc`
+- `third_party/plink-ng/2.0/libdeflate/lib/deflate_decompress.c`
+- `third_party/plink-ng/2.0/zstd/lib/common/`
+- `third_party/plink-ng/2.0/simde/`
+
+### 2. CMakeLists.txt additions
+
+Add after the existing extension target definitions. See P0-001 §0.3 for the
+full CMake specification. Key design decisions:
+
+#### libdeflate (C static library)
+- Compile from `third_party/plink-ng/2.0/libdeflate/lib/`
+- Include both x86 and ARM CPU feature detection sources
+- `-DLIBDEFLATE_STATIC`, hidden visibility, PIC enabled
+
+#### zstd (C static library, vendored copy)
+- Compile from `third_party/plink-ng/2.0/zstd/lib/`
+- Include common + decompress + compress source directories
+- `-DZSTD_DISABLE_ASM` to avoid inline assembly conflicts
+- **Hidden visibility is critical** to prevent symbol collisions with DuckDB's
+  bundled zstd. Both the extension and DuckDB link zstd, so our copy must not
+  leak symbols.
+
+#### pgenlib (C++ static library)
+- Compile from `third_party/plink-ng/2.0/include/`
+- Source files: `plink2_base.cc`, `plink2_bits.cc`, `plink2_bgzf.cc`,
+  `plink2_htable.cc`, `plink2_memory.cc`, `plink2_string.cc`, `plink2_text.cc`,
+  `plink2_thread.cc`, `plink2_zstfile.cc`, `pgenlib_misc.cc`,
+  `pgenlib_read.cc`, `pgenlib_ffi_support.cc`, `pvar_ffi_support.cc`
+- Links against libdeflate, zstd, ZLIB, Threads
+- C++17 standard
+- Hidden visibility, PIC enabled
+- Include paths: pgenlib dir, libdeflate dir, simde dir
+
+#### Link to extension targets
+```cmake
+target_link_libraries(${EXTENSION_NAME} pgenlib plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} pgenlib plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
+target_include_directories(${EXTENSION_NAME} PRIVATE ${PGENLIB_DIR})
+target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PGENLIB_DIR})
+```
+
+### 3. Verify source file inventory
+
+Before writing CMake, confirm which `.cc` files exist in the submodule's
+`2.0/include/` directory. The plan lists 13 source files — verify each exists
+at the pinned commit. Missing files indicate a submodule version mismatch.
+
+### 4. plink2_thread.cc handling
+
+This file must compile (other pgenlib code references its symbols) but we never
+invoke its threading functions. DuckDB controls all parallelism. If
+`plink2_thread.cc` introduces unwanted dependencies or link errors, stub out
+the problematic functions with empty implementations in a separate
+`src/plink2_thread_stubs.cpp`.
+
+---
+
+## Testing
+
+### Positive tests
+- `make clean && make` completes successfully
+- All three static libraries compile without errors
+- Extension shared object links without undefined symbols
+- `make test` still passes (existing extension load test from P0-002)
+
+### Negative / edge case verification
+- **Symbol conflict check**: Run `nm -D` on the built loadable extension and
+  verify no duplicate zstd symbols are exported. Specifically:
+  ```bash
+  nm -D build/release/extension/plinking_duck/plinking_duck.duckdb_extension | grep -i zstd
+  ```
+  Should show no ZSTD symbols (hidden visibility working correctly).
+
+- **Missing submodule**: If `third_party/plink-ng/` is empty, cmake should
+  fail with a clear error. Consider adding a cmake check:
+  ```cmake
+  if(NOT EXISTS ${PGENLIB_DIR}/pgenlib_read.cc)
+      message(FATAL_ERROR "plink-ng submodule not initialized. Run: git submodule update --init")
+  endif()
+  ```
+
+- **Platform portability**: The libdeflate ARM/x86 CPU feature files should
+  compile on both architectures (guarded by preprocessor). Verify no
+  hard-coded x86 assumptions.
+
+### Build configurations
+```bash
+make clean && make          # Release build
+make debug                  # Debug build (verify no new warnings treated as errors)
+```
+
+---
+
+## Known Risks
+
+1. **zstd symbol collisions** — Primary risk. If hidden visibility is
+   insufficient, escalation options:
+   - `objcopy --prefix-symbols=plink_` on the zstd object files
+   - Linker version script restricting exported symbols
+   - Compile with `-DZSTD_LIB_NAME_PREFIX=PLINK_` (if zstd build supports it)
+
+2. **plink2_thread.cc link failures** — May reference pthread primitives or
+   OS-specific threading APIs. If it fails to compile, create stub
+   implementations for the referenced symbols.
+
+3. **libdeflate ARM sources on x86** — The ARM CPU feature detection file
+   should be a no-op on x86 (guarded by `#ifdef`). Verify it compiles cleanly.
+
+---
+
+## Documentation
+
+- Add a comment block at the top of the CMake additions explaining the three
+  static libraries and why hidden visibility is used
+- No README changes needed yet
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Submodule initialized at correct commit
+2. [ ] `make clean && make` succeeds
+3. [ ] `make debug` succeeds
+4. [ ] No zstd symbols leaked from extension (nm check)
+5. [ ] Extension loads in DuckDB shell
+6. [ ] `make test` passes

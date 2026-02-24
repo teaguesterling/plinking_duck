@@ -1,0 +1,126 @@
+# plinking_duck — Distributed Execution Plan Index
+
+## Overview
+
+Implementation plan for the `plinking_duck` DuckDB extension. Organized into
+phases that maximize parallel execution across git worktrees.
+
+Reference: `P0-001-core-extension-connectivity` (master technical spec)
+
+---
+
+## Phase Map
+
+### P0 — Build Infrastructure (Sequential)
+
+| Plan | Title | Depends On | Branch |
+|------|-------|-----------|--------|
+| P0-001 | Master Technical Spec | — | (reference only) |
+| P0-002 | Template Cleanup | — | `feature/P0-002-template-cleanup` |
+| P0-003 | pgenlib Build Integration | P0-002 | `feature/P0-003-pgenlib-build` |
+| P0-004 | Build Validation | P0-003 | `feature/P0-004-build-validation` |
+
+### P1 — Reader Functions
+
+| Plan | Title | Depends On | Branch | Parallel Group |
+|------|-------|-----------|--------|----------------|
+| P1-001 | read_pvar | P0-004 | `feature/P1-001-read-pvar` | **A** |
+| P1-002 | read_psam | P0-004 | `feature/P1-002-read-psam` | **A** |
+| P1-003 | read_pgen | P1-001 + P1-002 | `feature/P1-003-read-pgen` | B |
+| P1-004 | read_pfile | P1-003 | `feature/P1-004-read-pfile` | C |
+| P1-005 | Integration & Documentation | P1-004 | `feature/P1-005-integration` | — |
+
+### P2 — Utility Functions (Future)
+
+Begins with a planning stage after P1-005 completion. Covers `plink_freq`,
+`plink_hardy`, `plink_missing`, `plink_ld`, and future analysis functions.
+
+---
+
+## Dependency Graph
+
+```
+P0-002 ──→ P0-003 ──→ P0-004
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+          P1-001                  P1-002        ← Parallel Group A
+       (read_pvar)             (read_psam)        (separate worktrees)
+             │                       │
+             └───────────┬───────────┘
+                         │ merge
+                      P1-003                    ← Group B
+                   (read_pgen)
+                         │
+                      P1-004                    ← Group C
+                   (read_pfile)
+                         │
+                      P1-005
+                 (integration & docs)
+```
+
+---
+
+## Parallel Execution Strategy
+
+### Group A: P1-001 + P1-002 (independent worktrees)
+
+These two tasks modify completely different files:
+
+| Concern | P1-001 (pvar) | P1-002 (psam) |
+|---------|---------------|---------------|
+| Source | `src/pvar_reader.cpp` | `src/psam_reader.cpp` |
+| Header | `src/include/pvar_reader.hpp` | `src/include/psam_reader.hpp` |
+| Tests | `test/sql/read_pvar.test` | `test/sql/read_psam.test` |
+| Data | `test/data/*.pvar`, `*.bim` | `test/data/*.psam`, `*.fam` |
+
+**Conflict point**: Both add a registration call to `plinking_duck_extension.cpp`.
+**Resolution**: Each reader exposes a `RegisterXxxReader(ExtensionLoader &loader)`
+function. The merge adds both calls to `LoadInternal()`. This is a trivial,
+predictable merge conflict.
+
+### Group B: P1-003 (after Group A merge)
+
+Depends on shared parsing utilities from P1-001 and P1-002 — specifically the
+.pvar and .psam parsing logic that `read_pgen` reuses in its bind phase to
+discover variant metadata and sample information.
+
+### Group C: P1-004 (after Group B merge)
+
+Unifies all three readers. Adds tidy mode, sample subsetting, and region
+filtering.
+
+---
+
+## Merge Strategy
+
+1. Each plan executes on its own branch, forked from the feature branch.
+2. Upon completion and validation, merge back into
+   `feature/P1-001-core-extension-connectivity`.
+3. For Group A, merge order is irrelevant (no file conflicts except the
+   trivial registration point).
+4. After each merge, run full test suite to catch integration issues.
+
+---
+
+## Conventions
+
+### Each plan includes
+- Goal and scope
+- Prerequisites
+- File manifest (create / modify / delete)
+- Implementation specification
+- Testing (positive, negative, edge cases)
+- Documentation updates
+- Acceptance criteria
+
+### Testing standards
+- Every reader has both format-specific tests (.pvar/.bim, .psam/.fam)
+- Negative tests cover: missing files, malformed data, type mismatches,
+  truncated files, empty files, encoding edge cases
+- All tests use DuckDB's `.test` format with `require plinking_duck`
+
+### Documentation standards
+- Each reader's public interface documented in README.md
+- Inline code comments for non-obvious logic only
+- Test files serve as usage examples

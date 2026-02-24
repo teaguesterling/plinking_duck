@@ -1,0 +1,286 @@
+# P1-005: Integration Testing & Documentation
+
+## Goal
+
+Final integration pass after all four readers are merged. Verify cross-reader
+consistency, add end-to-end tests, write comprehensive user documentation, and
+clean up any scaffolding from earlier phases.
+
+## Prerequisites
+
+- P1-004 merged (all readers functional)
+
+## Depends On
+
+P1-004
+
+## Branch
+
+`feature/P1-005-integration`
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `test/sql/integration.test` | Cross-reader consistency tests |
+| `test/sql/edge_cases.test` | Comprehensive edge case tests across all readers |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `README.md` | Complete rewrite: project description, installation, all function docs, examples |
+| `src/plinking_duck_extension.cpp` | Remove smoke test function (from P0-004), clean up |
+| `test/sql/plinking_duck.test` | Update to test extension metadata (version, name) |
+
+### Review (no changes unless issues found)
+
+| File | Review for |
+|------|------------|
+| `src/pvar_reader.cpp` | Consistent error messages, edge case handling |
+| `src/psam_reader.cpp` | Consistent error messages, edge case handling |
+| `src/pgen_reader.cpp` | Memory safety, parallel correctness |
+| `src/pfile_reader.cpp` | Mode consistency, parameter validation |
+
+---
+
+## Integration Tests
+
+### Cross-reader consistency (test/sql/integration.test)
+
+```sql
+require plinking_duck
+
+# read_pgen variant columns match read_pvar
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.CHROM, a.POS, a.ID, a.REF, a.ALT
+    FROM read_pvar('test/data/example.pvar') a
+    EXCEPT
+    SELECT b.CHROM, b.POS, b.ID, b.REF, b.ALT
+    FROM read_pgen('test/data/example.pgen') b
+);
+----
+0
+
+# read_pfile default mode matches read_pgen
+query I
+SELECT COUNT(*) FROM (
+    SELECT CHROM, POS, ID, REF, ALT, genotypes
+    FROM read_pgen('test/data/example.pgen')
+    EXCEPT
+    SELECT CHROM, POS, ID, REF, ALT, genotypes
+    FROM read_pfile('test/data/example')
+);
+----
+0
+
+# read_pfile tidy mode sample count matches read_psam
+query I
+SELECT COUNT(DISTINCT IID) FROM read_pfile('test/data/example', tidy := true)
+=
+(SELECT COUNT(*) FROM read_psam('test/data/example.psam'));
+----
+true
+
+# Variant count consistent across all readers
+query I
+SELECT
+    (SELECT COUNT(*) FROM read_pvar('test/data/example.pvar'))
+    = (SELECT COUNT(*) FROM read_pgen('test/data/example.pgen'))
+    AND
+    (SELECT COUNT(*) FROM read_pgen('test/data/example.pgen'))
+    = (SELECT COUNT(*) FROM read_pfile('test/data/example'));
+----
+true
+
+# Joining readers produces consistent results
+query IIIII
+SELECT v.CHROM, v.POS, v.ID, s.IID, s.SEX
+FROM read_pvar('test/data/example.pvar') v,
+     read_psam('test/data/example.psam') s
+WHERE v.ID = 'rs1' AND s.IID = 'SAMPLE1';
+----
+1	10000	rs1	SAMPLE1	1
+```
+
+### Edge cases (test/sql/edge_cases.test)
+
+```sql
+require plinking_duck
+
+# Large chromosome names (non-numeric)
+# Test data should include chrX, chrMT, etc.
+
+# Very long variant IDs
+# Test data should include IDs > 100 chars
+
+# Multi-allelic variants across all readers
+# Verify ALT with commas handled consistently
+
+# Empty genotype lists (0 samples — degenerate case)
+# May not be possible with valid .pgen, but document behavior
+
+# Single-variant files
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/minimal.pvar');
+----
+1
+
+# Single-sample files
+query I
+SELECT COUNT(*) FROM read_psam('test/data/minimal.psam');
+----
+1
+
+# All readers on the same data produce compatible types
+# (verify no implicit type coercion issues)
+query I
+SELECT typeof(CHROM) FROM read_pvar('test/data/example.pvar') LIMIT 1;
+----
+VARCHAR
+
+query I
+SELECT typeof(POS) FROM read_pvar('test/data/example.pvar') LIMIT 1;
+----
+INTEGER
+
+query I
+SELECT typeof(genotypes) FROM read_pgen('test/data/example.pgen') LIMIT 1;
+----
+TINYINT[]
+```
+
+---
+
+## Cleanup Tasks
+
+### Remove scaffolding
+
+1. Remove `plinking_duck_smoke_test` scalar function from P0-004
+2. Ensure no debug/temporary code remains in any reader
+3. Verify all TODO comments are resolved or tracked for P2
+
+### Error message consistency
+
+Audit all reader error messages for consistency:
+- File not found: `"Could not open file '%s': %s"`
+- Missing companion: `"Could not find %s file. Expected at '%s' or provide explicit path via %s parameter"`
+- Count mismatch: `"Sample count mismatch: .pgen has %d samples but .psam has %d"`
+- Format error: `"Failed to parse %s at line %d: %s"`
+
+### Memory safety audit
+
+- Verify all `cachealigned_malloc` calls have matching `aligned_free`
+- Verify PgenReader cleanup in all error paths (RAII wrappers preferred)
+- Verify no dangling references to bind data from local/global state
+
+---
+
+## Documentation
+
+### README.md rewrite
+
+Structure:
+```markdown
+# plinking_duck
+
+A DuckDB extension for reading PLINK2 genomic data files.
+
+## Installation
+
+INSTALL plinking_duck FROM community;
+LOAD plinking_duck;
+
+## Functions
+
+### read_pvar(path)
+Read variant information from .pvar or .bim files.
+[examples, column descriptions]
+
+### read_psam(path)
+Read sample information from .psam or .fam files.
+[examples, column descriptions]
+
+### read_pgen(path [, pvar, psam, dosages, phased])
+Read binary genotype data from .pgen files.
+[examples, column descriptions, genotype encoding table]
+
+### read_pfile(prefix [, tidy, dosages, phased, samples, region])
+Read complete PLINK2 filesets with unified interface.
+[examples for default and tidy modes, parameter descriptions]
+
+## File Format Reference
+[Brief description of PLINK2 file formats and their relationships]
+
+## Building from Source
+[Build instructions]
+```
+
+---
+
+## Testing Checklist
+
+### Per-reader verification
+
+| Test | pvar | psam | pgen | pfile |
+|------|------|------|------|-------|
+| Basic read | [ ] | [ ] | [ ] | [ ] |
+| Legacy format (.bim/.fam) | [ ] | [ ] | N/A | N/A |
+| File not found error | [ ] | [ ] | [ ] | [ ] |
+| Empty file error | [ ] | [ ] | [ ] | [ ] |
+| Projection pushdown | [ ] | [ ] | [ ] | [ ] |
+| Type correctness | [ ] | [ ] | [ ] | [ ] |
+| NULL handling | [ ] | [ ] | [ ] | [ ] |
+
+### Cross-reader verification
+
+| Test | Status |
+|------|--------|
+| Variant counts match (pvar = pgen = pfile) | [ ] |
+| Sample counts match (psam = pfile tidy distinct IIDs) | [ ] |
+| Column types consistent across readers | [ ] |
+| read_pfile default = read_pgen | [ ] |
+| Tidy mode row count = variants x samples | [ ] |
+
+### Build verification
+
+| Check | Status |
+|-------|--------|
+| `make clean && make` | [ ] |
+| `make test` | [ ] |
+| `make debug && make test_debug` | [ ] |
+| No compiler warnings | [ ] |
+| CI pipeline passes | [ ] |
+
+---
+
+## Acceptance Criteria
+
+1. [ ] All integration tests pass
+2. [ ] All edge case tests pass
+3. [ ] README.md comprehensively documents all functions
+4. [ ] Smoke test scaffolding removed
+5. [ ] Error messages are consistent across readers
+6. [ ] No memory leaks in reader cleanup paths
+7. [ ] `make clean && make && make test` passes
+8. [ ] `make debug && make test_debug` passes
+9. [ ] Code review completed (no TODOs, no debug code)
+
+---
+
+## Transition to P2
+
+After P1-005, the extension provides:
+- Four reader functions (read_pvar, read_psam, read_pgen, read_pfile)
+- Tidy mode for SQL-friendly genotype analysis
+- Sample subsetting and region filtering
+- Comprehensive test suite and documentation
+
+P2 planning begins: utility functions (plink_freq, plink_hardy, plink_missing,
+plink_ld) that leverage pgenlib's specialized counting functions for efficient
+population genetics computations.

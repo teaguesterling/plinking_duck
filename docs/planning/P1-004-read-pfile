@@ -1,0 +1,416 @@
+# P1-004: read_pfile Table Function
+
+## Goal
+
+Implement `read_pfile(prefix)` — a unified DuckDB table function that reads
+all three PLINK2 files (.pgen, .pvar, .psam) from a common prefix, with
+support for tidy output mode, sample subsetting, and region filtering.
+
+## Prerequisites
+
+- P1-003 merged (read_pgen with pgenlib integration)
+- All parsing utilities available: pvar, psam, pgen readers
+
+## Depends On
+
+P1-003
+
+## Parallel Group
+
+**C** — Sequential after Group B.
+
+## Branch
+
+`feature/P1-004-read-pfile`
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/pfile_reader.cpp` | Bind, init, scan for both default and tidy modes |
+| `src/include/pfile_reader.hpp` | Public interface: `RegisterPfileReader()` |
+| `test/sql/read_pfile.test` | Positive tests (default mode) |
+| `test/sql/read_pfile_tidy.test` | Tidy mode tests |
+| `test/sql/read_pfile_negative.test` | Negative and edge case tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `RegisterPfileReader(loader)` call |
+
+### Reuse
+
+| File | Used for |
+|------|----------|
+| `src/include/pvar_reader.hpp` | Variant metadata parsing |
+| `src/include/psam_reader.hpp` | Sample metadata parsing |
+| `src/include/pgen_reader.hpp` | Genotype reading utilities |
+
+---
+
+## Interface
+
+```sql
+-- Prefix-based (discovers .pgen, .pvar, .psam by replacing extension)
+SELECT * FROM read_pfile('data/example');
+
+-- Explicit file paths
+SELECT * FROM read_pfile(pgen := 'a.pgen', pvar := 'b.pvar', psam := 'c.psam');
+
+-- Tidy mode: one row per (variant, sample)
+SELECT * FROM read_pfile('data/example', tidy := true);
+
+-- Sample subsetting
+SELECT * FROM read_pfile('data/example', samples := ['SAMPLE1', 'SAMPLE3']);
+
+-- Region filtering
+SELECT * FROM read_pfile('data/example', region := '1:10000-30000');
+
+-- Combined
+SELECT chrom, pos, iid, sex, genotype
+FROM read_pfile('data/example', tidy := true)
+WHERE sex = 1 AND chrom = '1';
+```
+
+---
+
+## Schema
+
+### Default mode (variant-centric, same as read_pgen)
+
+| Column | DuckDB Type | Source |
+|--------|-------------|--------|
+| CHROM | VARCHAR | .pvar |
+| POS | INTEGER | .pvar |
+| ID | VARCHAR | .pvar |
+| REF | VARCHAR | .pvar |
+| ALT | VARCHAR | .pvar |
+| genotypes | LIST(TINYINT) | .pgen |
+| dosages | LIST(FLOAT) | .pgen (if `dosages := true`) |
+| phased | LIST(BOOLEAN) | .pgen (if `phased := true`) |
+
+### Tidy mode (one row per variant x sample)
+
+| Column | DuckDB Type | Source |
+|--------|-------------|--------|
+| CHROM | VARCHAR | .pvar |
+| POS | INTEGER | .pvar |
+| ID | VARCHAR | .pvar |
+| REF | VARCHAR | .pvar |
+| ALT | VARCHAR | .pvar |
+| FID | VARCHAR | .psam |
+| IID | VARCHAR | .psam |
+| SEX | INTEGER | .psam |
+| genotype | TINYINT | .pgen (scalar, not list) |
+| dosage | FLOAT | .pgen (if `dosages := true`) |
+| *phenotype columns* | VARCHAR | .psam (all additional columns) |
+
+Row count = variant_count x sample_count (can be very large).
+
+---
+
+## Implementation
+
+### Bind phase
+
+1. **Resolve file paths**:
+   - If positional arg given: append `.pgen`, `.pvar`, `.psam` to prefix
+   - If named params given: use explicit paths
+   - Validate all three files exist
+2. **Detect tidy mode** from named parameter
+3. **Initialize pgenlib** (reuse pattern from read_pgen bind)
+4. **Load variant metadata** (reuse ParsePvarHeader)
+5. **Load sample info** (reuse LoadSampleInfo)
+6. **Handle sample subsetting**: If `samples` parameter provided:
+   - Look up sample indices in SampleInfo
+   - Create sample_include bitarray for pgenlib
+   - Store subset indices and count
+7. **Handle region filtering**: If `region` parameter provided:
+   - Parse `chr:start-end` format
+   - Find variant index range for the region
+   - Store start/end variant indices
+8. **Build schema** based on mode (default vs tidy)
+
+### Scan: Default mode
+
+Identical to read_pgen scan, with optional sample subsetting applied:
+- If samples subset active: use `PgrSetSampleSubsetIndex()` and pass
+  `sample_include` to `PgrGet()`
+- Genotype lists contain only subset samples
+
+### Scan: Tidy mode
+
+Must track two cursors — current variant and current sample within that variant:
+
+```
+struct PfileTidyLocalState {
+    uint32_t current_variant;
+    uint32_t current_sample;     // within current variant's samples
+    // Genotype buffer for current variant (loaded once, iterated per sample)
+    int32_t* genotype_buf;
+    bool variant_loaded;         // true if genotype_buf is populated for current_variant
+};
+
+Scan:
+    while rows_emitted < STANDARD_VECTOR_SIZE:
+        if current_variant >= total_variants: break
+
+        if not variant_loaded:
+            PgrGet(..., current_variant, ..., genovec)
+            GenoarrToInt32sMinus9(genovec, sample_ct, genotype_buf)
+            variant_loaded = true
+
+        while current_sample < sample_ct and rows_emitted < STANDARD_VECTOR_SIZE:
+            emit row: (variant_metadata..., sample_metadata[current_sample], genotype_buf[current_sample])
+            current_sample++
+            rows_emitted++
+
+        if current_sample >= sample_ct:
+            current_variant++  (or fetch_add for parallel)
+            current_sample = 0
+            variant_loaded = false
+
+    output.SetCardinality(rows_emitted)
+```
+
+### Named parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pgen` | VARCHAR | prefix + `.pgen` | Explicit .pgen path |
+| `pvar` | VARCHAR | prefix + `.pvar` | Explicit .pvar path |
+| `psam` | VARCHAR | prefix + `.psam` | Explicit .psam path |
+| `tidy` | BOOLEAN | false | Tidy output (one row per variant x sample) |
+| `dosages` | BOOLEAN | false | Include dosage data |
+| `phased` | BOOLEAN | false | Include phase data |
+| `samples` | LIST(VARCHAR) | all | Filter to specific sample IDs |
+| `region` | VARCHAR | all | Filter to genomic region (`chr:start-end`) |
+
+### Sample subsetting with pgenlib
+
+```cpp
+// Build sample_include bitarray
+uintptr_t* sample_include;  // bitvector: 1 = include, 0 = exclude
+uint32_t subset_size;
+
+for (auto &sample_id : requested_samples) {
+    auto it = sample_info.iid_to_idx.find(sample_id);
+    if (it == sample_info.iid_to_idx.end()) {
+        throw InvalidInputException("Sample '%s' not found in .psam", sample_id);
+    }
+    SetBit(it->second, sample_include);
+    subset_size++;
+}
+
+// Create subset index for pgenlib
+plink2::PgrSetSampleSubsetIndex(sample_include, ...);
+// Pass to PgrGet: PgrGet(sample_include, pssi, subset_size, vidx, &pgr, genovec)
+```
+
+### Region filtering
+
+Parse region string and filter variant indices:
+```cpp
+// Parse "chr:start-end" or "chr"
+string chrom;
+int64_t start = 0, end = INT64_MAX;
+ParseRegion(region_str, chrom, start, end);
+
+// Find variant range (variants are sorted by chrom+pos in .pvar)
+uint32_t region_start_idx, region_end_idx;
+FindVariantRange(variant_metadata, chrom, start, end,
+                 region_start_idx, region_end_idx);
+
+// Scan only this range
+global.next_variant_idx = region_start_idx;
+global.total_variants = region_end_idx;
+```
+
+---
+
+## Testing
+
+### Positive tests — default mode (read_pfile.test)
+
+```sql
+require plinking_duck
+
+# Prefix-based discovery
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/example');
+----
+4
+
+# Matches read_pgen output
+query IIIII
+SELECT CHROM, POS, ID, REF, ALT FROM read_pfile('test/data/example');
+----
+(same as read_pgen)
+
+# Explicit paths
+query I
+SELECT COUNT(*) FROM read_pfile(
+    pgen := 'test/data/example.pgen',
+    pvar := 'test/data/example.pvar',
+    psam := 'test/data/example.psam');
+----
+4
+```
+
+### Positive tests — tidy mode (read_pfile_tidy.test)
+
+```sql
+require plinking_duck
+
+# Tidy mode row count = variants x samples
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/example', tidy := true);
+----
+16
+
+# Tidy mode columns include sample metadata
+query IIIII
+SELECT CHROM, POS, ID, IID, genotype
+FROM read_pfile('test/data/example', tidy := true)
+WHERE ID = 'rs1' AND IID = 'SAMPLE1';
+----
+1	10000	rs1	SAMPLE1	0
+
+# Missing genotype in tidy mode
+query I
+SELECT genotype
+FROM read_pfile('test/data/example', tidy := true)
+WHERE ID = 'rs1' AND IID = 'SAMPLE4';
+----
+NULL
+
+# Sample subsetting
+query I
+SELECT COUNT(DISTINCT IID)
+FROM read_pfile('test/data/example', tidy := true,
+                samples := ['SAMPLE1', 'SAMPLE3']);
+----
+2
+
+# Sample subsetting reduces row count
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/example', tidy := true,
+                samples := ['SAMPLE1', 'SAMPLE3']);
+----
+8
+
+# Region filtering
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/example', tidy := true,
+                region := '1:10000-20000');
+----
+8
+
+# SQL filtering on tidy output
+query III
+SELECT IID, SEX, genotype
+FROM read_pfile('test/data/example', tidy := true)
+WHERE genotype = 2;
+----
+(all hom_alt entries)
+```
+
+### Negative tests (read_pfile_negative.test)
+
+```sql
+require plinking_duck
+
+# Prefix with missing .pgen
+statement error
+SELECT * FROM read_pfile('test/data/nonexistent');
+----
+(error: cannot find .pgen)
+
+# Prefix with missing .pvar (pgen exists but pvar doesn't)
+statement error
+SELECT * FROM read_pfile('test/data/orphan_pgen_prefix');
+----
+(error: cannot find .pvar)
+
+# Invalid sample ID in samples filter
+statement error
+SELECT * FROM read_pfile('test/data/example', samples := ['NOSUCHSAMPLE']);
+----
+(error: sample not found)
+
+# Invalid region format
+statement error
+SELECT * FROM read_pfile('test/data/example', region := 'invalid');
+----
+(error: invalid region format)
+
+# Empty region (no variants in range)
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/example', region := '99:1-100');
+----
+0
+
+# No arguments
+statement error
+SELECT * FROM read_pfile();
+----
+(error)
+
+# Conflicting prefix and explicit paths
+# (document behavior: explicit paths override prefix)
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/example',
+    pvar := 'test/data/example.pvar');
+----
+4
+```
+
+---
+
+## Documentation
+
+### Update README.md
+
+```
+### read_pfile(prefix [, pgen, pvar, psam, tidy, dosages, phased, samples, region])
+Read a complete PLINK2 fileset (.pgen + .pvar + .psam).
+
+-- Read all variants (one row per variant, genotypes as list)
+SELECT * FROM read_pfile('data/example');
+
+-- Tidy mode (one row per variant x sample)
+SELECT chrom, pos, iid, genotype
+FROM read_pfile('data/example', tidy := true);
+
+-- Sample subset
+SELECT * FROM read_pfile('data/example',
+    tidy := true, samples := ['SAMPLE1', 'SAMPLE3']);
+
+-- Region filter
+SELECT * FROM read_pfile('data/example', region := '22:1-50000000');
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Prefix-based file discovery works (`.pgen`, `.pvar`, `.psam` appended)
+2. [ ] Explicit path parameters override discovery
+3. [ ] Default mode matches read_pgen output
+4. [ ] Tidy mode emits correct row count (variants x samples)
+5. [ ] Tidy mode includes sample metadata columns
+6. [ ] Tidy mode genotype is scalar TINYINT (not list)
+7. [ ] Sample subsetting works via `samples` parameter
+8. [ ] Unknown sample IDs produce clear error
+9. [ ] Region filtering works via `region` parameter
+10. [ ] Empty region returns 0 rows (not an error)
+11. [ ] All positive and negative tests pass
+12. [ ] `make test` passes
+13. [ ] README updated

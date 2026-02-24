@@ -1,0 +1,329 @@
+# P1-001: read_pvar Table Function
+
+## Goal
+
+Implement `read_pvar(path)` — a DuckDB table function that reads PLINK2 .pvar
+(variant information) and legacy .bim files into SQL-queryable tables.
+
+## Prerequisites
+
+- P0-004 completed (pgenlib linked, build validated)
+
+## Depends On
+
+P0-004
+
+## Parallel Group
+
+**A** — Can execute in parallel with P1-002 (read_psam) in a separate worktree.
+
+## Branch
+
+`feature/P1-001-read-pvar`
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/pvar_reader.cpp` | Bind, init, scan implementations |
+| `src/include/pvar_reader.hpp` | Public interface: `RegisterPvarReader()` + reusable parsing types |
+| `test/sql/read_pvar.test` | Positive tests |
+| `test/sql/read_pvar_negative.test` | Negative and edge case tests |
+| `test/data/example.pvar` | Standard .pvar with header |
+| `test/data/example.bim` | Legacy 6-column .bim format |
+| `test/data/minimal.pvar` | Minimal valid .pvar (header + 1 variant) |
+| `test/data/comments.pvar` | .pvar with `##` comment lines before header |
+| `test/data/optional_cols.pvar` | .pvar with QUAL, FILTER, INFO, CM columns |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "pvar_reader.hpp"`, call `RegisterPvarReader(loader)` in `LoadInternal()` |
+| `test/sql/plinking_duck.test` | Keep or update extension load test |
+
+---
+
+## Schema
+
+### .pvar format (with `#CHROM` header)
+
+| Column | DuckDB Type | Notes |
+|--------|-------------|-------|
+| CHROM | VARCHAR | Chromosome identifier |
+| POS | INTEGER | Base-pair coordinate (1-based) |
+| ID | VARCHAR | Variant identifier (rsID or `.`) |
+| REF | VARCHAR | Reference allele |
+| ALT | VARCHAR | Alternate allele(s), comma-separated for multi-allelic |
+| QUAL | FLOAT | Optional quality score (`.` → NULL) |
+| FILTER | VARCHAR | Optional filter status |
+| INFO | VARCHAR | Optional info field (raw string) |
+| CM | DOUBLE | Optional centimorgan position |
+
+Columns after the first 5 are optional — schema is discovered dynamically from
+the `#CHROM` header line.
+
+### .bim format (no header, 6 fixed columns)
+
+| Column | DuckDB Type | .bim column position |
+|--------|-------------|---------------------|
+| CHROM | VARCHAR | 1 |
+| ID | VARCHAR | 2 |
+| CM | DOUBLE | 3 |
+| POS | INTEGER | 4 |
+| ALT | VARCHAR | 5 |
+| REF | VARCHAR | 6 |
+
+Note the different column order from .pvar. The reader normalizes both formats
+to the same output schema (CHROM, POS, ID, REF, ALT, CM).
+
+---
+
+## Implementation
+
+### Architecture
+
+```
+pvar_reader.hpp
+├── RegisterPvarReader(ExtensionLoader &)  // public: called from extension entry point
+├── PvarBindData : TableFunctionData       // schema + file metadata
+├── PvarGlobalState : GlobalTableFunctionState
+├── PvarLocalState : LocalTableFunctionState
+└── ParsePvarHeader(...)                   // reusable: called by read_pgen bind phase
+```
+
+The header parsing logic must be factored as a standalone function so that
+`read_pgen` (P1-003) can reuse it to discover variant metadata without
+duplicating the parsing code.
+
+### Bind function
+
+1. Accept file path as first positional VARCHAR argument
+2. Open file, read lines:
+   - Lines starting with `##` → skip (pvar comment/meta lines)
+   - Line starting with `#CHROM` → parse as header, extract column names
+   - First non-comment line without `#` prefix → .bim format
+3. Determine column count and types from header (or default 6 for .bim)
+4. Populate `return_types` and `names` vectors
+5. Store format flag (`is_bim`) and file path in bind data
+6. Support projection pushdown: record `column_ids` from init input
+
+### Scan function
+
+1. Read lines from file in batches (up to `STANDARD_VECTOR_SIZE`)
+2. Split each line on tab characters
+3. Map fields to output columns based on schema
+4. Type conversion:
+   - POS → `INTEGER` via `strtol` (validate non-negative)
+   - CM → `DOUBLE` via `strtod`
+   - QUAL → `FLOAT` via `strtof`
+   - `.` (dot) → `NULL` for any column
+5. Fill output vectors, set cardinality
+6. Return empty chunk when EOF reached
+
+### Projection pushdown
+
+Only populate columns that DuckDB actually needs. If a query is
+`SELECT chrom, pos FROM read_pvar('file.pvar')`, skip parsing ID, REF, ALT, etc.
+The `column_ids` vector from `TableFunctionInitInput` specifies which columns
+are requested.
+
+### Registration
+
+```cpp
+void RegisterPvarReader(ExtensionLoader &loader) {
+    TableFunction read_pvar("read_pvar", {LogicalType::VARCHAR},
+                            PvarScan, PvarBind, PvarInitGlobal, PvarInitLocal);
+    read_pvar.projection_pushdown = true;
+    loader.RegisterFunction(read_pvar);
+}
+```
+
+---
+
+## Test Data
+
+### example.pvar
+```
+##fileformat=PVARv1.0
+#CHROM	POS	ID	REF	ALT
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A,C
+2	15000	rs4	T	C
+22	50000	.	A	G
+```
+
+### example.bim
+```
+1	rs1	0.5	10000	G	A
+1	rs2	1.2	20000	T	C
+2	rs4	0.0	15000	C	T
+```
+
+### comments.pvar
+```
+##fileformat=PVARv1.0
+##source=plink2
+##INFO=<ID=PR,Number=0,Type=Flag,Description="Provisional reference allele">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+1	10000	rs1	A	G	100.0	PASS	PR
+1	20000	rs2	C	T	.	.	.
+```
+
+### minimal.pvar
+```
+#CHROM	POS	ID	REF	ALT
+1	10000	rs1	A	G
+```
+
+---
+
+## Testing
+
+### Positive tests (read_pvar.test)
+
+```sql
+require plinking_duck
+
+# Basic .pvar reading
+query IIIII
+SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/example.pvar');
+----
+(expected rows)
+
+# .bim format auto-detection
+query IIIII
+SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/example.bim');
+----
+(expected rows, normalized column order)
+
+# Comment lines are skipped
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/comments.pvar');
+----
+2
+
+# Optional columns (QUAL, FILTER, INFO)
+query III
+SELECT QUAL, FILTER, INFO FROM read_pvar('test/data/comments.pvar');
+----
+100.0	PASS	PR
+NULL	NULL	NULL
+
+# Projection pushdown (only selected columns parsed)
+query II
+SELECT CHROM, POS FROM read_pvar('test/data/example.pvar');
+----
+(verify only requested columns appear)
+
+# Multi-allelic ALT (comma-separated)
+query I
+SELECT ALT FROM read_pvar('test/data/example.pvar') WHERE ID = 'rs3';
+----
+A,C
+
+# Dot as variant ID
+query I
+SELECT ID FROM read_pvar('test/data/example.pvar') WHERE CHROM = '22';
+----
+.
+
+# CM column in .bim
+query II
+SELECT ID, CM FROM read_pvar('test/data/example.bim') WHERE ID = 'rs1';
+----
+rs1	0.5
+
+# Row count
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/example.pvar');
+----
+5
+
+# Empty result with impossible filter
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/example.pvar') WHERE CHROM = '99';
+----
+0
+```
+
+### Negative tests (read_pvar_negative.test)
+
+```sql
+require plinking_duck
+
+# File not found
+statement error
+SELECT * FROM read_pvar('nonexistent.pvar');
+----
+(error message containing file path)
+
+# Empty file
+statement error
+SELECT * FROM read_pvar('test/data/empty.pvar');
+----
+(meaningful error: empty file or no header)
+
+# Wrong number of arguments
+statement error
+SELECT * FROM read_pvar();
+----
+(error about missing argument)
+
+# Non-string argument
+statement error
+SELECT * FROM read_pvar(42);
+----
+(type error)
+```
+
+### Edge case test data to create
+
+| File | Content | Tests |
+|------|---------|-------|
+| `test/data/empty.pvar` | Empty file (0 bytes) | Error handling |
+| `test/data/header_only.pvar` | `#CHROM POS ID REF ALT` with no data rows | Returns 0 rows, not an error |
+| `test/data/spaces.pvar` | Mixed tab/space delimiters | Correct parsing or clear error |
+
+---
+
+## Documentation
+
+### Update README.md
+
+Add a usage section for `read_pvar`:
+```
+## Usage
+
+### read_pvar(path)
+Read PLINK2 .pvar or legacy .bim variant information files.
+
+SELECT * FROM read_pvar('path/to/file.pvar');
+SELECT * FROM read_pvar('path/to/file.bim');
+```
+
+### Code comments
+
+- Document the .pvar vs .bim format detection logic
+- Document the column order normalization for .bim
+
+---
+
+## Acceptance Criteria
+
+1. [ ] `read_pvar('file.pvar')` returns correct data for standard .pvar files
+2. [ ] `read_pvar('file.bim')` auto-detects and reads legacy .bim format
+3. [ ] Comment lines (`##`) are skipped
+4. [ ] Optional columns (QUAL, FILTER, INFO, CM) handled correctly
+5. [ ] Dot (`.`) values produce NULL
+6. [ ] Projection pushdown works (verified via query plan or performance)
+7. [ ] All positive tests pass
+8. [ ] All negative tests pass (proper error messages)
+9. [ ] `ParsePvarHeader()` is exposed in header for reuse by P1-003
+10. [ ] `make test` passes (all tests including existing ones)
+11. [ ] README updated with read_pvar usage

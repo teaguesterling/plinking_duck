@@ -1,0 +1,133 @@
+# P0-004: Build Validation & Smoke Test
+
+## Goal
+
+Verify pgenlib is correctly linked and callable from extension code. Establish
+a minimal smoke test that exercises pgenlib initialization, confirming the
+build integration from P0-003 actually works at runtime, not just link time.
+
+## Prerequisites
+
+- P0-003 completed (pgenlib compiles and links)
+
+## Depends On
+
+P0-003
+
+## Branch
+
+`feature/P0-004-build-validation`
+
+---
+
+## File Manifest
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "pgenlib_read.h"` and a minimal pgenlib API call in a smoke-test scalar function |
+| `test/sql/plinking_duck.test` | Add test that calls the smoke-test function |
+
+---
+
+## Implementation
+
+### 1. Smoke test function
+
+Add a simple scalar function that exercises pgenlib initialization to prove
+the library is correctly linked and functional:
+
+```cpp
+#include "pgenlib_read.h"
+
+// In LoadInternal():
+// Register a temporary smoke test function that verifies pgenlib works
+auto smoke_test = ScalarFunction("plinking_duck_smoke_test", {},
+    LogicalType::VARCHAR, [](DataChunk &args, ExpressionState &state, Vector &result) {
+        // Exercise pgenlib API: initialize and immediately clean up
+        plink2::PgenFileInfo pgfi;
+        plink2::PreinitPgfi(&pgfi);
+        // If we get here without crashing, pgenlib is linked correctly
+        result.SetValue(0, Value("pgenlib OK"));
+    });
+loader.RegisterFunction(smoke_test);
+```
+
+Note: This function is temporary scaffolding. It will be removed when real
+table functions are added in P1.
+
+### 2. Test
+
+```sql
+# name: test/sql/plinking_duck.test
+# description: Verify plinking_duck extension loads and pgenlib is functional
+# group: [plinking_duck]
+
+require plinking_duck
+
+# Extension loads
+statement ok
+SELECT 1;
+
+# pgenlib smoke test — verifies library is linked and callable
+query I
+SELECT plinking_duck_smoke_test();
+----
+pgenlib OK
+```
+
+---
+
+## Testing
+
+### Positive tests
+- Smoke test function returns "pgenlib OK"
+- `make test` passes
+- Extension loads without errors
+
+### Negative tests
+- Deliberately mislink (as a manual verification): if pgenlib headers are
+  removed from include path, build should fail with clear errors referencing
+  pgenlib symbols
+- Verify the smoke test function is callable — if pgenlib init segfaults,
+  we catch it here rather than in a complex reader
+
+### Build configurations
+```bash
+make clean && make && make test
+make debug && make test_debug
+```
+
+### CI verification
+- Push branch and verify GitHub Actions passes
+- Both release and debug builds should succeed
+
+---
+
+## Documentation
+
+- No README changes
+- Comment the smoke test function as temporary scaffolding to be removed in P1
+
+---
+
+## Acceptance Criteria
+
+1. [ ] `make clean && make` succeeds
+2. [ ] `make test` passes with smoke test
+3. [ ] `make debug && make test_debug` passes
+4. [ ] Smoke test exercises pgenlib init without crash
+5. [ ] CI pipeline passes (if applicable)
+
+---
+
+## Transition to P1
+
+After P0-004 is merged, the extension has:
+- Clean skeleton (no template cruft)
+- pgenlib, libdeflate, zstd compiled and linked
+- Verified at runtime via smoke test
+
+P1-001 (read_pvar) and P1-002 (read_psam) can now begin in parallel worktrees,
+both branching from the merged P0-004 state.
