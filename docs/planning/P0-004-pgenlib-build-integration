@@ -1,4 +1,4 @@
-# P0-003: pgenlib Build Integration
+# P0-004: pgenlib Build Integration
 
 ## Goal
 
@@ -17,7 +17,7 @@ P0-002
 
 ## Branch
 
-`feature/P0-003-pgenlib-build`
+`feature/P0-004-pgenlib-build`
 
 ---
 
@@ -149,6 +149,9 @@ make debug                  # Debug build (verify no new warnings treated as err
 
 ## Known Risks
 
+See also **P0-003 §5** (Build System Notes from duckhts) for additional context
+on these risks from a working genomics extension build.
+
 1. **zstd symbol collisions** — Primary risk. If hidden visibility is
    insufficient, escalation options:
    - `objcopy --prefix-symbols=plink_` on the zstd object files
@@ -157,10 +160,17 @@ make debug                  # Debug build (verify no new warnings treated as err
 
 2. **plink2_thread.cc link failures** — May reference pthread primitives or
    OS-specific threading APIs. If it fails to compile, create stub
-   implementations for the referenced symbols.
+   implementations for the referenced symbols. P0-003 §3.2 notes that
+   plink2_thread.cc has thread-pool globals — verify compiling it doesn't
+   initialize them at load time.
 
 3. **libdeflate ARM sources on x86** — The ARM CPU feature detection file
    should be a no-op on x86 (guarded by `#ifdef`). Verify it compiles cleanly.
+
+4. **Include chain risks** (P0-003 §5) — pgenlib's .cc files may have
+   `#include` dependencies on each other that aren't obvious. If compilation
+   fails with missing headers, check the `plink2_base.h` → `plink2_bits.h`
+   chain. Test early.
 
 ---
 

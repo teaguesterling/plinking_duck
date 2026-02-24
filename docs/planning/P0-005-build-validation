@@ -1,4 +1,4 @@
-# P0-004: Build Validation & Smoke Test
+# P0-005: Build Validation & Smoke Test
 
 ## Goal
 
@@ -8,15 +8,15 @@ build integration from P0-003 actually works at runtime, not just link time.
 
 ## Prerequisites
 
-- P0-003 completed (pgenlib compiles and links)
+- P0-004 completed (pgenlib compiles and links)
 
 ## Depends On
 
-P0-003
+P0-004
 
 ## Branch
 
-`feature/P0-004-build-validation`
+`feature/P0-005-build-validation`
 
 ---
 
@@ -124,10 +124,10 @@ make debug && make test_debug
 
 ## Transition to P1
 
-After P0-004 is merged, the extension has:
+After P0-005 is merged, the extension has:
 - Clean skeleton (no template cruft)
 - pgenlib, libdeflate, zstd compiled and linked
 - Verified at runtime via smoke test
 
 P1-001 (read_pvar) and P1-002 (read_psam) can now begin in parallel worktrees,
-both branching from the merged P0-004 state.
+both branching from the merged P0-005 state.

@@ -145,6 +145,15 @@ Identical to read_pgen scan, with optional sample subsetting applied:
 
 ### Scan: Tidy mode
 
+**P0-003 §2.2**: This follows duckhts's tidy mode state machine pattern exactly
+(`tidy_current_sample` + `tidy_record_valid`). Decode genotypes once per
+variant, iterate samples to emit rows.
+
+**Caution** (P0-003 §2.2): The tidy expansion factor is `n_variants *
+n_samples`. For UK Biobank scale (800K variants x 500K samples), this is 400
+billion rows. The `samples` and `region` parameters are essential for practical
+use at scale.
+
 Must track two cursors — current variant and current sample within that variant:
 
 ```
@@ -192,6 +201,10 @@ Scan:
 | `region` | VARCHAR | all | Filter to genomic region (`chr:start-end`) |
 
 ### Sample subsetting with pgenlib
+
+**P0-003 §4.3**: When subsetting, the output genotype array length changes from
+`raw_sample_ct` to the subset count. Sample metadata (IID, SEX, etc.) must be
+filtered and reindexed to match. Precompute the mapping in bind.
 
 ```cpp
 // Build sample_include bitarray

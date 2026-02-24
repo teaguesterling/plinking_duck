@@ -175,9 +175,13 @@ Audit all reader error messages for consistency:
 
 ### Memory safety audit
 
+Per **P0-003 §3.1** (resource cleanup lessons from duckhts):
+
 - Verify all `cachealigned_malloc` calls have matching `aligned_free`
 - Verify PgenReader cleanup in all error paths (RAII wrappers preferred)
 - Verify no dangling references to bind data from local/global state
+- Verify no global mutable state (P0-003 §3.2) — check plink2_base.cc and
+  plink2_thread.cc for thread-pool globals that could conflict
 
 ---
 
@@ -270,6 +274,23 @@ Read complete PLINK2 filesets with unified interface.
 7. [ ] `make clean && make && make test` passes
 8. [ ] `make debug && make test_debug` passes
 9. [ ] Code review completed (no TODOs, no debug code)
+
+---
+
+## Interoperability with duckhts
+
+Per **P0-003 §6–7**: plinking_duck and duckhts together enable powerful
+cross-format queries — e.g., joining VCF annotations with PLINK2 genotypes:
+
+```sql
+SELECT v.CHROM, v.POS, v.ID, v.INFO_AF, g.genotypes
+FROM read_bcf('annotations.vcf.gz') v
+JOIN read_pgen('study.pgen') g
+ON v.CHROM = g.CHROM AND v.POS = g.POS;
+```
+
+The README should mention this interoperability as a key use case. See P0-003
+§6 for the full function mapping table between duckhts and plinking_duck.
 
 ---
 
