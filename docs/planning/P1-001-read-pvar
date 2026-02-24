@@ -7,11 +7,11 @@ Implement `read_pvar(path)` — a DuckDB table function that reads PLINK2 .pvar
 
 ## Prerequisites
 
-- P0-004 completed (pgenlib linked, build validated)
+- P0-005 completed (pgenlib linked, build validated)
 
 ## Depends On
 
-P0-004
+P0-005
 
 ## Parallel Group
 

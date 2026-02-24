@@ -1,0 +1,204 @@
+# P1-006: P2 Utility Function Research & Planning
+
+## Goal
+
+Research the full scope of plink2's analytical commands, evaluate which are
+good candidates for DuckDB table/aggregate functions, and produce individual
+P2-00X plan documents for each approved function. This is a planning-only
+activity — no code is written.
+
+## Prerequisites
+
+- P0-001 exists (master spec, §5 sketches freq/hardy/missing/ld/pca/glm/score)
+- P0-003 exists (duckhts lessons — informs implementation patterns)
+- P1-003 plan exists (read_pgen — defines the genotype access layer these
+  functions build on)
+
+No code dependencies — this runs in parallel with P1 implementation.
+
+## Depends On
+
+None (reference-only dependency on P0-001, P0-003, P1-003 plans)
+
+## Parallel Group
+
+Runs concurrently with any P1 implementation work.
+
+## Branch
+
+`feature/P1-006-p2-planning` (contains only planning documents)
+
+---
+
+## Agent Instructions
+
+The agent executing this plan should perform the following work in order.
+
+### Phase 1: Research plink2's Command Set
+
+**1.1 Enumerate plink2 analytical commands**
+
+Survey plink2's full command set. Focus on commands that produce tabular
+statistical output (not file-format conversions or data management). The key
+sources to consult:
+
+- plink2 documentation (https://www.cog-genomics.org/plink/2.0/)
+- The `--help` output categories, particularly:
+  - Basic statistics: `--freq`, `--missing`, `--hardy`, `--het`
+  - Association: `--glm`, `--assoc`, `--linear`, `--logistic`
+  - Relatedness: `--king-cutoff`, `--make-king`, `--make-grm`
+  - Population structure: `--pca`, `--fst`
+  - LD: `--r2`, `--indep-pairwise`, `--ld`
+  - Scoring: `--score`, `--variance-standardize`
+  - Quality control: `--geno`, `--mind`, `--maf`, `--hwe`
+
+**1.2 Identify pgenlib FFI functions that support each command**
+
+For each candidate, determine whether pgenlib provides a specialized API:
+
+| pgenlib function | What it does | Commands it supports |
+|-----------------|-------------|---------------------|
+| `PgrGetCounts()` | Genotype counts without decompression | freq, hardy, het |
+| `PgrGetMissingness()` | Missingness bitarray, fast | missing, mind |
+| `PgrGet()` + computation | Full genotype decode + custom math | ld, score, fst |
+| `PgrGetD()` + computation | Dosage decode + custom math | glm, pca |
+| No pgenlib support | Needs external libraries or algorithms | king, grm, pca eigenvectors |
+
+Commands backed by specialized pgenlib functions (like `PgrGetCounts`) are
+high-value targets — they're fast and the implementation is straightforward.
+Commands requiring heavy linear algebra (PCA, GRM) need careful scoping.
+
+### Phase 2: Evaluate Candidates
+
+For each plink2 command identified, evaluate against these criteria:
+
+**Include if:**
+- The computation is self-contained (input: genotypes + metadata → output: table)
+- pgenlib provides a fast-path API (`PgrGetCounts`, `PgrGetMissingness`)
+- The output is naturally tabular (fits DuckDB's table function model)
+- The function is commonly used in genomics workflows
+- It would be awkward or slow to replicate in pure SQL on `read_pgen` output
+
+**Defer if:**
+- Requires external LAPACK/BLAS (PCA eigenvectors, GRM computation)
+- The output is a matrix, not a table (kinship matrices, GRM)
+- The computation is trivially expressible in SQL on `read_pgen`/`read_pfile`
+  output (e.g., simple counts that `GROUP BY` handles)
+- The function requires write access to .pgen files
+
+**Exclude if:**
+- It's a file-format conversion (--make-pgen, --make-bed, --export)
+- It's a data management operation (--keep, --remove, --extract)
+- It duplicates DuckDB's native capabilities (sorting, filtering, joins)
+
+For borderline cases, document the trade-off and recommend Include or Defer
+with reasoning.
+
+### Phase 3: Design Each Approved Function
+
+For each function that passes evaluation, produce a section covering:
+
+1. **SQL interface**: Function signature, named parameters, example queries
+2. **Output schema**: Column names, types, one-row-per-what
+3. **pgenlib API path**: Which pgenlib functions it calls and how
+4. **Computation**: What math happens between pgenlib output and SQL output
+5. **Performance profile**: Is it variant-parallel? Sample-parallel? Memory bound?
+6. **Interaction with readers**: Does it reuse read_pgen's bind/init pattern?
+   Can it accept a `samples` or `region` parameter like read_pfile?
+7. **Test strategy**: What known-answer test cases can be generated?
+
+### Phase 4: Write P2-00X Plan Documents
+
+Produce one plan document per function (or per closely-related group), following
+the established plan format from PLAN-INDEX conventions:
+
+- Goal and scope
+- Prerequisites (which P1 functions it depends on)
+- File manifest (create / modify)
+- Implementation specification
+- Testing (positive, negative, edge cases)
+- Documentation updates
+- Acceptance criteria
+
+Also produce an updated PLAN-INDEX section for P2, including:
+- The P2 phase table with plan numbers, titles, dependencies
+- Parallel group assignments (which P2 functions are independent)
+- A dependency graph showing which P2 functions share infrastructure
+
+### Phase 5: Identify Shared Infrastructure
+
+Several utility functions will share patterns:
+- Opening a .pgen and iterating variants (same as read_pgen bind/init)
+- Sample subsetting (same bitarray logic as read_pfile)
+- Region filtering (same variant range logic as read_pfile)
+- Progress reporting (same SetProgress pattern)
+
+Recommend whether to:
+(a) Extract shared utilities into `src/plink_utils.cpp` during P1, or
+(b) Let P2 functions duplicate the pattern and refactor later
+
+Document this recommendation in the P2 phase overview.
+
+---
+
+## Known Candidates from P0-001
+
+P0-001 §5 already identifies these. The agent should start here and expand:
+
+| Function | P0-001 Status | pgenlib Fast-Path | Priority |
+|----------|--------------|-------------------|----------|
+| `plink_freq` | Sketched | `PgrGetCounts()` | High |
+| `plink_hardy` | Sketched | `PgrGetCounts()` | High |
+| `plink_missing` | Sketched | `PgrGetMissingness()` | High |
+| `plink_ld` | Sketched | `PgrGet()` × 2 + math | Medium |
+| `plink_pca` | Mentioned | Needs LAPACK | Evaluate |
+| `plink_glm` | Mentioned | `PgrGetD()` + regression | Evaluate |
+| `plink_score` | Mentioned | `PgrGet()` + dot product | Evaluate |
+
+The agent should identify additional candidates not listed here.
+
+---
+
+## Output Artifacts
+
+| Artifact | Location |
+|----------|----------|
+| Research summary | `docs/planning/P1-006-research-summary` |
+| P2-001 through P2-00N | `docs/planning/P2-00X-<function-name>` |
+| PLAN-INDEX update | Append P2 section to `docs/planning/PLAN-INDEX` |
+
+---
+
+## Quality Criteria
+
+1. [ ] All plink2 analytical commands surveyed (not just the P0-001 list)
+2. [ ] Each candidate evaluated with explicit include/defer/exclude reasoning
+3. [ ] Each approved function has a complete P2-00X plan document
+4. [ ] Plans follow established format (see PLAN-INDEX conventions)
+5. [ ] P2 dependency graph identifies parallel opportunities
+6. [ ] Shared infrastructure recommendation documented
+7. [ ] PLAN-INDEX updated with P2 phase table
+
+---
+
+## Guidance for the Agent
+
+- **Breadth first**: Survey the full plink2 command set before diving into
+  any single function's design. The goal is to find candidates we haven't
+  thought of, not just flesh out the known ones.
+
+- **pgenlib API is the constraint**: The most valuable utility functions are
+  those where pgenlib provides a specialized fast-path. Functions requiring
+  full genotype decode + heavy computation are less compelling because users
+  can already do `SELECT ... FROM read_pgen()` and compute in SQL.
+
+- **SQL-native thinking**: Consider how each function's output interacts with
+  DuckDB's query engine. A `plink_freq` that returns a table can be JOINed
+  with `read_pvar` results. Think about composability.
+
+- **Don't over-scope P2**: It's better to have 4–6 well-specified utility
+  functions than 15 vaguely defined ones. Defer aggressively. P3 exists.
+
+- **Reference P0-003**: The duckhts lessons document has patterns for
+  parallel scan, projection pushdown, and error handling that apply directly
+  to utility functions. Cross-reference where appropriate.

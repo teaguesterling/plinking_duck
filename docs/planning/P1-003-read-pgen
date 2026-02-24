@@ -8,9 +8,12 @@ information from .psam, with parallel scan support.
 
 This is the core reader — the primary value proposition of the extension.
 
+**Key reference**: P0-003 (duckhts lessons) directly informs this plan's
+implementation patterns — see cross-references throughout.
+
 ## Prerequisites
 
-- P0-004 completed (pgenlib linked)
+- P0-005 completed (pgenlib linked)
 - P1-001 merged (pvar parsing utilities: `ParsePvarHeader`, variant metadata)
 - P1-002 merged (psam parsing utilities: `LoadSampleInfo`, sample metadata)
 
@@ -101,6 +104,11 @@ same order as the .psam file.
 4. **Load variant metadata**: Call `ParsePvarHeader()` from pvar_reader to get
    column names and pre-load all variant records (CHROM, POS, ID, REF, ALT)
    into memory. For typical datasets this is small (variant count × ~5 strings).
+   **P0-003 §4.1**: Consider using pgenlib's `LoadMinimalPvar()` from
+   `pvar_ffi_support.h` instead — it provides variant IDs, chromosome names,
+   positions, and alleles with zero custom parsing code. Custom parsing via
+   `ParsePvarHeader()` is appropriate if we need .bim compatibility or extra
+   columns; `LoadMinimalPvar()` is simpler if we only need core metadata.
 5. **Load sample info**: Call `LoadSampleInfo()` from psam_reader to get
    sample count and IDs.
 6. **Validate consistency**:
@@ -154,6 +162,10 @@ allocate genotype_buf (sample_ct * sizeof(int32_t))
 
 ### Scan function (PgenScan)
 
+**P0-003 §2.3**: Use batch claiming (`fetch_add(BATCH_SIZE)` where
+BATCH_SIZE=64-256) to reduce atomic contention at biobank scale, rather than
+single-variant claiming shown below.
+
 ```
 while rows_emitted < STANDARD_VECTOR_SIZE:
     vidx = global.next_variant_idx.fetch_add(1)
@@ -178,6 +190,10 @@ output.SetCardinality(rows_emitted)
 ```
 
 ### Projection pushdown (critical)
+
+**P0-003 §2.1**: Use offset-based column index tracking (as duckhts does with
+`vep_col_start`, `info_col_start`, etc.) to classify projected columns into
+fixed metadata vs. genotype groups.
 
 The `column_ids` from `TableFunctionInitInput` determines which columns DuckDB
 needs. **If genotypes/dosages/phased are not in the projection, do NOT call
@@ -204,6 +220,10 @@ for (auto col_id : bind.projected_columns) {
 | `phased` | BOOLEAN | false | Include phased column |
 
 ### Memory management
+
+**P0-003 §3.1**: Use RAII wrappers (unique_ptr with custom deleters) rather
+than raw cleanup calls to avoid the cascading-cleanup bugs found in duckhts.
+See P0-003 for `UniquePgfi` and `UniquePgr` wrapper examples.
 
 pgenlib requires cache-aligned allocations. Use `plink2::cachealigned_malloc()`
 and `plink2::aligned_free()`. All allocations must be freed in destructors:
@@ -424,6 +444,16 @@ SELECT id, genotypes FROM read_pgen('file.pgen');
 - Document the genotype encoding (2-bit packed → int8)
 - Document the projection pushdown logic
 - Document thread safety model (shared PgenFileInfo, per-thread PgenReader)
+
+---
+
+## Multiallelic Variants
+
+**P0-003 §4.2**: Start with biallelic-only support. Use `PgrGet()` (which
+returns the biallelic-compatible 2-bit encoding) and emit a warning for
+multiallelic variants. The `allele_idx_offsetsp` from `MinimalPvar` indicates
+whether any variants are multiallelic. Add multiallelic support via
+`PgrGetM()`/`PgrGetMP()` in a follow-up phase.
 
 ---
 

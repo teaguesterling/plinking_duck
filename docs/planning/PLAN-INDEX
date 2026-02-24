@@ -17,46 +17,53 @@ Reference: `P0-001-core-extension-connectivity` (master technical spec)
 |------|-------|-----------|--------|
 | P0-001 | Master Technical Spec | — | (reference only) |
 | P0-002 | Template Cleanup | — | `feature/P0-002-template-cleanup` |
-| P0-003 | pgenlib Build Integration | P0-002 | `feature/P0-003-pgenlib-build` |
-| P0-004 | Build Validation | P0-003 | `feature/P0-004-build-validation` |
+| P0-003 | duckhts Lessons & Patterns | — | (reference only) |
+| P0-004 | pgenlib Build Integration | P0-002 | `feature/P0-004-pgenlib-build` |
+| P0-005 | Build Validation | P0-004 | `feature/P0-005-build-validation` |
 
 ### P1 — Reader Functions
 
 | Plan | Title | Depends On | Branch | Parallel Group |
 |------|-------|-----------|--------|----------------|
-| P1-001 | read_pvar | P0-004 | `feature/P1-001-read-pvar` | **A** |
-| P1-002 | read_psam | P0-004 | `feature/P1-002-read-psam` | **A** |
+| P1-001 | read_pvar | P0-005 | `feature/P1-001-read-pvar` | **A** |
+| P1-002 | read_psam | P0-005 | `feature/P1-002-read-psam` | **A** |
 | P1-003 | read_pgen | P1-001 + P1-002 | `feature/P1-003-read-pgen` | B |
 | P1-004 | read_pfile | P1-003 | `feature/P1-004-read-pfile` | C |
 | P1-005 | Integration & Documentation | P1-004 | `feature/P1-005-integration` | — |
+| P1-006 | P2 Utility Function Planning | — (plans only) | `feature/P1-006-p2-planning` | **A** (parallel with all P1) |
 
 ### P2 — Utility Functions (Future)
 
-Begins with a planning stage after P1-005 completion. Covers `plink_freq`,
-`plink_hardy`, `plink_missing`, `plink_ld`, and future analysis functions.
+Planned by P1-006. Covers `plink_freq`, `plink_hardy`, `plink_missing`,
+`plink_ld`, and additional functions identified through plink2 command survey.
+P2-00X plan documents will be produced by P1-006 before P2 implementation
+begins.
 
 ---
 
 ## Dependency Graph
 
 ```
-P0-002 ──→ P0-003 ──→ P0-004
-                         │
-             ┌───────────┴───────────┐
-             │                       │
-          P1-001                  P1-002        ← Parallel Group A
-       (read_pvar)             (read_psam)        (separate worktrees)
-             │                       │
-             └───────────┬───────────┘
-                         │ merge
-                      P1-003                    ← Group B
-                   (read_pgen)
-                         │
-                      P1-004                    ← Group C
-                   (read_pfile)
-                         │
-                      P1-005
-                 (integration & docs)
+P0-002 ──→ P0-004 ──→ P0-005
+              │           │
+           P0-003         │           P0-003 = duckhts lessons
+         (reference)      │           (informs P0-004, P1-003, P1-004)
+                          │
+              ┌───────────┴───────────┐
+              │                       │
+           P1-001                  P1-002        ← Parallel Group A
+        (read_pvar)             (read_psam)        (separate worktrees)
+              │                       │
+              └───────────┬───────────┘
+                          │ merge                    P1-006
+                       P1-003                    (P2 planning)
+                    (read_pgen)                  runs in parallel
+                          │                      with all P1 work;
+                       P1-004                    produces P2-00X
+                    (read_pfile)                 plan documents
+                          │
+                       P1-005
+                  (integration & docs)
 ```
 
 ---
