@@ -1,12 +1,8 @@
 # PlinkingDuck
 
-This repository is based on https://github.com/duckdb/extension-template, check it out if you want to build and ship your own DuckDB extension.
+A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/) genomics file formats directly in SQL.
 
----
-
-PlinkingDuck is a DuckDB extension for working with [PLINK2](https://www.cog-genomics.org/plink/2.0/)
-genomic data files (.pgen/.pvar/.psam). It exposes PLINK binary genotype data as
-SQL-queryable tables, enabling genomic analysis within DuckDB's analytical engine.
+PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific tools.
 
 ## Usage
 
@@ -63,6 +59,49 @@ The main binaries that will be built are:
 - `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
 - `plinking_duck.duckdb_extension` is the loadable binary as it would be distributed.
 
+### `read_psam(path)`
+
+Read PLINK 2 `.psam` (sample information) or PLINK 1 `.fam` files as DuckDB tables.
+
+```sql
+-- Read a .psam file
+SELECT * FROM read_psam('samples.psam');
+```
+
+**Supported formats:**
+
+| Format | Header | Columns |
+|--------|--------|---------|
+| `.psam` (`#FID` header) | `#FID  IID  SEX  [phenotypes...]` | FID + IID + dynamic columns |
+| `.psam` (`#IID` header) | `#IID  SEX  [phenotypes...]` | IID + dynamic columns (no FID) |
+| `.fam` (no header) | Fixed 6 columns | FID, IID, PAT, MAT, SEX, PHENO1 |
+
+**Type mapping:**
+
+| Column | DuckDB Type | Notes |
+|--------|-------------|-------|
+| SEX | INTEGER | 1=male, 2=female; `0`/`NA`/`.` → NULL |
+| PAT, MAT | VARCHAR | `0`/`.`/`NA` → NULL (unknown parent) |
+| All others | VARCHAR | `.`/`NA` → NULL |
+
+**Examples:**
+
+```sql
+-- Count samples per family
+SELECT FID, COUNT(*) AS n FROM read_psam('cohort.psam') GROUP BY FID;
+
+-- Filter by sex
+SELECT IID FROM read_psam('cohort.psam') WHERE SEX = 2;
+
+-- Join sample info with phenotype data
+SELECT s.IID, s.SEX, p.BMI
+FROM read_psam('cohort.psam') s
+JOIN 'phenotypes.csv' p ON s.IID = p.IID;
+
+-- Read a legacy .fam file
+SELECT * FROM read_psam('cohort.fam');
+```
+
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`.
 
@@ -78,6 +117,7 @@ D SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/example.pvar') LIMIT
 │ 1       │ 30000 │ rs3     │ G       │ A,C     │
 └─────────┴───────┴─────────┴─────────┴─────────┘
 ```
+
 
 ## Running the tests
 Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:

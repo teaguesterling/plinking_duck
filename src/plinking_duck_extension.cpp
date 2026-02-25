@@ -2,12 +2,14 @@
 
 #include "plinking_duck_extension.hpp"
 #include "pvar_reader.hpp"
+#include "psam_reader.hpp"
 #include "duckdb.hpp"
 
 namespace duckdb {
 
 void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPvarReader(loader);
+	RegisterPsamReader(loader);
 }
 
 std::string PlinkingDuckExtension::Name() {

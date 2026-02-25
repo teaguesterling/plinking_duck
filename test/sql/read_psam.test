@@ -1,0 +1,219 @@
+# name: test/sql/read_psam.test
+# description: Test read_psam table function
+# group: [plinking_duck]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# Standard .psam format (#FID header)
+# ---------------------------------------------------------------------------
+
+# Basic read — all columns
+query III
+SELECT * FROM read_psam('test/data/example.psam') ORDER BY IID;
+----
+FAM001	SAMPLE1	1
+FAM001	SAMPLE2	2
+FAM002	SAMPLE3	NULL
+FAM002	SAMPLE4	1
+
+# Column count
+query I
+SELECT COUNT(*) FROM read_psam('test/data/example.psam');
+----
+4
+
+# Projection pushdown — select specific columns
+query I
+SELECT IID FROM read_psam('test/data/example.psam') ORDER BY IID;
+----
+SAMPLE1
+SAMPLE2
+SAMPLE3
+SAMPLE4
+
+# SEX column type is INTEGER
+query I
+SELECT typeof(SEX) FROM read_psam('test/data/example.psam') LIMIT 1;
+----
+INTEGER
+
+# SEX = 0 maps to NULL
+query II
+SELECT IID, SEX FROM read_psam('test/data/example.psam') WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	NULL
+
+# Filter on SEX
+query I
+SELECT IID FROM read_psam('test/data/example.psam') WHERE SEX = 2;
+----
+SAMPLE2
+
+# FID column
+query II
+SELECT FID, IID FROM read_psam('test/data/example.psam') WHERE FID = 'FAM002' ORDER BY IID;
+----
+FAM002	SAMPLE3
+FAM002	SAMPLE4
+
+# ---------------------------------------------------------------------------
+# .psam format without FID (#IID header)
+# ---------------------------------------------------------------------------
+
+query III
+SELECT * FROM read_psam('test/data/no_fid.psam') ORDER BY IID;
+----
+SAMPLE1	1	2
+SAMPLE2	2	1
+SAMPLE3	NULL	NULL
+
+# Verify column names for #IID format
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_psam('test/data/no_fid.psam')) ORDER BY column_name;
+----
+IID
+PHENO1
+SEX
+
+# ---------------------------------------------------------------------------
+# Minimal .psam (single column, single row)
+# ---------------------------------------------------------------------------
+
+query I
+SELECT * FROM read_psam('test/data/minimal.psam');
+----
+SAMPLE1
+
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_psam('test/data/minimal.psam'));
+----
+IID
+
+# ---------------------------------------------------------------------------
+# .psam with phenotypes and PAT/MAT columns
+# ---------------------------------------------------------------------------
+
+# Full schema
+query IIIIIIII
+SELECT * FROM read_psam('test/data/phenotypes.psam') ORDER BY IID;
+----
+FAM001	S1	NULL	NULL	1	2	45	25.3
+FAM001	S2	S1	S3	2	1	38	22.1
+FAM002	S3	NULL	NULL	2	NULL	52	28.7
+
+# PAT/MAT "0" maps to NULL (unknown parent)
+query III
+SELECT IID, PAT, MAT FROM read_psam('test/data/phenotypes.psam') WHERE IID = 'S1';
+----
+S1	NULL	NULL
+
+# PAT/MAT with actual values
+query III
+SELECT IID, PAT, MAT FROM read_psam('test/data/phenotypes.psam') WHERE IID = 'S2';
+----
+S2	S1	S3
+
+# PHENO1 "NA" maps to NULL
+query II
+SELECT IID, PHENO1 FROM read_psam('test/data/phenotypes.psam') WHERE IID = 'S3';
+----
+S3	NULL
+
+# Extra phenotype columns are VARCHAR
+query I
+SELECT typeof(AGE) FROM read_psam('test/data/phenotypes.psam') LIMIT 1;
+----
+VARCHAR
+
+query I
+SELECT typeof(BMI) FROM read_psam('test/data/phenotypes.psam') LIMIT 1;
+----
+VARCHAR
+
+# Projection pushdown on phenotype columns
+query II
+SELECT IID, BMI FROM read_psam('test/data/phenotypes.psam') ORDER BY IID;
+----
+S1	25.3
+S2	22.1
+S3	28.7
+
+# ---------------------------------------------------------------------------
+# Legacy .fam format
+# ---------------------------------------------------------------------------
+
+query IIIIII
+SELECT * FROM read_psam('test/data/example.fam') ORDER BY IID;
+----
+FAM001	SAMPLE1	NULL	NULL	1	-9
+FAM001	SAMPLE2	NULL	NULL	2	1
+FAM002	SAMPLE3	NULL	NULL	NULL	2
+
+# .fam column names
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_psam('test/data/example.fam')) ORDER BY column_name;
+----
+FID
+IID
+MAT
+PAT
+PHENO1
+SEX
+
+# .fam SEX column type
+query I
+SELECT typeof(SEX) FROM read_psam('test/data/example.fam') LIMIT 1;
+----
+INTEGER
+
+# .fam PAT/MAT "0" → NULL
+query III
+SELECT IID, PAT, MAT FROM read_psam('test/data/example.fam') WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	NULL	NULL
+
+# .fam SEX=0 → NULL
+query II
+SELECT IID, SEX FROM read_psam('test/data/example.fam') WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	NULL
+
+# .fam projection pushdown
+query I
+SELECT IID FROM read_psam('test/data/example.fam') ORDER BY IID;
+----
+SAMPLE1
+SAMPLE2
+SAMPLE3
+
+# ---------------------------------------------------------------------------
+# Legacy .fam format — space-delimited (PLINK 1 compatibility)
+# ---------------------------------------------------------------------------
+
+# Space-delimited .fam files are common from PLINK 1 and other tools
+query IIIIII
+SELECT * FROM read_psam('test/data/spaces.fam') ORDER BY IID;
+----
+FAM001	SAMPLE1	NULL	NULL	1	-9
+FAM001	SAMPLE2	NULL	NULL	2	1
+FAM002	SAMPLE3	NULL	NULL	NULL	2
+
+# Results should match the tab-delimited version
+query I
+SELECT COUNT(*) FROM read_psam('test/data/spaces.fam');
+----
+3
+
+# ---------------------------------------------------------------------------
+# Header-only .psam (valid file, zero rows)
+# ---------------------------------------------------------------------------
+
+query III
+SELECT * FROM read_psam('test/data/header_only.psam');
+----
+
+query I
+SELECT COUNT(*) FROM read_psam('test/data/header_only.psam');
+----
+0
