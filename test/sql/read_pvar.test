@@ -53,6 +53,14 @@ SELECT COUNT(*) FROM read_pvar('test/data/example.bim');
 ----
 3
 
+# Space-delimited .bim (PLINK 1 allows spaces, tabs, or mixed)
+query TITTTR
+SELECT * FROM read_pvar('test/data/spaces.bim');
+----
+1	10000	rs10	A	G	0.5
+1	20000	rs11	C	T	1.2
+2	15000	rs12	T	C	0.0
+
 # ---------------------------------------------------------------------------
 # Comment line handling
 # ---------------------------------------------------------------------------

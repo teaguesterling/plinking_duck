@@ -186,6 +186,8 @@ static unique_ptr<LocalTableFunctionState> PvarInitLocal(ExecutionContext &conte
 // ---------------------------------------------------------------------------
 
 //! Split a line on tab characters into fields.
+//! Used for .pvar format where tabs are the only valid delimiter
+//! (fields like INFO can contain spaces).
 static vector<string> SplitTabs(const string &line) {
 	vector<string> fields;
 	size_t start = 0;
@@ -195,6 +197,30 @@ static vector<string> SplitTabs(const string &line) {
 		start = pos + 1;
 	}
 	fields.push_back(line.substr(start));
+	return fields;
+}
+
+//! Split a line on whitespace (spaces and/or tabs) into fields.
+//! Used for .bim format where PLINK 1 allows any whitespace delimiter.
+//! Consecutive whitespace is treated as a single delimiter.
+static vector<string> SplitWhitespace(const string &line) {
+	vector<string> fields;
+	size_t i = 0;
+	while (i < line.size()) {
+		// Skip whitespace between fields
+		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
+			i++;
+		}
+		if (i >= line.size()) {
+			break;
+		}
+		// Read field until next whitespace
+		size_t start = i;
+		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
+			i++;
+		}
+		fields.push_back(line.substr(start, i - start));
+	}
 	return fields;
 }
 
@@ -229,7 +255,7 @@ static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const 
 		char *end;
 		errno = 0;
 		float val = std::strtof(field.c_str(), &end);
-		if (end == field.c_str() || errno != 0) {
+		if (end == field.c_str() || *end != '\0' || errno != 0) {
 			throw InvalidInputException("read_pvar: invalid float value '%s'", field);
 		}
 		FlatVector::GetData<float>(vec)[row_idx] = val;
@@ -239,7 +265,7 @@ static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const 
 		char *end;
 		errno = 0;
 		double val = std::strtod(field.c_str(), &end);
-		if (end == field.c_str() || errno != 0) {
+		if (end == field.c_str() || *end != '\0' || errno != 0) {
 			throw InvalidInputException("read_pvar: invalid double value '%s'", field);
 		}
 		FlatVector::GetData<double>(vec)[row_idx] = val;
@@ -277,7 +303,9 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 			continue;
 		}
 
-		auto fields = SplitTabs(line);
+		// .bim uses whitespace-delimited fields (spaces, tabs, or mixed);
+		// .pvar uses tab-only (fields like INFO can contain spaces)
+		auto fields = header.is_bim ? SplitWhitespace(line) : SplitTabs(line);
 
 		// Validate field count
 		idx_t expected = header.is_bim ? 6 : header.column_names.size();
