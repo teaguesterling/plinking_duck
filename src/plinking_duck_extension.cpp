@@ -1,12 +1,13 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "plinking_duck_extension.hpp"
+#include "psam_reader.hpp"
 #include "duckdb.hpp"
 
 namespace duckdb {
 
 void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
-	// Reader functions will be registered here in P1 phases
+	RegisterPsamReader(loader);
 }
 
 std::string PlinkingDuckExtension::Name() {
