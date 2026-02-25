@@ -1,0 +1,93 @@
+# name: test/sql/read_pgen_negative.test
+# description: Negative and edge case tests for read_pgen table function
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- File not found ---
+
+statement error
+SELECT * FROM read_pgen('nonexistent.pgen');
+----
+read_pgen
+
+# --- Missing companion .pvar ---
+
+# A valid .pgen file with no .pvar or .bim companion
+statement error
+SELECT * FROM read_pgen('test/data/pgen_no_pvar.pgen');
+----
+cannot find .pvar or .bim
+
+# --- Mismatched sample count ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen',
+    psam := 'test/data/mismatched_samples.psam');
+----
+sample count mismatch
+
+# --- Mismatched variant count ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'test/data/mismatched_variants.pvar');
+----
+variant count mismatch
+
+# --- No arguments ---
+
+statement error
+SELECT * FROM read_pgen();
+----
+
+# --- Out-of-range integer sample index ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', samples := [999]);
+----
+sample index
+
+# --- VARCHAR samples without .psam ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_orphan.pgen',
+    samples := ['SAMPLE1']);
+----
+LIST(INTEGER)
+
+# --- Unknown sample name ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen',
+    samples := ['NONEXISTENT']);
+----
+not found
+
+# --- Empty samples list ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', samples := []::INTEGER[]);
+----
+must not be empty
+
+# --- Duplicate sample indices ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', samples := [0, 1, 0]);
+----
+duplicate sample index
+
+# --- Dosages not yet implemented ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', dosages := true);
+----
+not yet implemented
+
+# --- Phased not yet implemented ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', phased := true);
+----
+not yet implemented

@@ -1,0 +1,4 @@
+##contig=<ID=1,length=100000>
+#CHROM	POS	ID	REF	ALT
+1	1000	rs_miss1	A	G
+1	2000	rs_miss2	C	T

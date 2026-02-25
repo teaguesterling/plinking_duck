@@ -59,6 +59,36 @@ The main binaries that will be built are:
 - `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
 - `plinking_duck.duckdb_extension` is the loadable binary as it would be distributed.
 
+### `read_pgen(path [, pvar, psam, samples])`
+
+Read PLINK 2 `.pgen` binary genotype files. Auto-discovers companion `.pvar` and `.psam` files.
+
+```sql
+-- Basic usage (auto-discovers .pvar and .psam)
+SELECT * FROM read_pgen('path/to/file.pgen');
+
+-- Explicit companion file paths
+SELECT * FROM read_pgen('file.pgen', pvar := 'other.pvar', psam := 'other.psam');
+
+-- Only variant metadata (skips genotype decoding — fast)
+SELECT chrom, pos, id FROM read_pgen('file.pgen');
+
+-- Subset samples by 0-based index
+SELECT id, genotypes FROM read_pgen('file.pgen', samples := [0, 2]);
+```
+
+**Output columns:** CHROM, POS, ID, REF, ALT (from `.pvar`), genotypes (from `.pgen`).
+
+**Genotype encoding:** `LIST(TINYINT)` with one entry per sample:
+0 = homozygous reference, 1 = heterozygous, 2 = homozygous alternate, NULL = missing.
+
+**Projection pushdown:** If the `genotypes` column is not referenced in the query,
+genotype decoding is skipped entirely, making metadata-only queries very fast.
+
+**Optional .psam:** The `.psam` file is optional for `read_pgen`. Without it,
+genotype lists are sized from the `.pgen` header and the `samples` parameter
+only accepts integer indices.
+
 ### `read_psam(path)`
 
 Read PLINK 2 `.psam` (sample information) or PLINK 1 `.fam` files as DuckDB tables.

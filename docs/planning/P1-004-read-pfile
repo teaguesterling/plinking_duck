@@ -501,13 +501,108 @@ SELECT * FROM read_pfile('data/example', region := '22:1-50000000');
 4. [ ] Tidy mode emits correct row count (variants x samples)
 5. [ ] Tidy mode includes sample metadata columns
 6. [ ] Tidy mode genotype is scalar TINYINT (not list)
-7. [ ] Sample subsetting works via `samples` parameter
+7. [ ] Sample subsetting works via `samples` parameter (VARCHAR and INTEGER)
 8. [ ] Unknown sample IDs produce clear error
-9. [ ] Region filtering works via `region` parameter
-10. [ ] Variant filtering works via `variants` parameter
-11. [ ] `variants` + `region` combined uses intersection
-12. [ ] Unknown variant IDs produce clear error
-13. [ ] Empty region returns 0 rows (not an error)
-14. [ ] All positive and negative tests pass
-15. [ ] `make test` passes
-16. [ ] README updated
+9. [ ] Out-of-range sample indices produce clear error
+10. [ ] Region filtering works via `region` parameter
+11. [ ] Variant filtering works via `variants` parameter (VARCHAR and INTEGER)
+12. [ ] `variants` + `region` combined uses intersection
+13. [ ] Unknown variant IDs produce clear error
+14. [ ] Out-of-range variant indices produce clear error
+15. [ ] Empty region returns 0 rows (not an error)
+16. [ ] All positive and negative tests pass
+17. [ ] `make test` passes
+18. [ ] README updated
+
+---
+
+## Addendum: Integer Index Support for Filter Parameters
+
+*Added per DESIGN-GUIDE §2 amendment (integer index support for `samples`
+and `variants` parameters).*
+
+### Type dispatch
+
+The `samples` and `variants` parameters accept both string IDs and 0-based
+integer indices via type dispatch at bind time. See DESIGN-GUIDE §2 for the
+full specification.
+
+### Named parameters (updated)
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pgen` | VARCHAR | prefix + `.pgen` | Explicit .pgen path |
+| `pvar` | VARCHAR | prefix + `.pvar` | Explicit .pvar path |
+| `psam` | VARCHAR | prefix + `.psam` | Explicit .psam path |
+| `tidy` | BOOLEAN | false | Tidy output (one row per variant x sample) |
+| `dosages` | BOOLEAN | false | Include dosage data |
+| `phased` | BOOLEAN | false | Include phase data |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter samples by IID or 0-based index |
+| `region` | VARCHAR | all | Filter to genomic region (`chr:start-end`) |
+| `variants` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter variants by ID or 0-based index |
+
+### Implementation notes
+
+Integer variant indices skip the variant ID map lookup and set bits directly
+in the variant inclusion set. Combined with `region`, the effective set is
+the intersection: only variants that are both in the integer index set and
+within the region range are included.
+
+Integer sample indices build the `sample_include` bitmask directly (same
+pattern as P1-003 addendum). In tidy mode, sample metadata columns (FID,
+IID, SEX, etc.) are still populated from the .psam for indexed samples —
+the integer index selects which samples to include, not which metadata to
+show.
+
+### Examples
+
+```sql
+-- Integer sample indices in tidy mode
+SELECT ID, IID, genotype
+FROM read_pfile('data/example', tidy := true, samples := [0, 2]);
+
+-- Integer variant indices
+SELECT * FROM read_pfile('data/example', variants := [0, 3]);
+
+-- Integer variants + region (intersection)
+SELECT * FROM read_pfile('data/example',
+    variants := [0, 1, 2, 3], region := '1:10000-20000');
+```
+
+### Additional tests
+
+```sql
+# Integer sample indices in tidy mode
+query I
+SELECT COUNT(DISTINCT IID)
+FROM read_pfile('test/data/example', tidy := true, samples := [0, 2]);
+----
+2
+
+# Integer variant indices
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/example', variants := [0, 3]);
+----
+2
+
+# Integer variants + region (intersection)
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/example',
+    variants := [0, 1, 2, 3], region := '1:10000-20000');
+----
+2
+
+# Out-of-range sample index
+statement error
+SELECT * FROM read_pfile('test/data/example', samples := [999]);
+----
+(error: sample index out of range)
+
+# Out-of-range variant index
+statement error
+SELECT * FROM read_pfile('test/data/example', variants := [999]);
+----
+(error: variant index out of range)
+```
