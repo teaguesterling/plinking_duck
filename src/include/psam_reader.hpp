@@ -25,7 +25,8 @@ struct SampleInfo {
 
 //! Parse a .psam or .fam file and return sample metadata.
 //! Detects format automatically from the first line.
-SampleInfo LoadSampleInfo(const string &path);
+//! Uses DuckDB's VFS for file access (supports S3, HTTP, etc).
+SampleInfo LoadSampleInfo(ClientContext &context, const string &path);
 
 // ---------------------------------------------------------------------------
 // Psam header parsing — reusable by read_pgen bind phase
@@ -45,7 +46,8 @@ struct PsamHeaderInfo {
 };
 
 //! Parse the header (or detect .fam format) from the given file path.
-PsamHeaderInfo ParsePsamHeader(const string &path);
+//! Uses DuckDB's VFS for file access (supports S3, HTTP, etc).
+PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path);
 
 // ---------------------------------------------------------------------------
 // Registration

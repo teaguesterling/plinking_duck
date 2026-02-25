@@ -1,9 +1,9 @@
 #include "psam_reader.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/file_open_flags.hpp"
 
 #include <algorithm>
-#include <fstream>
-#include <sstream>
 #include <string>
 
 namespace duckdb {
@@ -53,25 +53,64 @@ static vector<string> SplitTabLine(const string &line) {
 }
 
 // ---------------------------------------------------------------------------
+// File reading via DuckDB VFS
+// ---------------------------------------------------------------------------
+
+//! Read an entire file via DuckDB's virtual file system and split into lines.
+//! Strips \r from line endings. Returns an empty vector for empty files.
+//! Uses VFS so that S3, HTTP, and custom filesystems work transparently.
+static vector<string> ReadFileLines(ClientContext &context, const string &path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto file_size = handle->GetFileSize();
+
+	if (file_size == 0) {
+		return {};
+	}
+
+	// Read entire file into a string buffer — .psam/.fam files are small
+	// metadata files (typically KB to low MB), so this is safe and simple
+	string content(file_size, '\0');
+	handle->Read(const_cast<char *>(content.data()), file_size);
+
+	// Split into lines, stripping \r and skipping trailing empty line
+	vector<string> lines;
+	size_t start = 0;
+	for (size_t i = 0; i < content.size(); i++) {
+		if (content[i] == '\n') {
+			size_t end = i;
+			if (end > start && content[end - 1] == '\r') {
+				end--;
+			}
+			lines.push_back(content.substr(start, end - start));
+			start = i + 1;
+		}
+	}
+	// Handle last line without trailing newline
+	if (start < content.size()) {
+		size_t end = content.size();
+		if (end > start && content[end - 1] == '\r') {
+			end--;
+		}
+		if (end > start) {
+			lines.push_back(content.substr(start, end - start));
+		}
+	}
+
+	return lines;
+}
+
+// ---------------------------------------------------------------------------
 // Header parsing
 // ---------------------------------------------------------------------------
 
-PsamHeaderInfo ParsePsamHeader(const string &path) {
-	std::ifstream file(path);
-	if (!file.good()) {
-		throw IOException("read_psam: could not open file '%s'", path);
-	}
-
-	string first_line;
-	if (!std::getline(file, first_line)) {
+PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path) {
+	auto lines = ReadFileLines(context, path);
+	if (lines.empty()) {
 		throw IOException("read_psam: file '%s' is empty", path);
 	}
 
-	// Strip trailing carriage return (Windows line endings)
-	if (!first_line.empty() && first_line.back() == '\r') {
-		first_line.pop_back();
-	}
-
+	auto &first_line = lines[0];
 	if (first_line.empty()) {
 		throw IOException("read_psam: file '%s' has an empty first line", path);
 	}
@@ -131,8 +170,14 @@ PsamHeaderInfo ParsePsamHeader(const string &path) {
 // LoadSampleInfo — reusable utility for read_pgen / read_pfile
 // ---------------------------------------------------------------------------
 
-SampleInfo LoadSampleInfo(const string &path) {
-	auto header = ParsePsamHeader(path);
+SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
+	auto lines = ReadFileLines(context, path);
+	if (lines.empty()) {
+		throw IOException("read_psam: file '%s' is empty", path);
+	}
+
+	// Parse header to get format and column layout
+	auto header = ParsePsamHeader(context, path);
 
 	// Find IID and FID column indices
 	idx_t iid_idx = DConstants::INVALID_INDEX;
@@ -152,23 +197,11 @@ SampleInfo LoadSampleInfo(const string &path) {
 	SampleInfo info;
 	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
 
-	std::ifstream file(path);
-	if (!file.good()) {
-		throw IOException("read_psam: could not open file '%s'", path);
-	}
-	string line;
+	// Data lines start at index 1 for .psam (skip header), 0 for .fam
+	idx_t data_start = (header.format != PsamFormat::FAM) ? 1 : 0;
 
-	// Skip header line for .psam files
-	if (header.format != PsamFormat::FAM) {
-		std::getline(file, line);
-	}
-
-	idx_t line_num = (header.format != PsamFormat::FAM) ? 1 : 0;
-	while (std::getline(file, line)) {
-		line_num++;
-		if (!line.empty() && line.back() == '\r') {
-			line.pop_back();
-		}
+	for (idx_t i = data_start; i < lines.size(); i++) {
+		auto &line = lines[i];
 		if (line.empty()) {
 			continue;
 		}
@@ -176,7 +209,7 @@ SampleInfo LoadSampleInfo(const string &path) {
 		auto fields = SplitTabLine(line);
 		if (iid_idx >= fields.size()) {
 			throw IOException("read_psam: file '%s' line %d has %d fields, expected at least %d",
-			                  path, line_num, fields.size(), iid_idx + 1);
+			                  path, i + 1, fields.size(), iid_idx + 1);
 		}
 
 		info.iids.push_back(fields[iid_idx]);
@@ -248,7 +281,7 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 	auto result = make_uniq<PsamBindData>();
 	result->file_path = input.inputs[0].GetValue<string>();
 
-	auto header = ParsePsamHeader(result->file_path);
+	auto header = ParsePsamHeader(context, result->file_path);
 	result->format = header.format;
 	result->column_names = header.column_names;
 	result->column_types = header.column_types;
@@ -295,28 +328,14 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 		state->is_parent_col.push_back(is_parent);
 	}
 
-	std::ifstream file(bind_data.file_path);
-	if (!file.good()) {
-		throw IOException("read_psam: could not open file '%s'", bind_data.file_path);
-	}
-
-	string line;
-
-	// Skip header line for .psam files
-	if (bind_data.format != PsamFormat::FAM) {
-		std::getline(file, line);
-	}
-
-	idx_t line_num = (bind_data.format != PsamFormat::FAM) ? 1 : 0;
+	auto lines = ReadFileLines(context, bind_data.file_path);
 	idx_t expected_cols = bind_data.column_names.size();
 
-	while (std::getline(file, line)) {
-		line_num++;
-		// Strip trailing CR
-		if (!line.empty() && line.back() == '\r') {
-			line.pop_back();
-		}
-		// Skip blank lines
+	// Data lines start at index 1 for .psam (skip header), 0 for .fam
+	idx_t data_start = (bind_data.format != PsamFormat::FAM) ? 1 : 0;
+
+	for (idx_t i = data_start; i < lines.size(); i++) {
+		auto &line = lines[i];
 		if (line.empty()) {
 			continue;
 		}
@@ -326,7 +345,7 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 		if (fields.size() != expected_cols) {
 			throw IOException(
 			    "read_psam: file '%s' line %d has %d fields, expected %d",
-			    bind_data.file_path, line_num, fields.size(), expected_cols);
+			    bind_data.file_path, i + 1, fields.size(), expected_cols);
 		}
 
 		state->rows.push_back(std::move(fields));
