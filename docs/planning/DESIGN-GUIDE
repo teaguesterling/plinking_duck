@@ -67,20 +67,86 @@ functions that use them:
 |-----------|------|-----------|---------|
 | `pvar` | VARCHAR | Explicit .pvar/.bim path (overrides auto-discovery) | read_pgen, read_pfile, all P2 |
 | `psam` | VARCHAR | Explicit .psam/.fam path (overrides auto-discovery) | read_pgen, read_pfile, all P2 |
-| `samples` | LIST(VARCHAR) | Filter to specific sample IDs by IID | read_pfile, all P2 |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific samples (by IID or 0-based index) | read_pgen, read_pfile, all P2 |
 | `region` | VARCHAR | Filter to genomic region (`chr:start-end`) | read_pfile, P2-001–P2-005 |
-| `variants` | LIST(VARCHAR) | Filter to specific variant IDs | read_pfile *(planned)* |
+| `variants` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific variants (by ID or 0-based index) | read_pfile *(planned)* |
 
-**`samples` not found**: Error with the unknown sample ID. Partial matches
-are not accepted. This is consistent across all functions.
+#### Type dispatch for filter parameters
+
+The `samples` and `variants` parameters accept either string IDs or integer
+indices, determined by the parameter's DuckDB type at bind time:
+
+| Parameter Type | Behavior |
+|---------------|----------|
+| `LIST(VARCHAR)` | Match by ID: look up IID (samples) or variant ID (variants) in the companion file metadata. Error on unknown ID. |
+| `LIST(INTEGER)` | Match by 0-based index: index directly into the .pgen's internal sample/variant ordering. Error if any index is out of range (>= `raw_sample_ct` or `raw_variant_ct`). |
+
+Integer indices bypass ID lookup entirely — they map directly to pgenlib's
+internal 0-based ordering. This is useful for:
+- **Quick inspection**: `samples := [0, 49]` without needing to know IIDs
+- **Orphaned .pgen files**: when no .psam exists (see §2.1 below), integer
+  indices are the only way to select specific samples
+- **Programmatic access**: when indices have been resolved externally
+
+```sql
+-- By name
+SELECT * FROM read_pfile('data/example', tidy := true, samples := ['SAMPLE1']);
+
+-- By 0-based index (same sample if SAMPLE1 is first in .psam)
+SELECT * FROM read_pfile('data/example', tidy := true, samples := [0]);
+
+-- Integer variant indexing
+SELECT * FROM read_pgen('data/example.pgen', variants := [0, 3]);
+```
+
+**Mixing types is not allowed**: a single `samples` or `variants` parameter
+must be entirely VARCHAR or entirely INTEGER. To combine, resolve IDs to
+indices (or vice versa) before passing.
+
+#### Error behavior for filter parameters
+
+**`samples` not found**: Error with the unknown sample ID (VARCHAR mode) or
+out-of-range index (INTEGER mode). Partial matches are not accepted. This is
+consistent across all functions.
 
 **`region` with no matches**: Returns 0 rows (not an error). A region that
 doesn't overlap any variants is a valid query with an empty result.
 
 **`variants` not found**: Behavior depends on context. For readers
-(`read_pfile`), error on unknown variant. For utility functions where
-partial matching is expected (e.g., `plink_score` ID-keyed weights), skip
-with a warning count.
+(`read_pfile`), error on unknown variant ID or out-of-range index. For
+utility functions where partial matching is expected (e.g., `plink_score`
+ID-keyed weights), skip with a warning count.
+
+### Optional companion files
+
+The .pgen binary contains a sample count (`raw_sample_ct`) and variant count
+(`raw_variant_ct`) in its header. Companion files (.pvar, .psam) provide
+metadata (names, positions, phenotypes) but are not strictly required for
+genotype access.
+
+**Policy for `read_pgen`**: The .psam file is **optional**. If no .psam is
+found (and none is provided via the `psam` parameter), `read_pgen` operates
+in **index-only mode**:
+- Genotype lists still work (sized by `raw_sample_ct` from the .pgen header)
+- The `samples` parameter only accepts `LIST(INTEGER)`, not `LIST(VARCHAR)`
+  (there are no IIDs to match against)
+- Projection pushdown still applies
+
+The .pvar file remains **required** for `read_pgen` because variant metadata
+columns (CHROM, POS, ID, REF, ALT) are part of the output schema. Without
+.pvar, the function can only output genotype lists with no variant context.
+A future enhancement could make .pvar optional with synthetic row indices,
+but this is not planned for P1.
+
+**Policy for `read_pfile`**: Both .pvar and .psam are **required** because
+the function's purpose is to unify all three files. Use `read_pgen` for
+.pgen-only access.
+
+**Policy for P2 utility functions**: Same as `read_pgen` — .psam is optional
+when the function doesn't need sample metadata in its output (e.g.,
+`plink_freq`, `plink_hardy` produce per-variant output). Functions that
+produce per-sample output (`plink_score`, `plink_missing` sample mode)
+require .psam for IID output columns unless operating in index-only mode.
 
 ### Three-tier type dispatch for small data
 

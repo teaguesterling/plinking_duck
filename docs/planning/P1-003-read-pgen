@@ -509,3 +509,139 @@ never materialize genotypes into DuckDB list form.
 10. [ ] Memory cleanup: no leaks (PgenReader, aligned allocations)
 11. [ ] `make test` passes
 12. [ ] README updated
+13. [ ] Optional .psam: genotype-only queries work without .psam file
+14. [ ] Integer sample indices work via `samples := [0, 2]`
+15. [ ] Out-of-range integer index produces clear error
+
+---
+
+## Addendum: Optional .psam and Integer Index Support
+
+*Added per DESIGN-GUIDE §2 amendment (integer index support, optional
+companion files).*
+
+### Optional .psam
+
+The .pgen header contains `raw_sample_ct`, so genotype access does not
+strictly require a .psam file. `read_pgen` should make .psam **optional**:
+
+- If .psam is found (or provided via `psam` parameter): load sample metadata
+  as before, validate `raw_sample_ct` matches
+- If .psam is not found and `psam` parameter is not provided: operate in
+  **index-only mode** — genotype lists are sized by `raw_sample_ct` from
+  the .pgen header, and no sample IDs are available
+
+This relaxation applies only to `read_pgen`, not `read_pfile` (which requires
+all three files by design).
+
+#### Bind phase changes
+
+Step 5 ("Load sample info") becomes conditional:
+
+```
+5. **Load sample info (optional)**:
+   - If .psam found or `psam` parameter provided:
+     LoadSampleInfo() → get sample IDs
+     Validate raw_sample_ct matches
+   - If .psam not found:
+     sample_ct = pgfi.raw_sample_ct
+     No sample IDs available (index-only mode)
+```
+
+#### Impact on `samples` parameter
+
+When .psam is absent, the `samples` parameter only accepts `LIST(INTEGER)`
+(0-based indices). Passing `LIST(VARCHAR)` without a .psam produces an error:
+
+```
+Error: samples parameter requires LIST(INTEGER) when no .psam is available
+(no sample IDs to match against)
+```
+
+### Integer index support for samples and variants
+
+Per DESIGN-GUIDE §2, the `samples` and `variants` filter parameters accept
+both string IDs and 0-based integer indices via type dispatch:
+
+| Parameter Type | Behavior |
+|---------------|----------|
+| `LIST(VARCHAR)` | Match by IID (requires .psam) |
+| `LIST(INTEGER)` | Direct 0-based index into .pgen sample order |
+
+#### Named parameters (updated)
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered (optional) | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter samples by IID or 0-based index |
+| `dosages` | BOOLEAN | false | Include dosages column |
+| `phased` | BOOLEAN | false | Include phased column |
+
+#### Implementation
+
+Integer sample subsetting builds the `sample_include` bitmask directly from
+indices without any ID lookup:
+
+```cpp
+if (samples_val.type() == LogicalType::LIST(LogicalType::INTEGER)) {
+    auto &idx_list = ListValue::GetChildren(samples_val);
+    for (auto &idx_val : idx_list) {
+        uint32_t idx = idx_val.GetValue<uint32_t>();
+        if (idx >= raw_sample_ct) {
+            throw InvalidInputException(
+                "Sample index %d out of range (sample count: %d)",
+                idx, raw_sample_ct);
+        }
+        SetBit(idx, sample_include);
+        subset_size++;
+    }
+} else {
+    // Existing VARCHAR path: look up by IID (requires .psam)
+    if (!has_sample_info) {
+        throw InvalidInputException(
+            "samples parameter requires LIST(INTEGER) when no .psam "
+            "is available (no sample IDs to match against)");
+    }
+    // ... existing string lookup code ...
+}
+```
+
+#### Additional tests
+
+```sql
+# Integer sample indices
+query I
+SELECT len(genotypes)
+FROM read_pgen('test/data/example.pgen', samples := [0, 2])
+LIMIT 1;
+----
+2
+
+# Out-of-range index
+statement error
+SELECT * FROM read_pgen('test/data/example.pgen', samples := [999]);
+----
+(error: sample index out of range)
+
+# read_pgen without .psam (genotype-only)
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/orphan_with_pvar.pgen')
+LIMIT 1;
+----
+(sample count from .pgen header)
+
+# VARCHAR samples without .psam
+statement error
+SELECT * FROM read_pgen('test/data/orphan_with_pvar.pgen',
+    samples := ['SAMPLE1']);
+----
+(error: samples requires LIST(INTEGER) when no .psam)
+```
+
+#### Edge case test data to create (additional)
+
+| File | Content | Tests |
+|------|---------|-------|
+| `test/data/orphan_with_pvar.pgen` | .pgen + .pvar but no .psam | Optional .psam, index-only mode |
+| `test/data/orphan_with_pvar.pvar` | Matching .pvar for above | Companion for orphan .pgen |
