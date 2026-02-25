@@ -149,10 +149,10 @@ FFI support — a purpose-built dot product function.
   pgenlib provides `LinearCombinationMeanimpute()` which computes the
   weighted sum with mean imputation for missing values in a single pass.
 - **Self-contained**: genotypes + weight table → per-sample score table
-- **Table-reference design**: Weights are accepted as a DuckDB table
-  reference via `query_table()`, not as a file path. This lets DuckDB handle
-  all file format parsing and allows weights from any source (CSV, Parquet,
-  database tables, filtered subqueries).
+- **Typed list parameters**: Weights are accepted as typed DuckDB values
+  (`LIST(DOUBLE)` positional or `LIST(STRUCT(id, allele, weight))` ID-keyed),
+  not as file paths. The .pgen is the only "big" streaming data; weights are
+  "small" and materialize as a DuckDB value from any source.
 - **Naturally tabular**: one row per sample with score columns
 - **Extremely common**: PRS (polygenic risk score) calculation is a core
   genomics workflow
@@ -254,20 +254,40 @@ with a threshold parameter that limits output to related pairs only.
 
 ## 3. Design Principles for P2 Functions
 
-### 3.1 Table references for external data inputs
+### 3.1 Big/small data separation and typed list parameters
 
-**Principle**: The extension never parses external file formats. Any table-like
-input (weights, sample lists, covariate tables) is accepted as a DuckDB table
-reference via `query_table()`. DuckDB handles all file format parsing (CSV,
-TSV, Parquet, JSON, etc.) and the extension receives materialized data.
+**Principle**: The .pgen file is always the "big" streaming data — it can't
+be materialized and must be read variant-by-variant through pgenlib. Everything
+else (weights, phenotypes, covariates, sample lists, population labels) is
+"small" data that fits in memory as a materialized DuckDB value, even at
+biobank scale with DuckDB's compressed vector representations.
 
-This applies to P2-005 (plink_score) where weights are provided via
-`query_table()`. The pattern should extend to any future P2/P3 function that
-accepts external data (e.g., covariate tables for plink_glm in P3).
+Small data is accepted as typed DuckDB scalar parameters:
 
-The `samples` parameter across all P2 functions remains `LIST(VARCHAR)` since
-sample lists are typically small. If large sample lists become a use case (e.g.,
-"all controls from a phenotype table"), extend the `query_table()` pattern.
+| Data Shape | Positional Form | ID-keyed Form |
+|-----------|-----------------|---------------|
+| **Variant-keyed** (weights, effect sizes) | `LIST(DOUBLE)` aligned with .pgen variant order | `LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))` matched by ID |
+| **Sample-keyed** (phenotypes, pop labels) | `LIST(DOUBLE)` or `LIST(VARCHAR)` aligned with .pgen sample order | `LIST(STRUCT(iid VARCHAR, ...))` matched by sample ID |
+
+The bind phase inspects the parameter type and dispatches:
+- **Positional**: fast path, no ID matching, assumes alignment with .pgen order
+- **ID-keyed**: flexible path, struct field names serve as the column contract
+
+Values can come from multiple DuckDB expressions:
+- **Literals**: `weights := [1.0, 0.5, -0.5]`
+- **Variables**: `SET VARIABLE w = (...); ... weights := getvariable('w')`
+- **Scalar subqueries** (when DuckDB supports this in table function params)
+
+The extension never parses external file formats. DuckDB handles all file
+format parsing (CSV, TSV, Parquet, JSON, etc.) and the extension receives
+materialized `Value` objects of the declared type.
+
+This applies to P2-005 (plink_score) where weights use this pattern. It
+extends to any future P2/P3 function that accepts external data (e.g.,
+phenotypes for plink_glm, population labels for plink_fst).
+
+The `samples` parameter across all P2 functions is already `LIST(VARCHAR)` —
+the simplest form of sample-keyed small data.
 
 ### 3.2 SQL composability
 

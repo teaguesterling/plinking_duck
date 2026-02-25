@@ -2,14 +2,15 @@
 
 ## Goal
 
-Implement `plink_score(path, weights)` — a DuckDB table function that computes
+Implement `plink_score(path)` — a DuckDB table function that computes
 per-sample polygenic risk scores (PRS) by multiplying genotype dosages with
-variant weights provided as a DuckDB table reference, using pgenlib's
-`PgrGetD()` for efficient genotype access.
+variant weights, using pgenlib's `PgrGetD()` for efficient genotype access.
 
-**Design principle**: Weights and all other table-like inputs are accepted as
-DuckDB table references via `query_table()`, not as file paths. The extension
-never parses external file formats — DuckDB handles all data loading.
+**Design principle**: Weights and all other small data inputs are accepted as
+typed DuckDB values (lists, structs), not as file paths. The extension never
+parses external file formats — DuckDB handles all data loading. The .pgen
+file is the only "big" data that streams through pgenlib; everything else
+materializes as a scalar parameter.
 
 ## Prerequisites
 
@@ -53,84 +54,95 @@ P2-001 (for shared infrastructure)
 
 ## SQL Interface
 
-The `weights` parameter accepts a DuckDB table reference via `query_table()`.
-The referenced table must contain columns for variant ID, scored allele, and
-one or more weight values. Column names are specified via named parameters.
+### Weight input modes
+
+Weights are accepted as a typed DuckDB value via the `weights` named
+parameter. Two forms are supported:
+
+**Positional mode — `LIST(DOUBLE)`**: One weight per variant, aligned with
+the .pgen variant order (or region-filtered order). Assumes the ALT allele
+is the scored allele.
+
+**ID-keyed mode — `LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))`**:
+Each struct identifies a variant by ID, specifies the scored allele, and
+provides the weight. Variants are matched against .pvar metadata. Unmatched
+variants in the weight list are skipped (with a warning count). Struct field
+names serve as the column contract — no separate `id_col`/`allele_col`
+parameters are needed.
+
+### Examples
 
 ```sql
--- Weights from a DuckDB table
-CREATE TABLE prs_weights AS
-    SELECT * FROM read_csv('scores/weights.tsv', header := true);
-
+-- Positional weights: simplest path (one weight per variant, ALT allele)
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table('prs_weights'),
-    id_col := 'variant_id',
-    allele_col := 'effect_allele',
-    weight_col := 'beta');
+    weights := [1.0, 0.5, -0.5, 2.0]);
 
--- Weights from a CSV file inline (DuckDB handles the parsing)
+-- Positional weights from a file via SET VARIABLE
+SET VARIABLE w = (SELECT list(beta ORDER BY rowid) FROM 'scores/weights.parquet');
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table(
-        'SELECT rsid, allele, beta FROM read_csv(''scores/weights.tsv'', header := true)'),
-    id_col := 'rsid',
-    allele_col := 'allele',
-    weight_col := 'beta');
+    weights := getvariable('w'));
 
--- Weights from a Parquet file
+-- ID-keyed weights: flexible path (variant matching by ID + allele)
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table(
-        'SELECT id, a1, weight FROM ''scores/prs_weights.parquet'''),
-    id_col := 'id',
-    allele_col := 'a1',
-    weight_col := 'weight');
+    weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+                {'id': 'rs2', 'allele': 'T', 'weight': 0.5}]);
 
--- Filtered weights (e.g., P+T method — only significant variants)
+-- ID-keyed weights from a GWAS summary stats file
+SET VARIABLE w = (
+    SELECT list({'id': rsid, 'allele': effect_allele, 'weight': beta})
+    FROM read_csv('scores/gwas_results.tsv', header := true)
+    WHERE pvalue < 5e-8
+);
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table(
-        'SELECT id, allele, beta FROM gwas_results WHERE pvalue < 5e-8'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'beta');
+    weights := getvariable('w'));
 
--- Multiple score columns from a single table
+-- ID-keyed weights from Parquet
+SET VARIABLE w = (
+    SELECT list({'id': id, 'allele': a1, 'weight': weight})
+    FROM 'scores/prs_weights.parquet'
+);
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table('prs_weights'),
-    id_col := 'variant_id',
-    allele_col := 'effect_allele',
-    weight_cols := ['beta_eur', 'beta_eas', 'beta_afr']);
+    weights := getvariable('w'));
 
 -- With variance standardization
+SET VARIABLE w = (SELECT list(beta ORDER BY rowid) FROM weights_table);
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table('prs_weights'),
-    id_col := 'variant_id',
-    allele_col := 'effect_allele',
-    weight_col := 'beta',
+    weights := getvariable('w'),
     center := true);
 
 -- Composable: join scores with phenotype data
 SELECT s.IID, s.SCORE_SUM, p.PHENO1
 FROM plink_score('data/example.pgen',
-    weights := query_table('prs_weights'),
-    id_col := 'variant_id',
-    allele_col := 'effect_allele',
-    weight_col := 'beta') s
+    weights := getvariable('w')) s
 JOIN read_psam('data/example.psam') p ON s.IID = p.IID;
 ```
 
-### Design rationale: query_table over file paths
+### Design rationale: typed list parameters over file paths
 
-Using `query_table()` instead of a file path parameter:
+1. **Big/small data separation**: The .pgen file is the only "big" data
+   source — it streams through pgenlib and cannot be materialized. Everything
+   else (weights, phenotypes, covariates, sample lists) is "small" and fits
+   in memory as a DuckDB value. Even millions of weights compress efficiently
+   in DuckDB's vector representation.
 
-1. **No file parsing in the extension**: DuckDB already handles CSV, TSV,
-   Parquet, JSON, and dozens of other formats. The extension shouldn't
-   reimplement this.
-2. **Full SQL composability**: Users can filter, transform, and join weights
-   before passing them to the scoring function. This replaces plink2's
-   `--extract` and `--q-score-range` flags with standard SQL.
-3. **Any data source**: Weights can come from local files, remote URLs,
-   attached databases, views, CTEs, or computed subqueries.
-4. **Column name flexibility**: Instead of positional column numbers (fragile),
-   users specify column names from their source data.
+2. **No file parsing in the extension**: DuckDB already handles CSV, TSV,
+   Parquet, JSON, and dozens of other formats. The extension receives
+   materialized DuckDB values, not file paths.
+
+3. **Full SQL composability**: Users can filter, transform, and aggregate
+   weights using standard SQL before passing them to the scoring function.
+   This replaces plink2's `--extract` and `--q-score-range` flags.
+
+4. **Multiple input paths**: Values can come from:
+   - **Literals**: `weights := [1.0, 0.5, -0.5]`
+   - **Variables**: `SET VARIABLE w = (...); ... weights := getvariable('w')`
+   - **Scalar subqueries** (when DuckDB supports this in table function params)
+   - **Lateral joins** (when DuckDB supports this in table function params)
+
+5. **Type dispatch**: The bind phase inspects the parameter type
+   (`LIST(DOUBLE)` vs `LIST(STRUCT(...))`) and dispatches accordingly.
+   Positional lists are the fast path; struct lists offer flexibility
+   with ID-based matching.
 
 ---
 
@@ -146,9 +158,7 @@ Using `query_table()` instead of a file path parameter:
 | SCORE_SUM | DOUBLE | Weighted sum: Σ(genotype_i × weight_i) |
 | SCORE_AVG | DOUBLE | Average score: SCORE_SUM / DENOM |
 
-One row per sample. If multiple weight columns are specified via
-`weight_cols`, additional `SCORE_SUM_<name>` and `SCORE_AVG_<name>` columns
-are added for each weight column.
+One row per sample.
 
 ---
 
@@ -156,16 +166,28 @@ are added for each weight column.
 
 | Parameter | Type | Default | Purpose |
 |-----------|------|---------|---------|
-| `weights` | TABLE | (required) | Table reference containing variant weights (via `query_table()`) |
-| `id_col` | VARCHAR | `'id'` | Column name in weights table for variant ID |
-| `allele_col` | VARCHAR | `'allele'` | Column name in weights table for scored allele |
-| `weight_col` | VARCHAR | `'weight'` | Column name in weights table for weight value (single-score) |
-| `weight_cols` | LIST(VARCHAR) | none | Column names for multiple weight values (multi-score) |
+| `weights` | LIST(DOUBLE) or LIST(STRUCT(...)) | (required) | Variant weights (see Weight input modes) |
 | `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
 | `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
 | `samples` | LIST(VARCHAR) | all | Filter to specific sample IDs |
 | `center` | BOOLEAN | false | Variance-standardize genotypes before scoring |
 | `no_mean_imputation` | BOOLEAN | false | Do not impute missing genotypes with mean |
+
+### Type dispatch rules
+
+The `weights` parameter type determines the mode:
+
+| Parameter Type | Mode | Allele | Matching |
+|---------------|------|--------|----------|
+| `LIST(DOUBLE)` | Positional | ALT assumed | weight[i] → variant[i] |
+| `LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))` | ID-keyed | Explicit | Match by ID against .pvar |
+
+In positional mode, the list length must equal the number of variants in the
+.pgen (or the region-filtered variant count). An error is raised on mismatch.
+
+In ID-keyed mode, unmatched IDs are silently skipped (count reported as a
+warning). The allele field controls sign orientation: if the allele matches
+ALT, the weight is used as-is; if it matches REF, the weight is negated.
 
 ---
 
@@ -173,9 +195,8 @@ are added for each weight column.
 
 ### Weight materialization (bind phase)
 
-During bind, the TABLE parameter from `query_table()` is materialized into
-an in-memory structure. DuckDB's C++ API provides access to the table
-function's TABLE-type parameters, which can be scanned to extract rows.
+During bind, the `weights` parameter is inspected for its DuckDB type and
+materialized into an in-memory vector:
 
 ```cpp
 struct ScoredVariant {
@@ -184,50 +205,59 @@ struct ScoredVariant {
 };
 
 // In bind:
-// 1. Scan the TABLE parameter, extracting (id, allele, weight) columns
-// 2. For each row:
-//    a. Look up variant ID in the PgenContext variant metadata → variant_idx
-//    b. Check allele orientation: if scored allele == ALT → use weight as-is;
-//       if scored allele == REF → negate weight (or adjust dosage direction)
-//    c. Store ScoredVariant{variant_idx, adjusted_weight}
-// 3. Variants not found in the .pgen are skipped (count logged as warning)
-// 4. Sort scored variants by variant_idx for sequential .pgen access
-```
+auto &weights_val = input.named_parameters.at("weights");
 
-Implementation approach for TABLE parameter access:
-
-```cpp
-// DuckDB TABLE parameter binding
-// The weights TABLE is bound as a named parameter of LogicalType::TABLE
-// During bind, execute the table to get a DataChunk iterator
-auto &weights_table = input.table_functions["weights"];
-// Iterate chunks, extract id/allele/weight columns
-for (auto &chunk : weights_table) {
-    auto &id_vec = chunk.data[id_col_idx];
-    auto &allele_vec = chunk.data[allele_col_idx];
-    auto &weight_vec = chunk.data[weight_col_idx];
-    for (idx_t i = 0; i < chunk.size(); i++) {
-        string id = id_vec.GetValue(i).GetValue<string>();
-        string allele = allele_vec.GetValue(i).GetValue<string>();
-        double weight = weight_vec.GetValue(i).GetValue<double>();
-        // ... look up and store
+if (weights_val.type() == LogicalType::LIST(LogicalType::DOUBLE)) {
+    // Positional mode: weights[i] → variant[i]
+    auto &weight_list = ListValue::GetChildren(weights_val);
+    if (weight_list.size() != variant_count) {
+        throw BinderException("weights list length (%d) must match variant count (%d)",
+                              weight_list.size(), variant_count);
     }
+    for (idx_t i = 0; i < weight_list.size(); i++) {
+        double w = weight_list[i].GetValue<double>();
+        if (w != 0.0) {  // skip zero-weight variants
+            scored_variants.push_back({(uint32_t)i, w});
+        }
+    }
+} else {
+    // ID-keyed mode: match by variant ID
+    auto &struct_list = ListValue::GetChildren(weights_val);
+    for (auto &entry : struct_list) {
+        string id = StructValue::GetChildren(entry)[0].GetValue<string>();
+        string allele = StructValue::GetChildren(entry)[1].GetValue<string>();
+        double weight = StructValue::GetChildren(entry)[2].GetValue<double>();
+
+        auto it = variant_id_map.find(id);
+        if (it == variant_id_map.end()) {
+            unmatched_count++;
+            continue;
+        }
+        uint32_t vidx = it->second;
+
+        // Allele orientation: negate weight if scored allele == REF
+        if (allele == ref_alleles[vidx]) {
+            weight = -weight;
+        } else if (allele != alt_alleles[vidx]) {
+            unmatched_allele_count++;
+            continue;
+        }
+
+        scored_variants.push_back({vidx, weight});
+    }
+    // Sort by variant index for sequential .pgen access
+    sort(scored_variants.begin(), scored_variants.end(),
+         [](auto &a, auto &b) { return a.variant_idx < b.variant_idx; });
 }
 ```
-
-**Note**: The exact API for TABLE parameter access in DuckDB's C++ extension
-API needs to be verified during implementation. If TABLE parameters are not
-directly supported in the named_parameters API, the alternative is to accept
-a VARCHAR table name and execute an internal query via
-`context.Query("SELECT ... FROM " + table_name)` to materialize the weights.
 
 ### Bind phase (PlinkScoreBind)
 
 1. Accept .pgen path as first positional VARCHAR argument
-2. Require `weights` TABLE/VARCHAR parameter (error if missing)
+2. Require `weights` parameter (error if missing)
 3. Initialize PgenContext via shared utility
-4. Materialize weights table → vector<ScoredVariant>
-5. Validate: at least one variant matched; warn if many unmatched
+4. Materialize weights → vector<ScoredVariant> (type dispatch as above)
+5. Validate: at least one variant with non-zero weight
 6. Sort scored variants by variant index for sequential access
 7. Load sample metadata (FID, IID) from .psam
 8. If `samples` provided: build SampleSubset
@@ -336,14 +366,14 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
 - **Variant iteration is sequential** in the simple implementation.
   Optimization: partition scored variants across threads, each with its own
   per-sample accumulation array, then merge.
-- **Memory**: O(sample_ct × num_scores) for accumulation arrays.
+- **Memory**: O(sample_ct) for accumulation arrays.
   For 500K samples × 1 score = 4MB. Manageable.
 - **I/O bound**: each scored variant requires one `PgrGetD()` call.
   Typical PRS uses 10K-1M variants from whole genome.
 - **Dosage vs hardcall**: `PgrGetD()` handles both. If no dosage data
   is present in the .pgen, hardcalls are used automatically.
 - **Weight materialization**: one-time cost during bind. Even 1M weights
-  materializes in milliseconds.
+  materializes in milliseconds as a DuckDB list.
 
 ---
 
@@ -354,52 +384,47 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
 ```sql
 require plinking_duck
 
-# Set up test weights as a DuckDB table
-statement ok
-CREATE TABLE test_weights (id VARCHAR, allele VARCHAR, weight DOUBLE);
-
-statement ok
-INSERT INTO test_weights VALUES
-    ('rs1', 'G', 1.0),
-    ('rs2', 'T', 0.5),
-    ('rs3', 'A', -0.5),
-    ('rs4', 'C', 2.0);
-
-# Basic scoring from a table
-query IIIRR
-SELECT IID, ALLELE_CT, DENOM, SCORE_SUM, SCORE_AVG
-FROM plink_score('test/data/example.pgen',
-    weights := query_table('test_weights'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'weight');
-----
-(expected values)
-
-# Hand-calculated example:
-# SAMPLE1: rs1=0/0(0), rs2=0/1(1), rs3=1/1(2), rs4=0/0(0)
-# score = 0*1.0 + 1*0.5 + 2*(-0.5) + 0*2.0 = -0.5
-# ALLELE_CT = 8 (4 variants × 2 alleles)
-# SCORE_AVG = -0.5 / 8 = -0.0625
+# Positional weights — hand-calculated example
+# Genotypes (ALT dosage):
+#   SAMPLE1: rs1=0, rs2=1, rs3=2, rs4=0
+#   SAMPLE2: rs1=1, rs2=1, rs3=0, rs4=1
+# Weights: [1.0, 0.5, -0.5, 2.0]
+# SAMPLE1 score = 0*1.0 + 1*0.5 + 2*(-0.5) + 0*2.0 = -0.5
+# SAMPLE2 score = 1*1.0 + 1*0.5 + 0*(-0.5) + 1*2.0 = 3.5
 query IRR
-SELECT IID, SCORE_SUM, SCORE_AVG
+SELECT IID, ALLELE_CT, SCORE_SUM, SCORE_AVG
 FROM plink_score('test/data/example.pgen',
-    weights := query_table('test_weights'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'weight')
+    weights := [1.0, 0.5, -0.5, 2.0])
 WHERE IID = 'SAMPLE1';
 ----
-SAMPLE1	-0.5	-0.0625
+SAMPLE1	8	-0.5	-0.0625
 
 # Row count matches sample count
 query I
 SELECT COUNT(*)
 FROM plink_score('test/data/example.pgen',
-    weights := query_table('test_weights'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'weight');
+    weights := [1.0, 0.5, -0.5, 2.0]);
+----
+4
+
+# ID-keyed weights — same computation, explicit alleles
+query R
+SELECT SCORE_SUM
+FROM plink_score('test/data/example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+                {'id': 'rs2', 'allele': 'T', 'weight': 0.5},
+                {'id': 'rs3', 'allele': 'A', 'weight': -0.5},
+                {'id': 'rs4', 'allele': 'C', 'weight': 2.0}])
+WHERE IID = 'SAMPLE1';
+----
+-0.5
+
+# ID-keyed weights — partial matching (only 2 of 4 variants)
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+                {'id': 'rs2', 'allele': 'T', 'weight': 0.5}]);
 ----
 4
 
@@ -407,37 +432,29 @@ FROM plink_score('test/data/example.pgen',
 query I
 SELECT COUNT(*)
 FROM plink_score('test/data/example.pgen',
-    weights := query_table('test_weights'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'weight',
+    weights := [1.0, 0.5, -0.5, 2.0],
     samples := ['SAMPLE1', 'SAMPLE3']);
 ----
 2
 
-# Weights from an inline query (CSV loaded by DuckDB)
-query I
-SELECT COUNT(*)
-FROM plink_score('test/data/example.pgen',
-    weights := query_table(
-        'SELECT id, allele, weight FROM test_weights WHERE weight > 0'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'weight');
-----
-4
-
-# Weights with no matching variants (empty table) → zero scores
+# Weights from a variable
 statement ok
-CREATE TABLE empty_weights (id VARCHAR, allele VARCHAR, weight DOUBLE);
+SET VARIABLE score_w = [1.0, 0.5, -0.5, 2.0];
 
 query R
 SELECT SCORE_SUM
 FROM plink_score('test/data/example.pgen',
-    weights := query_table('empty_weights'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'weight') LIMIT 1;
+    weights := getvariable('score_w'))
+WHERE IID = 'SAMPLE1';
+----
+-0.5
+
+# Zero-weight variants are skipped (still produces correct output)
+query R
+SELECT SCORE_SUM
+FROM plink_score('test/data/example.pgen',
+    weights := [0.0, 0.0, 0.0, 0.0])
+WHERE IID = 'SAMPLE1';
 ----
 0.0
 
@@ -445,10 +462,7 @@ FROM plink_score('test/data/example.pgen',
 query I
 SELECT COUNT(*)
 FROM plink_score('test/data/example.pgen',
-    weights := query_table('test_weights'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'weight')
+    weights := [1.0, 0.5, -0.5, 2.0])
 WHERE SCORE_SUM > 0;
 ----
 (expected count)
@@ -462,8 +476,7 @@ require plinking_duck
 # File not found
 statement error
 SELECT * FROM plink_score('nonexistent.pgen',
-    weights := query_table('test_weights'),
-    id_col := 'id', allele_col := 'allele', weight_col := 'weight');
+    weights := [1.0, 0.5]);
 ----
 (error)
 
@@ -479,44 +492,77 @@ SELECT * FROM plink_score();
 ----
 (error)
 
-# Invalid column name in weights table
-statement ok
-CREATE TABLE bad_weights (variant VARCHAR, a1 VARCHAR, beta DOUBLE);
-
+# Positional weights: wrong length
 statement error
 SELECT * FROM plink_score('test/data/example.pgen',
-    weights := query_table('bad_weights'),
-    id_col := 'nonexistent_col',
-    allele_col := 'a1',
-    weight_col := 'beta');
+    weights := [1.0, 0.5]);
 ----
-(error: column 'nonexistent_col' not found in weights table)
+(error: weights list length does not match variant count)
 
-# Weights table referenced but doesn't exist
+# ID-keyed weights: wrong struct field names
 statement error
 SELECT * FROM plink_score('test/data/example.pgen',
-    weights := query_table('no_such_table'),
-    id_col := 'id', allele_col := 'allele', weight_col := 'weight');
+    weights := [{'variant': 'rs1', 'a1': 'G', 'beta': 1.0}]);
 ----
-(error)
+(error: expected struct fields id, allele, weight)
+
+# Empty weights list
+statement error
+SELECT * FROM plink_score('test/data/example.pgen',
+    weights := []::DOUBLE[]);
+----
+(error: weights list is empty)
 ```
 
 ---
 
-## Design Note: Table References for Other Parameters
+## Design Note: Uniform Small-Data Pattern
 
-The `query_table()` pattern for weights establishes a precedent that could
-extend to other table-like parameters in P2 functions:
+The typed list parameter pattern for weights establishes a uniform approach
+for all "small data" inputs across P2 and future P3 functions. The principle:
+**the .pgen is always the big streaming data; everything else is a small
+materialized DuckDB value.**
 
-| Parameter | Current Design | Possible Table Reference |
-|-----------|---------------|-------------------------|
-| `samples` (all P2 functions) | `LIST(VARCHAR)` | `query_table('SELECT iid FROM my_samples')` |
-| `weights` (plink_score) | `query_table(...)` | **Implemented in this plan** |
+### Two axes of small data
 
-For P2, the `samples` parameter remains a `LIST(VARCHAR)` since sample lists
-are typically small (tens to hundreds of IDs). If a future use case requires
-large sample lists (e.g., "all controls from a phenotype table"), extending
-the same `query_table()` pattern would be straightforward.
+| Axis | Aligned With | Example Parameters | Type Pattern |
+|------|-------------|-------------------|--------------|
+| **Variant-keyed** | .pgen variant order | weights, effect sizes | `LIST(DOUBLE)` positional or `LIST(STRUCT(id, ...))` ID-keyed |
+| **Sample-keyed** | .pgen sample order | phenotypes, covariates, pop labels | `LIST(DOUBLE)` positional or `LIST(STRUCT(iid, ...))` ID-keyed |
+
+### Current P2 usage
+
+| Function | Parameter | Type | Notes |
+|----------|-----------|------|-------|
+| plink_score | `weights` | `LIST(DOUBLE)` or `LIST(STRUCT(id, allele, weight))` | Variant-keyed |
+| All P2 | `samples` | `LIST(VARCHAR)` | Sample filter (simple case) |
+
+### Future P3 extensions
+
+| Function | Parameter | Type | Notes |
+|----------|-----------|------|-------|
+| plink_glm | `phenotypes` | `LIST(DOUBLE)` | Sample-keyed, positional |
+| plink_glm | `covariates` | `LIST(STRUCT(iid, age, sex, pc1, ...))` | Sample-keyed, ID-keyed |
+| plink_fst | `pop_labels` | `LIST(VARCHAR)` | Sample-keyed, positional |
+
+### Value sourcing
+
+Small data values can come from multiple DuckDB expressions:
+
+```sql
+-- Literal
+weights := [1.0, 0.5, -0.5]
+
+-- Variable (most common for computed values)
+SET VARIABLE w = (SELECT list(beta) FROM 'weights.parquet');
+... weights := getvariable('w')
+
+-- Scalar subquery (when supported by DuckDB for table function params)
+weights := (SELECT list(beta) FROM weights_table)
+```
+
+The extension does not need to know or care how the value was produced —
+it receives a materialized DuckDB `Value` of the declared type.
 
 ---
 
@@ -525,32 +571,26 @@ the same `query_table()` pattern would be straightforward.
 ### Update README.md
 
 ```
-### plink_score(path, weights [, id_col, allele_col, weight_col, ...])
+### plink_score(path [, weights, samples, center, ...])
 Compute per-sample polygenic risk scores from genotype dosages and variant
-weights provided as a DuckDB table reference.
+weights.
 
--- Load weights from any source, then score
-CREATE TABLE weights AS SELECT * FROM read_csv('scores/weights.tsv', header := true);
+-- Positional weights (one per variant, ALT allele assumed)
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table('weights'),
-    id_col := 'rsid',
-    allele_col := 'effect_allele',
-    weight_col := 'beta');
+    weights := [1.0, 0.5, -0.5, 2.0]);
 
--- Inline with filtering (P+T method)
+-- ID-keyed weights (variant matching by ID + allele)
+SET VARIABLE w = (
+    SELECT list({'id': rsid, 'allele': effect_allele, 'weight': beta})
+    FROM read_csv('scores/weights.tsv', header := true)
+);
 SELECT * FROM plink_score('data/example.pgen',
-    weights := query_table(
-        'SELECT id, allele, beta FROM gwas_results WHERE pvalue < 5e-8'),
-    id_col := 'id',
-    allele_col := 'allele',
-    weight_col := 'beta');
+    weights := getvariable('w'));
 
 -- Join scores with phenotype data
 SELECT s.IID, s.SCORE_AVG, p.PHENO1
 FROM plink_score('data/example.pgen',
-    weights := query_table('weights'),
-    id_col := 'rsid', allele_col := 'effect_allele',
-    weight_col := 'beta') s
+    weights := getvariable('w')) s
 JOIN read_psam('data/example.psam') p ON s.IID = p.IID;
 ```
 
@@ -558,17 +598,18 @@ JOIN read_psam('data/example.psam') p ON s.IID = p.IID;
 
 ## Acceptance Criteria
 
-1. [ ] `plink_score` accepts weights via `query_table()` table reference
-2. [ ] Weights from DuckDB tables, views, and inline queries all work
-3. [ ] Column name parameters (`id_col`, `allele_col`, `weight_col`) correctly select columns
-4. [ ] Invalid column names produce clear error messages
-5. [ ] Hand-calculated scores match output for test data
-6. [ ] Variants not in weight table are correctly skipped
-7. [ ] Missing genotypes are mean-imputed by default
-8. [ ] `no_mean_imputation` parameter disables mean imputation
-9. [ ] `center` parameter applies variance standardization
-10. [ ] Sample subsetting works
-11. [ ] Results match plink2 `--score` output (within tolerance)
-12. [ ] All positive and negative tests pass
-13. [ ] `make test` passes
-14. [ ] README updated
+1. [ ] `plink_score` accepts positional `LIST(DOUBLE)` weights
+2. [ ] `plink_score` accepts ID-keyed `LIST(STRUCT(id, allele, weight))` weights
+3. [ ] Positional weights length must match variant count (error on mismatch)
+4. [ ] ID-keyed weights with unmatched IDs are skipped with warning
+5. [ ] Allele orientation correctly handled (ALT as-is, REF negated)
+6. [ ] Hand-calculated scores match output for test data
+7. [ ] Variables via `getvariable()` work correctly
+8. [ ] Missing genotypes are mean-imputed by default
+9. [ ] `no_mean_imputation` parameter disables mean imputation
+10. [ ] `center` parameter applies variance standardization
+11. [ ] Sample subsetting works
+12. [ ] Results match plink2 `--score` output (within tolerance)
+13. [ ] All positive and negative tests pass
+14. [ ] `make test` passes
+15. [ ] README updated
