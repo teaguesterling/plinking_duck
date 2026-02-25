@@ -1,0 +1,39 @@
+# name: test/sql/read_pvar_negative.test
+# description: Negative and edge case tests for read_pvar
+# group: [plinking_duck]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# File not found
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_pvar('nonexistent.pvar');
+----
+could not open file
+
+# ---------------------------------------------------------------------------
+# Empty file
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_pvar('test/data/empty.pvar');
+----
+empty
+
+# ---------------------------------------------------------------------------
+# Wrong number of arguments
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_pvar();
+----
+
+# ---------------------------------------------------------------------------
+# Non-string argument
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_pvar(42);
+----

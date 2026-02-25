@@ -1,0 +1,147 @@
+# name: test/sql/read_pvar.test
+# description: Test read_pvar table function for .pvar and .bim formats
+# group: [plinking_duck]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# Basic .pvar reading
+# ---------------------------------------------------------------------------
+
+query TITTT
+SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/example.pvar');
+----
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A,C
+2	15000	rs4	T	C
+22	50000	NULL	A	G
+
+# Row count
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/example.pvar');
+----
+5
+
+# Minimal .pvar (header + 1 row)
+query TITTT
+SELECT * FROM read_pvar('test/data/minimal.pvar');
+----
+1	10000	rs1	A	G
+
+# ---------------------------------------------------------------------------
+# .bim format auto-detection
+# ---------------------------------------------------------------------------
+
+# .bim reads with normalized column order (CHROM, POS, ID, REF, ALT, CM)
+query TITTTR
+SELECT * FROM read_pvar('test/data/example.bim');
+----
+1	10000	rs1	A	G	0.5
+1	20000	rs2	C	T	1.2
+2	15000	rs4	T	C	0.0
+
+# CM column in .bim
+query TR
+SELECT ID, CM FROM read_pvar('test/data/example.bim') WHERE ID = 'rs1';
+----
+rs1	0.5
+
+# .bim row count
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/example.bim');
+----
+3
+
+# ---------------------------------------------------------------------------
+# Comment line handling
+# ---------------------------------------------------------------------------
+
+# Comment lines (##) are skipped
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/comments.pvar');
+----
+2
+
+# Optional columns: QUAL, FILTER, INFO
+query RTT
+SELECT QUAL, FILTER, INFO FROM read_pvar('test/data/comments.pvar');
+----
+100.0	PASS	PR
+NULL	NULL	NULL
+
+# ---------------------------------------------------------------------------
+# Optional columns (all 9 columns: CHROM through CM)
+# ---------------------------------------------------------------------------
+
+query TITTTRTTR
+SELECT * FROM read_pvar('test/data/optional_cols.pvar');
+----
+1	10000	rs1	A	G	100.0	PASS	PR	0.5
+1	20000	rs2	C	T	50.5	LOW_QUAL	NULL	1.2
+2	30000	rs3	G	A	NULL	NULL	DP=100	0.0
+
+# Query specific optional columns
+query RR
+SELECT QUAL, CM FROM read_pvar('test/data/optional_cols.pvar') WHERE ID = 'rs1';
+----
+100.0	0.5
+
+# ---------------------------------------------------------------------------
+# Dot (.) values produce NULL
+# ---------------------------------------------------------------------------
+
+# Dot as variant ID produces NULL
+query T
+SELECT ID FROM read_pvar('test/data/example.pvar') WHERE CHROM = '22';
+----
+NULL
+
+# Dot in QUAL, FILTER, INFO produces NULL
+query RTT
+SELECT QUAL, FILTER, INFO FROM read_pvar('test/data/comments.pvar') WHERE ID = 'rs2';
+----
+NULL	NULL	NULL
+
+# ---------------------------------------------------------------------------
+# Multi-allelic ALT (comma-separated, treated as single VARCHAR)
+# ---------------------------------------------------------------------------
+
+query T
+SELECT ALT FROM read_pvar('test/data/example.pvar') WHERE ID = 'rs3';
+----
+A,C
+
+# ---------------------------------------------------------------------------
+# Projection pushdown (only selected columns populated)
+# ---------------------------------------------------------------------------
+
+query TI
+SELECT CHROM, POS FROM read_pvar('test/data/example.pvar');
+----
+1	10000
+1	20000
+1	30000
+2	15000
+22	50000
+
+query T
+SELECT REF FROM read_pvar('test/data/example.pvar') WHERE POS = 30000;
+----
+G
+
+# ---------------------------------------------------------------------------
+# Filtering edge cases
+# ---------------------------------------------------------------------------
+
+# Empty result with impossible filter
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/example.pvar') WHERE CHROM = '99';
+----
+0
+
+# Header-only file returns 0 rows
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/header_only.pvar');
+----
+0

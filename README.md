@@ -4,8 +4,39 @@ This repository is based on https://github.com/duckdb/extension-template, check 
 
 ---
 
-This extension, PlinkingDuck, allow you to ... <extension_goal>.
+PlinkingDuck is a DuckDB extension for working with [PLINK2](https://www.cog-genomics.org/plink/2.0/)
+genomic data files (.pgen/.pvar/.psam). It exposes PLINK binary genotype data as
+SQL-queryable tables, enabling genomic analysis within DuckDB's analytical engine.
 
+## Usage
+
+### read_pvar(path)
+
+Read PLINK2 `.pvar` (variant information) or legacy `.bim` files into SQL-queryable tables.
+Format is auto-detected: files with a `#CHROM` header line are parsed as `.pvar`,
+files without a header are parsed as legacy `.bim` (6-column, tab-delimited).
+
+```sql
+-- Read a .pvar file
+SELECT * FROM read_pvar('path/to/file.pvar');
+
+-- Read a legacy .bim file (auto-detected, columns normalized to .pvar order)
+SELECT * FROM read_pvar('path/to/file.bim');
+
+-- Filter variants by chromosome
+SELECT CHROM, POS, ID, REF, ALT
+FROM read_pvar('data/variants.pvar')
+WHERE CHROM = '22';
+```
+
+**Output columns (.pvar):** CHROM, POS, ID, REF, ALT, and any optional columns
+present in the header (QUAL, FILTER, INFO, CM).
+
+**Output columns (.bim):** CHROM, POS, ID, REF, ALT, CM (normalized from
+the .bim file order of CHROM, ID, CM, POS, ALT, REF).
+
+Dot values (`.`) in any column are returned as `NULL`. Projection pushdown is
+supported — only columns referenced in the query are parsed.
 
 ## Building
 ### Managing dependencies
@@ -35,15 +66,17 @@ The main binaries that will be built are:
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`.
 
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `plinking_duck()` that takes a string arguments and returns a string:
-```
-D select plinking_duck('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ PlinkingDuck Jane 🐥 │
-└───────────────┘
+Now we can use the features from the extension directly in DuckDB:
+```sql
+D SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/example.pvar') LIMIT 3;
+┌─────────┬───────┬─────────┬─────────┬─────────┐
+│  CHROM  │  POS  │   ID    │   REF   │   ALT   │
+│ varchar │ int32 │ varchar │ varchar │ varchar │
+├─────────┼───────┼─────────┼─────────┼─────────┤
+│ 1       │ 10000 │ rs1     │ A       │ G       │
+│ 1       │ 20000 │ rs2     │ C       │ T       │
+│ 1       │ 30000 │ rs3     │ G       │ A,C     │
+└─────────┴───────┴─────────┴─────────┴─────────┘
 ```
 
 ## Running the tests
