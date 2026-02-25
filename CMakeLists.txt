@@ -64,6 +64,7 @@ set_target_properties(plink_libdeflate PROPERTIES
 
 # --- zstd (C library, pgenlib's vendored copy) ---
 # Hidden visibility is critical to avoid symbol collisions with DuckDB's bundled zstd.
+# GLOB is acceptable here because the submodule is pinned; re-run cmake if pin changes.
 file(GLOB PLINK_ZSTD_COMMON_SRCS ${ZSTD_DIR}/lib/common/*.c)
 file(GLOB PLINK_ZSTD_DECOMPRESS_SRCS ${ZSTD_DIR}/lib/decompress/*.c)
 file(GLOB PLINK_ZSTD_COMPRESS_SRCS ${ZSTD_DIR}/lib/compress/*.c)
@@ -72,7 +73,9 @@ add_library(plink_zstd STATIC
     ${PLINK_ZSTD_DECOMPRESS_SRCS}
     ${PLINK_ZSTD_COMPRESS_SRCS}
 )
-target_include_directories(plink_zstd PUBLIC
+# PRIVATE: don't leak vendored zstd headers to extension targets (collision risk
+# with DuckDB's own bundled zstd headers).
+target_include_directories(plink_zstd PRIVATE
     ${ZSTD_DIR}/lib
     ${ZSTD_DIR}/lib/common
 )
@@ -83,6 +86,8 @@ set_target_properties(plink_zstd PROPERTIES
 )
 
 # --- pgenlib (C++ library) ---
+# Read-path only — pgenlib_write.cc, plink2_bitmap.cc, plink2_fmath.cc,
+# plink2_stats.cc are intentionally excluded.
 add_library(pgenlib STATIC
     ${PGENLIB_DIR}/plink2_base.cc
     ${PGENLIB_DIR}/plink2_bits.cc
@@ -103,6 +108,10 @@ target_include_directories(pgenlib PUBLIC
     ${LIBDEFLATE_DIR}
     ${SIMDE_DIR}
 )
+target_include_directories(pgenlib PRIVATE
+    ${ZSTD_DIR}/lib
+    ${ZSTD_DIR}/lib/common
+)
 target_link_libraries(pgenlib PRIVATE plink_libdeflate plink_zstd)
 target_compile_definitions(pgenlib PRIVATE
     ZSTD_DISABLE_ASM
@@ -114,11 +123,15 @@ target_link_libraries(pgenlib PRIVATE ZLIB::ZLIB Threads::Threads)
 set_target_properties(pgenlib PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
     POSITION_INDEPENDENT_CODE ON
     CXX_STANDARD 17
 )
 
 # --- Link pgenlib and its dependencies to extension targets ---
+# Deps are listed explicitly because pgenlib links them PRIVATE (won't propagate
+# in static builds) and DuckDB's macros require the plain target_link_libraries
+# signature (no PRIVATE/PUBLIC keyword).
 target_link_libraries(${EXTENSION_NAME} pgenlib plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} pgenlib plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
 target_include_directories(${EXTENSION_NAME} PRIVATE ${PGENLIB_DIR})
