@@ -1,0 +1,6 @@
+##fileformat=PVARv1.0
+##source=plink2
+##INFO=<ID=PR,Number=0,Type=Flag,Description="Provisional reference allele">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+1	10000	rs1	A	G	100.0	PASS	PR
+1	20000	rs2	C	T	.	.	.

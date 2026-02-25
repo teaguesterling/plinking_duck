@@ -1,0 +1,7 @@
+##fileformat=PVARv1.0
+#CHROM	POS	ID	REF	ALT
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A,C
+2	15000	rs4	T	C
+22	50000	.	A	G
