@@ -1,0 +1,453 @@
+# P2-001: plink_freq Table Function
+
+## Goal
+
+Implement `plink_freq(path)` — a DuckDB table function that computes per-variant
+allele frequencies directly from .pgen binary files using pgenlib's
+`PgrGetCounts()` fast-path, which counts genotypes without full decompression.
+
+This is the first P2 function and also establishes the shared utility
+infrastructure used by all subsequent P2 functions.
+
+## Prerequisites
+
+- P1-003 merged (read_pgen — provides pgenlib integration patterns and RAII
+  wrappers)
+- P1-001 merged (read_pvar — provides variant metadata parsing)
+- P1-002 merged (read_psam — provides sample metadata for subsetting)
+
+## Depends On
+
+P1-003
+
+## Parallel Group
+
+**A** (first in P2 — establishes shared infrastructure)
+
+## Branch
+
+`feature/P2-001-plink-freq`
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/include/plink_common.hpp` | Shared P2 infrastructure: RAII wrappers, PgenContext, SampleSubset, VariantRange |
+| `src/plink_common.cpp` | Implementation of shared utilities |
+| `src/plink_freq.cpp` | plink_freq bind, init, scan |
+| `src/include/plink_freq.hpp` | Public interface: `RegisterPlinkFreq()` |
+| `test/sql/plink_freq.test` | Positive tests |
+| `test/sql/plink_freq_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_freq.hpp"`, call `RegisterPlinkFreq(loader)` |
+| `src/pgen_reader.cpp` | Refactor to use shared utilities from `plink_common.hpp` |
+| `CMakeLists.txt` | Add `src/plink_common.cpp` and `src/plink_freq.cpp` to build |
+
+---
+
+## SQL Interface
+
+```sql
+-- Basic allele frequencies
+SELECT * FROM plink_freq('data/example.pgen');
+
+-- With explicit companion files
+SELECT * FROM plink_freq('data/example.pgen',
+    pvar := 'other.pvar', psam := 'other.psam');
+
+-- Sample subsetting (founder-only frequencies)
+SELECT * FROM plink_freq('data/example.pgen',
+    samples := ['SAMPLE1', 'SAMPLE3']);
+
+-- Region filtering
+SELECT * FROM plink_freq('data/example.pgen', region := '1:10000-50000');
+
+-- Include genotype counts alongside frequencies
+SELECT * FROM plink_freq('data/example.pgen', counts := true);
+
+-- Dosage-aware frequencies with imputation R2
+SELECT * FROM plink_freq('data/example.pgen', dosage := true);
+
+-- Composable: join with variant annotations
+SELECT f.*, v.INFO
+FROM plink_freq('data/example.pgen') f
+JOIN read_pvar('data/example.pvar') v
+ON f.ID = v.ID;
+
+-- Composable: filter low-frequency variants
+SELECT * FROM plink_freq('data/example.pgen')
+WHERE ALT_FREQ > 0.01 AND ALT_FREQ < 0.99;
+```
+
+---
+
+## Output Schema
+
+### Default mode
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| CHROM | VARCHAR | Chromosome |
+| POS | INTEGER | Base-pair position |
+| ID | VARCHAR | Variant identifier |
+| REF | VARCHAR | Reference allele |
+| ALT | VARCHAR | Alternate allele(s) |
+| ALT_FREQ | DOUBLE | Alternate allele frequency |
+| OBS_CT | INTEGER | Number of non-missing allele observations (2 × non-missing sample count) |
+
+One row per variant.
+
+### With `counts := true`
+
+Adds columns:
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| HOM_REF_CT | INTEGER | Homozygous reference count |
+| HET_CT | INTEGER | Heterozygous count |
+| HOM_ALT_CT | INTEGER | Homozygous alternate count |
+| MISSING_CT | INTEGER | Missing genotype count |
+
+### With `dosage := true`
+
+Replaces hardcall-based frequency with dosage-based:
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| ALT_FREQ | DOUBLE | Dosage-based alternate allele frequency |
+| MACH_R2 | DOUBLE | MaCH imputation quality (R-squared) |
+| OBS_CT | INTEGER | Non-missing observation count |
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) | all | Filter to specific sample IDs |
+| `region` | VARCHAR | all | Filter to genomic region (`chr:start-end`) |
+| `counts` | BOOLEAN | false | Include genotype count columns |
+| `dosage` | BOOLEAN | false | Use dosage-based frequencies with imputation R2 |
+
+---
+
+## Implementation
+
+### Shared infrastructure extraction (plink_common.hpp/cpp)
+
+Before implementing plink_freq itself, extract these patterns from
+`pgen_reader.cpp`:
+
+1. **RAII wrappers**: `UniquePgfi`, `UniquePgr`, `AlignedBuffer` — manage
+   pgenlib lifecycle with destructors (per P0-003 §3.1)
+2. **PgenContext**: Wraps PgenFileInfo + pgfi_alloc + variant metadata +
+   sample info. Single `InitPgenContext(pgen_path, pvar_path)` call.
+3. **Thread reader factory**: `InitThreadReader(ctx, pgen_path)` creates a
+   per-thread PgenReader with its own cache-aligned allocation.
+4. **SampleSubset**: Builds `sample_include` bitarray +
+   `sample_include_interleaved_vec` + `PgrSampleSubsetIndex` from a list of
+   sample IDs. The interleaved vec is required by `PgrGetCounts()`.
+5. **VariantRange**: Parses `chr:start-end` region string and resolves to
+   variant index range using the pre-loaded variant metadata.
+6. **Progress helper**: Wraps `context.SetProgress()` with batch-frequency
+   throttling to avoid excessive calls.
+
+After extraction, refactor `read_pgen` to use these shared utilities and
+verify all existing tests pass.
+
+### Bind phase (PlinkFreqBind)
+
+1. Accept .pgen path as first positional VARCHAR argument
+2. Auto-discover .pvar and .psam (same logic as read_pgen)
+3. Initialize PgenContext via shared utility
+4. If `samples` parameter provided: build SampleSubset
+5. If `region` parameter provided: resolve VariantRange
+6. Register output columns based on `counts` and `dosage` parameters
+7. Store PgenContext, SampleSubset, VariantRange, parameter flags in bind data
+
+### Global state (PlinkFreqGlobalState)
+
+```cpp
+struct PlinkFreqGlobalState : public GlobalTableFunctionState {
+    atomic<uint32_t> next_variant_idx;  // starts at region_start or 0
+    uint32_t end_variant_idx;           // ends at region_end or total_variants
+
+    idx_t MaxThreads() const override {
+        uint32_t range = end_variant_idx - next_variant_idx.load();
+        return std::min<idx_t>(range / 500 + 1, 16);
+    }
+};
+```
+
+### Local state (PlinkFreqLocalState)
+
+```cpp
+struct PlinkFreqLocalState : public LocalTableFunctionState {
+    plink2::PgenReader pgr;
+    unsigned char* pgr_alloc;
+    // No genovec needed — PgrGetCounts doesn't require it
+    // For dosage mode:
+    uintptr_t* genovec;       // scratch buffer
+    uintptr_t* dosage_present;
+    uint16_t* dosage_main;
+};
+```
+
+### Scan function (PlinkFreqScan)
+
+```
+BATCH_SIZE = 128  // variants per atomic claim
+
+while rows_emitted < STANDARD_VECTOR_SIZE:
+    batch_start = global.next_variant_idx.fetch_add(BATCH_SIZE)
+    if batch_start >= global.end_variant_idx: break
+
+    batch_end = min(batch_start + BATCH_SIZE, global.end_variant_idx)
+
+    for vidx in batch_start..batch_end:
+        if rows_emitted >= STANDARD_VECTOR_SIZE: break
+
+        STD_ARRAY_DECL(uint32_t, 4, genocounts)
+
+        if dosage_mode:
+            uint64_t all_dosages[2]  // ref dosage, alt dosage
+            double imp_r2
+            PgrGetDCounts(sample_include, sample_include_interleaved_vec,
+                         pssi, sample_ct, vidx, 0 /* MaCH R2 */,
+                         &pgr, &imp_r2, genocounts, all_dosages)
+            obs_ct = genocounts[0] + genocounts[1] + genocounts[2]
+            alt_freq = (double)all_dosages[1] / ((double)all_dosages[0] + all_dosages[1])
+            // imp_r2 already computed
+        else:
+            PgrGetCounts(sample_include, sample_include_interleaved_vec,
+                        pssi, sample_ct, vidx, &pgr, genocounts)
+            obs_ct = genocounts[0] + genocounts[1] + genocounts[2]
+            alt_freq = (genocounts[1] + 2.0 * genocounts[2]) / (2.0 * obs_ct)
+
+        // Fill output columns
+        output CHROM, POS, ID, REF, ALT from variant metadata
+        output ALT_FREQ = alt_freq
+        output OBS_CT = 2 * obs_ct
+
+        if counts_mode:
+            output HOM_REF_CT = genocounts[0]
+            output HET_CT = genocounts[1]
+            output HOM_ALT_CT = genocounts[2]
+            output MISSING_CT = genocounts[3]
+
+        if dosage_mode:
+            output MACH_R2 = imp_r2
+
+        rows_emitted++
+
+    update progress: vidx / total_variants
+
+output.SetCardinality(rows_emitted)
+```
+
+### Performance profile
+
+- **Variant-parallel**: each thread claims batches of variants independently
+- **No genotype decompression** (hardcall mode): `PgrGetCounts()` counts
+  directly from the compressed representation
+- **Memory bound**: negligible — only a 4-element count array per variant
+- **Throughput**: expected to process millions of variants per second
+  (the `PgrGetCounts` path in plink2 is highly optimized)
+
+### Registration
+
+```cpp
+void RegisterPlinkFreq(ExtensionLoader &loader) {
+    TableFunction plink_freq("plink_freq", {LogicalType::VARCHAR},
+                             PlinkFreqScan, PlinkFreqBind,
+                             PlinkFreqInitGlobal, PlinkFreqInitLocal);
+    plink_freq.named_parameters["pvar"] = LogicalType::VARCHAR;
+    plink_freq.named_parameters["psam"] = LogicalType::VARCHAR;
+    plink_freq.named_parameters["samples"] = LogicalType::LIST(LogicalType::VARCHAR);
+    plink_freq.named_parameters["region"] = LogicalType::VARCHAR;
+    plink_freq.named_parameters["counts"] = LogicalType::BOOLEAN;
+    plink_freq.named_parameters["dosage"] = LogicalType::BOOLEAN;
+    plink_freq.projection_pushdown = true;
+    loader.RegisterFunction(plink_freq);
+}
+```
+
+---
+
+## Testing
+
+### Positive tests (plink_freq.test)
+
+```sql
+require plinking_duck
+
+# Basic frequency output
+query IIIIIRI
+SELECT CHROM, POS, ID, REF, ALT, ALT_FREQ, OBS_CT
+FROM plink_freq('test/data/example.pgen');
+----
+(expected values based on test VCF genotypes)
+
+# rs1: genotypes [0/0, 0/1, 1/1, ./.] → alt_freq = (1+2)/(2*3) = 0.5
+query IRI
+SELECT ID, ALT_FREQ, OBS_CT
+FROM plink_freq('test/data/example.pgen') WHERE ID = 'rs1';
+----
+rs1	0.5	6
+
+# rs2: genotypes [0/1, 0/1, 0/0, 1/1] → alt_freq = (1+1+2)/(2*4) = 0.5
+query IRI
+SELECT ID, ALT_FREQ, OBS_CT
+FROM plink_freq('test/data/example.pgen') WHERE ID = 'rs2';
+----
+rs2	0.5	8
+
+# Row count matches variant count
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/example.pgen');
+----
+4
+
+# Counts mode
+query IIIII
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT
+FROM plink_freq('test/data/example.pgen', counts := true) WHERE ID = 'rs1';
+----
+rs1	1	1	1	1
+
+# Explicit companion files
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/example.pgen',
+    pvar := 'test/data/example.pvar',
+    psam := 'test/data/example.psam');
+----
+4
+
+# Sample subsetting changes frequencies
+query RI
+SELECT ALT_FREQ, OBS_CT
+FROM plink_freq('test/data/example.pgen',
+    samples := ['SAMPLE1', 'SAMPLE2']) WHERE ID = 'rs1';
+----
+(frequency based on only SAMPLE1 and SAMPLE2)
+
+# Region filtering reduces row count
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/example.pgen', region := '1:10000-20000');
+----
+2
+
+# Composable with DuckDB SQL
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/example.pgen')
+WHERE ALT_FREQ > 0.01;
+----
+(expected count)
+
+# All frequencies are between 0 and 1
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/example.pgen')
+WHERE ALT_FREQ < 0.0 OR ALT_FREQ > 1.0;
+----
+0
+```
+
+### Negative tests (plink_freq_negative.test)
+
+```sql
+require plinking_duck
+
+# File not found
+statement error
+SELECT * FROM plink_freq('nonexistent.pgen');
+----
+(error with file path)
+
+# Missing companion .pvar
+statement error
+SELECT * FROM plink_freq('test/data/orphan.pgen');
+----
+(error: cannot find .pvar)
+
+# Invalid sample ID
+statement error
+SELECT * FROM plink_freq('test/data/example.pgen',
+    samples := ['NOSUCHSAMPLE']);
+----
+(error: sample not found)
+
+# Invalid region format
+statement error
+SELECT * FROM plink_freq('test/data/example.pgen', region := 'invalid');
+----
+(error: invalid region)
+
+# No arguments
+statement error
+SELECT * FROM plink_freq();
+----
+(error)
+
+# Empty region returns 0 rows
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/example.pgen', region := '99:1-100');
+----
+0
+```
+
+---
+
+## Documentation
+
+### Update README.md
+
+```
+### plink_freq(path [, pvar, psam, samples, region, counts, dosage])
+Compute per-variant allele frequencies directly from a .pgen file.
+Uses pgenlib's fast counting path — no full genotype decompression.
+
+-- Basic usage
+SELECT * FROM plink_freq('data/example.pgen');
+
+-- With genotype counts
+SELECT * FROM plink_freq('data/example.pgen', counts := true);
+
+-- Filter to specific samples
+SELECT * FROM plink_freq('data/example.pgen',
+    samples := ['SAMPLE1', 'SAMPLE3']);
+
+-- Filter to a genomic region
+SELECT * FROM plink_freq('data/example.pgen', region := '22:1-50000000');
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] `plink_freq('file.pgen')` returns correct allele frequencies for known test data
+2. [ ] Frequencies match hand-calculated values from the test VCF
+3. [ ] Auto-discovery of .pvar and .psam works
+4. [ ] Named parameters `pvar` and `psam` override auto-discovery
+5. [ ] `counts := true` adds HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT columns
+6. [ ] `samples` parameter correctly subsets and recalculates frequencies
+7. [ ] `region` parameter filters to variants in the specified range
+8. [ ] Empty region returns 0 rows
+9. [ ] Shared utilities extracted to `plink_common.hpp/cpp`
+10. [ ] `read_pgen` refactored to use shared utilities (existing tests pass)
+11. [ ] All positive and negative tests pass
+12. [ ] `make test` passes
+13. [ ] README updated

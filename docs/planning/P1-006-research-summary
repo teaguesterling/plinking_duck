@@ -1,0 +1,463 @@
+# P1-006 Research Summary: plink2 Analytical Command Survey
+
+## Overview
+
+This document surveys plink2's full analytical command set, evaluates each
+command as a candidate for a DuckDB utility function, and recommends a set of
+P2 functions for implementation. It is the primary deliverable of P1-006
+Phase 1 and Phase 2.
+
+---
+
+## 1. plink2 Analytical Command Survey
+
+### 1.1 Basic Statistics
+
+| Command | Output | pgenlib Fast-Path | Workflow Frequency |
+|---------|--------|-------------------|--------------------|
+| `--freq` | Per-variant allele frequencies (.afreq) | `PgrGetCounts()` | Extremely common |
+| `--geno-counts` | Per-variant genotype counts (.gcount) | `PgrGetCounts()` | Common |
+| `--sample-counts` | Per-sample variant counts (.scount) | Full scan needed | Moderate |
+| `--missing` | Per-variant and per-sample missingness (.vmiss, .smiss) | `PgrGetMissingness()` | Extremely common |
+| `--hardy` | Per-variant HWE exact test p-values (.hardy) | `PgrGetCounts()` | Extremely common |
+| `--het` | Per-sample heterozygosity and F coefficient (.het) | `PgrGetCounts()` + freq | Very common |
+| `--mendel` | Mendel error detection across trios (.mendel, .lmendel) | Full scan + pedigree | Common (family studies) |
+| `--check-sex` | Sex concordance from chrX/chrY patterns (.sexcheck) | `PgrGetCounts()` on sex chr | Common |
+| `--fst` | Wright's FST between populations (.fst.summary) | `PgrGetCounts()` per pop | Common (pop genetics) |
+| `--genotyping-rate` | Overall missingness (scalar, log only) | `PgrGetMissingness()` | Common |
+| `--pgen-info` | File structure diagnostics (log only) | Header read | Rare |
+
+### 1.2 Linkage Disequilibrium
+
+| Command | Output | pgenlib Path | Workflow Frequency |
+|---------|--------|-------------|--------------------|
+| `--r2-phased` | Haplotype-based r-squared (.vcor tabular or matrix) | `PgrGetP()` x2 + math | Very common |
+| `--r2-unphased` | Dosage correlation squared (.vcor or matrix) | `PgrGet()` x2 + math | Common |
+| `--r-phased` | Signed haplotype correlation | `PgrGetP()` x2 + math | Less common |
+| `--r-unphased` | Signed dosage correlation | `PgrGet()` x2 + math | Less common |
+| `--ld` | Single variant-pair haplotype detail (console) | `PgrGet()` x2 | Ad-hoc |
+| `--indep-pairwise` | LD-pruned variant lists (.prune.in/.out) | `PgrGet()` windowed | Extremely common |
+| `--indep-pairphase` | LD-pruning via haplotype correlation | `PgrGetP()` windowed | Rare |
+| `--indep` | VIF-based pruning | Full scan + matrix | Rare |
+
+### 1.3 Relatedness / Distance
+
+| Command | Output | pgenlib Path | Workflow Frequency |
+|---------|--------|-------------|--------------------|
+| `--make-king-table` | Sample-pair kinship table (.kin0) | Full scan, O(N^2) | Very common |
+| `--make-king` | Kinship matrix (.king) | Full scan, O(N^2) | Common |
+| `--make-rel` / `--make-grm-*` | GRM matrix (.rel, .grm) | Full scan + BLAS | Very common |
+| `--king-cutoff` | Unrelated sample list (.king.cutoff.in.id) | Kinship + graph algo | Common |
+
+### 1.4 Population Stratification
+
+| Command | Output | pgenlib Path | Workflow Frequency |
+|---------|--------|-------------|--------------------|
+| `--pca` | Per-sample PC scores (.eigenvec, .eigenval) | Full scan + LAPACK | Extremely common |
+
+### 1.5 Association Testing
+
+| Command | Output | pgenlib Path | Workflow Frequency |
+|---------|--------|-------------|--------------------|
+| `--glm` | Per-variant association stats (.glm.linear/.logistic) | `PgrGetD()` + regression | Extremely common |
+| `--adjust` | Multiple testing corrections (.adjusted) | Postprocessing | Very common |
+
+### 1.6 Scoring
+
+| Command | Output | pgenlib Path | Workflow Frequency |
+|---------|--------|-------------|--------------------|
+| `--score` | Per-sample polygenic scores (.sscore) | `PgrGetD()` + dot product | Extremely common |
+| `--variant-score` | Per-variant scores from sample weights (.vscore) | `PgrGetD()` + dot product | Rare |
+| `--q-score-range` | Multi-threshold PRS (.sscore per range) | `PgrGetD()` + dot product | Common |
+
+### 1.7 Other
+
+| Command | Output | pgenlib Path | Workflow Frequency |
+|---------|--------|-------------|--------------------|
+| `--clump` | LD-clumped association signals (.clumps) | `PgrGet()` + external p-vals | Very common |
+| `--pgen-diff` | Genotype differences between filesets (.pdiff) | Dual scan | Rare |
+| `--sample-diff` | Within-dataset sample discordance (.sdiff) | Full scan | Rare |
+| `--gwas-ssf` | GWAS summary stat format conversion | Postprocessing | Moderate |
+
+---
+
+## 2. Candidate Evaluation
+
+### 2.1 Include (Approved for P2)
+
+#### plink_freq — Allele Frequencies
+
+**Include.** Strongest candidate overall.
+
+- **pgenlib fast-path**: `PgrGetCounts()` — counts genotypes without full
+  decompression. Also `PgrGetDCounts()` for dosage-aware frequencies with
+  imputation R2.
+- **Self-contained**: genotypes → per-variant frequency table
+- **Naturally tabular**: perfect fit for DuckDB table function
+- **Extremely common**: used in every GWAS pipeline for QC and filtering
+- **Not trivially SQL**: computing allele frequencies from `read_pgen` output
+  requires unnesting LIST columns and counting — slow and awkward vs. a
+  dedicated function that avoids full genotype decompression entirely
+
+#### plink_hardy — Hardy-Weinberg Equilibrium
+
+**Include.** Shares `PgrGetCounts()` fast-path with freq, adds HWE exact test.
+
+- **pgenlib fast-path**: `PgrGetCounts()` — same as freq
+- **Self-contained**: genotypes → per-variant HWE test table
+- **Naturally tabular**: one row per variant with counts, expected/observed
+  heterozygosity, and p-value
+- **Extremely common**: standard QC filter in every GWAS pipeline
+- **Not trivially SQL**: the HWE exact test requires a non-trivial algorithm
+  (Fisher exact test on 2x3 contingency table) that cannot be expressed in SQL
+
+#### plink_missing — Missingness Rates
+
+**Include.** Uses the dedicated `PgrGetMissingness()` fast-path.
+
+- **pgenlib fast-path**: `PgrGetMissingness()` — returns a missingness bitarray
+  without full genotype decompression
+- **Self-contained**: genotypes → missingness tables (variant and sample)
+- **Naturally tabular**: per-variant and per-sample missingness rates
+- **Extremely common**: standard QC in every GWAS pipeline
+- **Not trivially SQL**: computing per-sample missingness from read_pgen would
+  require scanning all variants and unnesting genotype lists — the dedicated
+  `PgrGetMissingness()` path is orders of magnitude faster
+
+#### plink_ld — Linkage Disequilibrium
+
+**Include.** No specialized pgenlib fast-path, but the computation is
+well-bounded and the output is naturally tabular.
+
+- **pgenlib path**: `PgrGet()` for each variant in a pair, then correlation
+  math. For phased LD, `PgrGetP()`.
+- **Self-contained**: genotypes + variant pair/window → LD statistics table
+- **Naturally tabular**: variant-pair r², D', optionally with frequency info
+- **Very common**: used for fine-mapping, visualization, clumping input
+- **Not trivially SQL**: cross-variant correlation requires loading two
+  variants simultaneously and computing sample-level products — impossible
+  with a single-variant-per-row table function output
+- **Scope note**: implement pairwise mode first (specific variant pairs),
+  windowed mode as an enhancement
+
+#### plink_score — Polygenic Risk Scoring
+
+**Include.** Uses `PgrGetD()` + `LinearCombinationMeanimpute()` from pgenlib
+FFI support — a purpose-built dot product function.
+
+- **pgenlib path**: `PgrGetD()` per variant + dot product with external weights.
+  pgenlib provides `LinearCombinationMeanimpute()` which computes the
+  weighted sum with mean imputation for missing values in a single pass.
+- **Self-contained**: genotypes + weight table → per-sample score table
+- **Table-reference design**: Weights are accepted as a DuckDB table
+  reference via `query_table()`, not as a file path. This lets DuckDB handle
+  all file format parsing and allows weights from any source (CSV, Parquet,
+  database tables, filtered subqueries).
+- **Naturally tabular**: one row per sample with score columns
+- **Extremely common**: PRS (polygenic risk score) calculation is a core
+  genomics workflow
+- **Not trivially SQL**: would require joining read_pfile tidy output with a
+  weights table, then aggregating per-sample — feasible but extremely slow for
+  whole-genome scoring. The dedicated function reads genotypes variant-by-variant
+  and accumulates scores without materializing the full tidy table.
+
+### 2.2 Defer (to P3 or later)
+
+#### plink_het — Heterozygosity / Inbreeding Coefficient
+
+**Defer.** Could be computed as a post-processing step on plink_freq output
+combined with per-sample genotype counting. Alternatively, it's expressible as:
+```sql
+SELECT iid, COUNT(*) FILTER (WHERE genotype = 1) AS het_ct, ...
+FROM read_pfile('data', tidy := true)
+GROUP BY iid;
+```
+While a dedicated function would be faster (avoiding tidy expansion), the
+value-add over SQL is moderate. Revisit for P3 if users request it.
+
+#### plink_fst — Population Differentiation
+
+**Defer.** Uses `PgrGetCounts()` with population-stratified sample subsets.
+Self-contained and tabular, but requires categorical population labels as
+input. The math (Hudson or Weir-Cockerham FST) is non-trivial but not
+complex enough to justify a P2 priority slot. The usage is specialized
+(population genetics, not standard GWAS QC). Revisit for P3.
+
+#### plink_geno_counts — Detailed Genotype Counts
+
+**Defer (merge with plink_freq).** Uses the same `PgrGetCounts()` path as
+plink_freq. Rather than a separate function, plink_freq should expose
+genotype counts as optional output columns. If users need raw counts, they
+can use `plink_freq('file', counts := true)`.
+
+#### plink_sample_counts — Per-Sample Variant Counts
+
+**Defer.** Requires a full genotype scan with per-sample accumulation.
+No specialized pgenlib fast-path beyond PgrGet(). Expressible via
+`read_pfile(tidy := true)` + `GROUP BY iid`. Revisit for P3.
+
+#### plink_glm — Association Testing
+
+**Defer.** Very high value but very high complexity:
+- Requires phenotype and covariate input (not just genotypes)
+- Linear/logistic/Firth regression requires matrix operations
+- Would benefit from LAPACK/BLAS or a lightweight regression library
+- The output schema is highly variable (different columns for linear vs.
+  logistic vs. Firth, optional confidence intervals, ERRCODE)
+- Scope is too large for the initial P2 batch
+
+Recommendation: implement in P3 as a dedicated plan with careful scoping.
+Consider a simplified "genotype-only" mode first (no covariates) and build
+up to the full plink2 `--glm` feature set.
+
+#### plink_pca — Principal Component Analysis
+
+**Defer.** Requires LAPACK or equivalent for eigendecomposition. The
+computation is O(N² × M) where N = samples and M = variants. The output
+(eigenvectors) is useful, but the implementation would need:
+- LAPACK dependency management
+- GRM computation as an intermediate step
+- Randomized SVD for large datasets (plink2's `approx` mode)
+
+This is a substantial project. Defer to P3, and consider whether DuckDB's
+query engine could instead provide PCA via a UDF on pre-computed GRM output.
+
+#### plink_king_table — Kinship Estimation
+
+**Defer.** Pairwise computation across all sample pairs is O(N²). For
+biobank-scale data (500K samples), this produces ~125 billion pairs. The
+KING-robust algorithm is well-defined, but the computational cost and
+output size make it a challenging DuckDB function. Defer to P3, potentially
+with a threshold parameter that limits output to related pairs only.
+
+### 2.3 Exclude
+
+| Command | Reason |
+|---------|--------|
+| `--indep-pairwise` | Output is variant ID lists, not statistical tables. Better as a SQL query on plink_ld output. |
+| `--indep` / `--indep-pairphase` | Same as above (variant lists). |
+| `--king-cutoff` | Output is sample ID lists. Graph algorithm on kinship matrix — not a natural table function. |
+| `--make-king` (matrix) | Output is N×N matrix, not tabular. |
+| `--make-rel` / `--make-grm-*` | Output is N×N matrix. Requires BLAS. |
+| `--adjust` / `--adjust-file` | Multiple testing correction on p-values. Trivially expressible in SQL with window functions. |
+| `--clump` | Requires external association results + genotype LD. Mixed input model doesn't fit table function pattern cleanly. |
+| `--check-sex` | Specialized QC. Expressible as SQL on plink_freq output filtered to chrX/chrY. |
+| `--mendel` | Requires pedigree structure (trio identification). Specialized for family studies. |
+| `--genotyping-rate` | Single scalar output. `SELECT 1 - AVG(f_miss) FROM plink_missing(...)` suffices. |
+| `--pgen-info` | Diagnostic, not analytical. |
+| `--pgen-diff` / `--sample-diff` | Niche QC operations. |
+| `--gwas-ssf` | Format conversion, not computation. |
+| `--variant-score` | Rare use case. Transposed scoring can be expressed via SQL on plink_score output. |
+| `--q-score-range` | Multi-threshold variant of --score. Can be expressed as multiple plink_score calls with SQL filtering. |
+
+---
+
+## 3. Design Principles for P2 Functions
+
+### 3.1 Table references for external data inputs
+
+**Principle**: The extension never parses external file formats. Any table-like
+input (weights, sample lists, covariate tables) is accepted as a DuckDB table
+reference via `query_table()`. DuckDB handles all file format parsing (CSV,
+TSV, Parquet, JSON, etc.) and the extension receives materialized data.
+
+This applies to P2-005 (plink_score) where weights are provided via
+`query_table()`. The pattern should extend to any future P2/P3 function that
+accepts external data (e.g., covariate tables for plink_glm in P3).
+
+The `samples` parameter across all P2 functions remains `LIST(VARCHAR)` since
+sample lists are typically small. If large sample lists become a use case (e.g.,
+"all controls from a phenotype table"), extend the `query_table()` pattern.
+
+### 3.2 SQL composability
+
+All P2 functions produce standard DuckDB table output that composes with:
+- `JOIN` for combining outputs (e.g., freq + hardy for QC reporting)
+- `WHERE` for filtering (e.g., `WHERE P_HWE > 1e-6`)
+- Aggregation for summarization
+- Other extensions (e.g., join with duckhts `read_bcf` output)
+
+### 3.3 Extension scope boundary
+
+The extension handles:
+- Binary .pgen genotype access (pgenlib fast-paths)
+- Genomics-specific computation (HWE exact test, LD correlation, scoring)
+
+The extension does NOT handle:
+- Text file format parsing (DuckDB handles via read_csv, etc.)
+- Multiple testing correction (SQL window functions)
+- Data management (filtering, sorting, joining — SQL handles these)
+
+---
+
+## 4. pgenlib FFI Function Mapping
+
+
+Summary of which pgenlib functions support the approved P2 utility functions:
+
+| pgenlib Function | What It Does | P2 Functions |
+|-----------------|-------------|--------------|
+| `PgrGetCounts()` | Genotype counts (hom_ref, het, hom_alt, missing) without full decompression | plink_freq, plink_hardy |
+| `PgrGetDCounts()` | Genotype counts + dosage sums + imputation R2 | plink_freq (dosage mode) |
+| `PgrGetMissingness()` | Missingness bitarray without decompression | plink_missing |
+| `PgrGetMissingnessD()` | Missingness distinguishing hardcall vs dosage | plink_missing (dosage mode) |
+| `PgrGet()` | Basic 2-bit genotype array | plink_ld |
+| `PgrGetP()` | Genotypes + phase information | plink_ld (phased mode) |
+| `PgrGetD()` | Genotypes + dosage values | plink_score |
+| `LinearCombinationMeanimpute()` | Dot product of weights × dosages with mean imputation | plink_score |
+| `GenoarrCountFreqsUnsafe()` | Count genotypes in a loaded genovec | plink_ld (internal) |
+| `Dosage16ToDoublesMeanimpute()` | Convert dosages to doubles with mean imputation | plink_score (alternative path) |
+
+### Key observation
+
+The approved P2 functions use three distinct pgenlib access patterns:
+
+1. **Count-only** (freq, hardy): `PgrGetCounts()` — fastest, no genotype
+   decompression needed
+2. **Bitarray-only** (missing): `PgrGetMissingness()` — fast, single bitarray
+3. **Full decode** (ld, score): `PgrGet()`/`PgrGetD()` — full genotype
+   decompression, but unavoidable for the computation
+
+This maps well to a prioritized implementation order: count-based functions
+first (simplest pgenlib interaction), then missingness, then full-decode
+functions.
+
+---
+
+## 5. Shared Infrastructure Recommendation
+
+### Pattern Analysis
+
+All five approved P2 functions share these patterns:
+
+1. **pgenlib two-phase initialization**: `PreinitPgfi` → `PgfiInitPhase1` →
+   allocate → `PgfiInitPhase2`
+2. **Per-thread PgenReader creation**: `PgrInit()` with cache-aligned buffers
+3. **Variant metadata loading**: `.pvar` parsing for CHROM, POS, ID, REF, ALT
+4. **Sample metadata loading**: `.psam` parsing for FID, IID (score needs this
+   for output; others need it for sample subsetting)
+5. **RAII cleanup**: `CleanupPgfi`, `CleanupPgr`, `aligned_free`
+6. **Variant iteration**: atomic counter, batch claiming
+7. **Sample subsetting**: bitarray construction, `PgrSetSampleSubsetIndex()`
+8. **Region filtering**: chromosome + position range → variant index range
+9. **Progress reporting**: `context.SetProgress(pct)`
+
+### Recommendation: Extract During First P2 Implementation
+
+**Do not add shared utilities during P1.** P1's scope is well-defined and
+the reader functions don't need a shared utility layer — the patterns are
+embedded in `pgen_reader.cpp` and work correctly.
+
+**At the start of P2**, the first plan to execute (P2-001, plink_freq) should:
+
+1. **Extract** the following from `pgen_reader.cpp` into new shared files:
+   - `src/include/plink_common.hpp`: RAII wrappers (`UniquePgfi`, `UniquePgr`,
+     `AlignedBuffer`), pgenlib initialization helper, sample subsetting helper,
+     region filtering helper, variant metadata types
+   - `src/plink_common.cpp`: Implementation of the above
+
+2. **Refactor** `read_pgen` to use the shared utilities (verify no regressions)
+
+3. **Build** `plink_freq` on the shared utilities
+
+Subsequent P2 functions (P2-002 through P2-005) then import from
+`plink_common.hpp` with no duplication.
+
+This adds ~1 day of scope to P2-001 but saves significant duplication and
+reduces the risk of divergent patterns across the five P2 functions.
+
+### Shared utility surface area
+
+```
+plink_common.hpp:
+  // RAII wrappers
+  struct PgfiDeleter { ... };
+  struct PgrDeleter { ... };
+  using UniquePgfi = unique_ptr<PgenFileInfo, PgfiDeleter>;
+  using UniquePgr = unique_ptr<PgenReader, PgrDeleter>;
+  struct AlignedBuffer { ... };  // wraps cachealigned_malloc/aligned_free
+
+  // Initialization
+  struct PgenContext {
+      PgenFileInfo pgfi;
+      unsigned char* pgfi_alloc;
+      uint32_t raw_variant_ct;
+      uint32_t raw_sample_ct;
+      uint32_t max_vrec_width;
+      uintptr_t pgr_alloc_cacheline_ct;
+      // Variant metadata
+      vector<string> chroms, ids, refs, alts;
+      vector<int32_t> positions;
+  };
+  PgenContext InitPgenContext(const string &pgen_path,
+                             const string &pvar_path);
+
+  // Per-thread reader
+  PgenReader InitThreadReader(const PgenContext &ctx,
+                              const string &pgen_path);
+
+  // Sample subsetting
+  struct SampleSubset {
+      uintptr_t* sample_include;
+      uintptr_t* sample_include_interleaved_vec;
+      PgrSampleSubsetIndex pssi;
+      uint32_t subset_size;
+  };
+  SampleSubset BuildSampleSubset(const SampleInfo &info,
+                                 const vector<string> &requested);
+
+  // Region filtering
+  struct VariantRange {
+      uint32_t start_idx;
+      uint32_t end_idx;
+  };
+  VariantRange ResolveRegion(const PgenContext &ctx,
+                             const string &region_str);
+```
+
+---
+
+## 6. Approved P2 Function Summary
+
+| Plan | Function | pgenlib Path | Priority | Parallel Group |
+|------|----------|-------------|----------|----------------|
+| P2-001 | `plink_freq` | `PgrGetCounts()` | High | **A** |
+| P2-002 | `plink_hardy` | `PgrGetCounts()` | High | **A** |
+| P2-003 | `plink_missing` | `PgrGetMissingness()` | High | **A** |
+| P2-004 | `plink_ld` | `PgrGet()` × 2 + math | Medium | **B** |
+| P2-005 | `plink_score` | `PgrGetD()` + dot product | Medium | **B** |
+
+### Dependency structure
+
+```
+P1-003 (read_pgen) ──→ P2-001 (plink_freq)     ← extracts shared utilities
+                            │
+                   ┌────────┼────────┬──────────┐
+                   │        │        │          │
+                P2-002   P2-003   P2-004     P2-005
+               (hardy)  (missing)  (ld)     (score)
+```
+
+P2-001 runs first (creates shared infrastructure). P2-002 through P2-005 are
+independent and can run in parallel after P2-001 merges.
+
+### Implementation order rationale
+
+1. **P2-001 (freq) first**: Simplest computation, establishes shared utilities
+2. **P2-002 (hardy), P2-003 (missing) parallel**: Both simple, independent
+3. **P2-004 (ld), P2-005 (score) parallel**: Both need full genotype decode,
+   independent of each other
+
+---
+
+## 7. Deferred Functions Summary (P3 Candidates)
+
+| Function | Reason Deferred | P3 Complexity |
+|----------|----------------|---------------|
+| `plink_het` | Expressible via plink_freq + SQL | Low |
+| `plink_fst` | Specialized (population genetics) | Medium |
+| `plink_geno_counts` | Merge with plink_freq as mode | Low |
+| `plink_sample_counts` | Expressible via read_pfile + SQL | Low |
+| `plink_glm` | Needs regression library / LAPACK | High |
+| `plink_pca` | Needs LAPACK eigendecomposition | High |
+| `plink_king_table` | O(N²) pairwise computation | High |

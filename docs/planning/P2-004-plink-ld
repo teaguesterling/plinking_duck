@@ -1,0 +1,476 @@
+# P2-004: plink_ld Table Function
+
+## Goal
+
+Implement `plink_ld(path)` — a DuckDB table function that computes linkage
+disequilibrium statistics (r², D', haplotype frequencies) between pairs of
+variants from .pgen files using pgenlib's `PgrGet()` and `PgrGetP()` for
+genotype access.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+- P1-003 merged (read_pgen pgenlib integration)
+
+## Depends On
+
+P2-001 (for shared infrastructure)
+
+## Parallel Group
+
+**B** — Can run in parallel with P2-002, P2-003, P2-005 after P2-001 merges.
+
+## Branch
+
+`feature/P2-004-plink-ld`
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_ld.cpp` | plink_ld bind, init, scan + LD computation |
+| `src/include/plink_ld.hpp` | Public interface: `RegisterPlinkLd()` |
+| `test/sql/plink_ld.test` | Positive tests (pairwise mode) |
+| `test/sql/plink_ld_window.test` | Positive tests (windowed mode) |
+| `test/sql/plink_ld_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_ld.hpp"`, call `RegisterPlinkLd(loader)` |
+| `CMakeLists.txt` | Add `src/plink_ld.cpp` to build |
+
+---
+
+## SQL Interface
+
+### Pairwise mode (specific variant pairs)
+
+```sql
+-- LD between two specific variants by ID
+SELECT * FROM plink_ld('data/example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+
+-- Multiple pairs via a table of variant IDs
+SELECT l.*
+FROM plink_ld('data/example.pgen') l
+WHERE (l.ID_A, l.ID_B) IN (('rs1','rs2'), ('rs3','rs4'));
+```
+
+### Windowed mode (all pairs within a window)
+
+```sql
+-- All pairs within 1Mb with r² ≥ 0.2
+SELECT * FROM plink_ld('data/example.pgen',
+    window_kb := 1000, r2_threshold := 0.2);
+
+-- LD within a specific region
+SELECT * FROM plink_ld('data/example.pgen',
+    region := '1:10000-50000', window_kb := 500);
+
+-- Inter-chromosomal LD (expensive — use cautiously)
+SELECT * FROM plink_ld('data/example.pgen',
+    inter_chr := true, r2_threshold := 0.8);
+
+-- Composable: find variants in high LD with a target
+SELECT ID_B, R2 FROM plink_ld('data/example.pgen',
+    window_kb := 1000, r2_threshold := 0.5)
+WHERE ID_A = 'rs1'
+ORDER BY R2 DESC;
+```
+
+---
+
+## Output Schema
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| CHROM_A | VARCHAR | Chromosome of variant A |
+| POS_A | INTEGER | Position of variant A |
+| ID_A | VARCHAR | Identifier of variant A |
+| CHROM_B | VARCHAR | Chromosome of variant B |
+| POS_B | INTEGER | Position of variant B |
+| ID_B | VARCHAR | Identifier of variant B |
+| R2 | DOUBLE | Squared correlation coefficient |
+| D_PRIME | DOUBLE | Normalized D' coefficient |
+| OBS_CT | INTEGER | Number of non-missing samples in both variants |
+
+One row per variant pair.
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `variant1` | VARCHAR | none | First variant ID (pairwise mode) |
+| `variant2` | VARCHAR | none | Second variant ID (pairwise mode) |
+| `window_kb` | INTEGER | 1000 | Window size in kilobases (windowed mode) |
+| `r2_threshold` | DOUBLE | 0.2 | Minimum r² to report (windowed mode) |
+| `region` | VARCHAR | all | Filter to genomic region |
+| `samples` | LIST(VARCHAR) | all | Filter to specific sample IDs |
+| `inter_chr` | BOOLEAN | false | Allow inter-chromosomal pairs |
+
+### Mode selection
+
+- If `variant1` and `variant2` are both provided: **pairwise mode**
+  (compute LD for that single pair)
+- Otherwise: **windowed mode** (all pairs within window)
+
+---
+
+## Implementation
+
+### LD Computation
+
+For two biallelic variants A and B with genotypes across N samples:
+
+**Unphased r² (default)**:
+
+Using genotype dosages (0, 1, 2 for alt allele count):
+```
+r² = [Σ(gA_i * gB_i) / N - (ΣgA_i/N)(ΣgB_i/N)]²
+     / [Var(gA) * Var(gB)]
+```
+
+This is the squared Pearson correlation of genotype dosage vectors.
+Equivalent to plink2's `--r2-unphased` computation.
+
+**Implementation using genotype counts**:
+
+Rather than decoding full genotype arrays, compute correlation from the
+joint genotype distribution (3x3 table):
+
+```
+For each sample i:
+    gA = genotype at variant A (0, 1, 2, or missing)
+    gB = genotype at variant B (0, 1, 2, or missing)
+    If either is missing: skip this sample
+
+Accumulate:
+    sum_A += gA
+    sum_B += gB
+    sum_AB += gA * gB
+    sum_A2 += gA * gA
+    sum_B2 += gB * gB
+    n++
+
+mean_A = sum_A / n
+mean_B = sum_B / n
+cov_AB = sum_AB / n - mean_A * mean_B
+var_A = sum_A2 / n - mean_A²
+var_B = sum_B2 / n - mean_B²
+
+r² = cov_AB² / (var_A * var_B)
+```
+
+**D' computation**:
+
+For unphased genotypes, D' requires estimating haplotype frequencies via
+EM algorithm or the composite D' approximation. The composite approach is:
+
+```
+D_composite = freq(AB) - freq(A)*freq(B)
+// where freq(AB) = (2*count_22 + count_21 + count_12) / (2*n)
+// Using the joint genotype table
+
+D_prime = D / D_max
+// where D_max depends on sign of D:
+//   D > 0: D_max = min(freq_A * (1-freq_B), (1-freq_A) * freq_B)
+//   D < 0: D_max = max(-freq_A * freq_B, -(1-freq_A) * (1-freq_B))
+```
+
+### Efficient genotype pairing
+
+For two variants, load both genotype arrays and compute the joint
+distribution in a single pass:
+
+```cpp
+void ComputeLdStats(const uintptr_t* genovec_a, const uintptr_t* genovec_b,
+                    uint32_t sample_ct,
+                    double* r2_ptr, double* dprime_ptr, uint32_t* obs_ct_ptr) {
+    // Iterate through packed 2-bit arrays simultaneously
+    // For each sample: extract geno_a (2 bits) and geno_b (2 bits)
+    // Skip if either is 0b11 (missing)
+    // Accumulate sums for correlation computation
+    //
+    // Optimization: process 32 samples at a time using bitwise operations
+    // on the packed nyparray words
+}
+```
+
+### Bind phase (PlinkLdBind)
+
+1. Accept .pgen path as first positional VARCHAR argument
+2. Initialize PgenContext
+3. Detect mode:
+   - If `variant1` and `variant2` both present: pairwise mode
+     - Look up variant indices by ID from variant metadata
+     - Error if either not found
+   - Otherwise: windowed mode
+4. If `samples` provided: build SampleSubset
+5. If `region` provided: resolve VariantRange
+6. Register output columns (fixed schema)
+
+### Pairwise mode scan
+
+For a single pair, the scan function runs once:
+
+```
+vidx_a = lookup(variant1)
+vidx_b = lookup(variant2)
+
+PgrGet(sample_include, pssi, sample_ct, vidx_a, &pgr, genovec_a)
+PgrGet(sample_include, pssi, sample_ct, vidx_b, &pgr, genovec_b)
+
+ComputeLdStats(genovec_a, genovec_b, sample_ct, &r2, &dprime, &obs_ct)
+
+output one row: (CHROM_A, POS_A, ID_A, CHROM_B, POS_B, ID_B, R2, D_PRIME, OBS_CT)
+output.SetCardinality(1)
+```
+
+### Windowed mode scan
+
+Windowed mode iterates through variant pairs (i, j) where:
+- `j > i` (upper triangle only)
+- `|pos_j - pos_i| ≤ window_kb * 1000` (within window)
+- `chrom_i == chrom_j` (same chromosome, unless inter_chr)
+
+**Scan pattern**: Each thread claims a batch of "anchor" variants via
+atomic counter. For each anchor variant i, it scans forward through variants
+j in the window.
+
+```
+while rows_emitted < STANDARD_VECTOR_SIZE:
+    anchor_idx = global.next_anchor_idx.fetch_add(1)
+    if anchor_idx >= end_variant_idx: break
+
+    PgrGet(sample_include, pssi, sample_ct, anchor_idx, &pgr, genovec_a)
+
+    // Scan forward through window
+    for j = anchor_idx + 1; j < end_variant_idx; j++:
+        if chrom[j] != chrom[anchor_idx] and not inter_chr: break
+        if pos[j] - pos[anchor_idx] > window_kb * 1000: break
+
+        PgrGet(sample_include, pssi, sample_ct, j, &pgr, genovec_b)
+        ComputeLdStats(genovec_a, genovec_b, sample_ct, &r2, &dprime, &obs_ct)
+
+        if r2 >= r2_threshold:
+            output (variant_meta[anchor], variant_meta[j], R2, D_PRIME, OBS_CT)
+            rows_emitted++
+            if rows_emitted >= STANDARD_VECTOR_SIZE:
+                // Save state: current anchor_idx and j
+                // Resume from here on next scan call
+                break
+
+output.SetCardinality(rows_emitted)
+```
+
+**State preservation**: Since the scan function may be called multiple times,
+the local state must track:
+- Current anchor variant index
+- Current partner variant index (within the window for that anchor)
+- Whether the anchor's genovec is already loaded
+
+### Performance profile
+
+- **Pairwise mode**: O(1) variant reads (2 PgrGet calls). Fast.
+- **Windowed mode**: O(V × W) where V = variants and W = average window
+  size. For 1M variants with 1Mb windows containing ~1000 variants each,
+  this is ~1 billion pair evaluations. Each requires 2 PgrGet calls and
+  correlation math.
+- **Optimization**: Cache the anchor genovec — it's reused for all partners
+  in its window. Only load genovec_b for each new partner.
+- **r² threshold filtering**: Avoids emitting low-LD pairs, which is the
+  majority of pairs. This dramatically reduces output size.
+- **Memory**: O(sample_ct) for two genotype arrays — negligible.
+
+---
+
+## Testing
+
+### Positive tests — pairwise mode (plink_ld.test)
+
+```sql
+require plinking_duck
+
+# LD between two specific variants
+query IIIIIIRRI
+SELECT CHROM_A, POS_A, ID_A, CHROM_B, POS_B, ID_B, R2, D_PRIME, OBS_CT
+FROM plink_ld('test/data/example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+(expected values — hand-calculated from test genotypes)
+
+# LD with self should be r²=1.0
+# (a variant is perfectly correlated with itself)
+query R
+SELECT R2 FROM plink_ld('test/data/example.pgen',
+    variant1 := 'rs1', variant2 := 'rs1');
+----
+1.0
+
+# R² between 0 and 1
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2')
+WHERE R2 < 0.0 OR R2 > 1.0;
+----
+0
+
+# Returns exactly one row in pairwise mode
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+1
+
+# Sample subsetting changes LD
+query R
+SELECT R2 FROM plink_ld('test/data/example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2',
+    samples := ['SAMPLE1', 'SAMPLE2']);
+----
+(different from full-sample LD)
+```
+
+### Positive tests — windowed mode (plink_ld_window.test)
+
+```sql
+require plinking_duck
+
+# Windowed LD with threshold
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/example.pgen',
+    window_kb := 1000, r2_threshold := 0.0);
+----
+(expected pair count — should be C(n,2) for same-chrom pairs within window)
+
+# Only same-chrom pairs by default
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/example.pgen',
+    window_kb := 10000, r2_threshold := 0.0)
+WHERE CHROM_A != CHROM_B;
+----
+0
+
+# Inter-chr mode allows cross-chromosome pairs
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/example.pgen',
+    window_kb := 10000, r2_threshold := 0.0, inter_chr := true)
+WHERE CHROM_A != CHROM_B;
+----
+(>0, expected cross-chrom pairs)
+
+# R² threshold filtering
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/example.pgen',
+    window_kb := 1000, r2_threshold := 0.0)
+WHERE R2 < 0.2;
+----
+(some count — these would be filtered at threshold 0.2)
+
+# Region filtering
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/example.pgen',
+    region := '1:10000-30000', r2_threshold := 0.0);
+----
+(expected count for chr1 variants in range)
+```
+
+### Negative tests (plink_ld_negative.test)
+
+```sql
+require plinking_duck
+
+# File not found
+statement error
+SELECT * FROM plink_ld('nonexistent.pgen', variant1 := 'rs1', variant2 := 'rs2');
+----
+(error)
+
+# Variant not found
+statement error
+SELECT * FROM plink_ld('test/data/example.pgen',
+    variant1 := 'NOSUCHVARIANT', variant2 := 'rs2');
+----
+(error: variant not found)
+
+# Only variant1 specified (incomplete pair)
+statement error
+SELECT * FROM plink_ld('test/data/example.pgen', variant1 := 'rs1');
+----
+(error: both variant1 and variant2 must be specified for pairwise mode)
+
+# No arguments
+statement error
+SELECT * FROM plink_ld();
+----
+(error)
+```
+
+### Known-answer test cases
+
+For LD validation, construct test variants with known correlations:
+
+| Pair | Genotypes A | Genotypes B | Expected r² | Notes |
+|------|------------|------------|-------------|-------|
+| Perfect LD | [0,1,2,0] | [0,1,2,0] | 1.0 | Identical genotypes |
+| Anti-correlated | [0,1,2,0] | [2,1,0,2] | 1.0 | Perfect negative correlation, r²=1 |
+| Independent | [0,0,1,1] | [0,1,0,1] | 0.0 | Uncorrelated |
+| Partial LD | (varied) | (varied) | 0.0 < r² < 1.0 | Verify against plink2 |
+
+Validate windowed mode output against `plink2 --r2-unphased --ld-window-r2 0`.
+
+---
+
+## Documentation
+
+### Update README.md
+
+```
+### plink_ld(path [, variant1, variant2, window_kb, r2_threshold, ...])
+Compute linkage disequilibrium statistics between variant pairs.
+
+-- LD between two specific variants
+SELECT * FROM plink_ld('data/example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+
+-- All pairs within 500kb with r² ≥ 0.5
+SELECT * FROM plink_ld('data/example.pgen',
+    window_kb := 500, r2_threshold := 0.5);
+
+-- Find variants in high LD with a target
+SELECT ID_B, R2 FROM plink_ld('data/example.pgen',
+    window_kb := 1000, r2_threshold := 0.5)
+WHERE ID_A = 'rs1' ORDER BY R2 DESC;
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Pairwise mode computes correct r² for known test genotypes
+2. [ ] Self-LD returns r²=1.0
+3. [ ] D' values are correct for known test cases
+4. [ ] Windowed mode returns all qualifying pairs within window
+5. [ ] r² threshold filtering works correctly
+6. [ ] Window size correctly limits pairs by physical distance
+7. [ ] Same-chromosome restriction enforced by default
+8. [ ] `inter_chr := true` allows cross-chromosome pairs
+9. [ ] Sample subsetting recalculates LD for subset
+10. [ ] Results match plink2 `--r2-unphased` output (within tolerance)
+11. [ ] All positive and negative tests pass
+12. [ ] `make test` passes
+13. [ ] README updated

@@ -1,0 +1,379 @@
+# P2-002: plink_hardy Table Function
+
+## Goal
+
+Implement `plink_hardy(path)` — a DuckDB table function that computes
+per-variant Hardy-Weinberg equilibrium exact test p-values from .pgen files
+using pgenlib's `PgrGetCounts()` fast-path.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+- P1-003 merged (read_pgen pgenlib integration)
+
+## Depends On
+
+P2-001 (for shared infrastructure)
+
+## Parallel Group
+
+**A** — Can run in parallel with P2-003, P2-004, P2-005 after P2-001 merges.
+
+## Branch
+
+`feature/P2-002-plink-hardy`
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_hardy.cpp` | plink_hardy bind, init, scan + HWE exact test implementation |
+| `src/include/plink_hardy.hpp` | Public interface: `RegisterPlinkHardy()` |
+| `test/sql/plink_hardy.test` | Positive tests |
+| `test/sql/plink_hardy_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_hardy.hpp"`, call `RegisterPlinkHardy(loader)` |
+| `CMakeLists.txt` | Add `src/plink_hardy.cpp` to build |
+
+---
+
+## SQL Interface
+
+```sql
+-- Basic HWE test
+SELECT * FROM plink_hardy('data/example.pgen');
+
+-- With mid-p correction
+SELECT * FROM plink_hardy('data/example.pgen', midp := true);
+
+-- Sample subsetting (e.g., controls only)
+SELECT * FROM plink_hardy('data/example.pgen',
+    samples := ['CTRL1', 'CTRL2', 'CTRL3']);
+
+-- Region filtering
+SELECT * FROM plink_hardy('data/example.pgen', region := '1:10000-50000');
+
+-- Common workflow: filter variants failing HWE
+SELECT f.*, h.P_HWE
+FROM plink_freq('data/example.pgen') f
+JOIN plink_hardy('data/example.pgen') h ON f.ID = h.ID
+WHERE h.P_HWE > 1e-6;
+
+-- QC: flag variants with extreme deviation
+SELECT ID, P_HWE FROM plink_hardy('data/example.pgen')
+WHERE P_HWE < 1e-10;
+```
+
+---
+
+## Output Schema
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| CHROM | VARCHAR | Chromosome |
+| POS | INTEGER | Base-pair position |
+| ID | VARCHAR | Variant identifier |
+| REF | VARCHAR | Reference allele |
+| ALT | VARCHAR | Alternate allele(s) |
+| A1 | VARCHAR | Tested allele (alternate) |
+| HOM_REF_CT | INTEGER | Homozygous reference count |
+| HET_CT | INTEGER | Heterozygous count |
+| HOM_ALT_CT | INTEGER | Homozygous alternate count |
+| O_HET | DOUBLE | Observed heterozygosity rate |
+| E_HET | DOUBLE | Expected heterozygosity rate under HWE |
+| P_HWE | DOUBLE | HWE exact test p-value (or mid-p if `midp := true`) |
+
+One row per variant.
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) | all | Filter to specific sample IDs |
+| `region` | VARCHAR | all | Filter to genomic region (`chr:start-end`) |
+| `midp` | BOOLEAN | false | Use mid-p correction for exact test |
+
+---
+
+## Implementation
+
+### HWE Exact Test Algorithm
+
+The Hardy-Weinberg exact test evaluates whether observed genotype frequencies
+are consistent with HWE expectations. For a biallelic variant with observed
+genotype counts (n_AA, n_Aa, n_aa), the algorithm computes the probability
+of observing the given heterozygote count or fewer under HWE, given the
+fixed allele counts.
+
+**Algorithm** (Wigginton et al. 2005, "A Note on Exact Tests of
+Hardy-Weinberg Equilibrium"):
+
+Given:
+- `n = n_AA + n_Aa + n_aa` (total non-missing diploid samples)
+- `n_A = 2*n_AA + n_Aa` (reference allele count)
+- `n_a = 2*n_aa + n_Aa` (alternate allele count)
+
+1. Compute the probability distribution of heterozygote counts under HWE
+   for fixed allele counts `n_A` and `n_a`:
+   ```
+   P(het = k) ∝ C(n, n_AA) * C(n - n_AA, n_Aa) * 2^n_Aa
+   ```
+   where `n_AA = (n_A - k)/2` and `n_aa = (n_a - k)/2` for valid `k`.
+
+2. Starting from the most likely heterozygote count (expected under HWE),
+   iteratively compute probabilities for all valid het counts using the
+   recurrence relation (avoids overflow with large factorials):
+   ```
+   P(het = k+2) / P(het = k) = ratio involving n_AA, n_Aa, n_aa
+   ```
+
+3. Sum probabilities for all het counts with probability ≤ P(observed het).
+
+4. **Mid-p correction** (optional): subtract half the probability of the
+   observed het count from the p-value.
+
+**Implementation note**: This algorithm runs in O(n) time per variant
+where n is the sample count. It uses double-precision floating point
+and is numerically stable for typical sample sizes (up to millions).
+Implement as a standalone function `HweExactTest(hom_ref, het, hom_alt,
+midp) → double` in `plink_hardy.cpp`.
+
+### Bind phase (PlinkHardyBind)
+
+1. Accept .pgen path as first positional VARCHAR argument
+2. Initialize PgenContext via shared utility from `plink_common.hpp`
+3. If `samples` provided: build SampleSubset
+4. If `region` provided: resolve VariantRange
+5. Register output columns (fixed schema as above)
+6. Store context, subset, range, midp flag in bind data
+
+### Global state
+
+Same as plink_freq: atomic variant counter with start/end range.
+
+### Local state
+
+Same as plink_freq: per-thread PgenReader with no genovec needed (uses
+PgrGetCounts only). No additional buffers.
+
+### Scan function (PlinkHardyScan)
+
+```
+BATCH_SIZE = 128
+
+while rows_emitted < STANDARD_VECTOR_SIZE:
+    batch_start = global.next_variant_idx.fetch_add(BATCH_SIZE)
+    if batch_start >= global.end_variant_idx: break
+
+    for vidx in batch_start..min(batch_start + BATCH_SIZE, end):
+        if rows_emitted >= STANDARD_VECTOR_SIZE: break
+
+        STD_ARRAY_DECL(uint32_t, 4, genocounts)
+        PgrGetCounts(sample_include, sample_include_interleaved_vec,
+                    pssi, sample_ct, vidx, &pgr, genocounts)
+
+        hom_ref = genocounts[0]
+        het = genocounts[1]
+        hom_alt = genocounts[2]
+        obs = hom_ref + het + hom_alt
+
+        o_het = (obs > 0) ? (double)het / obs : 0.0
+        // Expected het under HWE: 2pq where p = ref_freq, q = alt_freq
+        p = (2.0 * hom_ref + het) / (2.0 * obs)
+        q = 1.0 - p
+        e_het = 2.0 * p * q
+
+        p_hwe = HweExactTest(hom_ref, het, hom_alt, midp)
+
+        // Fill output columns
+        output CHROM, POS, ID, REF, ALT from variant metadata
+        output A1 = ALT
+        output HOM_REF_CT, HET_CT, HOM_ALT_CT
+        output O_HET = o_het
+        output E_HET = e_het
+        output P_HWE = p_hwe
+
+        rows_emitted++
+
+output.SetCardinality(rows_emitted)
+```
+
+### Performance profile
+
+- **Variant-parallel**: same atomic batch-claiming as plink_freq
+- **No genotype decompression**: `PgrGetCounts()` fast-path
+- **Compute-light**: HWE exact test is O(sample_count) per variant but
+  sample counts are typically small (< millions). The bottleneck is
+  I/O, not math.
+- **Memory**: negligible (count array + HWE probability array per variant)
+
+---
+
+## Testing
+
+### Positive tests (plink_hardy.test)
+
+```sql
+require plinking_duck
+
+# Basic HWE output
+query IIIIIIIIRRI
+SELECT CHROM, POS, ID, REF, ALT, A1,
+       HOM_REF_CT, HET_CT, HOM_ALT_CT,
+       O_HET, E_HET, P_HWE
+FROM plink_hardy('test/data/example.pgen');
+----
+(expected values)
+
+# rs1: [0/0, 0/1, 1/1, ./.] → counts: 1, 1, 1
+# obs_het = 1/3 = 0.333, exp_het = 2*(2/6)*(4/6) = 0.444
+# HWE p-value for 1:1:1 with 3 samples
+query IIRR
+SELECT ID, HET_CT, O_HET, P_HWE
+FROM plink_hardy('test/data/example.pgen') WHERE ID = 'rs1';
+----
+(hand-calculated values)
+
+# Row count matches variant count
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/example.pgen');
+----
+4
+
+# All p-values between 0 and 1
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/example.pgen')
+WHERE P_HWE < 0.0 OR P_HWE > 1.0;
+----
+0
+
+# O_HET between 0 and 1
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/example.pgen')
+WHERE O_HET < 0.0 OR O_HET > 1.0;
+----
+0
+
+# Mid-p correction produces different (smaller) p-values
+# (for variants not at exact HWE)
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/example.pgen', midp := true);
+----
+4
+
+# Sample subsetting
+query I
+SELECT HOM_REF_CT + HET_CT + HOM_ALT_CT
+FROM plink_hardy('test/data/example.pgen',
+    samples := ['SAMPLE1', 'SAMPLE2']) LIMIT 1;
+----
+2
+
+# Region filtering
+query I
+SELECT COUNT(*)
+FROM plink_hardy('test/data/example.pgen', region := '1:10000-20000');
+----
+2
+
+# Validate against plink2 output (if available)
+# Generate reference: plink2 --pgen example.pgen --hardy --out reference
+# Compare P_HWE values within floating-point tolerance
+```
+
+### Negative tests (plink_hardy_negative.test)
+
+```sql
+require plinking_duck
+
+# File not found
+statement error
+SELECT * FROM plink_hardy('nonexistent.pgen');
+----
+(error)
+
+# No arguments
+statement error
+SELECT * FROM plink_hardy();
+----
+(error)
+
+# Invalid sample ID
+statement error
+SELECT * FROM plink_hardy('test/data/example.pgen',
+    samples := ['NOSUCHSAMPLE']);
+----
+(error: sample not found)
+
+# Empty region returns 0 rows
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/example.pgen',
+    region := '99:1-100');
+----
+0
+```
+
+### Known-answer test cases
+
+For HWE exact test validation, use these known cases:
+
+| hom_ref | het | hom_alt | Expected P_HWE | Notes |
+|---------|-----|---------|----------------|-------|
+| 100 | 50 | 5 | ~0.67 | Mild deviation |
+| 100 | 0 | 100 | ≈0 | Extreme deviation (no hets) |
+| 10 | 10 | 10 | ~0.05 | Equal counts |
+| 50 | 50 | 0 | ~1.0 | Consistent with HWE |
+
+These should be verified against plink2's `--hardy` output or an
+independent HWE exact test implementation (e.g., R's `HardyWeinberg`
+package).
+
+---
+
+## Documentation
+
+### Update README.md
+
+```
+### plink_hardy(path [, pvar, psam, samples, region, midp])
+Compute per-variant Hardy-Weinberg equilibrium exact test p-values.
+Uses pgenlib's fast counting path.
+
+-- Basic usage
+SELECT * FROM plink_hardy('data/example.pgen');
+
+-- With mid-p correction
+SELECT * FROM plink_hardy('data/example.pgen', midp := true);
+
+-- QC workflow: keep variants passing HWE filter
+SELECT * FROM plink_hardy('data/example.pgen')
+WHERE P_HWE > 1e-6;
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] `plink_hardy('file.pgen')` returns correct HWE test results
+2. [ ] Genotype counts match plink_freq output for same data
+3. [ ] HWE exact test p-values are correct for known-answer cases
+4. [ ] Mid-p correction produces correct adjusted p-values
+5. [ ] O_HET and E_HET are correctly computed
+6. [ ] Sample subsetting recalculates HWE for subset
+7. [ ] Region filtering works
+8. [ ] P_HWE values match plink2 `--hardy` output (within tolerance)
+9. [ ] All positive and negative tests pass
+10. [ ] `make test` passes
+11. [ ] README updated
