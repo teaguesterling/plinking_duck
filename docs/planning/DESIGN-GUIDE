@@ -1,0 +1,304 @@
+# plinking_duck — API Design Guide & Coding Standards
+
+Cross-cutting design principles and implementation patterns for all
+plinking_duck functions. Individual plan documents reference this guide
+rather than duplicating conventions.
+
+---
+
+## 1. Core Architecture
+
+### The .pgen is always the big data
+
+The extension exists because .pgen files are too large and too specialized
+to handle through generic DuckDB file readers. At target biobank scale:
+
+| Data | Scale | Nature |
+|------|-------|--------|
+| .pgen genotypes | 10M+ samples × 170M variants, hundreds of GB to TB | **Big**: streams through pgenlib, never materialized |
+| .pvar metadata | 170M rows × ~5 columns, ~10GB text | **Medium**: loaded into memory during bind |
+| .psam metadata | 10M rows × ~10 columns, ~500MB text | **Medium**: loaded into memory during bind |
+| Weights, phenotypes, covariates | 1–10M values, ~50–800MB | **Small**: passed as DuckDB values |
+
+All extension functions take a .pgen path as their first positional argument.
+The .pgen is the immovable center; everything else revolves around it.
+
+### Reader functions vs utility functions
+
+**Reader functions** (P1: `read_pvar`, `read_psam`, `read_pgen`, `read_pfile`)
+expose raw file contents as DuckDB tables. They are for **inspection and
+moderate-scale analysis**: examining variant metadata, checking sample info,
+viewing genotypes for specific variants or small cohorts.
+
+At biobank scale, `read_pgen` produces ~10MB per output row (one
+`LIST(TINYINT)` with 10M entries per variant). A full scan of 170M variants
+would produce ~1.7PB of genotype data. Tidy mode (`read_pfile` with
+`tidy := true`) produces `N_variants × N_samples` rows — 1.7 trillion at
+full scale. These functions are not designed for whole-genome computation.
+
+**Utility functions** (P2: `plink_freq`, `plink_hardy`, `plink_missing`,
+`plink_ld`, `plink_score`) perform genomics-specific computation using
+pgenlib fast-paths that avoid full genotype decompression where possible.
+They are the path for **biobank-scale computation**.
+
+| Use Case | Function | Scale |
+|----------|----------|-------|
+| "What genotypes does sample X have at variant Y?" | `read_pfile` + WHERE | Small |
+| "Show me variants on chromosome 22" | `read_pvar` + WHERE | Medium |
+| "Compute allele frequencies for all variants" | `plink_freq` | Biobank |
+| "Compute per-sample missingness" | `plink_missing` | Biobank |
+| "Score 10M samples with 1M variant weights" | `plink_score` | Biobank |
+
+---
+
+## 2. Parameter Conventions
+
+### Positional arguments
+
+Every function takes the .pgen (or pfile prefix) path as its first and only
+positional argument. All other inputs are named parameters.
+
+### Shared named parameters
+
+These parameters have consistent names, types, and semantics across all
+functions that use them:
+
+| Parameter | Type | Semantics | Used By |
+|-----------|------|-----------|---------|
+| `pvar` | VARCHAR | Explicit .pvar/.bim path (overrides auto-discovery) | read_pgen, read_pfile, all P2 |
+| `psam` | VARCHAR | Explicit .psam/.fam path (overrides auto-discovery) | read_pgen, read_pfile, all P2 |
+| `samples` | LIST(VARCHAR) | Filter to specific sample IDs by IID | read_pfile, all P2 |
+| `region` | VARCHAR | Filter to genomic region (`chr:start-end`) | read_pfile, P2-001–P2-005 |
+| `variants` | LIST(VARCHAR) | Filter to specific variant IDs | read_pfile *(planned)* |
+
+**`samples` not found**: Error with the unknown sample ID. Partial matches
+are not accepted. This is consistent across all functions.
+
+**`region` with no matches**: Returns 0 rows (not an error). A region that
+doesn't overlap any variants is a valid query with an empty result.
+
+**`variants` not found**: Behavior depends on context. For readers
+(`read_pfile`), error on unknown variant. For utility functions where
+partial matching is expected (e.g., `plink_score` ID-keyed weights), skip
+with a warning count.
+
+### Three-tier type dispatch for small data
+
+Parameters that accept user-provided data (weights, phenotypes, covariates,
+population labels) follow a three-tier type dispatch:
+
+| Tier | Type | When to Use | Status |
+|------|------|-------------|--------|
+| 1 | `LIST(DOUBLE)`, `LIST(VARCHAR)` | Positional, small/filtered, tests | P2 |
+| 2 | `LIST(STRUCT(...))` or `STRUCT(LIST(...), ...)` | ID-keyed or multi-column | P2 |
+| 3 | `VARCHAR` (table name) | Data too large to materialize as Value | P3 |
+
+**Tier 1 (positional)**: Values aligned with .pgen variant or sample order.
+Fast path — no ID matching. Length must match the expected count (or
+region-filtered count).
+
+**Tier 2 (ID-keyed or multi-column)**: Struct field names serve as the
+column contract. No separate `id_col`/`weight_col` parameters.
+- `LIST(STRUCT(...))` (list-of-structs): row-oriented, best for sparse
+  ID-keyed data (e.g., variant weights matched by ID)
+- `STRUCT(LIST(...), ...)` (struct-of-lists): column-oriented, best for
+  positional multi-column data (e.g., covariates), aligns with DuckDB's
+  columnar internals
+
+**Tier 3 (table name)**: Extension executes `context.Query()` during bind
+to stream from a named DuckDB table. Column names must match the struct
+field contract. For data too large to materialize as a single DuckDB Value.
+
+**Value sourcing**: For Tiers 1–2, values can come from:
+- Literals: `weights := [1.0, 0.5, -0.5]`
+- Variables: `SET VARIABLE w = (...); ... weights := getvariable('w')`
+- Scalar subqueries (when DuckDB supports this for table function params)
+
+The extension receives a materialized `Value` and does not know or care
+how it was produced.
+
+---
+
+## 3. Output Column Conventions
+
+### Variant metadata columns
+
+All functions that output variant information use these column names:
+
+| Column | DuckDB Type | Source |
+|--------|-------------|--------|
+| CHROM | VARCHAR | .pvar |
+| POS | INTEGER | .pvar (1-based) |
+| ID | VARCHAR | .pvar |
+| REF | VARCHAR | .pvar |
+| ALT | VARCHAR | .pvar |
+
+### Sample metadata columns
+
+All functions that output sample information use these column names:
+
+| Column | DuckDB Type | Source |
+|--------|-------------|--------|
+| FID | VARCHAR | .psam (optional — may be absent) |
+| IID | VARCHAR | .psam (always present) |
+
+### Join compatibility
+
+P1 reader output and P2 utility output use the same column names, so they
+compose naturally:
+
+```sql
+-- Join frequency data with variant metadata
+SELECT v.ID, v.REF, v.ALT, f.ALT_FREQ
+FROM read_pvar('data/example.pvar') v
+JOIN plink_freq('data/example.pgen') f USING (CHROM, POS, ID);
+
+-- Join scores with sample metadata
+SELECT s.IID, s.SCORE_SUM, p.SEX
+FROM plink_score('data/example.pgen', weights := ...) s
+JOIN read_psam('data/example.psam') p USING (IID);
+```
+
+---
+
+## 4. Extension Scope Boundary
+
+### The extension handles
+
+- Binary .pgen genotype access (pgenlib fast-paths)
+- Genomics-specific computation (HWE exact test, LD correlation, PRS scoring)
+- .pvar and .psam text parsing (format-specific, not general-purpose)
+- RAII wrappers around pgenlib's C memory management
+
+### The extension does NOT handle
+
+- External file format parsing (CSV, Parquet, JSON — DuckDB handles this)
+- Multiple testing correction (SQL window functions suffice)
+- Data management (filtering, sorting, joining — SQL handles these)
+- Matrix output (GRM, kinship matrices — not a natural table function output)
+
+### When SQL suffices, don't add a function
+
+Before adding a new function, ask: can this be expressed as a SQL query
+on existing function output? Examples:
+
+- Genotyping rate: `SELECT 1 - AVG(F_MISS) FROM plink_missing(...)`
+- Het rate per sample: expressible via `read_pfile(tidy := true)` + GROUP BY
+- Multiple testing correction: SQL window functions on p-values
+- LD pruning: SQL query on `plink_ld` output to select independent variants
+
+A dedicated function is justified when:
+1. It uses a pgenlib fast-path that avoids full genotype decompression
+2. The computation is non-trivial and genomics-specific
+3. The SQL alternative would be orders of magnitude slower
+
+---
+
+## 5. Implementation Patterns
+
+### pgenlib initialization
+
+Two-phase init, shared across all functions:
+
+```
+PreinitPgfi(&pgfi)
+PgfiInitPhase1(path, ...) → raw_variant_ct, raw_sample_ct
+allocate pgfi_alloc (cache-aligned)
+PgfiInitPhase2(...) → max_vrec_width, pgr_alloc_cacheline_ct
+```
+
+P2-001 extracts this into `PgenContext` in `plink_common.hpp`.
+
+### Per-thread PgenReader
+
+pgenlib readers are NOT thread-safe. Each DuckDB scan thread creates its
+own PgenReader with its own cache-aligned working memory:
+
+```cpp
+allocate pgr_alloc (pgr_alloc_cacheline_ct * kCacheline, cache-aligned)
+PgrInit(filename, max_vrec_width, &pgfi, &pgr, pgr_alloc)
+```
+
+PgenFileInfo is shared (immutable after init).
+
+### RAII memory management
+
+Use `unique_ptr` with custom deleters for all pgenlib resources. Never
+rely on manual cleanup in destructors — the cascading-cleanup pattern is
+error-prone (see P0-003 for examples).
+
+```cpp
+struct PgfiDeleter { void operator()(PgenFileInfo* p) { ... } };
+struct PgrDeleter { void operator()(PgenReader* p) { ... } };
+using UniquePgfi = unique_ptr<PgenFileInfo, PgfiDeleter>;
+```
+
+Cache-aligned allocations (`cachealigned_malloc`) must be freed with
+`aligned_free`, not `free`.
+
+### Parallel scan with atomic batch claiming
+
+All variant-parallel functions use atomic batch claiming to reduce
+contention:
+
+```
+BATCH_SIZE = 128  // tune per function
+while rows_emitted < STANDARD_VECTOR_SIZE:
+    batch_start = global.next_variant_idx.fetch_add(BATCH_SIZE)
+    if batch_start >= end_idx: break
+    for vidx in batch_start..min(batch_start + BATCH_SIZE, end_idx):
+        // process variant
+```
+
+For functions requiring full-scan-then-emit (plink_missing sample mode,
+plink_score), use per-thread accumulation arrays with a merge step after
+all threads complete.
+
+### Projection pushdown
+
+Reader functions MUST support projection pushdown. If genotype columns
+are not in the projection, do NOT call `PgrGet()`. This makes metadata-only
+queries orders of magnitude faster.
+
+Check `column_ids` from `TableFunctionInitInput` to determine which
+columns are needed.
+
+---
+
+## 6. Testing Standards
+
+### Test format
+
+All tests use DuckDB's `.test` format with `require plinking_duck`.
+
+### Coverage requirements
+
+Each function needs:
+- **Positive tests**: known-answer tests with hand-calculated expected values
+- **Negative tests**: file not found, invalid parameters, type errors
+- **Edge cases**: empty results, all-missing data, boundary conditions
+- **Parameter interaction**: filtering + subsetting combined
+
+### Validation against plink2
+
+P2 utility functions should be validated against plink2's output for the
+same computation (within floating-point tolerance). Document the plink2
+command used for validation in the test file.
+
+---
+
+## 7. Documentation Standards
+
+### README.md
+
+Each function gets a section in README.md with:
+- Function signature with parameter list
+- 2-3 example SQL queries showing common use cases
+- Brief description of what the function does
+
+### Code comments
+
+- Document non-obvious logic only
+- Document the pgenlib API call pattern (which function, what it returns)
+- Document thread safety model
+- Test files serve as usage examples

@@ -32,12 +32,37 @@ Reference: `P0-001-core-extension-connectivity` (master technical spec)
 | P1-005 | Integration & Documentation | P1-004 | `feature/P1-005-integration` | — |
 | P1-006 | P2 Utility Function Planning | — (plans only) | `feature/P1-006-p2-planning` | **A** (parallel with all P1) |
 
-### P2 — Utility Functions (Future)
+### P2 — Utility Functions
 
-Planned by P1-006. Covers `plink_freq`, `plink_hardy`, `plink_missing`,
-`plink_ld`, and additional functions identified through plink2 command survey.
-P2-00X plan documents will be produced by P1-006 before P2 implementation
-begins.
+Planned by P1-006. Five functions approved after surveying plink2's full
+analytical command set. See `P1-006-research-summary` for the complete
+survey, evaluation criteria, and deferred candidates.
+
+| Plan | Title | Depends On | Branch | Parallel Group |
+|------|-------|-----------|--------|----------------|
+| P2-001 | plink_freq (allele frequencies) | P1-003 | `feature/P2-001-plink-freq` | **A** (first — creates shared infra) |
+| P2-002 | plink_hardy (HWE exact test) | P2-001 | `feature/P2-002-plink-hardy` | **B** |
+| P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-003-plink-missing` | **B** |
+| P2-004 | plink_ld (linkage disequilibrium) | P2-001 | `feature/P2-004-plink-ld` | **B** |
+| P2-005 | plink_score (polygenic scoring) | P2-001 | `feature/P2-005-plink-score` | **B** |
+
+**P2-001 runs first** — it extracts shared infrastructure (RAII wrappers,
+PgenContext, sample subsetting, region filtering) from `read_pgen` into
+`plink_common.hpp/cpp`. P2-002 through P2-005 are independent and run in
+parallel after P2-001 merges.
+
+### P3 — Advanced Functions (Future)
+
+Deferred by P1-006. Candidates requiring external libraries (LAPACK/BLAS),
+O(N²) computation, or complex input models:
+
+| Candidate | Reason Deferred | Estimated Complexity |
+|-----------|----------------|---------------------|
+| plink_glm (association) | Needs regression library | High |
+| plink_pca (PCA) | Needs LAPACK eigendecomposition | High |
+| plink_king_table (kinship) | O(N²) pairwise computation | High |
+| plink_het (heterozygosity) | Expressible via plink_freq + SQL | Low |
+| plink_fst (FST) | Specialized population genetics use | Medium |
 
 ---
 
@@ -51,7 +76,7 @@ P0-002 ──→ P0-004 ──→ P0-005
                           │
               ┌───────────┴───────────┐
               │                       │
-           P1-001                  P1-002        ← Parallel Group A
+           P1-001                  P1-002        ← P1 Parallel Group A
         (read_pvar)             (read_psam)        (separate worktrees)
               │                       │
               └───────────┬───────────┘
@@ -64,6 +89,16 @@ P0-002 ──→ P0-004 ──→ P0-005
                           │
                        P1-005
                   (integration & docs)
+                          │
+                          │ (P2 begins after P1 complete)
+                          │
+                       P2-001 ←────────── extracts shared infra
+                    (plink_freq)           from read_pgen into
+                          │                plink_common.hpp/cpp
+              ┌───────┬───┴───┬───────┐
+              │       │       │       │
+           P2-002  P2-003  P2-004  P2-005  ← P2 Parallel Group B
+          (hardy) (missing) (ld)  (score)    (independent worktrees)
 ```
 
 ---
@@ -97,6 +132,28 @@ discover variant metadata and sample information.
 Unifies all three readers. Adds tidy mode, sample subsetting, and region
 filtering.
 
+### P2 Group A: P2-001 (shared infrastructure + plink_freq)
+
+P2-001 runs first because it:
+1. Extracts shared utilities from `pgen_reader.cpp` into `plink_common.hpp/cpp`
+2. Refactors `read_pgen` to use the shared utilities (no regressions)
+3. Implements `plink_freq` as the first utility function
+
+### P2 Group B: P2-002 + P2-003 + P2-004 + P2-005 (independent worktrees)
+
+After P2-001 merges, these four functions modify completely different files:
+
+| Concern | P2-002 (hardy) | P2-003 (missing) | P2-004 (ld) | P2-005 (score) |
+|---------|---------------|-----------------|-------------|----------------|
+| Source | `src/plink_hardy.cpp` | `src/plink_missing.cpp` | `src/plink_ld.cpp` | `src/plink_score.cpp` |
+| Header | `src/include/plink_hardy.hpp` | `src/include/plink_missing.hpp` | `src/include/plink_ld.hpp` | `src/include/plink_score.hpp` |
+| Tests | `test/sql/plink_hardy.test` | `test/sql/plink_missing*.test` | `test/sql/plink_ld*.test` | `test/sql/plink_score*.test` |
+| pgenlib | `PgrGetCounts()` | `PgrGetMissingness()` | `PgrGet()`/`PgrGetP()` | `PgrGetD()` |
+
+**Conflict point**: All four add a registration call to `plinking_duck_extension.cpp`.
+**Resolution**: Same as P1 — each exposes a `RegisterPlinkXxx(ExtensionLoader &loader)`
+function. Merge conflicts are trivial.
+
 ---
 
 ## Merge Strategy
@@ -111,6 +168,12 @@ filtering.
 ---
 
 ## Conventions
+
+### Cross-cutting design guide
+
+See `DESIGN-GUIDE` for API design philosophy and coding standards that apply
+across all phases: parameter naming, output column conventions, three-tier
+type dispatch, extension scope boundary, pgenlib patterns, and scale guidance.
 
 ### Each plan includes
 - Goal and scope
