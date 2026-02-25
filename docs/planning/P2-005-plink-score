@@ -61,14 +61,26 @@ parameter. Two forms are supported:
 
 **Positional mode — `LIST(DOUBLE)`**: One weight per variant, aligned with
 the .pgen variant order (or region-filtered order). Assumes the ALT allele
-is the scored allele.
+is the scored allele. Best for small datasets, region-filtered analysis,
+and testing. Not recommended for whole-genome scoring at scale (e.g., 170M
+imputed variants would require a 170M-element list).
 
 **ID-keyed mode — `LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))`**:
 Each struct identifies a variant by ID, specifies the scored allele, and
 provides the weight. Variants are matched against .pvar metadata. Unmatched
 variants in the weight list are skipped (with a warning count). Struct field
 names serve as the column contract — no separate `id_col`/`allele_col`
-parameters are needed.
+parameters are needed. **This is the recommended mode for production PRS**,
+since weight lists are naturally sparse (1–5M variants with non-zero weights,
+even against 170M imputed variants).
+
+**Table-scan mode — `VARCHAR` (table name)** *(planned extension)*:
+For cases where even the ID-keyed list exceeds comfortable materialization
+size (e.g., multi-score PRS with 100+ weight columns × millions of variants),
+a table name string can be passed instead. The extension executes an internal
+query during bind to stream weight rows in chunks. Not implemented in P2 —
+documented as a planned extension point for P3 when covariate scale pressure
+is higher. See the Design Note below for the full type-dispatch roadmap.
 
 ### Examples
 
@@ -166,7 +178,7 @@ One row per sample.
 
 | Parameter | Type | Default | Purpose |
 |-----------|------|---------|---------|
-| `weights` | LIST(DOUBLE) or LIST(STRUCT(...)) | (required) | Variant weights (see Weight input modes) |
+| `weights` | LIST(DOUBLE), LIST(STRUCT(...)), or VARCHAR | (required) | Variant weights (see Weight input modes) |
 | `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
 | `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
 | `samples` | LIST(VARCHAR) | all | Filter to specific sample IDs |
@@ -177,10 +189,11 @@ One row per sample.
 
 The `weights` parameter type determines the mode:
 
-| Parameter Type | Mode | Allele | Matching |
-|---------------|------|--------|----------|
-| `LIST(DOUBLE)` | Positional | ALT assumed | weight[i] → variant[i] |
-| `LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))` | ID-keyed | Explicit | Match by ID against .pvar |
+| Parameter Type | Mode | Allele | Matching | Scale |
+|---------------|------|--------|----------|-------|
+| `LIST(DOUBLE)` | Positional | ALT assumed | weight[i] → variant[i] | Small/filtered |
+| `LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))` | ID-keyed | Explicit | Match by ID against .pvar | Production PRS (1–5M weights) |
+| `VARCHAR` (table name) | Table-scan | From column | Stream from DuckDB table | *(P3 extension)* |
 
 In positional mode, the list length must equal the number of variants in the
 .pgen (or the region-filtered variant count). An error is raised on mismatch.
@@ -188,6 +201,11 @@ In positional mode, the list length must equal the number of variants in the
 In ID-keyed mode, unmatched IDs are silently skipped (count reported as a
 warning). The allele field controls sign orientation: if the allele matches
 ALT, the weight is used as-is; if it matches REF, the weight is negated.
+
+In table-scan mode *(planned)*, the extension executes
+`context.Query("SELECT id, allele, weight FROM " + table_name)` during bind
+and streams results in chunks. The table must have columns named `id`,
+`allele`, and `weight` (same contract as struct field names).
 
 ---
 
@@ -367,13 +385,15 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
   Optimization: partition scored variants across threads, each with its own
   per-sample accumulation array, then merge.
 - **Memory**: O(sample_ct) for accumulation arrays.
-  For 500K samples × 1 score = 4MB. Manageable.
+  For 10M samples × 1 score = 80MB. Manageable.
 - **I/O bound**: each scored variant requires one `PgrGetD()` call.
-  Typical PRS uses 10K-1M variants from whole genome.
+  Typical PRS uses 10K–5M variants from whole genome.
 - **Dosage vs hardcall**: `PgrGetD()` handles both. If no dosage data
   is present in the .pgen, hardcalls are used automatically.
-- **Weight materialization**: one-time cost during bind. Even 1M weights
-  materializes in milliseconds as a DuckDB list.
+- **Weight materialization**: one-time cost during bind. ID-keyed list
+  with 5M weights (~250MB as LIST(STRUCT)) materializes in seconds.
+  Positional LIST(DOUBLE) is appropriate for region-filtered analysis,
+  not whole-genome with 170M variants.
 
 ---
 
@@ -523,6 +543,21 @@ for all "small data" inputs across P2 and future P3 functions. The principle:
 **the .pgen is always the big streaming data; everything else is a small
 materialized DuckDB value.**
 
+### Scale context
+
+Target biobank scale: 10M+ samples, 170M imputed variants, .pgen files at
+hundreds of GB to TB. The "small" data is 3–6 orders of magnitude smaller
+than the .pgen:
+
+| Small Data | Typical Size | As DuckDB Value |
+|-----------|-------------|-----------------|
+| PRS weights (sparse, ID-keyed) | 1–5M structs | ~50–250MB |
+| Phenotype vector | 10M × 1 DOUBLE | ~80MB |
+| Covariates | 10M × 10 | ~800MB |
+| Population labels | 10M × 1 VARCHAR | ~100–500MB |
+| PRS weights (positional, 170M) | 170M DOUBLE | ~1.36GB *(avoid)* |
+| Multi-score PRS (100 × 5M) | 500M values | ~4GB *(use table-scan)* |
+
 ### Two axes of small data
 
 | Axis | Aligned With | Example Parameters | Type Pattern |
@@ -530,11 +565,48 @@ materialized DuckDB value.**
 | **Variant-keyed** | .pgen variant order | weights, effect sizes | `LIST(DOUBLE)` positional or `LIST(STRUCT(id, ...))` ID-keyed |
 | **Sample-keyed** | .pgen sample order | phenotypes, covariates, pop labels | `LIST(DOUBLE)` positional or `LIST(STRUCT(iid, ...))` ID-keyed |
 
+### List-of-structs vs struct-of-lists
+
+Two DuckDB representations exist for multi-column small data:
+
+**List-of-structs** (row-oriented): `[{iid: 'S1', age: 30}, {iid: 'S2', age: 45}]`
+- Type: `LIST(STRUCT(iid VARCHAR, age DOUBLE, ...))`
+- Each entry is self-contained — natural for **ID-keyed** data
+- Best for sparse variant weights (each row is an (id, allele, weight) triple)
+- Construction: `SELECT list({'iid': iid, 'age': age}) FROM ...`
+
+**Struct-of-lists** (column-oriented): `{iid: ['S1', 'S2'], age: [30, 45]}`
+- Type: `STRUCT(iid LIST(VARCHAR), age LIST(DOUBLE), ...)`
+- Each column stored independently — aligns with DuckDB's columnar internals
+- Best for **positional** multi-column data (covariates, multi-phenotype)
+- Columns that aren't needed don't have to be materialized
+- Construction: `SELECT {'iid': list(iid), 'age': list(age)} FROM ...`
+
+**Guideline**: ID-keyed data → list-of-structs. Positional multi-column
+data → struct-of-lists. Single-column positional data → plain `LIST(DOUBLE)`
+or `LIST(VARCHAR)`.
+
+### Three-tier type dispatch
+
+The bind phase inspects the parameter type and dispatches. This provides a
+smooth upgrade path from small-scale to biobank-scale:
+
+| Tier | Parameter Type | When to Use | P2 Status |
+|------|---------------|-------------|-----------|
+| 1 | `LIST(DOUBLE)` | Positional, small/filtered data, tests | **Implement** |
+| 2 | `LIST(STRUCT(...))` or `STRUCT(LIST(...), ...)` | ID-keyed or multi-column, production scale | **Implement** |
+| 3 | `VARCHAR` (table name) | Data too large to materialize as Value | **Document, implement in P3** |
+
+Tier 3 uses `context.Query()` during bind to stream from a named DuckDB
+table. The table must have columns matching the struct field name contract
+(e.g., `id`, `allele`, `weight` for scoring weights). This avoids
+materializing the data as a single DuckDB Value.
+
 ### Current P2 usage
 
 | Function | Parameter | Type | Notes |
 |----------|-----------|------|-------|
-| plink_score | `weights` | `LIST(DOUBLE)` or `LIST(STRUCT(id, allele, weight))` | Variant-keyed |
+| plink_score | `weights` | Tier 1 or 2 (Tier 3 planned) | Variant-keyed |
 | All P2 | `samples` | `LIST(VARCHAR)` | Sample filter (simple case) |
 
 ### Future P3 extensions
@@ -542,8 +614,9 @@ materialized DuckDB value.**
 | Function | Parameter | Type | Notes |
 |----------|-----------|------|-------|
 | plink_glm | `phenotypes` | `LIST(DOUBLE)` | Sample-keyed, positional |
-| plink_glm | `covariates` | `LIST(STRUCT(iid, age, sex, pc1, ...))` | Sample-keyed, ID-keyed |
+| plink_glm | `covariates` | `STRUCT(LIST(...), ...)` or Tier 3 | Sample-keyed, struct-of-lists for ≤10 covariates; table-scan for large matrices |
 | plink_fst | `pop_labels` | `LIST(VARCHAR)` | Sample-keyed, positional |
+| plink_score | `weights` | Tier 3 | Multi-score PRS (100+ weight columns) |
 
 ### Value sourcing
 
@@ -559,10 +632,15 @@ SET VARIABLE w = (SELECT list(beta) FROM 'weights.parquet');
 
 -- Scalar subquery (when supported by DuckDB for table function params)
 weights := (SELECT list(beta) FROM weights_table)
+
+-- Table name (Tier 3, for large data)
+CREATE TEMP TABLE w AS SELECT id, allele, weight FROM 'big_weights.parquet';
+... weights := 'w'
 ```
 
-The extension does not need to know or care how the value was produced —
-it receives a materialized DuckDB `Value` of the declared type.
+The extension does not need to know or care how the value was produced for
+Tiers 1–2 — it receives a materialized DuckDB `Value` of the declared type.
+For Tier 3, it receives a table name and queries it internally.
 
 ---
 

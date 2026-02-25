@@ -254,37 +254,56 @@ with a threshold parameter that limits output to related pairs only.
 
 ## 3. Design Principles for P2 Functions
 
-### 3.1 Big/small data separation and typed list parameters
+### 3.1 Big/small data separation and typed parameters
 
 **Principle**: The .pgen file is always the "big" streaming data — it can't
 be materialized and must be read variant-by-variant through pgenlib. Everything
 else (weights, phenotypes, covariates, sample lists, population labels) is
 "small" data that fits in memory as a materialized DuckDB value, even at
-biobank scale with DuckDB's compressed vector representations.
+biobank scale (10M+ samples, 170M imputed variants) with DuckDB's compressed
+vector representations.
 
-Small data is accepted as typed DuckDB scalar parameters:
+**Scale context**: At target biobank scale, small data ranges from ~80MB
+(10M phenotype values) to ~800MB (10M × 10 covariates). This is 3–6 orders
+of magnitude smaller than the .pgen. Sparse variant-keyed data (PRS weights)
+is typically 1–5M entries (~50–250MB), not 170M. Dense positional lists at
+170M variants (~1.36GB) should be avoided in favor of ID-keyed sparse lists.
+
+**Three-tier type dispatch**: The bind phase inspects parameter type:
+
+| Tier | Type | Use Case | P2 Status |
+|------|------|----------|-----------|
+| 1 | `LIST(DOUBLE)`, `LIST(VARCHAR)` | Positional, small/filtered | Implement |
+| 2 | `LIST(STRUCT(...))` or `STRUCT(LIST(...), ...)` | ID-keyed or multi-column | Implement |
+| 3 | `VARCHAR` (table name) | Data too large for Value | Document, P3 |
+
+**Data shape guidelines**:
 
 | Data Shape | Positional Form | ID-keyed Form |
 |-----------|-----------------|---------------|
-| **Variant-keyed** (weights, effect sizes) | `LIST(DOUBLE)` aligned with .pgen variant order | `LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))` matched by ID |
-| **Sample-keyed** (phenotypes, pop labels) | `LIST(DOUBLE)` or `LIST(VARCHAR)` aligned with .pgen sample order | `LIST(STRUCT(iid VARCHAR, ...))` matched by sample ID |
+| **Variant-keyed** (weights, effect sizes) | `LIST(DOUBLE)` | `LIST(STRUCT(id, allele, weight))` |
+| **Sample-keyed** (phenotypes, pop labels) | `LIST(DOUBLE)` or `LIST(VARCHAR)` | `LIST(STRUCT(iid, ...))` |
+| **Multi-column** (covariates) | `STRUCT(LIST(...), ...)` (struct-of-lists) | `LIST(STRUCT(...))` (list-of-structs) |
 
-The bind phase inspects the parameter type and dispatches:
-- **Positional**: fast path, no ID matching, assumes alignment with .pgen order
-- **ID-keyed**: flexible path, struct field names serve as the column contract
+The struct-of-lists form (column-oriented) aligns with DuckDB's columnar
+internals and is preferred for positional multi-column data. The list-of-structs
+form (row-oriented) is preferred for ID-keyed data where each entry is
+self-contained.
 
 Values can come from multiple DuckDB expressions:
 - **Literals**: `weights := [1.0, 0.5, -0.5]`
 - **Variables**: `SET VARIABLE w = (...); ... weights := getvariable('w')`
 - **Scalar subqueries** (when DuckDB supports this in table function params)
+- **Table names** (Tier 3): `weights := 'my_weights_table'`
 
 The extension never parses external file formats. DuckDB handles all file
 format parsing (CSV, TSV, Parquet, JSON, etc.) and the extension receives
-materialized `Value` objects of the declared type.
+materialized `Value` objects (Tiers 1–2) or queries a named table (Tier 3).
 
-This applies to P2-005 (plink_score) where weights use this pattern. It
+This applies to P2-005 (plink_score) where weights use Tiers 1–2 now. It
 extends to any future P2/P3 function that accepts external data (e.g.,
-phenotypes for plink_glm, population labels for plink_fst).
+phenotypes for plink_glm, population labels for plink_fst, multi-score PRS
+via Tier 3).
 
 The `samples` parameter across all P2 functions is already `LIST(VARCHAR)` —
 the simplest form of sample-keyed small data.
