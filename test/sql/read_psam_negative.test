@@ -1,0 +1,57 @@
+# name: test/sql/read_psam_negative.test
+# description: Negative tests for read_psam table function
+# group: [plinking_duck]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# Missing file
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_psam('test/data/nonexistent.psam');
+----
+Cannot open file
+
+# ---------------------------------------------------------------------------
+# Empty file (no header, no data)
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_psam('test/data/empty.psam');
+----
+is empty
+
+# ---------------------------------------------------------------------------
+# Wrong argument type
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_psam(42);
+----
+
+# ---------------------------------------------------------------------------
+# No arguments
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_psam();
+----
+
+# ---------------------------------------------------------------------------
+# Invalid header (starts with # but not #FID or #IID)
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_psam('test/data/bad_header.psam');
+----
+must start with #FID or #IID
+
+# ---------------------------------------------------------------------------
+# Wrong number of columns in data line
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_psam('test/data/wrong_cols.psam');
+----
+has 2 fields, expected 3
