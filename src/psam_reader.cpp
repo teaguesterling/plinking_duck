@@ -4,6 +4,7 @@
 #include "duckdb/common/file_open_flags.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 
 namespace duckdb {
@@ -36,9 +37,10 @@ static bool IsParentMissing(const string &val) {
 // WHERE PHENO1 != '-9' if needed.
 
 // ---------------------------------------------------------------------------
-// Line splitting utility
+// Line splitting utilities
 // ---------------------------------------------------------------------------
 
+//! Split a line on tab characters. Used for .psam files (strictly tab-delimited).
 static vector<string> SplitTabLine(const string &line) {
 	vector<string> fields;
 	size_t start = 0;
@@ -50,6 +52,38 @@ static vector<string> SplitTabLine(const string &line) {
 	}
 	fields.push_back(line.substr(start));
 	return fields;
+}
+
+//! Split a line on any whitespace (spaces or tabs). Used for .fam files
+//! which are whitespace-delimited per the PLINK 1 spec. Consecutive
+//! whitespace characters are treated as a single delimiter.
+static vector<string> SplitWhitespaceLine(const string &line) {
+	vector<string> fields;
+	size_t i = 0;
+	while (i < line.size()) {
+		// Skip whitespace
+		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
+			i++;
+		}
+		if (i >= line.size()) {
+			break;
+		}
+		// Collect field
+		size_t start = i;
+		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
+			i++;
+		}
+		fields.push_back(line.substr(start, i - start));
+	}
+	return fields;
+}
+
+//! Split a line using the appropriate delimiter for the given format.
+static vector<string> SplitLine(const string &line, PsamFormat format) {
+	if (format == PsamFormat::FAM) {
+		return SplitWhitespaceLine(line);
+	}
+	return SplitTabLine(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -104,8 +138,10 @@ static vector<string> ReadFileLines(ClientContext &context, const string &path) 
 // Header parsing
 // ---------------------------------------------------------------------------
 
-PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path) {
-	auto lines = ReadFileLines(context, path);
+//! Core header parsing logic, operating on already-read lines.
+//! Separated from file I/O so callers that already have the lines
+//! (LoadSampleInfo, PsamInitGlobal) don't re-read the file.
+static PsamHeaderInfo ParsePsamHeaderFromLines(const vector<string> &lines, const string &path) {
 	if (lines.empty()) {
 		throw IOException("read_psam: file '%s' is empty", path);
 	}
@@ -119,13 +155,9 @@ PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path) {
 
 	if (first_line[0] == '#') {
 		// .psam format: header line starting with # describes columns
-		// Strip the leading # from the first field name
-		first_line[0] = ' ';
-		auto fields = SplitTabLine(first_line);
-		// Trim leading whitespace from first field (was '#')
-		if (!fields.empty()) {
-			fields[0].erase(0, fields[0].find_first_not_of(' '));
-		}
+		// Skip the leading '#' without mutating the input
+		string header_content = first_line.substr(1);
+		auto fields = SplitTabLine(header_content);
 
 		if (fields.empty()) {
 			throw IOException("read_psam: file '%s' has an empty header", path);
@@ -166,18 +198,19 @@ PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path) {
 	return info;
 }
 
+PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path) {
+	auto lines = ReadFileLines(context, path);
+	return ParsePsamHeaderFromLines(lines, path);
+}
+
 // ---------------------------------------------------------------------------
 // LoadSampleInfo — reusable utility for read_pgen / read_pfile
 // ---------------------------------------------------------------------------
 
 SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
+	// Single file read — ParsePsamHeaderFromLines reuses the same lines
 	auto lines = ReadFileLines(context, path);
-	if (lines.empty()) {
-		throw IOException("read_psam: file '%s' is empty", path);
-	}
-
-	// Parse header to get format and column layout
-	auto header = ParsePsamHeader(context, path);
+	auto header = ParsePsamHeaderFromLines(lines, path);
 
 	// Find IID and FID column indices
 	idx_t iid_idx = DConstants::INVALID_INDEX;
@@ -206,17 +239,27 @@ SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
 			continue;
 		}
 
-		auto fields = SplitTabLine(line);
+		auto fields = SplitLine(line, header.format);
 		if (iid_idx >= fields.size()) {
 			throw IOException("read_psam: file '%s' line %d has %d fields, expected at least %d",
 			                  path, i + 1, fields.size(), iid_idx + 1);
 		}
 
-		info.iids.push_back(fields[iid_idx]);
+		const auto &iid = fields[iid_idx];
+
+		// Duplicate IIDs are invalid — downstream code (read_pgen) relies on
+		// iid_to_idx being a 1:1 mapping for sample subsetting
+		if (info.iid_to_idx.count(iid)) {
+			throw IOException("read_psam: file '%s' line %d has duplicate IID '%s' "
+			                  "(first seen at sample %d)",
+			                  path, i + 1, iid, info.iid_to_idx[iid] + 1);
+		}
+
+		info.iids.push_back(iid);
 		if (has_fid) {
 			info.fids.push_back(fields[fid_idx]);
 		}
-		info.iid_to_idx[fields[iid_idx]] = info.iids.size() - 1;
+		info.iid_to_idx[iid] = info.iids.size() - 1;
 	}
 
 	info.sample_ct = info.iids.size();
@@ -329,6 +372,7 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 	}
 
 	auto lines = ReadFileLines(context, bind_data.file_path);
+	auto header = ParsePsamHeaderFromLines(lines, bind_data.file_path);
 	idx_t expected_cols = bind_data.column_names.size();
 
 	// Data lines start at index 1 for .psam (skip header), 0 for .fam
@@ -340,7 +384,7 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 			continue;
 		}
 
-		auto fields = SplitTabLine(line);
+		auto fields = SplitLine(line, header.format);
 
 		if (fields.size() != expected_cols) {
 			throw IOException(
@@ -414,7 +458,9 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 						} else {
 							FlatVector::GetData<int32_t>(vec)[row] = sex_val;
 						}
-					} catch (...) {
+					} catch (const std::invalid_argument &) {
+						FlatVector::SetNull(vec, row, true);
+					} catch (const std::out_of_range &) {
 						FlatVector::SetNull(vec, row, true);
 					}
 				}
