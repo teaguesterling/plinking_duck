@@ -6,8 +6,8 @@ cd "$(dirname "$0")"
 
 PLINK2="${PLINK2:-plink2}"
 
-# Generate main test files: example.pgen, example.pvar, example.psam
-"$PLINK2" --vcf example.vcf --make-pgen --out example --allow-extra-chr
+# Generate main test files: pgen_example.pgen, pgen_example.pvar, pgen_example.psam
+"$PLINK2" --vcf example.vcf --make-pgen --out pgen_example --allow-extra-chr
 
 # Generate all-missing genotype test files
 cat > all_missing.vcf <<'EOF'
@@ -20,6 +20,12 @@ cat > all_missing.vcf <<'EOF'
 EOF
 "$PLINK2" --vcf all_missing.vcf --make-pgen --out all_missing --allow-extra-chr
 
+# Generate orphan .pgen (no .psam companion) by copying main files without .psam
+cp pgen_example.pgen pgen_orphan.pgen
+cp pgen_example.pvar pgen_orphan.pvar
+
 echo "Test data generated successfully."
 echo "Generated files:"
-ls -la example.pgen example.pvar example.psam all_missing.pgen all_missing.pvar all_missing.psam
+ls -la pgen_example.pgen pgen_example.pvar pgen_example.psam \
+       all_missing.pgen all_missing.pvar all_missing.psam \
+       pgen_orphan.pgen pgen_orphan.pvar

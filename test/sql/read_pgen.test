@@ -13,7 +13,7 @@ SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen');
 4
 
 # Variant metadata columns (ordered by CHROM then POS for deterministic output)
-query IIIII
+query TITTT
 SELECT CHROM, POS, ID, REF, ALT FROM read_pgen('test/data/pgen_example.pgen') ORDER BY CHROM, POS;
 ----
 1	10000	rs1	A	G
@@ -23,7 +23,7 @@ SELECT CHROM, POS, ID, REF, ALT FROM read_pgen('test/data/pgen_example.pgen') OR
 
 # --- Projection pushdown (metadata-only, no PgrGet) ---
 
-query II
+query TI
 SELECT CHROM, POS FROM read_pgen('test/data/pgen_example.pgen') ORDER BY CHROM, POS;
 ----
 1	10000
@@ -31,7 +31,7 @@ SELECT CHROM, POS FROM read_pgen('test/data/pgen_example.pgen') ORDER BY CHROM, 
 1	30000
 2	15000
 
-query I
+query T
 SELECT ID FROM read_pgen('test/data/pgen_example.pgen') ORDER BY CHROM, POS;
 ----
 rs1
@@ -48,25 +48,25 @@ SELECT len(genotypes) FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
 4
 
 # Known genotype values for rs1: SAMPLE1=0/0, SAMPLE2=0/1, SAMPLE3=1/1, SAMPLE4=./.
-query II
+query TT
 SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs1';
 ----
 rs1	[0, 1, 2, NULL]
 
 # Known genotype values for rs2: SAMPLE1=0/1, SAMPLE2=0/1, SAMPLE3=0/0, SAMPLE4=1/1
-query II
+query TT
 SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs2';
 ----
 rs2	[1, 1, 0, 2]
 
 # Known genotype values for rs3: SAMPLE1=1/1, SAMPLE2=./., SAMPLE3=0/1, SAMPLE4=0/0
-query II
+query TT
 SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs3';
 ----
 rs3	[2, NULL, 1, 0]
 
 # Known genotype values for rs4: SAMPLE1=0/0, SAMPLE2=0/0, SAMPLE3=0/1, SAMPLE4=1/1
-query II
+query TT
 SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs4';
 ----
 rs4	[0, 0, 1, 2]
@@ -86,7 +86,7 @@ WHERE list_contains(genotypes, 3);
 
 # --- All-missing genotypes ---
 
-query II
+query TT
 SELECT ID, genotypes FROM read_pgen('test/data/all_missing.pgen') ORDER BY POS;
 ----
 rs_miss1	[NULL, NULL]
@@ -115,7 +115,7 @@ SELECT COUNT(*) FROM read_pgen('test/data/pgen_orphan.pgen');
 4
 
 # Variant metadata still available without .psam
-query II
+query TI
 SELECT CHROM, POS FROM read_pgen('test/data/pgen_orphan.pgen') ORDER BY CHROM, POS;
 ----
 1	10000
@@ -125,7 +125,7 @@ SELECT CHROM, POS FROM read_pgen('test/data/pgen_orphan.pgen') ORDER BY CHROM, P
 
 # --- Column types ---
 
-query IIIIII
+query TTTTTT
 SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(genotypes)
 FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
 ----
@@ -139,13 +139,20 @@ SELECT len(genotypes) FROM read_pgen('test/data/pgen_example.pgen', samples := [
 2
 
 # Sample subset genotype values: samples 0 and 2 for rs1 are 0/0 and 1/1
-query II
+query TT
 SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', samples := [0, 2]) WHERE ID = 'rs1';
 ----
 rs1	[0, 2]
 
 # Single sample
-query II
+query TT
 SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', samples := [3]) WHERE ID = 'rs2';
 ----
 rs2	[2]
+
+# --- Integer sample subsetting without .psam (orphan mode) ---
+
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/pgen_orphan.pgen', samples := [0, 2]) LIMIT 1;
+----
+2

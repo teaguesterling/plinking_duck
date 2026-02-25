@@ -13,11 +13,11 @@ read_pgen
 
 # --- Missing companion .pvar ---
 
-# A file with no .pvar or .bim companion
+# A valid .pgen file with no .pvar or .bim companion
 statement error
-SELECT * FROM read_pgen('test/data/example.psam');
+SELECT * FROM read_pgen('test/data/pgen_no_pvar.pgen');
 ----
-read_pgen
+cannot find .pvar or .bim
 
 # --- Mismatched sample count ---
 
@@ -63,6 +63,20 @@ SELECT * FROM read_pgen('test/data/pgen_example.pgen',
     samples := ['NONEXISTENT']);
 ----
 not found
+
+# --- Empty samples list ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', samples := []::INTEGER[]);
+----
+must not be empty
+
+# --- Duplicate sample indices ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', samples := [0, 1, 0]);
+----
+duplicate sample index
 
 # --- Dosages not yet implemented ---
 

@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -75,25 +76,43 @@ struct VariantMetadata {
 	idx_t variant_ct = 0;
 };
 
-//! Read one line from a DuckDB FileHandle, returning false at EOF.
-//! Handles \r\n and \n line endings (strips \r).
-static bool ReadLineFromHandle(FileHandle &handle, string &line) {
-	line.clear();
-	char buffer[1];
-	bool read_any = false;
-	while (true) {
-		auto bytes = handle.Read(buffer, 1);
-		if (bytes == 0) {
-			return read_any;
-		}
-		read_any = true;
-		if (buffer[0] == '\n') {
-			return true;
-		}
-		if (buffer[0] != '\r') {
-			line += buffer[0];
+//! Read an entire file via DuckDB's VFS and split into lines.
+//! Strips \r from line endings. Same pattern as psam_reader.
+static vector<string> ReadFileLines(ClientContext &context, const string &path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto file_size = handle->GetFileSize();
+
+	if (file_size == 0) {
+		return {};
+	}
+
+	string content(file_size, '\0');
+	handle->Read(const_cast<char *>(content.data()), file_size);
+
+	vector<string> lines;
+	size_t start = 0;
+	for (size_t i = 0; i < content.size(); i++) {
+		if (content[i] == '\n') {
+			size_t end = i;
+			if (end > start && content[end - 1] == '\r') {
+				end--;
+			}
+			lines.push_back(content.substr(start, end - start));
+			start = i + 1;
 		}
 	}
+	if (start < content.size()) {
+		size_t end = content.size();
+		if (end > start && content[end - 1] == '\r') {
+			end--;
+		}
+		if (end > start) {
+			lines.push_back(content.substr(start, end - start));
+		}
+	}
+
+	return lines;
 }
 
 //! Split on tabs (same as pvar_reader's SplitTabLine).
@@ -131,10 +150,10 @@ static vector<string> SplitWhitespaceLine(const string &line) {
 }
 
 //! Load variant metadata from a .pvar or .bim file.
-//! This reads the file via VFS and extracts the 5 core columns
-//! (CHROM, POS, ID, REF, ALT) needed by read_pgen.
+//! Reads the entire file into memory (via VFS bulk read) and extracts
+//! the 5 core columns (CHROM, POS, ID, REF, ALT) needed by read_pgen.
 static VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path) {
-	// First parse header to determine format and skip lines
+	// Parse header to determine format and skip lines
 	auto header_info = ParsePvarHeader(context, path);
 
 	// Find column indices for the 5 core fields in the header
@@ -167,18 +186,12 @@ static VariantMetadata LoadVariantMetadata(ClientContext &context, const string 
 		                            path);
 	}
 
-	// Re-open and read data lines
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
-
-	string line;
-	// Skip header/comment lines
-	for (idx_t i = 0; i < header_info.skip_lines; i++) {
-		ReadLineFromHandle(*handle, line);
-	}
+	// Read all lines from file
+	auto lines = ReadFileLines(context, path);
 
 	VariantMetadata meta;
-	while (ReadLineFromHandle(*handle, line)) {
+	for (idx_t line_idx = header_info.skip_lines; line_idx < lines.size(); line_idx++) {
+		auto &line = lines[line_idx];
 		if (line.empty()) {
 			continue;
 		}
@@ -186,10 +199,9 @@ static VariantMetadata LoadVariantMetadata(ClientContext &context, const string 
 		auto fields = header_info.is_bim ? SplitWhitespaceLine(line) : SplitTabLine(line);
 
 		// .bim files have 6 columns in file order: CHROM(0) ID(1) CM(2) POS(3) ALT(4) REF(5)
-		// But ParsePvarHeader normalizes the column_names to output order:
+		// ParsePvarHeader normalizes column_names to output order:
 		// CHROM(0) POS(1) ID(2) REF(3) ALT(4) CM(5)
-		// So our indices (chrom_idx=0, pos_idx=1, ...) refer to normalized order.
-		// We need to map back to file order for .bim.
+		// We need to remap for .bim.
 		vector<string> *source = &fields;
 		vector<string> normalized;
 		if (header_info.is_bim) {
@@ -197,8 +209,6 @@ static VariantMetadata LoadVariantMetadata(ClientContext &context, const string 
 				throw InvalidInputException("read_pgen: .bim file '%s' has line with %llu fields, expected 6",
 				                            path, static_cast<unsigned long long>(fields.size()));
 			}
-			// Normalize: file order [0,1,2,3,4,5] = [CHROM,ID,CM,POS,ALT,REF]
-			// to output order [CHROM,POS,ID,REF,ALT,CM]
 			normalized = {fields[0], fields[3], fields[1], fields[5], fields[4], fields[2]};
 			source = &normalized;
 		}
@@ -275,8 +285,6 @@ struct PgenBindData : public TableFunctionData {
 	// pgenlib initialization results (needed by init/scan)
 	uint32_t raw_variant_ct = 0;
 	uint32_t raw_sample_ct = 0;
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
 
 	// Column layout for projection pushdown
 	// Fixed metadata: CHROM(0), POS(1), ID(2), REF(3), ALT(4)
@@ -440,9 +448,6 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		                  bind_data->pgen_path, errstr_buf);
 	}
 
-	bind_data->max_vrec_width = max_vrec_width;
-	bind_data->pgr_alloc_cacheline_ct = pgr_alloc_cacheline_ct;
-
 	// --- Load variant metadata ---
 	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path);
 
@@ -476,6 +481,12 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		auto &samples_val = samples_it->second;
 		auto &child_type = ListType::GetChildType(samples_val.type());
 
+		auto &children_check = ListValue::GetChildren(samples_val);
+		if (children_check.empty()) {
+			throw InvalidInputException(
+			    "read_pgen: samples list must not be empty");
+		}
+
 		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
 			// Integer index mode
 			auto &children = ListValue::GetChildren(samples_val);
@@ -507,6 +518,17 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		} else {
 			throw InvalidInputException(
 			    "read_pgen: samples parameter must be LIST(VARCHAR) or LIST(INTEGER)");
+		}
+
+		// Validate no duplicate indices (pgenlib requires unique sample_include bits)
+		{
+			std::unordered_set<uint32_t> seen;
+			for (auto idx : bind_data->sample_indices) {
+				if (!seen.insert(idx).second) {
+					throw InvalidInputException(
+					    "read_pgen: duplicate sample index %u in samples list", idx);
+				}
+			}
 		}
 
 		bind_data->has_sample_subset = true;
@@ -601,21 +623,25 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	}
 
 	// Allocate PgenReader working memory and initialize
-	state->pgr_alloc_buf.Allocate(pgr_alloc_cacheline_ct * plink2::kCacheline);
+	if (pgr_alloc_cacheline_ct > 0) {
+		state->pgr_alloc_buf.Allocate(pgr_alloc_cacheline_ct * plink2::kCacheline);
+	}
 
 	err = plink2::PgrInit(bind_data.pgen_path.c_str(), max_vrec_width, &state->pgfi, &state->pgr,
 	                       state->pgr_alloc_buf.As<unsigned char>());
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
+		plink2::CleanupPgr(&state->pgr, &cleanup_err);
+		cleanup_err = plink2::kPglRetSuccess;
 		plink2::CleanupPgfi(&state->pgfi, &cleanup_err);
 		throw IOException("read_pgen: PgrInit failed for '%s'", bind_data.pgen_path);
 	}
 
-	// Allocate genovec buffer (2 bits per sample, cache-aligned)
+	// Allocate genovec buffer (2 bits per sample, vector-aligned for SIMD safety)
 	uint32_t effective_sample_ct = bind_data.has_sample_subset ? bind_data.raw_sample_ct
 	                                                           : bind_data.sample_ct;
-	uintptr_t genovec_word_ct = plink2::DivUp(effective_sample_ct, plink2::kBitsPerWordD2);
+	uintptr_t genovec_word_ct = plink2::NypCtToAlignedWordCt(effective_sample_ct);
 	state->genovec_buf.Allocate(genovec_word_ct * sizeof(uintptr_t));
 	std::memset(state->genovec_buf.ptr, 0, genovec_word_ct * sizeof(uintptr_t));
 
@@ -670,15 +696,16 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 	idx_t rows_emitted = 0;
 
 	while (rows_emitted < STANDARD_VECTOR_SIZE) {
-		// Claim a batch of variants
-		uint32_t batch_start = gstate.next_variant_idx.fetch_add(PGEN_BATCH_SIZE);
+		// Claim a batch of variants, capped to remaining output capacity
+		uint32_t remaining_capacity = static_cast<uint32_t>(STANDARD_VECTOR_SIZE - rows_emitted);
+		uint32_t claim_size = std::min(PGEN_BATCH_SIZE, remaining_capacity);
+		uint32_t batch_start = gstate.next_variant_idx.fetch_add(claim_size);
 		if (batch_start >= total_variants) {
 			break;
 		}
-		uint32_t batch_end = std::min(batch_start + PGEN_BATCH_SIZE, total_variants);
+		uint32_t batch_end = std::min(batch_start + claim_size, total_variants);
 
-		for (uint32_t vidx = batch_start; vidx < batch_end && rows_emitted < STANDARD_VECTOR_SIZE;
-		     vidx++) {
+		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
 
 			// Read genotype data if needed (before filling columns, since
 			// we need it for the genotypes column)
