@@ -13,6 +13,7 @@ set(EXTENSION_SOURCES
     src/plinking_duck_extension.cpp
     src/pvar_reader.cpp
     src/psam_reader.cpp
+    src/pgen_reader.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
