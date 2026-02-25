@@ -249,13 +249,20 @@ j in the window.
 
 ```
 while rows_emitted < STANDARD_VECTOR_SIZE:
-    anchor_idx = global.next_anchor_idx.fetch_add(1)
-    if anchor_idx >= end_variant_idx: break
+    // Resume from saved state, or claim a new anchor
+    if local.has_saved_state:
+        anchor_idx = local.saved_anchor_idx
+        j_start = local.saved_j + 1
+        genovec_a = local.saved_genovec_a  // already loaded
+        local.has_saved_state = false
+    else:
+        anchor_idx = global.next_anchor_idx.fetch_add(1)
+        if anchor_idx >= end_variant_idx: break
+        j_start = anchor_idx + 1
+        PgrGet(sample_include, pssi, sample_ct, anchor_idx, &pgr, genovec_a)
 
-    PgrGet(sample_include, pssi, sample_ct, anchor_idx, &pgr, genovec_a)
-
-    // Scan forward through window
-    for j = anchor_idx + 1; j < end_variant_idx; j++:
+    // Scan forward through window from j_start
+    for j = j_start; j < end_variant_idx; j++:
         if chrom[j] != chrom[anchor_idx] and not inter_chr: break
         if pos[j] - pos[anchor_idx] > window_kb * 1000: break
 
@@ -266,8 +273,11 @@ while rows_emitted < STANDARD_VECTOR_SIZE:
             output (variant_meta[anchor], variant_meta[j], R2, D_PRIME, OBS_CT)
             rows_emitted++
             if rows_emitted >= STANDARD_VECTOR_SIZE:
-                // Save state: current anchor_idx and j
-                // Resume from here on next scan call
+                // Save state for resume on next scan call
+                local.saved_anchor_idx = anchor_idx
+                local.saved_j = j
+                local.saved_genovec_a = genovec_a
+                local.has_saved_state = true
                 break
 
 output.SetCardinality(rows_emitted)
@@ -275,9 +285,10 @@ output.SetCardinality(rows_emitted)
 
 **State preservation**: Since the scan function may be called multiple times,
 the local state must track:
-- Current anchor variant index
-- Current partner variant index (within the window for that anchor)
-- Whether the anchor's genovec is already loaded
+- `has_saved_state`: whether a mid-window interruption occurred
+- `saved_anchor_idx`: the anchor variant to resume from
+- `saved_j`: the last emitted partner index (resume from j+1)
+- `saved_genovec_a`: the anchor's genotype array (avoid re-reading)
 
 ### Performance profile
 

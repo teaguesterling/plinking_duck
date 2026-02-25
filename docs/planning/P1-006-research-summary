@@ -343,9 +343,9 @@ Summary of which pgenlib functions support the approved P2 utility functions:
 | `PgrGet()` | Basic 2-bit genotype array | plink_ld |
 | `PgrGetP()` | Genotypes + phase information | plink_ld (phased mode) |
 | `PgrGetD()` | Genotypes + dosage values | plink_score |
-| `LinearCombinationMeanimpute()` | Dot product of weights × dosages with mean imputation | plink_score |
+| `Dosage16ToDoublesMeanimpute()` | Convert dosages to doubles with mean imputation | plink_score |
+| `LinearCombinationMeanimpute()` | Dot product of per-sample weights × one variant's genotypes (returns scalar) | — (`--variant-score`, excluded §2.3) |
 | `GenoarrCountFreqsUnsafe()` | Count genotypes in a loaded genovec | plink_ld (internal) |
-| `Dosage16ToDoublesMeanimpute()` | Convert dosages to doubles with mean imputation | plink_score (alternative path) |
 
 ### Key observation
 

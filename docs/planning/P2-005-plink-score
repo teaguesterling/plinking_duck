@@ -164,8 +164,8 @@ JOIN read_psam('data/example.psam') p ON s.IID = p.IID;
 |--------|-------------|-------------|
 | FID | VARCHAR | Family ID |
 | IID | VARCHAR | Individual/sample ID |
-| ALLELE_CT | INTEGER | Number of non-missing allele observations across scored variants |
-| DENOM | INTEGER | Denominator for averaging (2 × number of non-missing scored variants) |
+| ALLELE_CT | INTEGER | Non-missing allele count: 2 × scored variants with non-missing genotype for this sample. With default mean imputation, equals 2 × total scored variants for all samples. With `no_mean_imputation`, reflects actual data completeness. |
+| DENOM | INTEGER | Denominator for SCORE_AVG. Equals ALLELE_CT. (Separated for plink2 output compatibility.) |
 | NAMED_ALLELE_DOSAGE_SUM | DOUBLE | Sum of scored allele dosages across variants |
 | SCORE_SUM | DOUBLE | Weighted sum: Σ(genotype_i × weight_i) |
 | SCORE_AVG | DOUBLE | Average score: SCORE_SUM / DENOM |

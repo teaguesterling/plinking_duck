@@ -17,7 +17,7 @@ P2-001 (for shared infrastructure)
 
 ## Parallel Group
 
-**A** — Can run in parallel with P2-003, P2-004, P2-005 after P2-001 merges.
+**B** — Can run in parallel with P2-003, P2-004, P2-005 after P2-001 merges.
 
 ## Branch
 

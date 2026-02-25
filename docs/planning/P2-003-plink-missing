@@ -19,7 +19,7 @@ P2-001 (for shared infrastructure)
 
 ## Parallel Group
 
-**A** — Can run in parallel with P2-002, P2-004, P2-005 after P2-001 merges.
+**B** — Can run in parallel with P2-002, P2-004, P2-005 after P2-001 merges.
 
 ## Branch
 
@@ -181,59 +181,72 @@ output.SetCardinality(rows_emitted)
 
 ### Sample mode implementation
 
-Sample mode requires a full scan before emitting any rows. Implementation
-uses a two-phase approach within the scan function:
+Sample mode requires a full variant scan before emitting any rows.
+Implementation uses a two-phase approach: parallel accumulation across
+threads, then row emission.
 
-**Phase 1 (accumulation)**: On the first scan call, iterate all variants
-and accumulate per-sample missing counts:
+At biobank scale (170M variants × 10M samples), single-threaded
+accumulation would be too slow. The parallel approach partitions variants
+across threads with per-thread count arrays, then merges — adding minimal
+complexity for full parallelism.
+
+**Phase 1 (parallel accumulation)**: Each thread claims variant batches
+and accumulates into its own per-sample count array. After all variants
+are processed, a merge step sums the per-thread arrays.
 
 ```cpp
 // In global state:
-atomic<bool> accumulation_done{false};
-mutex accumulation_mutex;
-vector<uint32_t> sample_missing_counts;  // size = sample_ct, initialized to 0
-uint32_t total_variant_ct;               // number of variants scanned
+atomic<uint32_t> next_variant_idx{region_start};
+atomic<uint32_t> threads_done{0};
+uint32_t total_thread_ct;
+atomic<bool> merge_done{false};
+vector<uint32_t> sample_missing_counts;  // merged result, size = sample_ct
+uint32_t total_variant_ct;
 
-// Phase 1: first thread to enter acquires the mutex, all threads
-// participate in parallel accumulation
-if (!global.accumulation_done.load()) {
-    lock_guard<mutex> lock(global.accumulation_mutex);
-    if (!global.accumulation_done.load()) {
-        // Single-threaded accumulation (simplest correct implementation)
-        // For optimization: partition variants across threads with per-thread
-        // count arrays, then merge
-        for (vidx = region_start; vidx < region_end; vidx++) {
-            PgrGetMissingness(sample_include, pssi, sample_ct, vidx,
-                             &pgr, missingness, genovec_buf);
-            // Add to per-sample counts
-            for (uint32_t byte_idx = 0; byte_idx < word_ct; byte_idx++) {
-                uintptr_t word = missingness[byte_idx];
-                while (word) {
-                    uint32_t bit_pos = ctzw(word);
-                    sample_missing_counts[byte_idx * BITS_PER_WORD + bit_pos]++;
-                    word &= word - 1;  // clear lowest set bit
-                }
-            }
-        }
-        global.total_variant_ct = region_end - region_start;
-        global.accumulation_done.store(true);
-    }
-}
+// In local state (per-thread):
+vector<uint32_t> local_missing_counts;  // size = sample_ct, initialized to 0
+
+// Phase 1a: each thread accumulates its own count array
+BATCH_SIZE = 128
+while true:
+    batch_start = global.next_variant_idx.fetch_add(BATCH_SIZE)
+    if batch_start >= region_end: break
+
+    for vidx in batch_start..min(batch_start + BATCH_SIZE, region_end):
+        PgrGetMissingness(sample_include, pssi, sample_ct, vidx,
+                         &pgr, missingness, genovec_buf)
+        for (uint32_t byte_idx = 0; byte_idx < word_ct; byte_idx++):
+            uintptr_t word = missingness[byte_idx]
+            while (word):
+                uint32_t bit_pos = ctzw(word)
+                local_missing_counts[byte_idx * BITS_PER_WORD + bit_pos]++
+                word &= word - 1  // clear lowest set bit
+
+// Phase 1b: merge per-thread arrays into global result
+// Last thread to finish performs the merge
+if global.threads_done.fetch_add(1) + 1 == total_thread_ct:
+    for each thread's local_missing_counts:
+        for (uint32_t s = 0; s < sample_ct; s++):
+            global.sample_missing_counts[s] += local_missing_counts[s]
+    global.total_variant_ct = region_end - region_start
+    global.merge_done.store(true)
+else:
+    // Spin-wait for merge (brief — only one merge pass needed)
+    while !global.merge_done.load(): yield
 
 // Phase 2: emit rows from accumulated counts
-while (global.next_sample_idx < sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
-    sidx = global.next_sample_idx.fetch_add(1);
-    if (sidx >= sample_ct) break;
+while (global.next_sample_idx < sample_ct && rows_emitted < STANDARD_VECTOR_SIZE):
+    sidx = global.next_sample_idx.fetch_add(1)
+    if (sidx >= sample_ct) break
 
-    missing_ct = global.sample_missing_counts[sidx];
-    obs_ct = global.total_variant_ct - missing_ct;
-    f_miss = (double)missing_ct / global.total_variant_ct;
+    missing_ct = global.sample_missing_counts[sidx]
+    obs_ct = global.total_variant_ct - missing_ct
+    f_miss = (double)missing_ct / global.total_variant_ct
 
     output FID, IID from sample metadata
     output MISSING_CT, OBS_CT, F_MISS
 
-    rows_emitted++;
-}
+    rows_emitted++
 ```
 
 ### Local state
@@ -242,8 +255,9 @@ while (global.next_sample_idx < sample_ct && rows_emitted < STANDARD_VECTOR_SIZE
 struct PlinkMissingLocalState : public LocalTableFunctionState {
     plink2::PgenReader pgr;
     unsigned char* pgr_alloc;
-    uintptr_t* missingness;     // bitarray buffer (sample_ct bits)
-    uintptr_t* genovec_buf;     // scratch buffer for PgrGetMissingness
+    uintptr_t* missingness;             // bitarray buffer (sample_ct bits)
+    uintptr_t* genovec_buf;             // scratch buffer for PgrGetMissingness
+    vector<uint32_t> local_missing_counts;  // per-thread accumulation (sample mode)
 };
 ```
 
@@ -256,11 +270,13 @@ struct PlinkMissingLocalState : public LocalTableFunctionState {
 
 **Sample mode**:
 - Requires full variant scan before any output
-- Single-thread accumulation is the simple implementation
-- Future optimization: partition variants across threads with per-thread
-  count arrays, then atomic merge
-- Memory: O(sample_ct) for the accumulation array — small even for
-  biobank scale
+- Parallel accumulation: each thread maintains its own `uint32_t[sample_ct]`
+  count array, variant batches claimed via atomic counter, arrays merged
+  after all variants processed
+- Memory: O(sample_ct × thread_ct) for accumulation arrays. At 10M
+  samples × 8 threads = 320MB — acceptable for biobank-scale machines
+- The merge step is O(sample_ct × thread_ct), a single pass after all
+  variant scanning is complete
 
 ---
 

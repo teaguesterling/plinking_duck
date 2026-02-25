@@ -169,6 +169,12 @@ function. Merge conflicts are trivial.
 
 ## Conventions
 
+### Cross-cutting design guide
+
+See `DESIGN-GUIDE` for API design philosophy and coding standards that apply
+across all phases: parameter naming, output column conventions, three-tier
+type dispatch, extension scope boundary, pgenlib patterns, and scale guidance.
+
 ### Each plan includes
 - Goal and scope
 - Prerequisites

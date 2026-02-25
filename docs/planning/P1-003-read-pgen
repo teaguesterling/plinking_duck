@@ -457,6 +457,24 @@ whether any variants are multiallelic. Add multiallelic support via
 
 ---
 
+## Scale Guidance
+
+`read_pgen` is for **inspection and moderate-scale analysis**, not for
+biobank-scale computation. See `DESIGN-GUIDE` §1 for the full rationale.
+
+At biobank scale (10M+ samples), each output row contains a `LIST(TINYINT)`
+with 10M entries (~10MB per row). A full scan of 170M variants would produce
+~1.7PB of genotype data. This is not a practical operation.
+
+Intended use cases:
+- Examining genotypes for specific variants (with SQL WHERE on metadata)
+- Inspecting small cohorts or test datasets
+- Projection-pushdown queries that only read metadata columns
+
+For whole-genome computation, use P2 utility functions (`plink_freq`,
+`plink_missing`, `plink_score`, etc.) which use pgenlib fast-paths and
+never materialize genotypes into DuckDB list form.
+
 ## Performance Considerations
 
 1. **Projection pushdown** is the single most important optimization. Skipping
@@ -466,10 +484,10 @@ whether any variants are multiallelic. Add multiallelic support via
 2. **Parallel scan** via atomic variant counter allows DuckDB to scale across
    cores. Each thread gets its own PgenReader.
 
-3. **Memory**: Each variant's genotype list holds `sample_ct` entries. For
-   biobank-scale data (500K samples), this is ~500KB per row. DuckDB's vector
-   size (2048 rows) × 500KB = ~1GB per chunk. Monitor memory and consider
-   reducing batch size for large sample counts.
+3. **Memory**: Each variant's genotype list holds `sample_ct` entries. At
+   biobank scale (10M samples), this is ~10MB per row. DuckDB's vector size
+   (2048 rows) × 10MB = ~20GB per chunk. Reduce batch size or limit queries
+   with projection pushdown at large sample counts.
 
 4. **List construction**: Building `LIST(TINYINT)` vectors efficiently requires
    using DuckDB's list vector APIs correctly — pre-allocate child vector size,
