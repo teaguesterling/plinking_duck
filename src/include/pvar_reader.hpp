@@ -27,7 +27,7 @@ struct PvarHeaderInfo {
 //!
 //! This function is factored out for reuse by read_pgen (P1-003), which
 //! needs variant metadata schema during its bind phase.
-PvarHeaderInfo ParsePvarHeader(const string &file_path);
+PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path);
 
 //! Register the read_pvar table function with DuckDB.
 void RegisterPvarReader(ExtensionLoader &loader);

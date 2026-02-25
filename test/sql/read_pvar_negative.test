@@ -11,7 +11,7 @@ require plinking_duck
 statement error
 SELECT * FROM read_pvar('nonexistent.pvar');
 ----
-could not open file
+nonexistent.pvar
 
 # ---------------------------------------------------------------------------
 # Empty file

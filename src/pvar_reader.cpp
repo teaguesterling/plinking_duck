@@ -1,11 +1,90 @@
 #include "pvar_reader.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/file_open_flags.hpp"
 
 #include <cerrno>
 #include <cstdlib>
-#include <fstream>
 #include <limits>
 
 namespace duckdb {
+
+// ---------------------------------------------------------------------------
+// VFS line reader
+// ---------------------------------------------------------------------------
+
+//! Read one line from a DuckDB FileHandle, returning false at EOF.
+//! Handles \r\n and \n line endings (strips \r). This is a streaming
+//! alternative to ReadFileLines for files too large to slurp into memory
+//! (.pvar can be ~10GB at biobank scale).
+static bool ReadLineFromHandle(FileHandle &handle, string &line) {
+	line.clear();
+	char buffer[1];
+	bool read_any = false;
+	while (true) {
+		auto bytes = handle.Read(buffer, 1);
+		if (bytes == 0) {
+			return read_any; // EOF: true only if we got partial data
+		}
+		read_any = true;
+		if (buffer[0] == '\n') {
+			return true;
+		}
+		if (buffer[0] != '\r') {
+			line += buffer[0];
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Line splitting utilities
+// ---------------------------------------------------------------------------
+
+//! Split a line on tab characters. Used for .pvar files (strictly
+//! tab-delimited; fields like INFO can contain spaces).
+//! Matches psam_reader's SplitTabLine — will be extracted to a shared
+//! utility header in P2-001 (plink_common.hpp).
+static vector<string> SplitTabLine(const string &line) {
+	vector<string> fields;
+	size_t start = 0;
+	size_t pos = line.find('\t');
+	while (pos != string::npos) {
+		fields.push_back(line.substr(start, pos - start));
+		start = pos + 1;
+		pos = line.find('\t', start);
+	}
+	fields.push_back(line.substr(start));
+	return fields;
+}
+
+//! Split a line on any whitespace (spaces or tabs). Used for .bim files
+//! which are whitespace-delimited per the PLINK 1 spec. Consecutive
+//! whitespace characters are treated as a single delimiter.
+//! Matches psam_reader's SplitWhitespaceLine.
+static vector<string> SplitWhitespaceLine(const string &line) {
+	vector<string> fields;
+	size_t i = 0;
+	while (i < line.size()) {
+		// Skip whitespace
+		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
+			i++;
+		}
+		if (i >= line.size()) {
+			break;
+		}
+		// Collect field
+		size_t start = i;
+		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
+			i++;
+		}
+		fields.push_back(line.substr(start, i - start));
+	}
+	return fields;
+}
+
+//! Split a line using the appropriate delimiter for the file format.
+static vector<string> SplitPvarLine(const string &line, bool is_bim) {
+	return is_bim ? SplitWhitespaceLine(line) : SplitTabLine(line);
+}
 
 // ---------------------------------------------------------------------------
 // Header parsing
@@ -28,11 +107,9 @@ static LogicalType PvarColumnType(const string &name) {
 	return LogicalType::VARCHAR;
 }
 
-PvarHeaderInfo ParsePvarHeader(const string &file_path) {
-	std::ifstream file(file_path);
-	if (!file.is_open()) {
-		throw IOException("read_pvar: could not open file '%s'", file_path);
-	}
+PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_READ);
 
 	PvarHeaderInfo info;
 	info.skip_lines = 0;
@@ -40,11 +117,7 @@ PvarHeaderInfo ParsePvarHeader(const string &file_path) {
 	string line;
 	bool found_header_or_data = false;
 
-	while (std::getline(file, line)) {
-		// Handle Windows line endings
-		if (!line.empty() && line.back() == '\r') {
-			line.pop_back();
-		}
+	while (ReadLineFromHandle(*handle, line)) {
 		// Skip empty lines
 		if (line.empty()) {
 			info.skip_lines++;
@@ -69,20 +142,13 @@ PvarHeaderInfo ParsePvarHeader(const string &file_path) {
 		info.is_bim = false;
 		info.skip_lines++; // count the header line itself
 
-		// Strip the leading '#' so "#CHROM" becomes "CHROM"
-		string header = line.substr(1);
-		size_t start = 0;
-		size_t pos;
-		while ((pos = header.find('\t', start)) != string::npos) {
-			string col_name = header.substr(start, pos - start);
+		// Strip the leading '#' so "#CHROM" becomes "CHROM", then split on tabs
+		string header_content = line.substr(1);
+		auto fields = SplitTabLine(header_content);
+		for (auto &col_name : fields) {
 			info.column_names.push_back(col_name);
 			info.column_types.push_back(PvarColumnType(col_name));
-			start = pos + 1;
 		}
-		// Last column (no trailing tab)
-		string col_name = header.substr(start);
-		info.column_names.push_back(col_name);
-		info.column_types.push_back(PvarColumnType(col_name));
 	} else {
 		// No #CHROM header: legacy .bim format with 6 fixed columns.
 		//
@@ -117,7 +183,7 @@ struct PvarBindData : public TableFunctionData {
 };
 
 struct PvarGlobalState : public GlobalTableFunctionState {
-	std::ifstream file;
+	unique_ptr<FileHandle> handle;
 	bool finished = false;
 	vector<column_t> column_ids;
 
@@ -129,13 +195,15 @@ struct PvarGlobalState : public GlobalTableFunctionState {
 struct PvarLocalState : public LocalTableFunctionState {};
 
 // ---------------------------------------------------------------------------
-// .bim column order mapping
+// .bim column order normalization
 // ---------------------------------------------------------------------------
 
-// Maps normalized output column index to .bim file field index.
-// Output: CHROM(0) POS(1) ID(2) REF(3) ALT(4) CM(5)
-// File:   CHROM(0) ID(1)  CM(2) POS(3) ALT(4) REF(5)
-static constexpr idx_t BIM_OUTPUT_TO_FILE[] = {0, 3, 1, 5, 4, 2};
+//! Rearrange .bim fields from file order to normalized output order.
+//! File:   CHROM(0) ID(1)  CM(2) POS(3) ALT(4) REF(5)
+//! Output: CHROM(0) POS(1) ID(2) REF(3) ALT(4) CM(5)
+static vector<string> NormalizeBimFields(vector<string> &fields) {
+	return {fields[0], fields[3], fields[1], fields[5], fields[4], fields[2]};
+}
 
 // ---------------------------------------------------------------------------
 // Table function callbacks
@@ -145,7 +213,7 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PvarBindData>();
 	bind_data->file_path = input.inputs[0].GetValue<string>();
-	bind_data->header_info = ParsePvarHeader(bind_data->file_path);
+	bind_data->header_info = ParsePvarHeader(context, bind_data->file_path);
 
 	names = bind_data->header_info.column_names;
 	return_types = bind_data->header_info.column_types;
@@ -158,15 +226,13 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 	auto &bind_data = input.bind_data->Cast<PvarBindData>();
 	auto state = make_uniq<PvarGlobalState>();
 
-	state->file.open(bind_data.file_path);
-	if (!state->file.is_open()) {
-		throw IOException("read_pvar: could not open file '%s'", bind_data.file_path);
-	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	state->handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ);
 
 	// Skip comment and header lines to reach the first data line
 	string skip;
 	for (idx_t i = 0; i < bind_data.header_info.skip_lines; i++) {
-		std::getline(state->file, skip);
+		ReadLineFromHandle(*state->handle, skip);
 	}
 
 	// Store projected column indices for the scan function
@@ -185,50 +251,11 @@ static unique_ptr<LocalTableFunctionState> PvarInitLocal(ExecutionContext &conte
 // Scan helpers
 // ---------------------------------------------------------------------------
 
-//! Split a line on tab characters into fields.
-//! Used for .pvar format where tabs are the only valid delimiter
-//! (fields like INFO can contain spaces).
-static vector<string> SplitTabs(const string &line) {
-	vector<string> fields;
-	size_t start = 0;
-	size_t pos;
-	while ((pos = line.find('\t', start)) != string::npos) {
-		fields.push_back(line.substr(start, pos - start));
-		start = pos + 1;
-	}
-	fields.push_back(line.substr(start));
-	return fields;
-}
-
-//! Split a line on whitespace (spaces and/or tabs) into fields.
-//! Used for .bim format where PLINK 1 allows any whitespace delimiter.
-//! Consecutive whitespace is treated as a single delimiter.
-static vector<string> SplitWhitespace(const string &line) {
-	vector<string> fields;
-	size_t i = 0;
-	while (i < line.size()) {
-		// Skip whitespace between fields
-		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
-			i++;
-		}
-		if (i >= line.size()) {
-			break;
-		}
-		// Read field until next whitespace
-		size_t start = i;
-		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
-			i++;
-		}
-		fields.push_back(line.substr(start, i - start));
-	}
-	return fields;
-}
-
 //! Parse a field value and write it to an output vector.
 //! A single dot (".") is treated as NULL for any column type.
 static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const LogicalType &type) {
 	if (field == ".") {
-		FlatVector::Validity(vec).SetInvalid(row_idx);
+		FlatVector::SetNull(vec, row_idx, true);
 		return;
 	}
 
@@ -290,22 +317,16 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 	}
 
 	auto &header = bind_data.header_info;
+	auto &column_ids = state.column_ids;
 	idx_t row_count = 0;
 	string line;
 
-	while (row_count < STANDARD_VECTOR_SIZE && std::getline(state.file, line)) {
-		// Handle Windows line endings
-		if (!line.empty() && line.back() == '\r') {
-			line.pop_back();
-		}
-		// Skip empty lines
+	while (row_count < STANDARD_VECTOR_SIZE && ReadLineFromHandle(*state.handle, line)) {
 		if (line.empty()) {
 			continue;
 		}
 
-		// .bim uses whitespace-delimited fields (spaces, tabs, or mixed);
-		// .pvar uses tab-only (fields like INFO can contain spaces)
-		auto fields = header.is_bim ? SplitWhitespace(line) : SplitTabs(line);
+		auto fields = SplitPvarLine(line, header.is_bim);
 
 		// Validate field count
 		idx_t expected = header.is_bim ? 6 : header.column_names.size();
@@ -316,16 +337,20 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 			    static_cast<unsigned long long>(expected), bind_data.file_path);
 		}
 
+		// Normalize .bim field order to match output column order
+		if (header.is_bim) {
+			fields = NormalizeBimFields(fields);
+		}
+
 		// Fill projected output columns
-		for (idx_t i = 0; i < state.column_ids.size(); i++) {
-			auto col_idx = state.column_ids[i];
-			if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
+			auto file_col = column_ids[out_col];
+			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
 				continue;
 			}
 
-			// Map output column index to file field index
-			idx_t file_idx = header.is_bim ? BIM_OUTPUT_TO_FILE[col_idx] : col_idx;
-			SetPvarValue(output.data[i], row_count, fields[file_idx], header.column_types[col_idx]);
+			SetPvarValue(output.data[out_col], row_count, fields[file_col],
+			             header.column_types[file_col]);
 		}
 
 		row_count++;
