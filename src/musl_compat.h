@@ -15,11 +15,12 @@
 #ifdef __cplusplus
 extern "C"
 #endif
-inline void *rawmemchr(const void *s, int c) {
-    const unsigned char *p = (const unsigned char *)s;
-    while (*p != (unsigned char)c)
-        ++p;
-    return (void *)p;
+    inline void *
+    rawmemchr(const void *s, int c) {
+	const unsigned char *p = (const unsigned char *)s;
+	while (*p != (unsigned char)c)
+		++p;
+	return (void *)p;
 }
 
 #endif // PLINK_MUSL_COMPAT_H
