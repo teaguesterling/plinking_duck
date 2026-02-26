@@ -1,6 +1,6 @@
 # name: test/sql/read_psam_negative.test
 # description: Negative tests for read_psam table function
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 

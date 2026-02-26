@@ -161,12 +161,12 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 		info.skip_lines = 0; // no header to skip; data starts at line 1
 		info.column_names = {"CHROM", "POS", "ID", "REF", "ALT", "CM"};
 		info.column_types = {
-		    LogicalType::VARCHAR,  // CHROM
-		    LogicalType::INTEGER,  // POS
-		    LogicalType::VARCHAR,  // ID
-		    LogicalType::VARCHAR,  // REF
-		    LogicalType::VARCHAR,  // ALT
-		    LogicalType::DOUBLE    // CM
+		    LogicalType::VARCHAR, // CHROM
+		    LogicalType::INTEGER, // POS
+		    LogicalType::VARCHAR, // ID
+		    LogicalType::VARCHAR, // REF
+		    LogicalType::VARCHAR, // ALT
+		    LogicalType::DOUBLE   // CM
 		};
 	}
 
@@ -221,8 +221,7 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 	return std::move(bind_data);
 }
 
-static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &context,
-                                                           TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PvarBindData>();
 	auto state = make_uniq<PvarGlobalState>();
 
@@ -241,8 +240,7 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 	return std::move(state);
 }
 
-static unique_ptr<LocalTableFunctionState> PvarInitLocal(ExecutionContext &context,
-                                                         TableFunctionInitInput &input,
+static unique_ptr<LocalTableFunctionState> PvarInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state) {
 	return make_uniq<PvarLocalState>();
 }
@@ -331,10 +329,9 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		// Validate field count
 		idx_t expected = header.is_bim ? 6 : header.column_names.size();
 		if (fields.size() < expected) {
-			throw InvalidInputException(
-			    "read_pvar: line has %llu fields, expected at least %llu in '%s'",
-			    static_cast<unsigned long long>(fields.size()),
-			    static_cast<unsigned long long>(expected), bind_data.file_path);
+			throw InvalidInputException("read_pvar: line has %llu fields, expected at least %llu in '%s'",
+			                            static_cast<unsigned long long>(fields.size()),
+			                            static_cast<unsigned long long>(expected), bind_data.file_path);
 		}
 
 		// Normalize .bim field order to match output column order
@@ -349,8 +346,7 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				continue;
 			}
 
-			SetPvarValue(output.data[out_col], row_count, fields[file_col],
-			             header.column_types[file_col]);
+			SetPvarValue(output.data[out_col], row_count, fields[file_col], header.column_types[file_col]);
 		}
 
 		row_count++;
@@ -368,8 +364,7 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 // ---------------------------------------------------------------------------
 
 void RegisterPvarReader(ExtensionLoader &loader) {
-	TableFunction read_pvar("read_pvar", {LogicalType::VARCHAR}, PvarScan, PvarBind, PvarInitGlobal,
-	                        PvarInitLocal);
+	TableFunction read_pvar("read_pvar", {LogicalType::VARCHAR}, PvarScan, PvarBind, PvarInitGlobal, PvarInitLocal);
 	read_pvar.projection_pushdown = true;
 	loader.RegisterFunction(read_pvar);
 }

@@ -1,0 +1,266 @@
+# name: test/sql/read_pfile_tidy.test
+# description: Tidy mode tests for read_pfile table function
+# group: [sql]
+
+require plinking_duck
+
+# --- Basic tidy mode ---
+
+# Row count = variants x samples = 4 x 4 = 16
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true);
+----
+16
+
+# Tidy mode genotype is scalar TINYINT (not list)
+query T
+SELECT typeof(genotype)
+FROM read_pfile('test/data/pfile_example', tidy := true) LIMIT 1;
+----
+TINYINT
+
+# --- Schema includes variant + sample metadata ---
+
+# Variant columns present
+query TITTT
+SELECT CHROM, POS, ID, REF, ALT
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE ID = 'rs1' AND IID = 'SAMPLE1';
+----
+1	10000	rs1	A	G
+
+# Sample metadata columns present (FID, IID, SEX from pfile_example.psam)
+query TTI
+SELECT FID, IID, SEX
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE ID = 'rs1' AND IID = 'SAMPLE1';
+----
+FAM001	SAMPLE1	1
+
+# SEX=0 maps to NULL (same as read_psam convention)
+query I
+SELECT SEX
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE ID = 'rs1' AND IID = 'SAMPLE3';
+----
+NULL
+
+# --- Known genotype values ---
+
+# rs1: SAMPLE1=0, SAMPLE2=1, SAMPLE3=2, SAMPLE4=missing
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE ID = 'rs1'
+ORDER BY IID;
+----
+SAMPLE1	0
+SAMPLE2	1
+SAMPLE3	2
+SAMPLE4	NULL
+
+# rs2: SAMPLE1=1, SAMPLE2=1, SAMPLE3=0, SAMPLE4=2
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE ID = 'rs2'
+ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE2	1
+SAMPLE3	0
+SAMPLE4	2
+
+# rs3: SAMPLE1=2, SAMPLE2=missing, SAMPLE3=1, SAMPLE4=0
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE ID = 'rs3'
+ORDER BY IID;
+----
+SAMPLE1	2
+SAMPLE2	NULL
+SAMPLE3	1
+SAMPLE4	0
+
+# --- Projection pushdown in tidy mode ---
+
+# Only variant metadata (no genotypes decoded)
+query TI
+SELECT CHROM, POS
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE IID = 'SAMPLE1'
+ORDER BY CHROM, POS;
+----
+1	10000
+1	20000
+1	30000
+2	15000
+
+# Only sample metadata
+query TT
+SELECT DISTINCT FID, IID
+FROM read_pfile('test/data/pfile_example', tidy := true)
+ORDER BY IID;
+----
+FAM001	SAMPLE1
+FAM001	SAMPLE2
+FAM002	SAMPLE3
+FAM002	SAMPLE4
+
+# --- Sample subsetting in tidy mode ---
+
+# By name: 2 samples x 4 variants = 8 rows
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                samples := ['SAMPLE1', 'SAMPLE3']);
+----
+8
+
+# Verify correct samples are included
+query I
+SELECT COUNT(DISTINCT IID)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                samples := ['SAMPLE1', 'SAMPLE3']);
+----
+2
+
+# Genotype values for subsetted samples at rs1
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                samples := ['SAMPLE1', 'SAMPLE3'])
+WHERE ID = 'rs1'
+ORDER BY IID;
+----
+SAMPLE1	0
+SAMPLE3	2
+
+# By integer index
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true, samples := [0, 2]);
+----
+8
+
+query I
+SELECT COUNT(DISTINCT IID)
+FROM read_pfile('test/data/pfile_example', tidy := true, samples := [0, 2]);
+----
+2
+
+# Reverse-order integer indices: genotype must match the correct sample
+# (regression test: pgenlib returns genotypes in ascending bit order)
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true, samples := [2, 0])
+WHERE ID = 'rs1'
+ORDER BY IID;
+----
+SAMPLE1	0
+SAMPLE3	2
+
+# Reverse-order string IDs
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                samples := ['SAMPLE3', 'SAMPLE1'])
+WHERE ID = 'rs1'
+ORDER BY IID;
+----
+SAMPLE1	0
+SAMPLE3	2
+
+# --- Region filtering in tidy mode ---
+
+# Region on chr1: 3 variants x 4 samples = 12
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                region := '1:10000-30000');
+----
+12
+
+# Region with no matches returns 0 rows
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                region := '99:1-100');
+----
+0
+
+# --- Variant filtering in tidy mode ---
+
+# 2 variants x 4 samples = 8
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                variants := ['rs1', 'rs2']);
+----
+8
+
+# Integer variant indices
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                variants := [0, 3]);
+----
+8
+
+# --- Combined filters in tidy mode ---
+
+# Region + variant filter (intersection): rs1 is in 1:10000-20000, rs3 is not
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                region := '1:10000-20000', variants := ['rs1', 'rs3']);
+----
+4
+
+# Region + samples
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                region := '1:10000-20000', samples := ['SAMPLE1', 'SAMPLE2']);
+----
+4
+
+# Variant + samples
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                variants := ['rs1'], samples := ['SAMPLE1']);
+----
+1
+
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true,
+                variants := ['rs1'], samples := ['SAMPLE1']);
+----
+SAMPLE1	0
+
+# --- SQL filtering on tidy output ---
+
+# Filter by genotype value
+query TT
+SELECT ID, IID
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE genotype = 2
+ORDER BY ID, IID;
+----
+rs1	SAMPLE3
+rs2	SAMPLE4
+rs3	SAMPLE1
+rs4	SAMPLE4
+
+# Filter by sample metadata
+query TI
+SELECT ID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE SEX = 1 AND ID = 'rs1'
+ORDER BY IID;
+----
+rs1	0
+rs1	NULL

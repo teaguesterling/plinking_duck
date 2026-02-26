@@ -14,6 +14,7 @@ set(EXTENSION_SOURCES
     src/pvar_reader.cpp
     src/psam_reader.cpp
     src/pgen_reader.cpp
+    src/pfile_reader.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

@@ -169,8 +169,7 @@ static PsamHeaderInfo ParsePsamHeaderFromLines(const vector<string> &lines, cons
 		} else if (fields[0] == "IID") {
 			info.format = PsamFormat::PSAM_IID;
 		} else {
-			throw IOException("read_psam: file '%s' header must start with #FID or #IID, got '#%s'",
-			                  path, fields[0]);
+			throw IOException("read_psam: file '%s' header must start with #FID or #IID, got '#%s'", path, fields[0]);
 		}
 
 		for (auto &name : fields) {
@@ -241,8 +240,8 @@ SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
 
 		auto fields = SplitLine(line, header.format);
 		if (iid_idx >= fields.size()) {
-			throw IOException("read_psam: file '%s' line %d has %d fields, expected at least %d",
-			                  path, i + 1, fields.size(), iid_idx + 1);
+			throw IOException("read_psam: file '%s' line %d has %d fields, expected at least %d", path, i + 1,
+			                  fields.size(), iid_idx + 1);
 		}
 
 		const auto &iid = fields[iid_idx];
@@ -352,8 +351,7 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 // Init functions
 // ---------------------------------------------------------------------------
 
-static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &context,
-                                                           TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PsamBindData>();
 	auto state = make_uniq<PsamGlobalState>();
 
@@ -387,9 +385,8 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 		auto fields = SplitLine(line, header.format);
 
 		if (fields.size() != expected_cols) {
-			throw IOException(
-			    "read_psam: file '%s' line %d has %d fields, expected %d",
-			    bind_data.file_path, i + 1, fields.size(), expected_cols);
+			throw IOException("read_psam: file '%s' line %d has %d fields, expected %d", bind_data.file_path, i + 1,
+			                  fields.size(), expected_cols);
 		}
 
 		state->rows.push_back(std::move(fields));
@@ -398,8 +395,7 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 	return std::move(state);
 }
 
-static unique_ptr<LocalTableFunctionState> PsamInitLocal(ExecutionContext &context,
-                                                         TableFunctionInitInput &input,
+static unique_ptr<LocalTableFunctionState> PsamInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state) {
 	return make_uniq<PsamLocalState>();
 }
@@ -418,8 +414,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 	{
 		lock_guard<mutex> guard(global_state.lock);
 		start_idx = global_state.next_row_idx;
-		batch_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE,
-		                             global_state.rows.size() - start_idx);
+		batch_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, global_state.rows.size() - start_idx);
 		global_state.next_row_idx += batch_size;
 	}
 
@@ -490,8 +485,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 // ---------------------------------------------------------------------------
 
 void RegisterPsamReader(ExtensionLoader &loader) {
-	TableFunction read_psam("read_psam", {LogicalType::VARCHAR}, PsamScan, PsamBind, PsamInitGlobal,
-	                        PsamInitLocal);
+	TableFunction read_psam("read_psam", {LogicalType::VARCHAR}, PsamScan, PsamBind, PsamInitGlobal, PsamInitLocal);
 	read_psam.projection_pushdown = true;
 	loader.RegisterFunction(read_psam);
 }

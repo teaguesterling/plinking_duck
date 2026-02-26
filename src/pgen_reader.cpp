@@ -206,16 +206,16 @@ static VariantMetadata LoadVariantMetadata(ClientContext &context, const string 
 		vector<string> normalized;
 		if (header_info.is_bim) {
 			if (fields.size() < 6) {
-				throw InvalidInputException("read_pgen: .bim file '%s' has line with %llu fields, expected 6",
-				                            path, static_cast<unsigned long long>(fields.size()));
+				throw InvalidInputException("read_pgen: .bim file '%s' has line with %llu fields, expected 6", path,
+				                            static_cast<unsigned long long>(fields.size()));
 			}
 			normalized = {fields[0], fields[3], fields[1], fields[5], fields[4], fields[2]};
 			source = &normalized;
 		}
 
 		auto &src = *source;
-		if (chrom_idx >= src.size() || pos_idx >= src.size() || id_idx >= src.size() ||
-		    ref_idx >= src.size() || alt_idx >= src.size()) {
+		if (chrom_idx >= src.size() || pos_idx >= src.size() || id_idx >= src.size() || ref_idx >= src.size() ||
+		    alt_idx >= src.size()) {
 			throw InvalidInputException("read_pgen: .pvar/.bim file '%s' has line with too few fields", path);
 		}
 
@@ -254,8 +254,7 @@ static string ReplaceExtension(const string &path, const string &new_ext) {
 
 //! Try to find a companion file by replacing the .pgen extension.
 //! Returns the first existing path from candidates, or empty string if none found.
-static string FindCompanionFile(FileSystem &fs, const string &pgen_path,
-                                const vector<string> &extensions) {
+static string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions) {
 	for (auto &ext : extensions) {
 		auto candidate = ReplaceExtension(pgen_path, ext);
 		if (fs.FileExists(candidate)) {
@@ -409,11 +408,10 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	plink2::PgenHeaderCtrl header_ctrl;
 	uintptr_t pgfi_alloc_cacheline_ct = 0;
 
-	plink2::PglErr err = plink2::PgfiInitPhase1(
-	    bind_data->pgen_path.c_str(), nullptr, // no .pgi file
-	    UINT32_MAX,                             // infer raw_variant_ct
-	    UINT32_MAX,                             // infer raw_sample_ct
-	    &header_ctrl, &pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
+	plink2::PglErr err = plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, // no .pgi file
+	                                            UINT32_MAX,                            // infer raw_variant_ct
+	                                            UINT32_MAX,                            // infer raw_sample_ct
+	                                            &header_ctrl, &pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		// Clean up the FILE* that PgfiInitPhase1 may have opened
@@ -434,9 +432,8 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	uint32_t max_vrec_width = 0;
 	uintptr_t pgr_alloc_cacheline_ct = 0;
 
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct,
-	                              &max_vrec_width, &pgfi, pgfi_alloc.As<unsigned char>(),
-	                              &pgr_alloc_cacheline_ct, errstr_buf);
+	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct, &max_vrec_width, &pgfi,
+	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
 
 	// Clean up pgfi — we only needed it to get counts and alloc sizes.
 	// Each thread will open its own PgenReader in InitLocal.
@@ -444,19 +441,17 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	plink2::CleanupPgfi(&pgfi, &cleanup_err);
 
 	if (err != plink2::kPglRetSuccess) {
-		throw IOException("read_pgen: failed to initialize '%s' (phase 2): %s",
-		                  bind_data->pgen_path, errstr_buf);
+		throw IOException("read_pgen: failed to initialize '%s' (phase 2): %s", bind_data->pgen_path, errstr_buf);
 	}
 
 	// --- Load variant metadata ---
 	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path);
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
-		throw InvalidInputException(
-		    "read_pgen: variant count mismatch: .pgen has %u variants, "
-		    ".pvar/.bim '%s' has %llu variants",
-		    bind_data->raw_variant_ct, bind_data->pvar_path,
-		    static_cast<unsigned long long>(bind_data->variants.variant_ct));
+		throw InvalidInputException("read_pgen: variant count mismatch: .pgen has %u variants, "
+		                            ".pvar/.bim '%s' has %llu variants",
+		                            bind_data->raw_variant_ct, bind_data->pvar_path,
+		                            static_cast<unsigned long long>(bind_data->variants.variant_ct));
 	}
 
 	// --- Load sample info (optional) ---
@@ -466,10 +461,9 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		bind_data->sample_ct = static_cast<uint32_t>(bind_data->sample_info.sample_ct);
 
 		if (bind_data->sample_ct != bind_data->raw_sample_ct) {
-			throw InvalidInputException(
-			    "read_pgen: sample count mismatch: .pgen has %u samples, "
-			    ".psam/.fam '%s' has %u samples",
-			    bind_data->raw_sample_ct, bind_data->psam_path, bind_data->sample_ct);
+			throw InvalidInputException("read_pgen: sample count mismatch: .pgen has %u samples, "
+			                            ".psam/.fam '%s' has %u samples",
+			                            bind_data->raw_sample_ct, bind_data->psam_path, bind_data->sample_ct);
 		}
 	} else {
 		bind_data->sample_ct = bind_data->raw_sample_ct;
@@ -483,8 +477,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 
 		auto &children_check = ListValue::GetChildren(samples_val);
 		if (children_check.empty()) {
-			throw InvalidInputException(
-			    "read_pgen: samples list must not be empty");
+			throw InvalidInputException("read_pgen: samples list must not be empty");
 		}
 
 		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
@@ -493,18 +486,16 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			for (auto &child : children) {
 				int64_t idx = child.GetValue<int64_t>();
 				if (idx < 0 || static_cast<uint32_t>(idx) >= bind_data->raw_sample_ct) {
-					throw InvalidInputException(
-					    "read_pgen: sample index %lld out of range (sample count: %u)",
-					    static_cast<long long>(idx), bind_data->raw_sample_ct);
+					throw InvalidInputException("read_pgen: sample index %lld out of range (sample count: %u)",
+					                            static_cast<long long>(idx), bind_data->raw_sample_ct);
 				}
 				bind_data->sample_indices.push_back(static_cast<uint32_t>(idx));
 			}
 		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
 			// String IID mode — requires .psam
 			if (!bind_data->has_sample_info) {
-				throw InvalidInputException(
-				    "read_pgen: samples parameter requires LIST(INTEGER) when no .psam "
-				    "is available (no sample IDs to match against)");
+				throw InvalidInputException("read_pgen: samples parameter requires LIST(INTEGER) when no .psam "
+				                            "is available (no sample IDs to match against)");
 			}
 			auto &children = ListValue::GetChildren(samples_val);
 			for (auto &child : children) {
@@ -516,8 +507,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 				bind_data->sample_indices.push_back(static_cast<uint32_t>(it->second));
 			}
 		} else {
-			throw InvalidInputException(
-			    "read_pgen: samples parameter must be LIST(VARCHAR) or LIST(INTEGER)");
+			throw InvalidInputException("read_pgen: samples parameter must be LIST(VARCHAR) or LIST(INTEGER)");
 		}
 
 		// Validate no duplicate indices (pgenlib requires unique sample_include bits)
@@ -525,8 +515,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			std::unordered_set<uint32_t> seen;
 			for (auto idx : bind_data->sample_indices) {
 				if (!seen.insert(idx).second) {
-					throw InvalidInputException(
-					    "read_pgen: duplicate sample index %u in samples list", idx);
+					throw InvalidInputException("read_pgen: duplicate sample index %u in samples list", idx);
 				}
 			}
 		}
@@ -547,8 +536,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 // Init global
 // ---------------------------------------------------------------------------
 
-static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &context,
-                                                            TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PgenBindData>();
 	auto state = make_uniq<PgenGlobalState>();
 
@@ -571,9 +559,8 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 // Init local (per-thread PgenReader)
 // ---------------------------------------------------------------------------
 
-static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &context,
-                                                          TableFunctionInitInput &input,
-                                                          GlobalTableFunctionState *global_state) {
+static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                         GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PgenBindData>();
 	auto &gstate = global_state->Cast<PgenGlobalState>();
 	auto state = make_uniq<PgenLocalState>();
@@ -594,9 +581,9 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	plink2::PgenHeaderCtrl header_ctrl;
 	uintptr_t pgfi_alloc_cacheline_ct = 0;
 
-	plink2::PglErr err = plink2::PgfiInitPhase1(
-	    bind_data.pgen_path.c_str(), nullptr, bind_data.raw_variant_ct, bind_data.raw_sample_ct,
-	    &header_ctrl, &state->pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
+	plink2::PglErr err =
+	    plink2::PgfiInitPhase1(bind_data.pgen_path.c_str(), nullptr, bind_data.raw_variant_ct, bind_data.raw_sample_ct,
+	                           &header_ctrl, &state->pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -611,10 +598,8 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	uint32_t max_vrec_width = 0;
 	uintptr_t pgr_alloc_cacheline_ct = 0;
 
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state->pgfi.raw_variant_ct,
-	                              &max_vrec_width, &state->pgfi,
-	                              state->pgfi_alloc_buf.As<unsigned char>(),
-	                              &pgr_alloc_cacheline_ct, errstr_buf);
+	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state->pgfi.raw_variant_ct, &max_vrec_width, &state->pgfi,
+	                             state->pgfi_alloc_buf.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -628,7 +613,7 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	}
 
 	err = plink2::PgrInit(bind_data.pgen_path.c_str(), max_vrec_width, &state->pgfi, &state->pgr,
-	                       state->pgr_alloc_buf.As<unsigned char>());
+	                      state->pgr_alloc_buf.As<unsigned char>());
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -639,8 +624,7 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	}
 
 	// Allocate genovec buffer (2 bits per sample, vector-aligned for SIMD safety)
-	uint32_t effective_sample_ct = bind_data.has_sample_subset ? bind_data.raw_sample_ct
-	                                                           : bind_data.sample_ct;
+	uint32_t effective_sample_ct = bind_data.has_sample_subset ? bind_data.raw_sample_ct : bind_data.sample_ct;
 	uintptr_t genovec_word_ct = plink2::NypCtToAlignedWordCt(effective_sample_ct);
 	state->genovec_buf.Allocate(genovec_word_ct * sizeof(uintptr_t));
 	std::memset(state->genovec_buf.ptr, 0, genovec_word_ct * sizeof(uintptr_t));
@@ -651,8 +635,7 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	// Set up sample subsetting if needed
 	if (bind_data.has_sample_subset) {
 		// Build sample_include bitmask
-		uintptr_t include_word_ct = plink2::DivUp(bind_data.raw_sample_ct,
-		                                           static_cast<uint32_t>(plink2::kBitsPerWord));
+		uintptr_t include_word_ct = plink2::DivUp(bind_data.raw_sample_ct, static_cast<uint32_t>(plink2::kBitsPerWord));
 		state->sample_include_buf.Allocate(include_word_ct * sizeof(uintptr_t));
 		auto *sample_include = state->sample_include_buf.As<uintptr_t>();
 		std::memset(sample_include, 0, include_word_ct * sizeof(uintptr_t));
@@ -690,8 +673,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 	uint32_t total_variants = gstate.total_variants;
 
 	// Effective sample count for output lists
-	uint32_t output_sample_ct = bind_data.has_sample_subset ? bind_data.subset_sample_ct
-	                                                         : bind_data.sample_ct;
+	uint32_t output_sample_ct = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
 
 	idx_t rows_emitted = 0;
 
@@ -714,9 +696,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				const uintptr_t *sample_include =
 				    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
-				plink2::PglErr err = plink2::PgrGet(
-				    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				    lstate.genovec_buf.As<uintptr_t>());
+				plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                                    lstate.genovec_buf.As<uintptr_t>());
 
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pgen: PgrGet failed for variant %u", vidx);
@@ -724,7 +705,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 
 				// Unpack 2-bit genotypes to bytes (-9 = missing)
 				plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
-				                              lstate.genotype_bytes.data());
+				                             lstate.genotype_bytes.data());
 				genotypes_read = true;
 			}
 
@@ -752,8 +733,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -767,8 +747,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -820,8 +799,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 // ---------------------------------------------------------------------------
 
 void RegisterPgenReader(ExtensionLoader &loader) {
-	TableFunction read_pgen("read_pgen", {LogicalType::VARCHAR}, PgenScan, PgenBind, PgenInitGlobal,
-	                        PgenInitLocal);
+	TableFunction read_pgen("read_pgen", {LogicalType::VARCHAR}, PgenScan, PgenBind, PgenInitGlobal, PgenInitLocal);
 
 	read_pgen.projection_pushdown = true;
 
