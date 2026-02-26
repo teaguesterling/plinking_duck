@@ -14,6 +14,12 @@ cannot find .pgen
 
 # --- Missing companion files ---
 
+# Prefix where .pgen exists but .pvar does not
+statement error
+SELECT * FROM read_pfile('test/data/pgen_no_pvar');
+----
+cannot find .pvar
+
 # Prefix where .pgen exists but .psam does not (pgen_orphan has no .psam)
 statement error
 SELECT * FROM read_pfile('test/data/pgen_orphan');
@@ -78,10 +84,29 @@ SELECT * FROM read_pfile('test/data/pfile_example', variants := [999]);
 ----
 variant index
 
+# --- Duplicate variant indices ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', variants := [0, 1, 0]);
+----
+duplicate variant index
+
 # --- Empty variants list ---
 
 statement error
 SELECT * FROM read_pfile('test/data/pfile_example', variants := []::INTEGER[]);
+----
+must not be empty
+
+# --- Empty VARCHAR lists ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', samples := []::VARCHAR[]);
+----
+must not be empty
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', variants := []::VARCHAR[]);
 ----
 must not be empty
 

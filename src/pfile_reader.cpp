@@ -343,29 +343,51 @@ static bool PfileIsMissingValue(const string &val) {
 }
 
 //! Load full sample metadata including all columns for tidy mode output.
-static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const string &path) {
+//! Also populates sample_info to avoid a separate file read for LoadSampleInfo.
+static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const string &path,
+                                                   SampleInfo &sample_info_out) {
 	auto lines = PfileReadFileLines(context, path);
 
 	PfileSampleMetadata meta;
 
-	// Parse header
 	if (lines.empty()) {
 		throw IOException("read_pfile: .psam/.fam file '%s' is empty", path);
 	}
 
+	// Parse header from first line (avoids re-reading the file)
 	meta.header = ParsePsamHeader(context, path);
 
 	// Find special column indices
+	idx_t iid_idx = DConstants::INVALID_INDEX;
+	idx_t fid_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < meta.header.column_names.size(); i++) {
-		if (meta.header.column_names[i] == "SEX") {
+		auto &name = meta.header.column_names[i];
+		if (name == "SEX") {
 			meta.sex_col_idx = i;
-		} else if (meta.header.column_names[i] == "PAT" || meta.header.column_names[i] == "MAT") {
+		} else if (name == "PAT" || name == "MAT") {
 			meta.parent_col_indices.push_back(i);
+		}
+		if (name == "IID") {
+			iid_idx = i;
+		} else if (name == "FID") {
+			fid_idx = i;
 		}
 	}
 
-	// Data lines start at index 1 for .psam (skip header), 0 for .fam
-	idx_t data_start = (meta.header.format != PsamFormat::FAM) ? 1 : 0;
+	if (iid_idx == DConstants::INVALID_INDEX) {
+		throw IOException("read_pfile: .psam/.fam file '%s' has no IID column", path);
+	}
+
+	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
+
+	// Skip header/comment lines: .fam has no header (start at 0),
+	// .psam may have ## comment lines before the # header line.
+	idx_t data_start = 0;
+	if (meta.header.format != PsamFormat::FAM) {
+		while (data_start < lines.size() && !lines[data_start].empty() && lines[data_start][0] == '#') {
+			data_start++;
+		}
+	}
 
 	for (idx_t i = data_start; i < lines.size(); i++) {
 		auto &line = lines[i];
@@ -380,9 +402,24 @@ static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const
 			fields = PfileSplitTabLine(line);
 		}
 
+		// Extract sample info for IID lookups
+		if (iid_idx < fields.size()) {
+			const auto &iid = fields[iid_idx];
+			if (sample_info_out.iid_to_idx.count(iid)) {
+				throw IOException("read_pfile: file '%s' line %llu has duplicate IID '%s'", path,
+				                  static_cast<unsigned long long>(i + 1), iid);
+			}
+			sample_info_out.iids.push_back(iid);
+			if (has_fid && fid_idx < fields.size()) {
+				sample_info_out.fids.push_back(fields[fid_idx]);
+			}
+			sample_info_out.iid_to_idx[iid] = sample_info_out.iids.size() - 1;
+		}
+
 		meta.rows.push_back(std::move(fields));
 	}
 
+	sample_info_out.sample_ct = sample_info_out.iids.size();
 	return meta;
 }
 
@@ -476,19 +513,23 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint32_t> next_variant_idx {0};
 	uint32_t total_variants = 0;
 
-	// For tidy mode: sequential scanning
-	std::atomic<uint32_t> next_effective_variant_pos {0};
+	// For tidy mode: total effective variant count (scanning is sequential via local state)
 	uint32_t total_effective_variants = 0;
 
 	// Projection
 	bool need_genotypes = false;
 	vector<column_t> column_ids;
+	bool tidy_mode = false;
 
 	idx_t MaxThreads() const override {
 		// Tidy mode must be single-threaded: the state machine tracks
 		// current_variant and current_sample, which are not thread-safe.
-		// Default mode can parallelize across variants.
-		return 1;
+		if (tidy_mode) {
+			return 1;
+		}
+		// Default mode: same parallelism as read_pgen
+		uint32_t effective_ct = total_variants > 0 ? total_variants : total_effective_variants;
+		return std::min<idx_t>(effective_ct / 1000 + 1, 16);
 	}
 };
 
@@ -683,18 +724,19 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	// --- Load sample info ---
-	bind_data->sample_info = LoadSampleInfo(context, bind_data->psam_path);
+	// In tidy mode, LoadPfileSampleMetadata populates both sample_info and
+	// sample_metadata from a single file read. Otherwise, use LoadSampleInfo.
+	if (bind_data->tidy_mode) {
+		bind_data->sample_metadata = LoadPfileSampleMetadata(context, bind_data->psam_path, bind_data->sample_info);
+	} else {
+		bind_data->sample_info = LoadSampleInfo(context, bind_data->psam_path);
+	}
 
 	if (bind_data->sample_info.sample_ct != bind_data->raw_sample_ct) {
 		throw InvalidInputException("read_pfile: sample count mismatch: .pgen has %u samples, "
 		                            ".psam/.fam '%s' has %llu samples",
 		                            bind_data->raw_sample_ct, bind_data->psam_path,
 		                            static_cast<unsigned long long>(bind_data->sample_info.sample_ct));
-	}
-
-	// Load full sample metadata for tidy mode
-	if (bind_data->tidy_mode) {
-		bind_data->sample_metadata = LoadPfileSampleMetadata(context, bind_data->psam_path);
 	}
 
 	// --- Process samples parameter ---
@@ -790,6 +832,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			throw InvalidInputException("read_pfile: variants parameter must be LIST(VARCHAR) or LIST(INTEGER)");
 		}
 
+		// Validate no duplicate variant indices (consistent with samples behavior)
+		{
+			std::unordered_set<uint32_t> seen;
+			for (auto idx : bind_data->variant_indices) {
+				if (!seen.insert(idx).second) {
+					throw InvalidInputException("read_pfile: duplicate variant index %u in variants list", idx);
+				}
+			}
+		}
+
 		bind_data->has_variant_filter = true;
 	}
 
@@ -873,6 +925,7 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	auto state = make_uniq<PfileGlobalState>();
 
 	state->column_ids = input.column_ids;
+	state->tidy_mode = bind_data.tidy_mode;
 
 	if (bind_data.tidy_mode) {
 		state->total_effective_variants = bind_data.EffectiveVariantCt();
@@ -1198,21 +1251,6 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 	uint32_t total_effective_variants = gstate.total_effective_variants;
 	uint32_t output_sample_ct = bind_data.OutputSampleCt();
 
-	// Build the list of sample indices to iterate in order
-	// If subsetting, iterate over sample_indices in order.
-	// If not subsetting, iterate 0..sample_ct-1.
-	const vector<uint32_t> *sample_order = nullptr;
-	vector<uint32_t> default_sample_order;
-	if (bind_data.has_sample_subset) {
-		sample_order = &bind_data.sample_indices;
-	} else {
-		default_sample_order.resize(output_sample_ct);
-		for (uint32_t i = 0; i < output_sample_ct; i++) {
-			default_sample_order[i] = i;
-		}
-		sample_order = &default_sample_order;
-	}
-
 	idx_t rows_emitted = 0;
 
 	while (rows_emitted < STANDARD_VECTOR_SIZE) {
@@ -1242,8 +1280,13 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 		// Emit rows for samples within current variant
 		while (lstate.tidy_current_sample < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
-
-			uint32_t sample_file_idx = (*sample_order)[lstate.tidy_current_sample];
+			// Map scan-order sample index to file-order sample index.
+			// When subsetting, sample_indices is sorted to match pgenlib's
+			// ascending-bit-order output, so genotype_bytes[i] corresponds
+			// to sample_indices[i].
+			uint32_t sample_file_idx = bind_data.has_sample_subset
+			                               ? bind_data.sample_indices[lstate.tidy_current_sample]
+			                               : lstate.tidy_current_sample;
 
 			// Fill projected columns
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {

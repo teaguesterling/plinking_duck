@@ -38,7 +38,7 @@ WHERE ID = 'rs1' AND IID = 'SAMPLE1';
 FAM001	SAMPLE1	1
 
 # SEX=0 maps to NULL (same as read_psam convention)
-query T
+query I
 SELECT SEX
 FROM read_pfile('test/data/pfile_example', tidy := true)
 WHERE ID = 'rs1' AND IID = 'SAMPLE3';

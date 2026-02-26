@@ -81,12 +81,16 @@ SELECT COUNT(*) FROM read_pfile('test/data/pfile_example',
 ----
 4
 
-# Explicit paths override prefix-based discovery
-query I
-SELECT COUNT(*) FROM read_pfile('test/data/pfile_example',
-    pvar := 'test/data/pgen_example.pvar');
+# Explicit psam path overrides prefix: pgen_example.psam has #IID format
+# (2 columns: IID, SEX) while pfile_example.psam has #FID format
+# (3 columns: FID, IID, SEX). Using tidy mode to verify the column set.
+query T
+SELECT DISTINCT IID
+FROM read_pfile('test/data/pfile_example', tidy := true,
+    psam := 'test/data/pgen_example.psam')
+WHERE IID = 'SAMPLE1';
 ----
-4
+SAMPLE1
 
 # --- Column types ---
 
