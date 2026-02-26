@@ -19,8 +19,12 @@ jobs:
       duckdb_version: v1.4.4
       ci_tools_version: v1.4.4
       extension_name: plinking_duck
-      # plink-ng SIMD code segfaults on musl at runtime (pgenlib issue, not ours)
-      exclude_archs: 'linux_amd64_musl'
+      # plink-ng portability issues (not ours):
+      #   musl: SIMD segfault at runtime
+      #   macOS: linker symbol visibility issue
+      #   Windows: MSVC can't compile libdeflate (__attribute__ syntax)
+      #   Wasm: plink-ng requires POSIX APIs (pthreads, file I/O)
+      exclude_archs: 'linux_amd64_musl;osx_amd64;osx_arm64;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:
     name: Code Quality Check
