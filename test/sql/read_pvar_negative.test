@@ -1,6 +1,6 @@
 # name: test/sql/read_pvar_negative.test
 # description: Negative and edge case tests for read_pvar
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 

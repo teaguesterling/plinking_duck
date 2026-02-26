@@ -1,0 +1,139 @@
+# name: test/sql/read_pfile_negative.test
+# description: Negative and edge case tests for read_pfile table function
+# group: [sql]
+
+require plinking_duck
+
+# --- File not found ---
+
+# Nonexistent prefix
+statement error
+SELECT * FROM read_pfile('test/data/nonexistent');
+----
+cannot find .pgen
+
+# --- Missing companion files ---
+
+# Prefix where .pgen exists but .psam does not (pgen_orphan has no .psam)
+statement error
+SELECT * FROM read_pfile('test/data/pgen_orphan');
+----
+cannot find .psam
+
+# --- Sample count mismatch ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example',
+    psam := 'test/data/mismatched_samples.psam');
+----
+sample count mismatch
+
+# --- Variant count mismatch ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example',
+    pvar := 'test/data/mismatched_variants.pvar');
+----
+variant count mismatch
+
+# --- Invalid sample ID ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', samples := ['NOSUCHSAMPLE']);
+----
+not found
+
+# --- Invalid sample index ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', samples := [999]);
+----
+sample index
+
+# --- Empty samples list ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', samples := []::INTEGER[]);
+----
+must not be empty
+
+# --- Duplicate sample indices ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', samples := [0, 1, 0]);
+----
+duplicate sample index
+
+# --- Invalid variant ID ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', variants := ['NOSUCHVARIANT']);
+----
+not found
+
+# --- Invalid variant index ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', variants := [999]);
+----
+variant index
+
+# --- Empty variants list ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', variants := []::INTEGER[]);
+----
+must not be empty
+
+# --- Invalid region format ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', region := 'invalid:abc-def');
+----
+invalid region
+
+# Region with empty chromosome
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', region := ':100-200');
+----
+empty chromosome
+
+# Region start > end
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', region := '1:30000-10000');
+----
+start
+
+# --- No arguments ---
+
+statement error
+SELECT * FROM read_pfile();
+----
+
+# --- Dosages not yet implemented ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', dosages := true);
+----
+not yet implemented
+
+# --- Phased not yet implemented ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', phased := true);
+----
+not yet implemented
+
+# --- Edge cases ---
+
+# Empty region returns 0 rows (not an error)
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', region := '99:1-100');
+----
+0
+
+# Empty region in tidy mode also returns 0 rows
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true, region := '99:1-100');
+----
+0

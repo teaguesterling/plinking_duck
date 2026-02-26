@@ -59,6 +59,55 @@ The main binaries that will be built are:
 - `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
 - `plinking_duck.duckdb_extension` is the loadable binary as it would be distributed.
 
+### `read_pfile(prefix [, pgen, pvar, psam, tidy, samples, variants, region])`
+
+Read a complete PLINK 2 fileset (`.pgen` + `.pvar` + `.psam`) from a common prefix.
+Supports tidy output mode, sample subsetting, variant filtering, and region filtering.
+
+```sql
+-- Read all variants (one row per variant, genotypes as list)
+SELECT * FROM read_pfile('data/example');
+
+-- Tidy mode (one row per variant x sample)
+SELECT chrom, pos, iid, genotype
+FROM read_pfile('data/example', tidy := true);
+
+-- Sample subset (by name or 0-based index)
+SELECT * FROM read_pfile('data/example',
+    tidy := true, samples := ['SAMPLE1', 'SAMPLE3']);
+
+-- Region filter
+SELECT * FROM read_pfile('data/example', region := '22:1-50000000');
+
+-- Variant filter
+SELECT * FROM read_pfile('data/example', variants := ['rs1', 'rs2']);
+
+-- Combined filters
+SELECT iid, genotype
+FROM read_pfile('data/example', tidy := true,
+    region := '1:10000-50000', samples := ['SAMPLE1']);
+```
+
+**Default mode output:** CHROM, POS, ID, REF, ALT, genotypes `LIST(TINYINT)` — same as `read_pgen`.
+
+**Tidy mode output:** CHROM, POS, ID, REF, ALT, plus all `.psam` columns (FID, IID, SEX, etc.),
+plus scalar `genotype` (TINYINT). One row per variant x sample combination.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `pgen` | VARCHAR | Explicit `.pgen` path (overrides prefix) |
+| `pvar` | VARCHAR | Explicit `.pvar`/`.bim` path (overrides prefix) |
+| `psam` | VARCHAR | Explicit `.psam`/`.fam` path (overrides prefix) |
+| `tidy` | BOOLEAN | Tidy output: one row per (variant, sample). Default: false |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific samples by IID or 0-based index |
+| `variants` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific variants by ID or 0-based index |
+| `region` | VARCHAR | Filter to genomic region (`chr:start-end` or `chr`) |
+
+**Projection pushdown:** Genotype decoding is skipped when genotype columns
+are not referenced in the query, making metadata-only queries fast.
+
 ### `read_pgen(path [, pvar, psam, samples])`
 
 Read PLINK 2 `.pgen` binary genotype files. Auto-discovers companion `.pvar` and `.psam` files.
