@@ -1,5 +1,5 @@
 # name: test/sql/plinking_duck.test
-# description: Verify plinking_duck extension loads
+# description: Verify plinking_duck extension loads and registers all functions
 # group: [sql]
 
 require plinking_duck
@@ -7,3 +7,30 @@ require plinking_duck
 # Extension loads without error
 statement ok
 SELECT 1;
+
+# Extension name is correct
+query T
+SELECT extension_name FROM duckdb_extensions() WHERE extension_name = 'plinking_duck' AND loaded;
+----
+plinking_duck
+
+# All four reader functions are accessible
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/minimal.pvar');
+----
+1
+
+query I
+SELECT COUNT(*) FROM read_psam('test/data/minimal.psam');
+----
+1
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen');
+----
+4
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example');
+----
+4
