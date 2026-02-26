@@ -156,3 +156,119 @@ query I
 SELECT len(genotypes) FROM read_pgen('test/data/pgen_orphan.pgen', samples := [0, 2]) LIMIT 1;
 ----
 2
+
+# --- .bim companion file ---
+
+# read_pgen works with .bim as the variant metadata source
+query TITTT
+SELECT CHROM, POS, ID, REF, ALT FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'test/data/pgen_example.bim') ORDER BY CHROM, POS;
+----
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A
+2	15000	rs4	T	C
+
+# Genotypes via .bim match genotypes via .pvar
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'test/data/pgen_example.bim') WHERE ID = 'rs1';
+----
+rs1	[0, 1, 2, NULL]
+
+# --- VARCHAR sample subsetting ---
+
+# Subset by sample name (requires .psam)
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/pgen_example.pgen',
+    samples := ['SAMPLE1', 'SAMPLE3']) LIMIT 1;
+----
+2
+
+# VARCHAR subset genotype values: SAMPLE1(idx=0) and SAMPLE3(idx=2) for rs1 = [0, 2]
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen',
+    samples := ['SAMPLE1', 'SAMPLE3']) WHERE ID = 'rs1';
+----
+rs1	[0, 2]
+
+# Verify alignment on a different variant: rs2 SAMPLE1=1, SAMPLE3=0
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen',
+    samples := ['SAMPLE1', 'SAMPLE3']) WHERE ID = 'rs2';
+----
+rs2	[1, 0]
+
+# --- SELECT * ---
+
+# All 6 columns returned in a single SELECT *
+query TITTTT
+SELECT * FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs1';
+----
+1	10000	rs1	A	G	[0, 1, 2, NULL]
+
+# --- Multi-column genotype alignment ---
+
+# Genotypes stay aligned with the correct variant row across all variants
+query TTTT
+SELECT ID, REF, ALT, genotypes FROM read_pgen('test/data/pgen_example.pgen') ORDER BY CHROM, POS;
+----
+rs1	A	G	[0, 1, 2, NULL]
+rs2	C	T	[1, 1, 0, 2]
+rs3	G	A	[2, NULL, 1, 0]
+rs4	T	C	[0, 0, 1, 2]
+
+# --- Multi-batch scan (large dataset, >2048 variants) ---
+
+# Total variant count
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/large_example.pgen');
+----
+3000
+
+# Genotype list length matches 8 samples
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/large_example.pgen') LIMIT 1;
+----
+8
+
+# All genotype values are valid (0, 1, 2, or NULL — no value of 3+)
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/large_example.pgen')
+WHERE list_contains(genotypes, 3);
+----
+0
+
+# Spot-check var1 genotypes: cycling pattern (1+s)%4 → [1,2,NULL,0,1,2,NULL,0]
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/large_example.pgen') WHERE ID = 'var1';
+----
+var1	[1, 2, NULL, 0, 1, 2, NULL, 0]
+
+# --- Parallel scan correctness (3000 variants → MaxThreads = 4) ---
+
+# No duplicate rows from thread races
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pgen('test/data/large_example.pgen');
+----
+3000
+
+# DISTINCT count matches total count
+query I
+SELECT COUNT(*) - COUNT(DISTINCT ID) FROM read_pgen('test/data/large_example.pgen');
+----
+0
+
+# Metadata-only projection pushdown at scale (no genotype decoding)
+query I
+SELECT COUNT(*) FROM (SELECT CHROM, POS, ID FROM read_pgen('test/data/large_example.pgen'));
+----
+3000
+
+# Verify variants span all 3 chromosomes (1000 each)
+query TI
+SELECT CHROM, COUNT(*) FROM read_pgen('test/data/large_example.pgen') GROUP BY CHROM ORDER BY CHROM;
+----
+1	1000
+2	1000
+3	1000
