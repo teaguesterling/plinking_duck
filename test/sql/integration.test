@@ -1,0 +1,195 @@
+# name: test/sql/integration.test
+# description: Cross-reader consistency and integration tests
+# group: [sql]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# Variant count consistency across readers
+# ---------------------------------------------------------------------------
+
+# read_pvar, read_pgen, and read_pfile all report the same variant count
+query III
+SELECT
+    (SELECT COUNT(*) FROM read_pvar('test/data/pgen_example.pvar')) AS pvar_count,
+    (SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen')) AS pgen_count,
+    (SELECT COUNT(*) FROM read_pfile('test/data/pfile_example')) AS pfile_count;
+----
+4	4	4
+
+# ---------------------------------------------------------------------------
+# Variant metadata consistent: read_pvar = read_pgen = read_pfile
+# ---------------------------------------------------------------------------
+
+# read_pvar and read_pgen return identical variant metadata
+query I
+SELECT COUNT(*) FROM (
+    SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/pgen_example.pvar')
+    EXCEPT
+    SELECT CHROM, POS, ID, REF, ALT FROM read_pgen('test/data/pgen_example.pgen')
+);
+----
+0
+
+# read_pvar and read_pfile return identical variant metadata
+query I
+SELECT COUNT(*) FROM (
+    SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/pgen_example.pvar')
+    EXCEPT
+    SELECT CHROM, POS, ID, REF, ALT FROM read_pfile('test/data/pfile_example')
+);
+----
+0
+
+# ---------------------------------------------------------------------------
+# read_pfile default mode = read_pgen (same columns, same values)
+# ---------------------------------------------------------------------------
+
+# Same genotype lists for every variant
+query I
+SELECT COUNT(*) FROM (
+    SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen')
+    EXCEPT
+    SELECT ID, genotypes FROM read_pfile('test/data/pfile_example')
+);
+----
+0
+
+# ---------------------------------------------------------------------------
+# Column types consistent across readers
+# ---------------------------------------------------------------------------
+
+# read_pvar column types
+query TTTTT
+SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT)
+FROM read_pvar('test/data/pgen_example.pvar') LIMIT 1;
+----
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR
+
+# read_pgen column types (variant metadata + genotypes)
+query TTTTTT
+SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(genotypes)
+FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
+----
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[]
+
+# read_pfile default mode column types match read_pgen
+query TTTTTT
+SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(genotypes)
+FROM read_pfile('test/data/pfile_example') LIMIT 1;
+----
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[]
+
+# read_pfile tidy mode genotype is scalar TINYINT
+query T
+SELECT typeof(genotype)
+FROM read_pfile('test/data/pfile_example', tidy := true) LIMIT 1;
+----
+TINYINT
+
+# ---------------------------------------------------------------------------
+# Tidy mode: distinct IIDs = read_psam count
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(DISTINCT IID)
+FROM read_pfile('test/data/pfile_example', tidy := true);
+----
+4
+
+query I
+SELECT COUNT(*) FROM read_psam('test/data/pfile_example.psam');
+----
+4
+
+# Tidy mode row count = variants x samples = 4 x 4 = 16
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true);
+----
+16
+
+# ---------------------------------------------------------------------------
+# Genotype values match across readers
+# ---------------------------------------------------------------------------
+
+# rs1 genotypes: read_pgen list = read_pfile list
+query T
+SELECT
+    (SELECT genotypes FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs1')
+    =
+    (SELECT genotypes FROM read_pfile('test/data/pfile_example') WHERE ID = 'rs1');
+----
+true
+
+# rs1 genotypes: read_pfile tidy values match the list from default mode
+# SAMPLE1=0, SAMPLE2=1, SAMPLE3=2, SAMPLE4=NULL
+query TI
+SELECT IID, genotype
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE ID = 'rs1'
+ORDER BY IID;
+----
+SAMPLE1	0
+SAMPLE2	1
+SAMPLE3	2
+SAMPLE4	NULL
+
+# All variants: tidy genotypes match list genotypes (unnested)
+# Join pfile default (list) with pfile tidy (scalar) and verify agreement
+query I
+SELECT COUNT(*) FROM (
+    SELECT t.ID, t.IID, t.genotype AS tidy_gt,
+           d.genotypes[s.row_num] AS list_gt
+    FROM read_pfile('test/data/pfile_example', tidy := true) t
+    JOIN read_pfile('test/data/pfile_example') d ON t.ID = d.ID
+    JOIN (
+        SELECT IID, ROW_NUMBER() OVER (ORDER BY IID) AS row_num
+        FROM read_psam('test/data/pfile_example.psam')
+    ) s ON t.IID = s.IID
+    WHERE tidy_gt IS DISTINCT FROM list_gt
+);
+----
+0
+
+# ---------------------------------------------------------------------------
+# Join between readers produces expected results
+# ---------------------------------------------------------------------------
+
+# Join variant info from read_pvar with genotypes from read_pgen
+query TITTT
+SELECT v.CHROM, v.POS, v.ID, v.REF, v.ALT
+FROM read_pvar('test/data/pgen_example.pvar') v
+JOIN read_pgen('test/data/pgen_example.pgen') g ON v.ID = g.ID
+ORDER BY v.CHROM, v.POS;
+----
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A
+2	15000	rs4	T	C
+
+# Join sample info from read_psam with tidy genotypes from read_pfile
+query TTI
+SELECT s.FID, t.IID, t.genotype
+FROM read_pfile('test/data/pfile_example', tidy := true) t
+JOIN read_psam('test/data/pfile_example.psam') s ON t.IID = s.IID
+WHERE t.ID = 'rs1'
+ORDER BY t.IID;
+----
+FAM001	SAMPLE1	0
+FAM001	SAMPLE2	1
+FAM002	SAMPLE3	2
+FAM002	SAMPLE4	NULL
+
+# ---------------------------------------------------------------------------
+# Sample metadata in tidy mode matches read_psam
+# ---------------------------------------------------------------------------
+
+# FID values from tidy mode match read_psam
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT FID, IID FROM read_pfile('test/data/pfile_example', tidy := true)
+    EXCEPT
+    SELECT FID, IID FROM read_psam('test/data/pfile_example.psam')
+);
+----
+0
