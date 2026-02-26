@@ -1,0 +1,186 @@
+# name: test/sql/edge_cases.test
+# description: Edge cases and boundary condition tests across readers
+# group: [sql]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# Single-variant / single-sample files
+# ---------------------------------------------------------------------------
+
+# Single-variant file through read_pvar
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/minimal.pvar');
+----
+1
+
+query TITTT
+SELECT * FROM read_pvar('test/data/minimal.pvar');
+----
+1	10000	rs1	A	G
+
+# Single-sample file through read_psam
+query I
+SELECT COUNT(*) FROM read_psam('test/data/minimal.psam');
+----
+1
+
+query T
+SELECT IID FROM read_psam('test/data/minimal.psam');
+----
+SAMPLE1
+
+# ---------------------------------------------------------------------------
+# Header-only files return 0 rows
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/header_only.pvar');
+----
+0
+
+query I
+SELECT COUNT(*) FROM read_psam('test/data/header_only.psam');
+----
+0
+
+# ---------------------------------------------------------------------------
+# Multi-allelic ALT preserved as VARCHAR
+# ---------------------------------------------------------------------------
+
+# Multi-allelic ALT is a single comma-separated VARCHAR string
+query TT
+SELECT ALT, typeof(ALT) FROM read_pvar('test/data/example.pvar') WHERE ID = 'rs3';
+----
+A,C	VARCHAR
+
+# ---------------------------------------------------------------------------
+# All-missing genotypes through read_pgen
+# ---------------------------------------------------------------------------
+
+# All genotype values are NULL
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/all_missing.pgen') ORDER BY POS;
+----
+rs_miss1	[NULL, NULL]
+rs_miss2	[NULL, NULL]
+
+# Individual elements are NULL
+query I
+SELECT genotypes[1] FROM read_pgen('test/data/all_missing.pgen') WHERE ID = 'rs_miss1';
+----
+NULL
+
+# ---------------------------------------------------------------------------
+# All-missing genotypes through read_pfile
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing');
+----
+2
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/all_missing') ORDER BY POS;
+----
+rs_miss1	[NULL, NULL]
+rs_miss2	[NULL, NULL]
+
+# Tidy mode: all genotypes NULL, row count = 2 variants x 2 samples = 4
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', tidy := true);
+----
+4
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', tidy := true)
+WHERE genotype IS NOT NULL;
+----
+0
+
+# ---------------------------------------------------------------------------
+# Column type verification across all readers
+# ---------------------------------------------------------------------------
+
+# read_pvar types
+query TTTTT
+SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT)
+FROM read_pvar('test/data/pgen_example.pvar') LIMIT 1;
+----
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR
+
+# read_psam types (#FID format)
+query TTT
+SELECT typeof(FID), typeof(IID), typeof(SEX)
+FROM read_psam('test/data/pfile_example.psam') LIMIT 1;
+----
+VARCHAR	VARCHAR	INTEGER
+
+# read_psam types (#IID format)
+query TT
+SELECT typeof(IID), typeof(SEX)
+FROM read_psam('test/data/pgen_example.psam') LIMIT 1;
+----
+VARCHAR	INTEGER
+
+# read_pgen genotype type
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
+----
+TINYINT[]
+
+# read_pfile default mode genotype type
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example') LIMIT 1;
+----
+TINYINT[]
+
+# read_pfile tidy mode genotype type
+query T
+SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', tidy := true) LIMIT 1;
+----
+TINYINT
+
+# ---------------------------------------------------------------------------
+# Orphan .pgen (no .psam) still works via read_pgen
+# ---------------------------------------------------------------------------
+
+# pgen_orphan.pgen has a .pvar but no .psam — still readable
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_orphan.pgen');
+----
+4
+
+# Variant metadata still accessible
+query T
+SELECT ID FROM read_pgen('test/data/pgen_orphan.pgen') WHERE POS = 10000;
+----
+rs1
+
+# Genotype lists still properly sized (from .pgen header)
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/pgen_orphan.pgen') LIMIT 1;
+----
+4
+
+# ---------------------------------------------------------------------------
+# Empty region returns 0 rows
+# ---------------------------------------------------------------------------
+
+# read_pfile with region matching no variants
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', region := '99:1-100');
+----
+0
+
+# read_pfile tidy with region matching no variants
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true, region := '99:1-100');
+----
+0
+
+# read_pfile with variant filter matching nothing (error: validates upfront)
+statement error
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', variants := ['nonexistent']);
+----
+variant 'nonexistent' not found
