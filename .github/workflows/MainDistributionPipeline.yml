@@ -19,6 +19,8 @@ jobs:
       duckdb_version: v1.4.4
       ci_tools_version: v1.4.4
       extension_name: plinking_duck
+      # plink-ng SIMD code segfaults on musl at runtime (pgenlib issue, not ours)
+      exclude_archs: 'linux_amd64_musl'
 
   code-quality-check:
     name: Code Quality Check
