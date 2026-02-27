@@ -1,0 +1,82 @@
+# name: test/sql/plink_ld_negative.test
+# description: Negative tests for plink_ld table function
+# group: [sql]
+
+require plinking_duck
+
+# --- File not found ---
+
+statement error
+SELECT * FROM plink_ld('nonexistent.pgen', variant1 := 'rs1', variant2 := 'rs2');
+----
+plink_ld
+
+# --- Variant not found ---
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'NOSUCHVARIANT', variant2 := 'rs2');
+----
+variant
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'NOSUCHVARIANT');
+----
+variant
+
+# --- Incomplete pair (only variant1) ---
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1');
+----
+both variant1 and variant2
+
+# --- Incomplete pair (only variant2) ---
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant2 := 'rs2');
+----
+both variant1 and variant2
+
+# --- No arguments ---
+
+statement error
+SELECT * FROM plink_ld();
+----
+
+# --- Invalid r2_threshold ---
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen', r2_threshold := -0.1);
+----
+r2_threshold
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen', r2_threshold := 1.5);
+----
+r2_threshold
+
+# --- Invalid window_kb ---
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen', window_kb := -1);
+----
+window_kb
+
+# --- Unknown sample ---
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2',
+    samples := ['NOSUCHSAMPLE']);
+----
+sample
+
+# --- Invalid region format ---
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    region := 'invalid_region', variant1 := 'rs1', variant2 := 'rs2');
+----
+region

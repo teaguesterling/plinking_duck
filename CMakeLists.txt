@@ -18,6 +18,7 @@ set(EXTENSION_SOURCES
     src/plink_common.cpp
     src/plink_freq.cpp
     src/plink_missing.cpp
+    src/plink_ld.cpp
     src/plink_score.cpp
 )
 

@@ -1,0 +1,168 @@
+# name: test/sql/plink_ld.test
+# description: Positive tests for plink_ld table function (pairwise mode)
+# group: [sql]
+
+require plinking_duck
+
+# --- Pairwise mode: known-answer tests ---
+# Genotype matrix (pgen_example, 4 samples × 4 variants):
+#   rs1 [0, 1, 2, NULL]  chr1:10000
+#   rs2 [1, 1, 0, 2]     chr1:20000
+#   rs3 [2, NULL, 1, 0]  chr1:30000
+#   rs4 [0, 0, 1, 2]     chr2:15000
+#
+# r² validated against plink2 --r2-unphased:
+#   rs1 vs rs2: UNPHASED_R2=0.75
+#   rs1 vs rs3: UNPHASED_R2=1.0
+#   rs2 vs rs3: UNPHASED_R2=0.25
+
+# rs1 vs rs2: common non-missing = {S1,S2,S3}, OBS_CT=3
+# gA=[0,1,2], gB=[1,1,0], r²=0.75
+query TTTRRI
+SELECT ID_A, ID_B, CHROM_A, R2, D_PRIME, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+rs1	rs2	1	0.75	0.5	3
+
+# rs1 vs rs3: common non-missing = {S1,S3}, OBS_CT=2
+# gA=[0,2], gB=[2,1], r²=1.0
+query TTRI
+SELECT ID_A, ID_B, R2, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs3');
+----
+rs1	rs3	1.0	2
+
+# rs2 vs rs3: common non-missing = {S1,S3,S4}, OBS_CT=3
+# gA=[1,0,2], gB=[2,1,0], r²=0.25
+query TTRI
+SELECT ID_A, ID_B, R2, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs2', variant2 := 'rs3');
+----
+rs2	rs3	0.25	3
+
+# --- Self-LD: r² = 1.0 ---
+
+query RI
+SELECT R2, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs1');
+----
+1.0	3
+
+query RI
+SELECT R2, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs2', variant2 := 'rs2');
+----
+1.0	4
+
+# --- Cross-chromosome pairwise LD ---
+
+# rs1 (chr1:10000) vs rs4 (chr2:15000): r² = 0.75, OBS_CT = 3
+# (pairwise mode always computes, regardless of inter_chr setting)
+query TTTTRI
+SELECT ID_A, CHROM_A, ID_B, CHROM_B, R2, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs4');
+----
+rs1	1	rs4	2	0.75	3
+
+# --- Returns exactly 1 row in pairwise mode ---
+
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+1
+
+# --- R2 bounds ---
+
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2')
+WHERE R2 < 0.0 OR R2 > 1.0;
+----
+0
+
+# --- D_PRIME bounds ---
+
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2')
+WHERE D_PRIME < 0.0 OR D_PRIME > 1.0;
+----
+0
+
+# D_PRIME for rs1 vs rs3 = 1.0
+query R
+SELECT D_PRIME FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs3');
+----
+1.0
+
+# --- Output column types ---
+
+query TTTTTTTTT
+SELECT typeof(CHROM_A), typeof(POS_A), typeof(ID_A),
+       typeof(CHROM_B), typeof(POS_B), typeof(ID_B),
+       typeof(R2), typeof(D_PRIME), typeof(OBS_CT)
+FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+VARCHAR	INTEGER	VARCHAR	VARCHAR	INTEGER	VARCHAR	DOUBLE	DOUBLE	INTEGER
+
+# --- Full output verification with positional columns ---
+
+query TITTITRRI
+SELECT CHROM_A, POS_A, ID_A, CHROM_B, POS_B, ID_B, R2, D_PRIME, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+1	10000	rs1	1	20000	rs2	0.75	0.5	3
+
+# --- Sample subsetting ---
+
+# Subsetting to SAMPLE1+SAMPLE2: rs1=[0,1], rs2=[1,1]
+# rs2 monomorphic in this subset → R2 = NULL, OBS_CT = 2
+query RRI
+SELECT R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2',
+    samples := ['SAMPLE1', 'SAMPLE2']);
+----
+NULL	NULL	2
+
+# Integer sample indices (same as SAMPLE1+SAMPLE2)
+query RRI
+SELECT R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2',
+    samples := [0, 1]);
+----
+NULL	NULL	2
+
+# --- All-missing genotypes ---
+
+# Both variants fully missing → OBS_CT = 0, R2 = NULL
+query RRI
+SELECT R2, D_PRIME, OBS_CT FROM plink_ld('test/data/all_missing.pgen',
+    variant1 := 'rs_miss1', variant2 := 'rs_miss2');
+----
+NULL	NULL	0
+
+# --- Explicit companion files ---
+
+query RI
+SELECT R2, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    pvar := 'test/data/pgen_example.pvar',
+    psam := 'test/data/pgen_example.psam',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+0.75	3
+
+# .bim companion
+query RI
+SELECT R2, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    pvar := 'test/data/pgen_example.bim',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+0.75	3
