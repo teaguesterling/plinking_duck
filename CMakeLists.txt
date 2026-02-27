@@ -91,6 +91,14 @@ set_target_properties(plink_zstd PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+# --- musl libc compatibility ---
+# rawmemchr is a GNU extension that plink-ng uses when _GNU_SOURCE is defined.
+# glibc provides it, but musl (which also defines _GNU_SOURCE) does not.
+# Detect at configure time and force-include a shim header if missing.
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+check_symbol_exists(rawmemchr "string.h" HAVE_RAWMEMCHR)
+
 # --- pgenlib (C++ library) ---
 # Read-path only — pgenlib_write.cc, plink2_bitmap.cc, plink2_fmath.cc,
 # plink2_stats.cc are intentionally excluded.
@@ -133,6 +141,11 @@ set_target_properties(pgenlib PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_STANDARD 17
 )
+if(NOT HAVE_RAWMEMCHR)
+    target_compile_options(pgenlib PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h
+    )
+endif()
 
 # --- Link pgenlib and its dependencies to extension targets ---
 # Deps are listed explicitly because pgenlib links them PRIVATE (won't propagate
