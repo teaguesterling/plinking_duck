@@ -42,26 +42,23 @@ PR #10 added read_pgen test coverage, fixed the CI zlib dependency, added a
 musl rawmemchr shim, and excluded non-Linux platforms (macOS, Windows, WASM,
 musl) from CI due to pre-existing plink-ng portability issues.
 
-### P2 — Utility Functions (In Progress)
+### P2 — Utility Functions ✓
 
 Planned by P1-006. Five functions approved after surveying plink2's full
 analytical command set. See `P1-006-research-summary` for the complete
 survey, evaluation criteria, and deferred candidates.
 
-P2-001 is complete — shared infrastructure is in place. Group B can begin.
-
 | Plan | Title | Depends On | Branch | Parallel Group | Status |
 |------|-------|-----------|--------|----------------|--------|
 | P2-001 | plink_freq (allele frequencies) | P1-003 | `feature/P2-001-plink-freq` | **A** (first — creates shared infra) | ✓ Merged (PR #12) |
-| P2-002 | plink_hardy (HWE exact test) | P2-001 | `feature/P2-002-plink-hardy` | **B** | Planned |
-| P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-002-plink-missing` | **B** | In Progress (PR #15) |
-| P2-004 | plink_ld (linkage disequilibrium) | P2-001 | `feature/P2-004-plink-ld` | **B** | Planned |
-| P2-005 | plink_score (polygenic scoring) | P2-001 | `feature/P2-005-plink-score` | **B** | Planned |
+| P2-002 | plink_hardy (HWE exact test) | P2-001 | `feature/P2-002-plink-hardy` | **B** | ✓ Merged (PR #14) |
+| P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-003-plink-missing` | **B** | ✓ Merged (PR #15) |
+| P2-004 | plink_ld (linkage disequilibrium) | P2-001 | `feature/P2-004-plink-ld` | **B** | ✓ Merged (PR #16) |
+| P2-005 | plink_score (polygenic scoring) | P2-001 | `feature/P2-005-plink-score` | **B** | ✓ Merged (PR #17) |
 
-**P2-001 complete** — shared infrastructure (AlignedBuffer, SampleSubset,
-VariantRange, companion file discovery) extracted into `plink_common.hpp/cpp`.
-`read_pgen` refactored to use shared utilities. Dosage mode deferred (no test
-data). P2-002 through P2-005 are independent and run in parallel.
+**P2 complete** — all five utility functions implemented and merged. Shared
+infrastructure (AlignedBuffer, SampleSubset, VariantRange, companion file
+discovery) in `plink_common.hpp/cpp`. Dosage mode deferred (no test data).
 
 ### P3 — Advanced Functions (Future)
 

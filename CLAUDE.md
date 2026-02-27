@@ -13,6 +13,8 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
   - `plink_freq.cpp` / `.hpp` — `plink_freq()`: per-variant allele frequencies via PgrGetCounts
   - `plink_hardy.cpp` / `.hpp` — `plink_hardy()`: per-variant HWE exact test p-values via PgrGetCounts
   - `plink_missing.cpp` / `.hpp` — `plink_missing()`: per-variant and per-sample missingness via PgrGetMissingness
+  - `plink_ld.cpp` / `.hpp` — `plink_ld()`: pairwise linkage disequilibrium (r², D, D') via PgrGet/PgrGetP
+  - `plink_score.cpp` / `.hpp` — `plink_score()`: polygenic risk scoring via PgrGetD
 - `test/sql/` — DuckDB sqllogictest files (positive + negative per reader)
 - `test/data/` — test fixtures (small VCF-derived PLINK files)
 - `docs/planning/` — design docs and implementation plans
