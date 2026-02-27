@@ -225,8 +225,8 @@ VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path, 
 // Sample parameter resolution
 // ---------------------------------------------------------------------------
 
-vector<uint32_t> ResolveSampleIndices(const Value &samples_val, uint32_t raw_sample_ct,
-                                      const SampleInfo *sample_info, const string &func_name) {
+vector<uint32_t> ResolveSampleIndices(const Value &samples_val, uint32_t raw_sample_ct, const SampleInfo *sample_info,
+                                      const string &func_name) {
 	auto &child_type = ListType::GetChildType(samples_val.type());
 	auto &children = ListValue::GetChildren(samples_val);
 

@@ -48,8 +48,7 @@ struct AlignedBuffer {
 	//! Allocate a cache-aligned buffer of the given size in bytes.
 	void Allocate(uintptr_t size) {
 		if (plink2::cachealigned_malloc(size, &ptr)) {
-			throw IOException("failed to allocate %llu bytes of aligned memory",
-			                  static_cast<unsigned long long>(size));
+			throw IOException("failed to allocate %llu bytes of aligned memory", static_cast<unsigned long long>(size));
 		}
 	}
 
@@ -116,8 +115,8 @@ VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path, 
 
 //! Resolve the `samples` named parameter into 0-based sample indices.
 //! Handles both LIST(INTEGER) and LIST(VARCHAR) dispatch.
-vector<uint32_t> ResolveSampleIndices(const Value &samples_val, uint32_t raw_sample_ct,
-                                      const SampleInfo *sample_info, const string &func_name);
+vector<uint32_t> ResolveSampleIndices(const Value &samples_val, uint32_t raw_sample_ct, const SampleInfo *sample_info,
+                                      const string &func_name);
 
 //! Sample subsetting buffers shared across all scan threads.
 //! Built once in bind, provides sample_include bitmask, interleaved vec

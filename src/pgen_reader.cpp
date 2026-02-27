@@ -210,9 +210,9 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	// --- Process samples parameter ---
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
-		bind_data->sample_indices = ResolveSampleIndices(
-		    samples_it->second, bind_data->raw_sample_ct,
-		    bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "read_pgen");
+		bind_data->sample_indices =
+		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
+		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "read_pgen");
 
 		bind_data->has_sample_subset = true;
 		bind_data->subset_sample_ct = static_cast<uint32_t>(bind_data->sample_indices.size());
