@@ -17,6 +17,7 @@ set(EXTENSION_SOURCES
     src/pfile_reader.cpp
     src/plink_common.cpp
     src/plink_freq.cpp
+    src/plink_score.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
