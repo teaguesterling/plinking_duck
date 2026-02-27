@@ -42,26 +42,26 @@ PR #10 added read_pgen test coverage, fixed the CI zlib dependency, added a
 musl rawmemchr shim, and excluded non-Linux platforms (macOS, Windows, WASM,
 musl) from CI due to pre-existing plink-ng portability issues.
 
-### P2 — Utility Functions (Ready)
+### P2 — Utility Functions (In Progress)
 
 Planned by P1-006. Five functions approved after surveying plink2's full
 analytical command set. See `P1-006-research-summary` for the complete
 survey, evaluation criteria, and deferred candidates.
 
-P1 is complete — P2 can begin.
+P2-001 is complete — shared infrastructure is in place. Group B can begin.
 
 | Plan | Title | Depends On | Branch | Parallel Group | Status |
 |------|-------|-----------|--------|----------------|--------|
-| P2-001 | plink_freq (allele frequencies) | P1-003 | `feature/P2-001-plink-freq` | **A** (first — creates shared infra) | Planned |
+| P2-001 | plink_freq (allele frequencies) | P1-003 | `feature/P2-001-plink-freq` | **A** (first — creates shared infra) | ✓ Merged (PR #12) |
 | P2-002 | plink_hardy (HWE exact test) | P2-001 | `feature/P2-002-plink-hardy` | **B** | Planned |
 | P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-003-plink-missing` | **B** | Planned |
 | P2-004 | plink_ld (linkage disequilibrium) | P2-001 | `feature/P2-004-plink-ld` | **B** | Planned |
 | P2-005 | plink_score (polygenic scoring) | P2-001 | `feature/P2-005-plink-score` | **B** | Planned |
 
-**P2-001 runs first** — it extracts shared infrastructure (RAII wrappers,
-PgenContext, sample subsetting, region filtering) from `read_pgen` into
-`plink_common.hpp/cpp`. P2-002 through P2-005 are independent and run in
-parallel after P2-001 merges.
+**P2-001 complete** — shared infrastructure (AlignedBuffer, SampleSubset,
+VariantRange, companion file discovery) extracted into `plink_common.hpp/cpp`.
+`read_pgen` refactored to use shared utilities. Dosage mode deferred (no test
+data). P2-002 through P2-005 are independent and run in parallel.
 
 ### P3 — Advanced Functions (Future)
 

@@ -9,6 +9,8 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
   - `pvar_reader.cpp` / `.hpp` — `read_pvar()`: .pvar and .bim files
   - `psam_reader.cpp` / `.hpp` — `read_psam()`: .psam and .fam files
   - `pgen_reader.cpp` / `.hpp` — `read_pgen()`: .pgen binary genotype files (uses pgenlib)
+  - `plink_common.cpp` / `.hpp` — shared P2 infrastructure: RAII wrappers, file utilities, sample subsetting, region filtering
+  - `plink_freq.cpp` / `.hpp` — `plink_freq()`: per-variant allele frequencies via PgrGetCounts
 - `test/sql/` — DuckDB sqllogictest files (positive + negative per reader)
 - `test/data/` — test fixtures (small VCF-derived PLINK files)
 - `docs/planning/` — design docs and implementation plans
@@ -26,8 +28,9 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - **Table function lifecycle**: Bind → InitGlobal → InitLocal (per-thread) → Scan
 - **Projection pushdown**: all readers support it; skip expensive work (e.g., PgrGet) when columns aren't referenced
 - **VFS integration**: use DuckDB FileSystem for all file I/O (not raw stdio)
-- **Bulk file reads**: read entire file into memory then parse (see ReadFileLines in psam_reader, pgen_reader)
+- **Bulk file reads**: read entire file into memory then parse (see ReadFileLines in plink_common)
 - **Parallel scan**: atomic batch claiming on variant index; per-thread local state
+- **Shared P2 infrastructure** (`plink_common.hpp/cpp`): AlignedBuffer RAII wrapper, VariantMetadata, SampleSubset (sample_include + interleaved_vec + cumulative_popcounts), VariantRange region filtering, companion file discovery. All P2 utility functions build on these.
 
 ## pgenlib Notes
 
@@ -36,6 +39,9 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - Buffer sizing: use `NypCtToAlignedWordCt` (not `DivUp`) for SIMD-safe genovec allocation
 - Cleanup order: CleanupPgr before CleanupPgfi
 - `GenoarrToBytesMinus9`: unpacks 2-bit genovec → int8 array (-9 = missing)
+- `PgrGetCounts()`: fast genotype counting without decompression; requires `sample_include_interleaved_vec` (built via `FillInterleavedMaskVec`)
+- `FillInterleavedMaskVec`: builds interleaved bit vector from sample_include mask; buffer must be `BitCtToAlignedWordCt`-aligned (not `DivUp`)
+- `PgrSampleSubsetIndex`: init from sample_include + cumulative_popcounts for subsetting with PgrGetCounts
 
 ## Test Data
 
