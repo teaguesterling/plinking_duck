@@ -15,6 +15,8 @@ set(EXTENSION_SOURCES
     src/psam_reader.cpp
     src/pgen_reader.cpp
     src/pfile_reader.cpp
+    src/plink_common.cpp
+    src/plink_freq.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

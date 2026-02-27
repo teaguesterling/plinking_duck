@@ -1,0 +1,97 @@
+# name: test/sql/plink_freq_negative.test
+# description: Negative and edge case tests for plink_freq table function
+# group: [sql]
+
+require plinking_duck
+
+# --- File not found ---
+
+statement error
+SELECT * FROM plink_freq('nonexistent.pgen');
+----
+plink_freq
+
+# --- Missing companion .pvar ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_no_pvar.pgen');
+----
+cannot find .pvar or .bim
+
+# --- No arguments ---
+
+statement error
+SELECT * FROM plink_freq();
+----
+
+# --- Invalid sample ID ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen',
+    samples := ['NONEXISTENT']);
+----
+not found
+
+# --- VARCHAR samples without .psam ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_orphan.pgen',
+    samples := ['SAMPLE1']);
+----
+LIST(INTEGER)
+
+# --- Out-of-range integer sample index ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', samples := [999]);
+----
+sample index
+
+# --- Empty samples list ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', samples := []::INTEGER[]);
+----
+must not be empty
+
+# --- Duplicate sample indices ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', samples := [0, 1, 0]);
+----
+duplicate sample index
+
+# --- Invalid region format ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', region := 'invalid');
+----
+region
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', region := '1:abc-def');
+----
+region
+
+# --- Mismatched variant count ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen',
+    pvar := 'test/data/mismatched_variants.pvar');
+----
+variant count mismatch
+
+# --- Mismatched sample count ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen',
+    psam := 'test/data/mismatched_samples.psam');
+----
+sample count mismatch
+
+# --- Dosage not yet implemented ---
+
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', dosage := true);
+----
+not yet implemented

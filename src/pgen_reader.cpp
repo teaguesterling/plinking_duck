@@ -1,268 +1,9 @@
 #include "pgen_reader.hpp"
-#include "pvar_reader.hpp"
-#include "psam_reader.hpp"
-
-#include "duckdb/common/file_system.hpp"
-
-#include <pgenlib_read.h>
-#include <pgenlib_ffi_support.h>
+#include "plink_common.hpp"
 
 #include <atomic>
-#include <cstring>
-#include <unordered_set>
 
 namespace duckdb {
-
-// ---------------------------------------------------------------------------
-// RAII wrappers for pgenlib resources
-// ---------------------------------------------------------------------------
-
-//! RAII wrapper for cache-aligned allocations from pgenlib.
-//! Uses plink2::aligned_free() which expects the aligned_malloc header.
-struct AlignedBuffer {
-	void *ptr = nullptr;
-
-	~AlignedBuffer() {
-		if (ptr) {
-			plink2::aligned_free(ptr);
-		}
-	}
-
-	// Non-copyable, movable
-	AlignedBuffer() = default;
-	AlignedBuffer(const AlignedBuffer &) = delete;
-	AlignedBuffer &operator=(const AlignedBuffer &) = delete;
-	AlignedBuffer(AlignedBuffer &&other) noexcept : ptr(other.ptr) {
-		other.ptr = nullptr;
-	}
-	AlignedBuffer &operator=(AlignedBuffer &&other) noexcept {
-		if (this != &other) {
-			if (ptr) {
-				plink2::aligned_free(ptr);
-			}
-			ptr = other.ptr;
-			other.ptr = nullptr;
-		}
-		return *this;
-	}
-
-	//! Allocate a cache-aligned buffer of the given size in bytes.
-	//! Throws on allocation failure.
-	void Allocate(uintptr_t size) {
-		if (plink2::cachealigned_malloc(size, &ptr)) {
-			throw IOException("read_pgen: failed to allocate %llu bytes of aligned memory",
-			                  static_cast<unsigned long long>(size));
-		}
-	}
-
-	template <typename T>
-	T *As() {
-		return static_cast<T *>(ptr);
-	}
-};
-
-// ---------------------------------------------------------------------------
-// Variant metadata loading
-// ---------------------------------------------------------------------------
-
-//! Pre-loaded variant metadata for the bind phase.
-//! One entry per variant, in file order.
-struct VariantMetadata {
-	vector<string> chroms;
-	vector<int32_t> positions;
-	vector<string> ids;
-	vector<string> refs;
-	vector<string> alts;
-	idx_t variant_ct = 0;
-};
-
-//! Read an entire file via DuckDB's VFS and split into lines.
-//! Strips \r from line endings. Same pattern as psam_reader.
-static vector<string> ReadFileLines(ClientContext &context, const string &path) {
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
-	auto file_size = handle->GetFileSize();
-
-	if (file_size == 0) {
-		return {};
-	}
-
-	string content(file_size, '\0');
-	handle->Read(const_cast<char *>(content.data()), file_size);
-
-	vector<string> lines;
-	size_t start = 0;
-	for (size_t i = 0; i < content.size(); i++) {
-		if (content[i] == '\n') {
-			size_t end = i;
-			if (end > start && content[end - 1] == '\r') {
-				end--;
-			}
-			lines.push_back(content.substr(start, end - start));
-			start = i + 1;
-		}
-	}
-	if (start < content.size()) {
-		size_t end = content.size();
-		if (end > start && content[end - 1] == '\r') {
-			end--;
-		}
-		if (end > start) {
-			lines.push_back(content.substr(start, end - start));
-		}
-	}
-
-	return lines;
-}
-
-//! Split on tabs (same as pvar_reader's SplitTabLine).
-static vector<string> SplitTabLine(const string &line) {
-	vector<string> fields;
-	size_t start = 0;
-	size_t pos = line.find('\t');
-	while (pos != string::npos) {
-		fields.push_back(line.substr(start, pos - start));
-		start = pos + 1;
-		pos = line.find('\t', start);
-	}
-	fields.push_back(line.substr(start));
-	return fields;
-}
-
-//! Split on whitespace (for .bim).
-static vector<string> SplitWhitespaceLine(const string &line) {
-	vector<string> fields;
-	size_t i = 0;
-	while (i < line.size()) {
-		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
-			i++;
-		}
-		if (i >= line.size()) {
-			break;
-		}
-		size_t start = i;
-		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
-			i++;
-		}
-		fields.push_back(line.substr(start, i - start));
-	}
-	return fields;
-}
-
-//! Load variant metadata from a .pvar or .bim file.
-//! Reads the entire file into memory (via VFS bulk read) and extracts
-//! the 5 core columns (CHROM, POS, ID, REF, ALT) needed by read_pgen.
-static VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path) {
-	// Parse header to determine format and skip lines
-	auto header_info = ParsePvarHeader(context, path);
-
-	// Find column indices for the 5 core fields in the header
-	idx_t chrom_idx = DConstants::INVALID_INDEX;
-	idx_t pos_idx = DConstants::INVALID_INDEX;
-	idx_t id_idx = DConstants::INVALID_INDEX;
-	idx_t ref_idx = DConstants::INVALID_INDEX;
-	idx_t alt_idx = DConstants::INVALID_INDEX;
-
-	for (idx_t i = 0; i < header_info.column_names.size(); i++) {
-		const auto &name = header_info.column_names[i];
-		if (name == "CHROM") {
-			chrom_idx = i;
-		} else if (name == "POS") {
-			pos_idx = i;
-		} else if (name == "ID") {
-			id_idx = i;
-		} else if (name == "REF") {
-			ref_idx = i;
-		} else if (name == "ALT") {
-			alt_idx = i;
-		}
-	}
-
-	if (chrom_idx == DConstants::INVALID_INDEX || pos_idx == DConstants::INVALID_INDEX ||
-	    id_idx == DConstants::INVALID_INDEX || ref_idx == DConstants::INVALID_INDEX ||
-	    alt_idx == DConstants::INVALID_INDEX) {
-		throw InvalidInputException("read_pgen: .pvar/.bim file '%s' is missing required columns "
-		                            "(need CHROM, POS, ID, REF, ALT)",
-		                            path);
-	}
-
-	// Read all lines from file
-	auto lines = ReadFileLines(context, path);
-
-	VariantMetadata meta;
-	for (idx_t line_idx = header_info.skip_lines; line_idx < lines.size(); line_idx++) {
-		auto &line = lines[line_idx];
-		if (line.empty()) {
-			continue;
-		}
-
-		auto fields = header_info.is_bim ? SplitWhitespaceLine(line) : SplitTabLine(line);
-
-		// .bim files have 6 columns in file order: CHROM(0) ID(1) CM(2) POS(3) ALT(4) REF(5)
-		// ParsePvarHeader normalizes column_names to output order:
-		// CHROM(0) POS(1) ID(2) REF(3) ALT(4) CM(5)
-		// We need to remap for .bim.
-		vector<string> *source = &fields;
-		vector<string> normalized;
-		if (header_info.is_bim) {
-			if (fields.size() < 6) {
-				throw InvalidInputException("read_pgen: .bim file '%s' has line with %llu fields, expected 6", path,
-				                            static_cast<unsigned long long>(fields.size()));
-			}
-			normalized = {fields[0], fields[3], fields[1], fields[5], fields[4], fields[2]};
-			source = &normalized;
-		}
-
-		auto &src = *source;
-		if (chrom_idx >= src.size() || pos_idx >= src.size() || id_idx >= src.size() || ref_idx >= src.size() ||
-		    alt_idx >= src.size()) {
-			throw InvalidInputException("read_pgen: .pvar/.bim file '%s' has line with too few fields", path);
-		}
-
-		meta.chroms.push_back(src[chrom_idx]);
-
-		// Parse POS
-		char *end;
-		errno = 0;
-		long pos_val = std::strtol(src[pos_idx].c_str(), &end, 10);
-		if (end == src[pos_idx].c_str() || *end != '\0' || errno != 0) {
-			throw InvalidInputException("read_pgen: invalid POS value '%s' in '%s'", src[pos_idx], path);
-		}
-		meta.positions.push_back(static_cast<int32_t>(pos_val));
-
-		meta.ids.push_back(src[id_idx] == "." ? "" : src[id_idx]);
-		meta.refs.push_back(src[ref_idx]);
-		meta.alts.push_back(src[alt_idx]);
-	}
-
-	meta.variant_ct = meta.chroms.size();
-	return meta;
-}
-
-// ---------------------------------------------------------------------------
-// Companion file auto-discovery
-// ---------------------------------------------------------------------------
-
-//! Replace the extension of a file path.
-static string ReplaceExtension(const string &path, const string &new_ext) {
-	auto dot = path.rfind('.');
-	if (dot == string::npos) {
-		return path + new_ext;
-	}
-	return path.substr(0, dot) + new_ext;
-}
-
-//! Try to find a companion file by replacing the .pgen extension.
-//! Returns the first existing path from candidates, or empty string if none found.
-static string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions) {
-	for (auto &ext : extensions) {
-		auto candidate = ReplaceExtension(pgen_path, ext);
-		if (fs.FileExists(candidate)) {
-			return candidate;
-		}
-	}
-	return "";
-}
 
 // ---------------------------------------------------------------------------
 // Bind data
@@ -288,7 +29,6 @@ struct PgenBindData : public TableFunctionData {
 	// Column layout for projection pushdown
 	// Fixed metadata: CHROM(0), POS(1), ID(2), REF(3), ALT(4)
 	static constexpr idx_t GENOTYPES_COL_IDX = 5;
-	// dosages and phased would be 6, 7 if enabled
 
 	// Options
 	bool include_dosages = false;
@@ -414,7 +154,6 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	                                            &header_ctrl, &pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
-		// Clean up the FILE* that PgfiInitPhase1 may have opened
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 		plink2::CleanupPgfi(&pgfi, &cleanup_err);
 		throw IOException("read_pgen: failed to open '%s': %s", bind_data->pgen_path, errstr_buf);
@@ -436,7 +175,6 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
 
 	// Clean up pgfi — we only needed it to get counts and alloc sizes.
-	// Each thread will open its own PgenReader in InitLocal.
 	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 	plink2::CleanupPgfi(&pgfi, &cleanup_err);
 
@@ -445,7 +183,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path);
+	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "read_pgen");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("read_pgen: variant count mismatch: .pgen has %u variants, "
@@ -472,53 +210,9 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	// --- Process samples parameter ---
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
-		auto &samples_val = samples_it->second;
-		auto &child_type = ListType::GetChildType(samples_val.type());
-
-		auto &children_check = ListValue::GetChildren(samples_val);
-		if (children_check.empty()) {
-			throw InvalidInputException("read_pgen: samples list must not be empty");
-		}
-
-		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
-			// Integer index mode
-			auto &children = ListValue::GetChildren(samples_val);
-			for (auto &child : children) {
-				int64_t idx = child.GetValue<int64_t>();
-				if (idx < 0 || static_cast<uint32_t>(idx) >= bind_data->raw_sample_ct) {
-					throw InvalidInputException("read_pgen: sample index %lld out of range (sample count: %u)",
-					                            static_cast<long long>(idx), bind_data->raw_sample_ct);
-				}
-				bind_data->sample_indices.push_back(static_cast<uint32_t>(idx));
-			}
-		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
-			// String IID mode — requires .psam
-			if (!bind_data->has_sample_info) {
-				throw InvalidInputException("read_pgen: samples parameter requires LIST(INTEGER) when no .psam "
-				                            "is available (no sample IDs to match against)");
-			}
-			auto &children = ListValue::GetChildren(samples_val);
-			for (auto &child : children) {
-				auto iid = child.GetValue<string>();
-				auto it = bind_data->sample_info.iid_to_idx.find(iid);
-				if (it == bind_data->sample_info.iid_to_idx.end()) {
-					throw InvalidInputException("read_pgen: sample '%s' not found in .psam", iid);
-				}
-				bind_data->sample_indices.push_back(static_cast<uint32_t>(it->second));
-			}
-		} else {
-			throw InvalidInputException("read_pgen: samples parameter must be LIST(VARCHAR) or LIST(INTEGER)");
-		}
-
-		// Validate no duplicate indices (pgenlib requires unique sample_include bits)
-		{
-			std::unordered_set<uint32_t> seen;
-			for (auto idx : bind_data->sample_indices) {
-				if (!seen.insert(idx).second) {
-					throw InvalidInputException("read_pgen: duplicate sample index %u in samples list", idx);
-				}
-			}
-		}
+		bind_data->sample_indices = ResolveSampleIndices(
+		    samples_it->second, bind_data->raw_sample_ct,
+		    bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "read_pgen");
 
 		bind_data->has_sample_subset = true;
 		bind_data->subset_sample_ct = static_cast<uint32_t>(bind_data->sample_indices.size());
@@ -571,9 +265,6 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	}
 
 	// --- Initialize per-thread PgenFileInfo + PgenReader ---
-	// Each thread gets its own PgenFileInfo (with its own FILE*) and
-	// PgenReader. The pgfi must outlive the pgr since pgr holds a reference.
-
 	plink2::PreinitPgfi(&state->pgfi);
 	plink2::PreinitPgr(&state->pgr);
 
@@ -607,7 +298,6 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 		throw IOException("read_pgen: thread init failed (phase 2): %s", errstr_buf);
 	}
 
-	// Allocate PgenReader working memory and initialize
 	if (pgr_alloc_cacheline_ct > 0) {
 		state->pgr_alloc_buf.Allocate(pgr_alloc_cacheline_ct * plink2::kCacheline);
 	}
