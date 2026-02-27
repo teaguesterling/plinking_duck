@@ -7,6 +7,9 @@ testext
 test/python/__pycache__/
 .Rhistory
 
+# mkdocs build output
+site/
+
 # Shared across worktrees via .git-worktree-shared (not tracked in git)
 .lq
 .mcp.json

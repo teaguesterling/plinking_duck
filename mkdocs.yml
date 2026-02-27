@@ -1,0 +1,59 @@
+site_name: PlinkingDuck
+site_description: DuckDB extension for reading PLINK 2 genomics file formats in SQL
+repo_url: https://github.com/teaguesterling/plinking_duck
+repo_name: teaguesterling/plinking_duck
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.expand
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - File Formats: file-formats.md
+  - Genotype Encoding: genotype-encoding.md
+  - Common Parameters: common-parameters.md
+  - Functions:
+      - Overview: functions/index.md
+      - read_pvar: functions/read_pvar.md
+      - read_psam: functions/read_psam.md
+      - read_pgen: functions/read_pgen.md
+      - read_pfile: functions/read_pfile.md
+      - plink_freq: functions/plink_freq.md
+      - plink_hardy: functions/plink_hardy.md
+      - plink_missing: functions/plink_missing.md
+      - plink_ld: functions/plink_ld.md
+      - plink_score: functions/plink_score.md
+  - Guides:
+      - Quality Control: guides/quality-control.md
+      - Performance: guides/performance.md
+  - Development: development.md
