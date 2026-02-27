@@ -1,0 +1,53 @@
+# name: test/sql/plink_missing_negative.test
+# description: Negative tests for plink_missing table function
+# group: [sql]
+
+require plinking_duck
+
+# --- File not found ---
+
+statement error
+SELECT * FROM plink_missing('nonexistent.pgen');
+----
+plink_missing
+
+# --- Invalid mode ---
+
+statement error
+SELECT * FROM plink_missing('test/data/pgen_example.pgen', mode := 'invalid');
+----
+mode must be 'variant' or 'sample'
+
+# --- No arguments ---
+
+statement error
+SELECT * FROM plink_missing();
+----
+
+# --- Sample mode without .psam ---
+
+statement error
+SELECT * FROM plink_missing('test/data/pgen_orphan.pgen', mode := 'sample');
+----
+sample mode requires
+
+# --- Unknown sample ID ---
+
+statement error
+SELECT * FROM plink_missing('test/data/pgen_example.pgen', samples := ['NONEXISTENT']);
+----
+plink_missing
+
+# --- Sample index out of range ---
+
+statement error
+SELECT * FROM plink_missing('test/data/pgen_example.pgen', samples := [999]);
+----
+plink_missing
+
+# --- Empty region returns 0 rows (not an error) ---
+
+query I
+SELECT COUNT(*) FROM plink_missing('test/data/pgen_example.pgen', region := '99:1-100');
+----
+0
