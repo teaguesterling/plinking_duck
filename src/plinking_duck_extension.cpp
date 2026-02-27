@@ -8,6 +8,7 @@
 #include "plink_freq.hpp"
 #include "plink_missing.hpp"
 #include "plink_ld.hpp"
+#include "plink_score.hpp"
 #include "duckdb.hpp"
 
 namespace duckdb {
@@ -20,6 +21,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPlinkFreq(loader);
 	RegisterPlinkMissing(loader);
 	RegisterPlinkLd(loader);
+	RegisterPlinkScore(loader);
 }
 
 std::string PlinkingDuckExtension::Name() {
