@@ -1,0 +1,340 @@
+# name: test/sql/plink_score.test
+# description: Positive tests for plink_score table function
+# group: [sql]
+
+require plinking_duck
+
+# --- Basic output structure ---
+
+# Row count matches sample count
+query I
+SELECT COUNT(*) FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0]);
+----
+4
+
+# Column types
+query TTTTTTT
+SELECT typeof(FID), typeof(IID), typeof(ALLELE_CT), typeof(DENOM),
+       typeof(NAMED_ALLELE_DOSAGE_SUM), typeof(SCORE_SUM), typeof(SCORE_AVG)
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0]) LIMIT 1;
+----
+VARCHAR	VARCHAR	INTEGER	INTEGER	DOUBLE	DOUBLE	DOUBLE
+
+# FID is NULL when .psam has #IID format (no FID column)
+query T
+SELECT FID FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0]) LIMIT 1;
+----
+NULL
+
+# --- Positional weights: hand-calculated scores with mean imputation ---
+# Genotype matrix (ALT dosage):
+#          SAMPLE1  SAMPLE2  SAMPLE3  SAMPLE4
+# rs1 (A/G):  0       1        2       missing → mean=1.0
+# rs2 (C/T):  1       1        0       2
+# rs3 (G/A):  2       missing  1       0       → mean=1.0
+# rs4 (T/C):  0       0        1       2
+# Weights: [1.0, 0.5, -0.5, 2.0]
+
+# SAMPLE1: 0*1.0 + 1*0.5 + 2*(-0.5) + 0*2.0 = -0.5
+query TRIIRR
+SELECT IID, ALLELE_CT, DENOM, NAMED_ALLELE_DOSAGE_SUM, SCORE_SUM, SCORE_AVG
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0])
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	8	8	3.0	-0.5	-0.0625
+
+# SAMPLE2: 1*1.0 + 1*0.5 + mean(1.0)*(-0.5) + 0*2.0 = 1.0
+query TRIIRR
+SELECT IID, ALLELE_CT, DENOM, NAMED_ALLELE_DOSAGE_SUM, SCORE_SUM, SCORE_AVG
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0])
+WHERE IID = 'SAMPLE2';
+----
+SAMPLE2	8	8	3.0	1.0	0.125
+
+# SAMPLE3: 2*1.0 + 0*0.5 + 1*(-0.5) + 1*2.0 = 3.5
+query TRIIRR
+SELECT IID, ALLELE_CT, DENOM, NAMED_ALLELE_DOSAGE_SUM, SCORE_SUM, SCORE_AVG
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0])
+WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	8	8	4.0	3.5	0.4375
+
+# SAMPLE4: mean(1.0)*1.0 + 2*0.5 + 0*(-0.5) + 2*2.0 = 6.0
+query TRIIRR
+SELECT IID, ALLELE_CT, DENOM, NAMED_ALLELE_DOSAGE_SUM, SCORE_SUM, SCORE_AVG
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0])
+WHERE IID = 'SAMPLE4';
+----
+SAMPLE4	8	8	5.0	6.0	0.75
+
+# --- ID-keyed weights: same computation, explicit ALT alleles ---
+
+query R
+SELECT SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+                {'id': 'rs2', 'allele': 'T', 'weight': 0.5},
+                {'id': 'rs3', 'allele': 'A', 'weight': -0.5},
+                {'id': 'rs4', 'allele': 'C', 'weight': 2.0}])
+WHERE IID = 'SAMPLE1';
+----
+-0.5
+
+# --- ID-keyed weights: REF allele triggers flip ---
+# rs1 REF=A, allele='A' → flip=true: scored_dosage = 2 - alt_dosage
+# SAMPLE1: scored = 2-0 = 2, score = 1.0 * 2 = 2.0
+# SAMPLE2: scored = 2-1 = 1, score = 1.0 * 1 = 1.0
+# SAMPLE3: scored = 2-2 = 0, score = 1.0 * 0 = 0.0
+# SAMPLE4: missing → mean_alt=1.0 → scored = 2-1 = 1, score = 1.0
+
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'A', 'weight': 1.0}])
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	2.0
+
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'A', 'weight': 1.0}])
+WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	0.0
+
+# --- ID-keyed weights: partial matching (only 2 of 4 variants) ---
+
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+                {'id': 'rs2', 'allele': 'T', 'weight': 0.5}]);
+----
+4
+
+# Only rs1+rs2 scored: SAMPLE1 = 0*1.0 + 1*0.5 = 0.5
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+                {'id': 'rs2', 'allele': 'T', 'weight': 0.5}])
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	0.5
+
+# --- ID-keyed weights: unmatched variant IDs silently skipped ---
+# SAMPLE2 has rs1 ALT dosage=1, so SCORE_SUM=1.0 confirms rs_nonexistent (weight=99) didn't contribute
+
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+                {'id': 'rs_nonexistent', 'allele': 'A', 'weight': 99.0}])
+WHERE IID = 'SAMPLE2';
+----
+SAMPLE2	1.0
+
+# --- Zero weights → all scores = 0.0, ALLELE_CT = 0 ---
+
+query TIRR
+SELECT IID, ALLELE_CT, SCORE_SUM, SCORE_AVG
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [0.0, 0.0, 0.0, 0.0])
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	0	0.0	0.0
+
+# --- Sample subsetting reduces rows ---
+
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    samples := ['SAMPLE1', 'SAMPLE3']);
+----
+2
+
+# Subsetting: SAMPLE1 score matches (no missing in subset for SAMPLE1)
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    samples := ['SAMPLE1', 'SAMPLE3'])
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	-0.5
+
+# --- Sample subsetting by index ---
+
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    samples := [0, 2]);
+----
+2
+
+# --- Weights from a variable ---
+
+statement ok
+SET VARIABLE score_w = [1.0, 0.5, -0.5, 2.0];
+
+query R
+SELECT SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := getvariable('score_w'))
+WHERE IID = 'SAMPLE1';
+----
+-0.5
+
+# --- no_mean_imputation mode ---
+# Missing genotypes are skipped, ALLELE_CT reflects only non-missing variants
+# SAMPLE2 has rs3 missing: only rs1, rs2, rs4 scored
+# SCORE_SUM = 1*1.0 + 1*0.5 + 0*2.0 = 1.5, ALLELE_CT = 6
+
+query TIRR
+SELECT IID, ALLELE_CT, SCORE_SUM, NAMED_ALLELE_DOSAGE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    no_mean_imputation := true)
+WHERE IID = 'SAMPLE2';
+----
+SAMPLE2	6	1.5	2.0
+
+# SAMPLE4 has rs1 missing: only rs2, rs3, rs4 scored
+# SCORE_SUM = 2*0.5 + 0*(-0.5) + 2*2.0 = 5.0, ALLELE_CT = 6
+query TIRR
+SELECT IID, ALLELE_CT, SCORE_SUM, NAMED_ALLELE_DOSAGE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    no_mean_imputation := true)
+WHERE IID = 'SAMPLE4';
+----
+SAMPLE4	6	5.0	4.0
+
+# SAMPLE1 has no missing genotypes: same as mean imputation
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    no_mean_imputation := true)
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	-0.5
+
+# --- All-missing genotypes → all skipped, zero scores ---
+
+query TIRR
+SELECT IID, ALLELE_CT, SCORE_SUM, SCORE_AVG
+FROM plink_score('test/data/all_missing.pgen',
+    weights := [1.0, 0.5])
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	0	0.0	0.0
+
+# --- Region filtering ---
+
+# Region '1:10000-20000' includes rs1 and rs2 only; positional weights match region variant count
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5],
+    region := '1:10000-20000');
+----
+4
+
+# SAMPLE1: rs1=0*1.0 + rs2=1*0.5 = 0.5
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5],
+    region := '1:10000-20000')
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	0.5
+
+# --- Explicit companion files ---
+
+query I
+SELECT COUNT(*) FROM plink_score('test/data/pgen_example.pgen',
+    pvar := 'test/data/pgen_example.pvar',
+    psam := 'test/data/pgen_example.psam',
+    weights := [1.0, 0.5, -0.5, 2.0]);
+----
+4
+
+# .bim companion file
+query TR
+SELECT IID, SCORE_SUM FROM plink_score('test/data/pgen_example.pgen',
+    pvar := 'test/data/pgen_example.bim',
+    weights := [1.0, 0.5, -0.5, 2.0])
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	-0.5
+
+# --- center mode: variance-standardized scoring ---
+# rs2 only (region '1:20000-20000'), no missing data, weight=1.0
+# rs2 genotypes: [1, 1, 0, 2], mean=1.0, freq=0.5, sd=sqrt(0.5)
+# SAMPLE1: (1-1)/sd = 0.0
+# SAMPLE2: (1-1)/sd = 0.0
+# SAMPLE3: (0-1)/sd = -sqrt(2) ≈ -1.414213562373095
+# SAMPLE4: (2-1)/sd =  sqrt(2) ≈  1.414213562373095
+# NAMED_ALLELE_DOSAGE_SUM is 0.0 in center mode (not tracked)
+
+query TIRR
+SELECT IID, ALLELE_CT, NAMED_ALLELE_DOSAGE_SUM, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0],
+    region := '1:20000-20000',
+    center := true)
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	2	0.0	0.0
+
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0],
+    region := '1:20000-20000',
+    center := true)
+WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	-1.414213562373095
+
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0],
+    region := '1:20000-20000',
+    center := true)
+WHERE IID = 'SAMPLE4';
+----
+SAMPLE4	1.414213562373095
+
+# Center mode with missing data: SAMPLE2 has rs3 missing, ALLELE_CT reflects
+query TI
+SELECT IID, ALLELE_CT
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    center := true)
+WHERE IID = 'SAMPLE2';
+----
+SAMPLE2	6
+
+# --- Composable with SQL filtering ---
+
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0])
+WHERE SCORE_SUM > 0;
+----
+3
