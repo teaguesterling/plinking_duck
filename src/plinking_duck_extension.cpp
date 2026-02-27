@@ -7,6 +7,7 @@
 #include "pfile_reader.hpp"
 #include "plink_freq.hpp"
 #include "plink_missing.hpp"
+#include "plink_ld.hpp"
 #include "duckdb.hpp"
 
 namespace duckdb {
@@ -18,6 +19,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPfileReader(loader);
 	RegisterPlinkFreq(loader);
 	RegisterPlinkMissing(loader);
+	RegisterPlinkLd(loader);
 }
 
 std::string PlinkingDuckExtension::Name() {
