@@ -11,6 +11,7 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
   - `pgen_reader.cpp` / `.hpp` — `read_pgen()`: .pgen binary genotype files (uses pgenlib)
   - `plink_common.cpp` / `.hpp` — shared P2 infrastructure: RAII wrappers, file utilities, sample subsetting, region filtering
   - `plink_freq.cpp` / `.hpp` — `plink_freq()`: per-variant allele frequencies via PgrGetCounts
+  - `plink_missing.cpp` / `.hpp` — `plink_missing()`: per-variant and per-sample missingness via PgrGetMissingness
 - `test/sql/` — DuckDB sqllogictest files (positive + negative per reader)
 - `test/data/` — test fixtures (small VCF-derived PLINK files)
 - `docs/planning/` — design docs and implementation plans
@@ -42,6 +43,9 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - `PgrGetCounts()`: fast genotype counting without decompression; requires `sample_include_interleaved_vec` (built via `FillInterleavedMaskVec`)
 - `FillInterleavedMaskVec`: builds interleaved bit vector from sample_include mask; buffer must be `BitCtToAlignedWordCt`-aligned (not `DivUp`)
 - `PgrSampleSubsetIndex`: init from sample_include + cumulative_popcounts for subsetting with PgrGetCounts
+- `PgrGetMissingness()`: fast missingness extraction without decompression; returns bitarray (1 = missing), needs `sample_include` + `pssi` (not `interleaved_vec`), requires caller-provided `genovec_buf` scratch buffer
+- `PopcountWords()`: count set bits in bitarray; `BitCtToWordCt(sample_ct)` for word_ct arg
+- `ctzw()`: count trailing zeros — used with `word &= word - 1` pattern to iterate set bits in missingness bitarray
 
 ## Test Data
 
