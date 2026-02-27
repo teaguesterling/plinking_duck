@@ -40,11 +40,24 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 ## Test Data
 
 - `pgen_example.*`: 4 variants × 4 samples (main pgen test dataset)
+- `pgen_example.bim`: .bim companion for pgen_example (4 variants)
 - `pgen_orphan.*`: .pgen + .pvar only, no .psam (index-only mode)
 - `all_missing.*`: 2 variants × 2 samples, all genotypes missing
+- `large_example.*`: 3000 variants × 8 samples, 3 chroms × 1000 each (multi-batch/parallel tests)
 - `example.*`: pvar/psam/bim/fam test data for P1-001/P1-002 — do not overwrite
 - `generate_test_data.sh`: regenerates pgen fixtures (needs plink2)
 - `plink2`: Binary is in `/mnt/aux-data/teague/Dev/spack/opt/spack/linux-zen3/plink2-2.0.0-a.6.9-e2l3wx22vy6tkmdwzhaexlml4rs3okx3`
+
+## CI / Platform Support
+
+- **Linux amd64 + arm64**: fully supported, build + all tests pass
+- **Excluded platforms** (pre-existing plink-ng portability issues):
+  - `linux_amd64_musl`: compiles with rawmemchr shim (`src/musl_compat.h`), but pgenlib SIMD segfaults at runtime
+  - `osx_amd64`, `osx_arm64`: linker symbol visibility issue
+  - `windows_amd64`, `windows_amd64_mingw`: MSVC can't compile plink-ng libdeflate (`__attribute__` syntax)
+  - `wasm_*`: plink-ng requires POSIX APIs (pthreads, file I/O)
+- Exclusions configured in `.github/workflows/MainDistributionPipeline.yml` via `exclude_archs`
+- `src/musl_compat.h`: inline rawmemchr for musl; force-included via CMake `check_symbol_exists`
 
 ## Conventions
 
