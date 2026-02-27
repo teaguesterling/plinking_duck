@@ -17,6 +17,7 @@ set(EXTENSION_SOURCES
     src/pfile_reader.cpp
     src/plink_common.cpp
     src/plink_freq.cpp
+    src/plink_missing.cpp
     src/plink_ld.cpp
 )
 

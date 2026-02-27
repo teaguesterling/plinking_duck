@@ -54,7 +54,7 @@ P2-001 is complete — shared infrastructure is in place. Group B can begin.
 |------|-------|-----------|--------|----------------|--------|
 | P2-001 | plink_freq (allele frequencies) | P1-003 | `feature/P2-001-plink-freq` | **A** (first — creates shared infra) | ✓ Merged (PR #12) |
 | P2-002 | plink_hardy (HWE exact test) | P2-001 | `feature/P2-002-plink-hardy` | **B** | Planned |
-| P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-003-plink-missing` | **B** | Planned |
+| P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-002-plink-missing` | **B** | In Progress (PR #15) |
 | P2-004 | plink_ld (linkage disequilibrium) | P2-001 | `feature/P2-004-plink-ld` | **B** | Planned |
 | P2-005 | plink_score (polygenic scoring) | P2-001 | `feature/P2-005-plink-score` | **B** | Planned |
 
