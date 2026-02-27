@@ -1,7 +1,8 @@
-#include "plink_freq.hpp"
+#include "plink_hardy.hpp"
 #include "plink_common.hpp"
 
 #include <atomic>
+#include <cmath>
 
 namespace duckdb {
 
@@ -9,25 +10,126 @@ namespace duckdb {
 // Column indices
 // ---------------------------------------------------------------------------
 
-// Default columns: CHROM(0) POS(1) ID(2) REF(3) ALT(4) ALT_FREQ(5) OBS_CT(6)
-// With counts := true: + HOM_REF_CT(7) HET_CT(8) HOM_ALT_CT(9) MISSING_CT(10)
+// CHROM(0) POS(1) ID(2) REF(3) ALT(4) A1(5) HOM_REF_CT(6) HET_CT(7)
+// HOM_ALT_CT(8) O_HET(9) E_HET(10) P_HWE(11)
 static constexpr idx_t COL_CHROM = 0;
 static constexpr idx_t COL_POS = 1;
 static constexpr idx_t COL_ID = 2;
 static constexpr idx_t COL_REF = 3;
 static constexpr idx_t COL_ALT = 4;
-static constexpr idx_t COL_ALT_FREQ = 5;
-static constexpr idx_t COL_OBS_CT = 6;
-static constexpr idx_t COL_HOM_REF_CT = 7;
-static constexpr idx_t COL_HET_CT = 8;
-static constexpr idx_t COL_HOM_ALT_CT = 9;
-static constexpr idx_t COL_MISSING_CT = 10;
+static constexpr idx_t COL_A1 = 5;
+static constexpr idx_t COL_HOM_REF_CT = 6;
+static constexpr idx_t COL_HET_CT = 7;
+static constexpr idx_t COL_HOM_ALT_CT = 8;
+static constexpr idx_t COL_O_HET = 9;
+static constexpr idx_t COL_E_HET = 10;
+static constexpr idx_t COL_P_HWE = 11;
+
+// ---------------------------------------------------------------------------
+// HWE exact test (Wigginton et al. 2005)
+// ---------------------------------------------------------------------------
+
+// Computes the Hardy-Weinberg equilibrium exact test p-value.
+// Algorithm: enumerate all valid heterozygote counts for fixed allele counts,
+// compute relative probabilities via a recurrence relation, then sum
+// probabilities of configurations as likely or less likely than observed.
+static double HweExactTest(int32_t obs_hom1, int32_t obs_hets, int32_t obs_hom2, bool midp) {
+	if (obs_hom1 + obs_hets + obs_hom2 == 0) {
+		return 1.0;
+	}
+
+	// Order so obs_homr <= obs_homc (rare/common homozygotes)
+	int32_t obs_homc = std::max(obs_hom1, obs_hom2);
+	int32_t obs_homr = std::min(obs_hom1, obs_hom2);
+
+	int32_t rare_copies = 2 * obs_homr + obs_hets;
+	int32_t common_copies = 2 * obs_homc + obs_hets;
+	int32_t n = obs_homc + obs_homr + obs_hets;
+
+	// het counts must have same parity as rare_copies
+	// Find the mode: expected het count under HWE
+	int32_t mid = static_cast<int32_t>(static_cast<double>(rare_copies) * common_copies / (2.0 * n));
+	// Ensure same parity as rare_copies
+	if ((mid % 2) != (rare_copies % 2)) {
+		mid++;
+	}
+
+	// Allocate probability array for valid het counts (0..rare_copies, stepping by 2)
+	// We store all entries but only use those with correct parity
+	vector<double> het_probs(rare_copies + 1, 0.0);
+	het_probs[mid] = 1.0;
+	double sum = 1.0;
+
+	// Fill upward from mid (increasing het count)
+	int32_t curr_hets = mid;
+	int32_t curr_homr = (rare_copies - mid) / 2;
+	int32_t curr_homc = (common_copies - mid) / 2;
+
+	while (curr_hets <= rare_copies - 2) {
+		// P(k+2)/P(k) = 4 * homr * homc / ((k+1) * (k+2))
+		het_probs[curr_hets + 2] = het_probs[curr_hets] * 4.0 * curr_homr * curr_homc /
+		                           ((static_cast<double>(curr_hets) + 1.0) * (static_cast<double>(curr_hets) + 2.0));
+		sum += het_probs[curr_hets + 2];
+		curr_homr--;
+		curr_homc--;
+		curr_hets += 2;
+	}
+
+	// Fill downward from mid (decreasing het count)
+	curr_hets = mid;
+	curr_homr = (rare_copies - mid) / 2;
+	curr_homc = (common_copies - mid) / 2;
+
+	while (curr_hets >= 2) {
+		// P(k-2)/P(k) = k * (k-1) / (4 * (homr+1) * (homc+1))
+		het_probs[curr_hets - 2] =
+		    het_probs[curr_hets] * static_cast<double>(curr_hets) * (static_cast<double>(curr_hets) - 1.0) /
+		    (4.0 * (static_cast<double>(curr_homr) + 1.0) * (static_cast<double>(curr_homc) + 1.0));
+		sum += het_probs[curr_hets - 2];
+		curr_homr++;
+		curr_homc++;
+		curr_hets -= 2;
+	}
+
+	// Sum probabilities of all het counts with P <= P(observed)
+	double obs_prob = het_probs[obs_hets] / sum;
+	double p_value = 0.0;
+
+	// Use a small tolerance for floating-point comparison
+	double threshold = obs_prob * (1.0 + 1e-8);
+
+	for (int32_t i = 0; i <= rare_copies; i += 2) {
+		if (het_probs[i] / sum <= threshold) {
+			p_value += het_probs[i] / sum;
+		}
+	}
+	// Also check odd values if rare_copies parity is odd
+	if (rare_copies % 2 == 1) {
+		for (int32_t i = 1; i <= rare_copies; i += 2) {
+			if (het_probs[i] / sum <= threshold) {
+				p_value += het_probs[i] / sum;
+			}
+		}
+	}
+
+	if (midp) {
+		p_value -= obs_prob * 0.5;
+	}
+
+	if (p_value < 0.0) {
+		return 0.0;
+	}
+	if (p_value > 1.0) {
+		return 1.0;
+	}
+	return p_value;
+}
 
 // ---------------------------------------------------------------------------
 // Bind data
 // ---------------------------------------------------------------------------
 
-struct PlinkFreqBindData : public TableFunctionData {
+struct PlinkHardyBindData : public TableFunctionData {
 	string pgen_path;
 	string pvar_path;
 	string psam_path;
@@ -42,25 +144,25 @@ struct PlinkFreqBindData : public TableFunctionData {
 	// Sample subsetting
 	bool has_sample_subset = false;
 	unique_ptr<SampleSubset> sample_subset;
-	uint32_t effective_sample_ct = 0; // subset_sample_ct or raw_sample_ct
+	uint32_t effective_sample_ct = 0;
 
 	// Region filtering
 	VariantRange variant_range;
 
 	// Options
-	bool include_counts = false;
+	bool midp = false;
 };
 
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
-struct PlinkFreqGlobalState : public GlobalTableFunctionState {
+struct PlinkHardyGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint32_t> next_variant_idx {0};
 	uint32_t start_variant_idx = 0;
 	uint32_t end_variant_idx = 0;
 	vector<column_t> column_ids;
-	bool need_frequencies = false; // true if any freq/count column is projected
+	bool need_genotype_counts = false;
 
 	idx_t MaxThreads() const override {
 		uint32_t range = end_variant_idx - start_variant_idx;
@@ -72,7 +174,7 @@ struct PlinkFreqGlobalState : public GlobalTableFunctionState {
 // Local state (per-thread)
 // ---------------------------------------------------------------------------
 
-struct PlinkFreqLocalState : public LocalTableFunctionState {
+struct PlinkHardyLocalState : public LocalTableFunctionState {
 	plink2::PgenFileInfo pgfi;
 	AlignedBuffer pgfi_alloc_buf;
 
@@ -83,7 +185,7 @@ struct PlinkFreqLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
-	~PlinkFreqLocalState() {
+	~PlinkHardyLocalState() {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
 			plink2::CleanupPgr(&pgr, &reterr);
@@ -96,9 +198,9 @@ struct PlinkFreqLocalState : public LocalTableFunctionState {
 // Bind
 // ---------------------------------------------------------------------------
 
-static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
-	auto bind_data = make_uniq<PlinkFreqBindData>();
+static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<PlinkHardyBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
@@ -109,12 +211,8 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 			bind_data->pvar_path = kv.second.GetValue<string>();
 		} else if (kv.first == "psam") {
 			bind_data->psam_path = kv.second.GetValue<string>();
-		} else if (kv.first == "counts") {
-			bind_data->include_counts = kv.second.GetValue<bool>();
-		} else if (kv.first == "dosage") {
-			if (kv.second.GetValue<bool>()) {
-				throw NotImplementedException("plink_freq: dosage mode is not yet implemented");
-			}
+		} else if (kv.first == "midp") {
+			bind_data->midp = kv.second.GetValue<bool>();
 		} else if (kv.first == "samples" || kv.first == "region") {
 			// Handled after pgenlib init
 		}
@@ -124,7 +222,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	if (bind_data->pvar_path.empty()) {
 		bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
 		if (bind_data->pvar_path.empty()) {
-			throw InvalidInputException("plink_freq: cannot find .pvar or .bim companion for '%s' "
+			throw InvalidInputException("plink_hardy: cannot find .pvar or .bim companion for '%s' "
 			                            "(use pvar := 'path' to specify explicitly)",
 			                            bind_data->pgen_path);
 		}
@@ -132,7 +230,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 
 	if (bind_data->psam_path.empty()) {
 		bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
-		// .psam is optional for plink_freq — frequency computation only needs sample count
+		// .psam is optional for plink_hardy — HWE only needs sample count
 	}
 
 	// --- Initialize pgenlib (Phase 1) to get counts ---
@@ -149,13 +247,13 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 		plink2::CleanupPgfi(&pgfi, &cleanup_err);
-		throw IOException("plink_freq: failed to open '%s': %s", bind_data->pgen_path, errstr_buf);
+		throw IOException("plink_hardy: failed to open '%s': %s", bind_data->pgen_path, errstr_buf);
 	}
 
 	bind_data->raw_variant_ct = pgfi.raw_variant_ct;
 	bind_data->raw_sample_ct = pgfi.raw_sample_ct;
 
-	// Phase 2 (needed to validate the file, but per-thread readers will re-init)
+	// Phase 2 (validates the file; per-thread readers will re-init)
 	AlignedBuffer pgfi_alloc;
 	if (pgfi_alloc_cacheline_ct > 0) {
 		pgfi_alloc.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
@@ -171,14 +269,14 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	plink2::CleanupPgfi(&pgfi, &cleanup_err);
 
 	if (err != plink2::kPglRetSuccess) {
-		throw IOException("plink_freq: failed to initialize '%s' (phase 2): %s", bind_data->pgen_path, errstr_buf);
+		throw IOException("plink_hardy: failed to initialize '%s' (phase 2): %s", bind_data->pgen_path, errstr_buf);
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_freq");
+	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_hardy");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
-		throw InvalidInputException("plink_freq: variant count mismatch: .pgen has %u variants, "
+		throw InvalidInputException("plink_hardy: variant count mismatch: .pgen has %u variants, "
 		                            ".pvar/.bim '%s' has %llu variants",
 		                            bind_data->raw_variant_ct, bind_data->pvar_path,
 		                            static_cast<unsigned long long>(bind_data->variants.variant_ct));
@@ -190,7 +288,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 		bind_data->has_sample_info = true;
 
 		if (static_cast<uint32_t>(bind_data->sample_info.sample_ct) != bind_data->raw_sample_ct) {
-			throw InvalidInputException("plink_freq: sample count mismatch: .pgen has %u samples, "
+			throw InvalidInputException("plink_hardy: sample count mismatch: .pgen has %u samples, "
 			                            ".psam/.fam '%s' has %llu samples",
 			                            bind_data->raw_sample_ct, bind_data->psam_path,
 			                            static_cast<unsigned long long>(bind_data->sample_info.sample_ct));
@@ -204,7 +302,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	if (samples_it != input.named_parameters.end()) {
 		auto indices =
 		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
-		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_freq");
+		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_hardy");
 
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
@@ -214,19 +312,15 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	// --- Process region parameter ---
 	auto region_it = input.named_parameters.find("region");
 	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_freq");
+		bind_data->variant_range =
+		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_hardy");
 	}
 
 	// --- Register output columns ---
-	names = {"CHROM", "POS", "ID", "REF", "ALT", "ALT_FREQ", "OBS_CT"};
+	names = {"CHROM", "POS", "ID", "REF", "ALT", "A1", "HOM_REF_CT", "HET_CT", "HOM_ALT_CT", "O_HET", "E_HET", "P_HWE"};
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER};
-
-	if (bind_data->include_counts) {
-		names.insert(names.end(), {"HOM_REF_CT", "HET_CT", "HOM_ALT_CT", "MISSING_CT"});
-		return_types.insert(return_types.end(),
-		                    {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER});
-	}
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::INTEGER, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE};
 
 	return std::move(bind_data);
 }
@@ -235,9 +329,10 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 // Init global
 // ---------------------------------------------------------------------------
 
-static unique_ptr<GlobalTableFunctionState> PlinkFreqInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->Cast<PlinkFreqBindData>();
-	auto state = make_uniq<PlinkFreqGlobalState>();
+static unique_ptr<GlobalTableFunctionState> PlinkHardyInitGlobal(ClientContext &context,
+                                                                 TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<PlinkHardyBindData>();
+	auto state = make_uniq<PlinkHardyGlobalState>();
 
 	if (bind_data.variant_range.has_filter) {
 		state->start_variant_idx = bind_data.variant_range.start_idx;
@@ -250,11 +345,11 @@ static unique_ptr<GlobalTableFunctionState> PlinkFreqInitGlobal(ClientContext &c
 	state->next_variant_idx.store(state->start_variant_idx);
 	state->column_ids = input.column_ids;
 
-	// Check if any frequency/count columns are projected
-	state->need_frequencies = false;
+	// Check if any genotype-dependent columns are projected
+	state->need_genotype_counts = false;
 	for (auto col_id : input.column_ids) {
-		if (col_id != COLUMN_IDENTIFIER_ROW_ID && col_id >= COL_ALT_FREQ && col_id <= COL_MISSING_CT) {
-			state->need_frequencies = true;
+		if (col_id != COLUMN_IDENTIFIER_ROW_ID && col_id >= COL_HOM_REF_CT) {
+			state->need_genotype_counts = true;
 			break;
 		}
 	}
@@ -266,13 +361,13 @@ static unique_ptr<GlobalTableFunctionState> PlinkFreqInitGlobal(ClientContext &c
 // Init local (per-thread PgenReader)
 // ---------------------------------------------------------------------------
 
-static unique_ptr<LocalTableFunctionState> PlinkFreqInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
-                                                              GlobalTableFunctionState *global_state) {
-	auto &bind_data = input.bind_data->Cast<PlinkFreqBindData>();
-	auto &gstate = global_state->Cast<PlinkFreqGlobalState>();
-	auto state = make_uniq<PlinkFreqLocalState>();
+static unique_ptr<LocalTableFunctionState> PlinkHardyInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                               GlobalTableFunctionState *global_state) {
+	auto &bind_data = input.bind_data->Cast<PlinkHardyBindData>();
+	auto &gstate = global_state->Cast<PlinkHardyGlobalState>();
+	auto state = make_uniq<PlinkHardyLocalState>();
 
-	if (!gstate.need_frequencies) {
+	if (!gstate.need_genotype_counts) {
 		return std::move(state);
 	}
 
@@ -291,7 +386,7 @@ static unique_ptr<LocalTableFunctionState> PlinkFreqInitLocal(ExecutionContext &
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 		plink2::CleanupPgfi(&state->pgfi, &cleanup_err);
-		throw IOException("plink_freq: thread init failed (phase 1): %s", errstr_buf);
+		throw IOException("plink_hardy: thread init failed (phase 1): %s", errstr_buf);
 	}
 
 	if (pgfi_alloc_cacheline_ct > 0) {
@@ -307,7 +402,7 @@ static unique_ptr<LocalTableFunctionState> PlinkFreqInitLocal(ExecutionContext &
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 		plink2::CleanupPgfi(&state->pgfi, &cleanup_err);
-		throw IOException("plink_freq: thread init failed (phase 2): %s", errstr_buf);
+		throw IOException("plink_hardy: thread init failed (phase 2): %s", errstr_buf);
 	}
 
 	if (pgr_alloc_cacheline_ct > 0) {
@@ -322,7 +417,7 @@ static unique_ptr<LocalTableFunctionState> PlinkFreqInitLocal(ExecutionContext &
 		plink2::CleanupPgr(&state->pgr, &cleanup_err);
 		cleanup_err = plink2::kPglRetSuccess;
 		plink2::CleanupPgfi(&state->pgfi, &cleanup_err);
-		throw IOException("plink_freq: PgrInit failed for '%s'", bind_data.pgen_path);
+		throw IOException("plink_hardy: PgrInit failed for '%s'", bind_data.pgen_path);
 	}
 
 	// Set up sample subsetting
@@ -340,12 +435,12 @@ static unique_ptr<LocalTableFunctionState> PlinkFreqInitLocal(ExecutionContext &
 // Scan function
 // ---------------------------------------------------------------------------
 
-static constexpr uint32_t FREQ_BATCH_SIZE = 128;
+static constexpr uint32_t HARDY_BATCH_SIZE = 128;
 
-static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<PlinkFreqBindData>();
-	auto &gstate = data_p.global_state->Cast<PlinkFreqGlobalState>();
-	auto &lstate = data_p.local_state->Cast<PlinkFreqLocalState>();
+static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<PlinkHardyBindData>();
+	auto &gstate = data_p.global_state->Cast<PlinkHardyGlobalState>();
+	auto &lstate = data_p.local_state->Cast<PlinkHardyLocalState>();
 
 	auto &column_ids = gstate.column_ids;
 	uint32_t end_idx = gstate.end_variant_idx;
@@ -363,7 +458,7 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 	while (rows_emitted < STANDARD_VECTOR_SIZE) {
 		uint32_t remaining_capacity = static_cast<uint32_t>(STANDARD_VECTOR_SIZE - rows_emitted);
-		uint32_t claim_size = std::min(FREQ_BATCH_SIZE, remaining_capacity);
+		uint32_t claim_size = std::min(HARDY_BATCH_SIZE, remaining_capacity);
 		uint32_t batch_start = gstate.next_variant_idx.fetch_add(claim_size);
 		if (batch_start >= end_idx) {
 			break;
@@ -376,27 +471,37 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			genocounts[0] = genocounts[1] = genocounts[2] = genocounts[3] = 0;
 
-			if (gstate.need_frequencies && lstate.initialized) {
+			if (gstate.need_genotype_counts && lstate.initialized) {
 				plink2::PglErr err = plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,
 				                                          &lstate.pgr, genocounts);
 
 				if (err != plink2::kPglRetSuccess) {
-					throw IOException("plink_freq: PgrGetCounts failed for variant %u", vidx);
+					throw IOException("plink_hardy: PgrGetCounts failed for variant %u", vidx);
 				}
 			}
 
 			// Compute derived values
-			uint32_t obs_sample_ct = genocounts[0] + genocounts[1] + genocounts[2];
-			uint32_t obs_ct = 2 * obs_sample_ct; // allele observations
-			double alt_freq;
-			bool freq_is_null = false;
+			uint32_t hom_ref = genocounts[0];
+			uint32_t het = genocounts[1];
+			uint32_t hom_alt = genocounts[2];
+			uint32_t obs = hom_ref + het + hom_alt;
 
-			if (obs_sample_ct == 0) {
-				freq_is_null = true;
-				alt_freq = 0.0;
+			double o_het;
+			double e_het;
+			double p_hwe;
+			bool stats_are_null = (obs == 0);
+
+			if (stats_are_null) {
+				o_het = 0.0;
+				e_het = 0.0;
+				p_hwe = 1.0;
 			} else {
-				alt_freq = (static_cast<double>(genocounts[1]) + 2.0 * static_cast<double>(genocounts[2])) /
-				           (2.0 * static_cast<double>(obs_sample_ct));
+				o_het = static_cast<double>(het) / static_cast<double>(obs);
+				double p = (2.0 * hom_ref + het) / (2.0 * obs);
+				double q = 1.0 - p;
+				e_het = 2.0 * p * q;
+				p_hwe = HweExactTest(static_cast<int32_t>(hom_ref), static_cast<int32_t>(het),
+				                     static_cast<int32_t>(hom_alt), bind_data.midp);
 			}
 
 			// Fill projected columns
@@ -441,32 +546,50 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					}
 					break;
 				}
-				case COL_ALT_FREQ: {
-					if (freq_is_null) {
+				case COL_A1: {
+					// A1 = tested allele (alternate)
+					auto &val = bind_data.variants.alts[vidx];
+					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = alt_freq;
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
-				case COL_OBS_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
-					break;
-				}
 				case COL_HOM_REF_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[0]);
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(hom_ref);
 					break;
 				}
 				case COL_HET_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[1]);
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(het);
 					break;
 				}
 				case COL_HOM_ALT_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[2]);
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(hom_alt);
 					break;
 				}
-				case COL_MISSING_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[3]);
+				case COL_O_HET: {
+					if (stats_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<double>(vec)[rows_emitted] = o_het;
+					}
+					break;
+				}
+				case COL_E_HET: {
+					if (stats_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<double>(vec)[rows_emitted] = e_het;
+					}
+					break;
+				}
+				case COL_P_HWE: {
+					if (stats_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<double>(vec)[rows_emitted] = p_hwe;
+					}
 					break;
 				}
 				default:
@@ -485,20 +608,19 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 // Registration
 // ---------------------------------------------------------------------------
 
-void RegisterPlinkFreq(ExtensionLoader &loader) {
-	TableFunction plink_freq("plink_freq", {LogicalType::VARCHAR}, PlinkFreqScan, PlinkFreqBind, PlinkFreqInitGlobal,
-	                         PlinkFreqInitLocal);
+void RegisterPlinkHardy(ExtensionLoader &loader) {
+	TableFunction plink_hardy("plink_hardy", {LogicalType::VARCHAR}, PlinkHardyScan, PlinkHardyBind,
+	                          PlinkHardyInitGlobal, PlinkHardyInitLocal);
 
-	plink_freq.projection_pushdown = true;
+	plink_hardy.projection_pushdown = true;
 
-	plink_freq.named_parameters["pvar"] = LogicalType::VARCHAR;
-	plink_freq.named_parameters["psam"] = LogicalType::VARCHAR;
-	plink_freq.named_parameters["samples"] = LogicalType::ANY;
-	plink_freq.named_parameters["region"] = LogicalType::VARCHAR;
-	plink_freq.named_parameters["counts"] = LogicalType::BOOLEAN;
-	plink_freq.named_parameters["dosage"] = LogicalType::BOOLEAN;
+	plink_hardy.named_parameters["pvar"] = LogicalType::VARCHAR;
+	plink_hardy.named_parameters["psam"] = LogicalType::VARCHAR;
+	plink_hardy.named_parameters["samples"] = LogicalType::ANY;
+	plink_hardy.named_parameters["region"] = LogicalType::VARCHAR;
+	plink_hardy.named_parameters["midp"] = LogicalType::BOOLEAN;
 
-	loader.RegisterFunction(plink_freq);
+	loader.RegisterFunction(plink_hardy);
 }
 
 } // namespace duckdb
