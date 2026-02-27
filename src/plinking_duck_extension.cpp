@@ -5,6 +5,7 @@
 #include "psam_reader.hpp"
 #include "pgen_reader.hpp"
 #include "pfile_reader.hpp"
+#include "plink_freq.hpp"
 #include "duckdb.hpp"
 
 namespace duckdb {
@@ -14,6 +15,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPsamReader(loader);
 	RegisterPgenReader(loader);
 	RegisterPfileReader(loader);
+	RegisterPlinkFreq(loader);
 }
 
 std::string PlinkingDuckExtension::Name() {
