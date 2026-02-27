@@ -11,40 +11,52 @@ Reference: `P0-001-core-extension-connectivity` (master technical spec)
 
 ## Phase Map
 
-### P0 — Build Infrastructure (Sequential)
+### P0 — Build Infrastructure (Sequential) ✓
 
-| Plan | Title | Depends On | Branch |
-|------|-------|-----------|--------|
-| P0-001 | Master Technical Spec | — | (reference only) |
-| P0-002 | Template Cleanup | — | `feature/P0-002-template-cleanup` |
-| P0-003 | duckhts Lessons & Patterns | — | (reference only) |
-| P0-004 | pgenlib Build Integration | P0-002 | `feature/P0-004-pgenlib-build` |
-| P0-005 | Build Validation | P0-004 | `feature/P0-005-build-validation` |
+| Plan | Title | Depends On | Branch | Status |
+|------|-------|-----------|--------|--------|
+| P0-001 | Master Technical Spec | — | (reference only) | ✓ Done |
+| P0-002 | Template Cleanup | — | `feature/P0-002-template-cleanup` | ✓ Merged |
+| P0-003 | duckhts Lessons & Patterns | — | (reference only) | ✓ Done |
+| P0-004 | pgenlib Build Integration | P0-002 | `feature/P0-004-pgenlib-build` | ✓ Merged |
+| P0-005 | Build Validation | P0-004 | `feature/P0-005-build-validation` | ✓ Merged |
 
-### P1 — Reader Functions
+### P1 — Reader Functions ✓
 
-| Plan | Title | Depends On | Branch | Parallel Group |
-|------|-------|-----------|--------|----------------|
-| P1-001 | read_pvar | P0-005 | `feature/P1-001-read-pvar` | **A** |
-| P1-002 | read_psam | P0-005 | `feature/P1-002-read-psam` | **A** |
-| P1-003 | read_pgen | P1-001 + P1-002 | `feature/P1-003-read-pgen` | B |
-| P1-004 | read_pfile | P1-003 | `feature/P1-004-read-pfile` | C |
-| P1-005 | Integration & Documentation | P1-004 | `feature/P1-005-integration` | — |
-| P1-006 | P2 Utility Function Planning | — (plans only) | `feature/P1-006-p2-planning` | **A** (parallel with all P1) |
+| Plan | Title | Depends On | Branch | Parallel Group | Status |
+|------|-------|-----------|--------|----------------|--------|
+| P1-001 | read_pvar | P0-005 | `feature/P1-001-read-pvar` | **A** | ✓ Merged (PR #4) |
+| P1-002 | read_psam | P0-005 | `feature/P1-002-read-psam` | **A** | ✓ Merged (PR #5) |
+| P1-003 | read_pgen | P1-001 + P1-002 | `feature/P1-003-read-pgen` | B | ✓ Merged (PR #6) |
+| P1-004 | read_pfile | P1-003 | `feature/P1-004-read-pfile` | C | ✓ Merged (PR #8) |
+| P1-005 | Integration & Documentation | P1-004 | `feature/P1-005-integration` | — | ✓ Merged (PR #9) |
+| P1-006 | P2 Utility Function Planning | — (plans only) | `feature/P1-006-p2-planning` | **A** (parallel with all P1) | ✓ Done (PR #3) |
 
-### P2 — Utility Functions
+#### P1 Follow-up
+
+| Issue | Title | Branch | Status |
+|-------|-------|--------|--------|
+| #7 | Test coverage gaps & CI fixes | `issue/7-P1-003-test-coverage-gaps-and-ci` | ✓ Merged (PR #10) |
+
+PR #10 added read_pgen test coverage, fixed the CI zlib dependency, added a
+musl rawmemchr shim, and excluded non-Linux platforms (macOS, Windows, WASM,
+musl) from CI due to pre-existing plink-ng portability issues.
+
+### P2 — Utility Functions (Ready)
 
 Planned by P1-006. Five functions approved after surveying plink2's full
 analytical command set. See `P1-006-research-summary` for the complete
 survey, evaluation criteria, and deferred candidates.
 
-| Plan | Title | Depends On | Branch | Parallel Group |
-|------|-------|-----------|--------|----------------|
-| P2-001 | plink_freq (allele frequencies) | P1-003 | `feature/P2-001-plink-freq` | **A** (first — creates shared infra) |
-| P2-002 | plink_hardy (HWE exact test) | P2-001 | `feature/P2-002-plink-hardy` | **B** |
-| P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-003-plink-missing` | **B** |
-| P2-004 | plink_ld (linkage disequilibrium) | P2-001 | `feature/P2-004-plink-ld` | **B** |
-| P2-005 | plink_score (polygenic scoring) | P2-001 | `feature/P2-005-plink-score` | **B** |
+P1 is complete — P2 can begin.
+
+| Plan | Title | Depends On | Branch | Parallel Group | Status |
+|------|-------|-----------|--------|----------------|--------|
+| P2-001 | plink_freq (allele frequencies) | P1-003 | `feature/P2-001-plink-freq` | **A** (first — creates shared infra) | Planned |
+| P2-002 | plink_hardy (HWE exact test) | P2-001 | `feature/P2-002-plink-hardy` | **B** | Planned |
+| P2-003 | plink_missing (missingness rates) | P2-001 | `feature/P2-003-plink-missing` | **B** | Planned |
+| P2-004 | plink_ld (linkage disequilibrium) | P2-001 | `feature/P2-004-plink-ld` | **B** | Planned |
+| P2-005 | plink_score (polygenic scoring) | P2-001 | `feature/P2-005-plink-score` | **B** | Planned |
 
 **P2-001 runs first** — it extracts shared infrastructure (RAII wrappers,
 PgenContext, sample subsetting, region filtering) from `read_pgen` into
