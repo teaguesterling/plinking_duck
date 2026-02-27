@@ -438,16 +438,29 @@ SELECT * FROM plink_freq('data/example.pgen', region := '22:1-50000000');
 
 ## Acceptance Criteria
 
-1. [ ] `plink_freq('file.pgen')` returns correct allele frequencies for known test data
-2. [ ] Frequencies match hand-calculated values from the test VCF
-3. [ ] Auto-discovery of .pvar and .psam works
-4. [ ] Named parameters `pvar` and `psam` override auto-discovery
-5. [ ] `counts := true` adds HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT columns
-6. [ ] `samples` parameter correctly subsets and recalculates frequencies
-7. [ ] `region` parameter filters to variants in the specified range
-8. [ ] Empty region returns 0 rows
-9. [ ] Shared utilities extracted to `plink_common.hpp/cpp`
-10. [ ] `read_pgen` refactored to use shared utilities (existing tests pass)
-11. [ ] All positive and negative tests pass
-12. [ ] `make test` passes
-13. [ ] README updated
+1. [x] `plink_freq('file.pgen')` returns correct allele frequencies for known test data
+2. [x] Frequencies match hand-calculated values from the test VCF
+3. [x] Auto-discovery of .pvar and .psam works
+4. [x] Named parameters `pvar` and `psam` override auto-discovery
+5. [x] `counts := true` adds HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT columns
+6. [x] `samples` parameter correctly subsets and recalculates frequencies
+7. [x] `region` parameter filters to variants in the specified range
+8. [x] Empty region returns 0 rows
+9. [x] Shared utilities extracted to `plink_common.hpp/cpp`
+10. [x] `read_pgen` refactored to use shared utilities (existing tests pass)
+11. [x] All positive and negative tests pass
+12. [x] `make test` passes (877 assertions, 14 test cases)
+13. [ ] README updated (deferred — no README exists yet)
+
+## Implementation Notes
+
+- **Dosage mode deferred**: `dosage := true` parameter is registered but throws
+  `NotImplementedException`. No test data with dosage information is available.
+  Will be implemented when dosage test fixtures are created.
+- **Projection pushdown**: frequency columns are only computed when projected.
+  Guard against `COLUMN_IDENTIFIER_ROW_ID` (UINT64_MAX) in column ID checks.
+- **LoadVariantMetadata**: reads file once via ReadFileLines and parses header
+  inline from in-memory lines (avoids double file read).
+- **samples parameter**: uses `LogicalType::ANY` to support both LIST(VARCHAR)
+  and LIST(INTEGER) dispatch.
+- **Merged**: PR #12, 2026-02-26
