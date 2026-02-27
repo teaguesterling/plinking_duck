@@ -2,7 +2,6 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
-#include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
 #include <pgenlib_read.h>

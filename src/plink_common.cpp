@@ -102,7 +102,47 @@ string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<s
 // ---------------------------------------------------------------------------
 
 VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path, const string &func_name) {
-	auto header_info = ParsePvarHeader(context, path);
+	// Read the file once into memory, then parse header and data from the
+	// in-memory lines. Avoids the double-read that would occur if we called
+	// ParsePvarHeader (which opens the file separately) before ReadFileLines.
+	auto lines = ReadFileLines(context, path);
+
+	if (lines.empty()) {
+		throw InvalidInputException("%s: .pvar/.bim file '%s' is empty", func_name, path);
+	}
+
+	// Detect format and parse header from in-memory lines
+	idx_t skip_lines = 0;
+	bool is_bim = false;
+	vector<string> column_names;
+
+	// Skip ## comment/meta lines
+	while (skip_lines < lines.size()) {
+		auto &line = lines[skip_lines];
+		if (line.empty() || (line.size() >= 2 && line[0] == '#' && line[1] == '#')) {
+			skip_lines++;
+			continue;
+		}
+		break;
+	}
+
+	if (skip_lines >= lines.size()) {
+		throw InvalidInputException("%s: .pvar/.bim file '%s' contains no header or data", func_name, path);
+	}
+
+	auto &header_line = lines[skip_lines];
+	if (header_line.size() >= 6 && header_line.substr(0, 6) == "#CHROM") {
+		// .pvar format: parse column names from the #CHROM header line
+		is_bim = false;
+		auto fields = SplitTabLine(header_line.substr(1)); // strip leading '#'
+		column_names = std::move(fields);
+		skip_lines++; // skip the header line
+	} else {
+		// Legacy .bim format: fixed 6-column schema, no header to skip
+		// Normalized order: CHROM, POS, ID, REF, ALT, CM
+		is_bim = true;
+		column_names = {"CHROM", "POS", "ID", "REF", "ALT", "CM"};
+	}
 
 	// Find column indices for the 5 core fields
 	idx_t chrom_idx = DConstants::INVALID_INDEX;
@@ -111,8 +151,8 @@ VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path, 
 	idx_t ref_idx = DConstants::INVALID_INDEX;
 	idx_t alt_idx = DConstants::INVALID_INDEX;
 
-	for (idx_t i = 0; i < header_info.column_names.size(); i++) {
-		const auto &name = header_info.column_names[i];
+	for (idx_t i = 0; i < column_names.size(); i++) {
+		const auto &name = column_names[i];
 		if (name == "CHROM") {
 			chrom_idx = i;
 		} else if (name == "POS") {
@@ -134,22 +174,20 @@ VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path, 
 		                            func_name, path);
 	}
 
-	auto lines = ReadFileLines(context, path);
-
 	VariantMetadata meta;
-	for (idx_t line_idx = header_info.skip_lines; line_idx < lines.size(); line_idx++) {
+	for (idx_t line_idx = skip_lines; line_idx < lines.size(); line_idx++) {
 		auto &line = lines[line_idx];
 		if (line.empty()) {
 			continue;
 		}
 
-		auto fields = header_info.is_bim ? SplitWhitespaceLine(line) : SplitTabLine(line);
+		auto fields = is_bim ? SplitWhitespaceLine(line) : SplitTabLine(line);
 
 		// .bim files: CHROM(0) ID(1) CM(2) POS(3) ALT(4) REF(5)
 		// Normalize to: CHROM(0) POS(1) ID(2) REF(3) ALT(4) CM(5)
 		vector<string> *source = &fields;
 		vector<string> normalized;
-		if (header_info.is_bim) {
+		if (is_bim) {
 			if (fields.size() < 6) {
 				throw InvalidInputException("%s: .bim file '%s' has line with %llu fields, expected 6", func_name, path,
 				                            static_cast<unsigned long long>(fields.size()));

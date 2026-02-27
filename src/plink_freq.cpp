@@ -255,7 +255,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkFreqInitGlobal(ClientContext &c
 	// Check if any frequency/count columns are projected
 	state->need_frequencies = false;
 	for (auto col_id : input.column_ids) {
-		if (col_id >= COL_ALT_FREQ) {
+		if (col_id != COLUMN_IDENTIFIER_ROW_ID && col_id >= COL_ALT_FREQ && col_id <= COL_MISSING_CT) {
 			state->need_frequencies = true;
 			break;
 		}
