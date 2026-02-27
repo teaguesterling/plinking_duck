@@ -126,7 +126,7 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PlinkScoreBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -178,8 +178,7 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 	plink2::PgenHeaderCtrl header_ctrl;
 	uintptr_t pgfi_alloc_cacheline_ct = 0;
 
-	plink2::PglErr err = plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr,
-	                                            UINT32_MAX, UINT32_MAX,
+	plink2::PglErr err = plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX,
 	                                            &header_ctrl, &pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
@@ -235,9 +234,8 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
-		auto indices = ResolveSampleIndices(
-		    samples_it->second, bind_data->raw_sample_ct,
-		    &bind_data->sample_info, "plink_score");
+		auto indices =
+		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &bind_data->sample_info, "plink_score");
 
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
@@ -258,7 +256,8 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 	// --- Process region parameter ---
 	auto region_it = input.named_parameters.find("region");
 	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_score");
+		bind_data->variant_range =
+		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_score");
 	}
 
 	// --- Process weights parameter ---
@@ -272,7 +271,8 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 
 	// Determine variant range for positional mode
 	uint32_t range_start = bind_data->variant_range.has_filter ? bind_data->variant_range.start_idx : 0;
-	uint32_t range_end = bind_data->variant_range.has_filter ? bind_data->variant_range.end_idx : bind_data->raw_variant_ct;
+	uint32_t range_end =
+	    bind_data->variant_range.has_filter ? bind_data->variant_range.end_idx : bind_data->raw_variant_ct;
 	uint32_t variant_count = range_end - range_start;
 
 	if (weights_type.id() == LogicalTypeId::LIST) {
@@ -350,9 +350,7 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 
 			// Sort by variant index for sequential .pgen access
 			std::sort(bind_data->scored_variants.begin(), bind_data->scored_variants.end(),
-			          [](const ScoredVariant &a, const ScoredVariant &b) {
-				          return a.variant_idx < b.variant_idx;
-			          });
+			          [](const ScoredVariant &a, const ScoredVariant &b) { return a.variant_idx < b.variant_idx; });
 
 		} else {
 			// --- Positional mode: LIST(numeric) ---
@@ -375,9 +373,8 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 
 	// --- Register output columns ---
 	names = {"FID", "IID", "ALLELE_CT", "DENOM", "NAMED_ALLELE_DOSAGE_SUM", "SCORE_SUM", "SCORE_AVG"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::INTEGER, LogicalType::INTEGER,
-	                LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE};
 
 	return std::move(bind_data);
 }
@@ -387,7 +384,7 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 // ---------------------------------------------------------------------------
 
 static unique_ptr<GlobalTableFunctionState> PlinkScoreInitGlobal(ClientContext &context,
-                                                                  TableFunctionInitInput &input) {
+                                                                 TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PlinkScoreBindData>();
 	auto state = make_uniq<PlinkScoreGlobalState>();
 
@@ -406,9 +403,8 @@ static unique_ptr<GlobalTableFunctionState> PlinkScoreInitGlobal(ClientContext &
 // Init local (per-thread PgenReader)
 // ---------------------------------------------------------------------------
 
-static unique_ptr<LocalTableFunctionState> PlinkScoreInitLocal(ExecutionContext &context,
-                                                                TableFunctionInitInput &input,
-                                                                GlobalTableFunctionState *global_state) {
+static unique_ptr<LocalTableFunctionState> PlinkScoreInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                               GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PlinkScoreBindData>();
 	auto state = make_uniq<PlinkScoreLocalState>();
 
@@ -513,9 +509,8 @@ static void PerformScoring(const PlinkScoreBindData &bind_data, PlinkScoreGlobal
 	for (auto &sv : bind_data.scored_variants) {
 		uint32_t dosage_ct = 0;
 
-		plink2::PglErr err = plink2::PgrGetD(sample_include, lstate.pssi, sample_ct,
-		                                      sv.variant_idx, &lstate.pgr,
-		                                      genovec, dosage_present, dosage_main, &dosage_ct);
+		plink2::PglErr err = plink2::PgrGetD(sample_include, lstate.pssi, sample_ct, sv.variant_idx, &lstate.pgr,
+		                                     genovec, dosage_present, dosage_main, &dosage_ct);
 
 		if (err != plink2::kPglRetSuccess) {
 			throw IOException("plink_score: PgrGetD failed for variant %u", sv.variant_idx);
@@ -523,8 +518,7 @@ static void PerformScoring(const PlinkScoreBindData &bind_data, PlinkScoreGlobal
 
 		// Always use Dosage16ToDoublesMinus9 to get raw dosages with -9 sentinel.
 		// This gives us full control over missing-data handling across all modes.
-		plink2::Dosage16ToDoublesMinus9(genovec, dosage_present, dosage_main,
-		                                 sample_ct, dosage_ct, dosage_doubles);
+		plink2::Dosage16ToDoublesMinus9(genovec, dosage_present, dosage_main, sample_ct, dosage_ct, dosage_doubles);
 
 		// Count non-missing samples and compute sum for mean imputation / centering
 		double sum_alt = 0.0;

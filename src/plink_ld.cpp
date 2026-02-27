@@ -45,8 +45,7 @@ static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *geno
 		uintptr_t word_b = genovec_b[widx];
 
 		uint32_t samples_remaining = sample_ct - widx * plink2::kBitsPerWordD2;
-		uint32_t samples_in_word =
-		    std::min(samples_remaining, static_cast<uint32_t>(plink2::kBitsPerWordD2));
+		uint32_t samples_in_word = std::min(samples_remaining, static_cast<uint32_t>(plink2::kBitsPerWordD2));
 
 		for (uint32_t sidx = 0; sidx < samples_in_word; sidx++) {
 			uint32_t geno_a = word_a & 3;
@@ -218,7 +217,7 @@ struct PlinkLdLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PlinkLdBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -345,9 +344,8 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
-		auto indices = ResolveSampleIndices(
-		    samples_it->second, bind_data->raw_sample_ct,
-		    bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_ld");
+		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
+		                                    bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_ld");
 
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
@@ -424,7 +422,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkLdInitGlobal(ClientContext &con
 // ---------------------------------------------------------------------------
 
 static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
-                                                             GlobalTableFunctionState *global_state) {
+                                                            GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PlinkLdBindData>();
 	auto state = make_uniq<PlinkLdLocalState>();
 
@@ -620,8 +618,8 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 				bool same_chrom = (variants.chroms[j] == variants.chroms[ai]);
 
 				if (same_chrom) {
-					int64_t dist = static_cast<int64_t>(variants.positions[j]) -
-					               static_cast<int64_t>(variants.positions[ai]);
+					int64_t dist =
+					    static_cast<int64_t>(variants.positions[j]) - static_cast<int64_t>(variants.positions[ai]);
 					if (dist > bind_data.window_bp) {
 						if (!bind_data.inter_chr) {
 							break; // Past window, no cross-chrom needed

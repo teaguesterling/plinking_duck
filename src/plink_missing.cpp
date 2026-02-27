@@ -127,7 +127,7 @@ struct PlinkMissingLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PlinkMissingBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -240,9 +240,9 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
-		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
-		                                    bind_data->has_sample_info ? &bind_data->sample_info : nullptr,
-		                                    "plink_missing");
+		auto indices =
+		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
+		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_missing");
 
 		// Store sorted indices for sample mode output mapping
 		bind_data->subset_original_indices = indices;
@@ -267,8 +267,8 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 		                LogicalType::DOUBLE};
 	} else {
 		names = {"CHROM", "POS", "ID", "REF", "ALT", "MISSING_CT", "OBS_CT", "F_MISS"};
-		return_types = {LogicalType::VARCHAR,  LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
-		                LogicalType::VARCHAR,  LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::DOUBLE};
+		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::DOUBLE};
 	}
 
 	return std::move(bind_data);
@@ -279,7 +279,7 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 // ---------------------------------------------------------------------------
 
 static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext &context,
-                                                                    TableFunctionInitInput &input) {
+                                                                   TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PlinkMissingBindData>();
 	auto state = make_uniq<PlinkMissingGlobalState>();
 
@@ -330,8 +330,8 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 // ---------------------------------------------------------------------------
 
 static unique_ptr<LocalTableFunctionState> PlinkMissingInitLocal(ExecutionContext &context,
-                                                                  TableFunctionInitInput &input,
-                                                                  GlobalTableFunctionState *global_state) {
+                                                                 TableFunctionInitInput &input,
+                                                                 GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PlinkMissingBindData>();
 	auto &gstate = global_state->Cast<PlinkMissingGlobalState>();
 	auto state = make_uniq<PlinkMissingLocalState>();
@@ -456,8 +456,7 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 			}
 
 			uint32_t obs_ct = sample_ct - missing_ct;
-			double f_miss =
-			    (sample_ct > 0) ? static_cast<double>(missing_ct) / static_cast<double>(sample_ct) : 0.0;
+			double f_miss = (sample_ct > 0) ? static_cast<double>(missing_ct) / static_cast<double>(sample_ct) : 0.0;
 
 			// Fill projected columns
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
@@ -602,8 +601,7 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 			switch (file_col) {
 			case SCOL_FID: {
 				if (bind_data.has_sample_info && !bind_data.sample_info.fids.empty() &&
-				    orig_idx < bind_data.sample_info.fids.size() &&
-				    !bind_data.sample_info.fids[orig_idx].empty()) {
+				    orig_idx < bind_data.sample_info.fids.size() && !bind_data.sample_info.fids[orig_idx].empty()) {
 					FlatVector::GetData<string_t>(vec)[rows_emitted] =
 					    StringVector::AddString(vec, bind_data.sample_info.fids[orig_idx]);
 				} else {
