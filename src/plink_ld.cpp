@@ -94,9 +94,11 @@ static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *geno
 	result.is_valid = true;
 	result.r2 = (cov_ab * cov_ab) / (var_a * var_b);
 
-	// D' via composite estimator (Weir 1979):
+	// D' via composite LD estimator (Weir 1979):
 	//   D = cov(gA, gB) / 4
 	//   D' = D / D_max where D_max depends on sign of D
+	// Note: this estimator uses genotype-level (not haplotype-level) statistics,
+	// so D' can exceed 1.0 when samples deviate from Hardy-Weinberg equilibrium.
 	double D = cov_ab / 4.0;
 	double p_a = sum_a / (2.0 * dn);
 	double p_b = sum_b / (2.0 * dn);
@@ -621,7 +623,14 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 					int64_t dist = static_cast<int64_t>(variants.positions[j]) -
 					               static_cast<int64_t>(variants.positions[ai]);
 					if (dist > bind_data.window_bp) {
-						break; // Past window
+						if (!bind_data.inter_chr) {
+							break; // Past window, no cross-chrom needed
+						}
+						// Skip remaining same-chrom variants beyond window
+						while (j < end_idx && variants.chroms[j] == variants.chroms[ai]) {
+							j++;
+						}
+						continue; // Check next chromosome
 					}
 				} else {
 					if (!bind_data.inter_chr) {

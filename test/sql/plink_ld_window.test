@@ -79,6 +79,32 @@ WHERE CHROM_A != CHROM_B;
 ----
 3
 
+# --- Inter-chr + small window (regression test) ---
+# window_kb=15 excludes rs1-rs3 (20kb apart) but inter_chr should still
+# find cross-chrom pairs: rs1-rs4, rs2-rs4, rs3-rs4
+# Within-window same-chrom: rs1-rs2 (10kb), rs2-rs3 (10kb) = 2
+# Cross-chrom: rs1-rs4, rs2-rs4, rs3-rs4 = 3
+# Total: 5
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 15, r2_threshold := 0.0, inter_chr := true);
+----
+5
+
+# Verify both within-window and cross-chrom pairs are present
+query TT
+SELECT ID_A, ID_B
+FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 15, r2_threshold := 0.0, inter_chr := true)
+ORDER BY ID_A, ID_B;
+----
+rs1	rs2
+rs1	rs4
+rs2	rs3
+rs2	rs4
+rs3	rs4
+
 # --- r² threshold filtering ---
 
 # With r2_threshold = 0.5: only rs1-rs2 (0.75) and rs1-rs3 (1.0) pass
