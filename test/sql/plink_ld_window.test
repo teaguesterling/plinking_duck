@@ -1,0 +1,198 @@
+# name: test/sql/plink_ld_window.test
+# description: Positive tests for plink_ld windowed mode
+# group: [sql]
+
+require plinking_duck
+
+# --- Windowed mode basics (pgen_example) ---
+# Variants: rs1(chr1:10000), rs2(chr1:20000), rs3(chr1:30000), rs4(chr2:15000)
+
+# All same-chrom pairs within 1Mb, r2_threshold = 0
+# Same-chrom chr1 pairs: (rs1,rs2), (rs1,rs3), (rs2,rs3) = 3 pairs
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000, r2_threshold := 0.0);
+----
+3
+
+# Verify the actual pairs and their r² values (matches plink2 --r2-unphased)
+query TTRRI
+SELECT ID_A, ID_B, R2, D_PRIME, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000, r2_threshold := 0.0) ORDER BY ID_A, ID_B;
+----
+rs1	rs2	0.75	0.5	3
+rs1	rs3	1.0	1.0	2
+rs2	rs3	0.25	0.3333333333333333	3
+
+# --- Window size filtering ---
+
+# 15kb window: rs1-rs2 (10kb ✓), rs2-rs3 (10kb ✓), rs1-rs3 (20kb ✗)
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 15, r2_threshold := 0.0);
+----
+2
+
+query TT
+SELECT ID_A, ID_B FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 15, r2_threshold := 0.0) ORDER BY ID_A, ID_B;
+----
+rs1	rs2
+rs2	rs3
+
+# 5kb window: all same-chrom distances >= 10kb → no pairs
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 5, r2_threshold := 0.0);
+----
+0
+
+# --- Same-chromosome restriction (default) ---
+
+# No cross-chromosome pairs by default
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 10000, r2_threshold := 0.0)
+WHERE CHROM_A != CHROM_B;
+----
+0
+
+# --- Inter-chromosome mode ---
+
+# inter_chr allows cross-chromosome pairs
+# All C(4,2) = 6 pairs
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 10000, r2_threshold := 0.0, inter_chr := true);
+----
+6
+
+# Cross-chromosome pairs exist
+query I
+SELECT COUNT(*)
+FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 10000, r2_threshold := 0.0, inter_chr := true)
+WHERE CHROM_A != CHROM_B;
+----
+3
+
+# --- r² threshold filtering ---
+
+# With r2_threshold = 0.5: only rs1-rs2 (0.75) and rs1-rs3 (1.0) pass
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000, r2_threshold := 0.5);
+----
+2
+
+query TT
+SELECT ID_A, ID_B FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000, r2_threshold := 0.5) ORDER BY ID_A, ID_B;
+----
+rs1	rs2
+rs1	rs3
+
+# With r2_threshold = 0.8: only rs1-rs3 (1.0) passes
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000, r2_threshold := 0.8);
+----
+1
+
+# Default r2_threshold = 0.2: rs1-rs2 (0.75 ✓), rs1-rs3 (1.0 ✓), rs2-rs3 (0.25 ✓)
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000);
+----
+3
+
+# --- Region filtering ---
+
+# Region '1:10000-20000' contains rs1 and rs2 → 1 pair
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    region := '1:10000-20000', r2_threshold := 0.0);
+----
+1
+
+query TTR
+SELECT ID_A, ID_B, R2 FROM plink_ld('test/data/pgen_example.pgen',
+    region := '1:10000-20000', r2_threshold := 0.0);
+----
+rs1	rs2	0.75
+
+# Region on chr2 (only rs4) → no pairs (need at least 2 variants)
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    region := '2:15000-15000', r2_threshold := 0.0);
+----
+0
+
+# Empty region → 0 pairs
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    region := '99:1-100', r2_threshold := 0.0);
+----
+0
+
+# --- Upper triangle only (no duplicate pairs) ---
+
+# Every pair (i,j) has i < j in variant index order
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000, r2_threshold := 0.0)
+WHERE POS_A >= POS_B AND CHROM_A = CHROM_B;
+----
+0
+
+# --- Large dataset (multi-batch scan) ---
+# large_example: 3000 variants, 100bp spacing, 3 chroms × 1000
+# Cyclic genotype pattern: all pairs have r² = 1.0
+
+# Region on chr1 with 10 variants (pos 100-1000), 1kb window
+# All 10 are within 1000bp → C(10,2) = 45 pairs
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/large_example.pgen',
+    region := '1:100-1000', window_kb := 1, r2_threshold := 0.0);
+----
+45
+
+# All pairs in cyclic pattern have r² = 1.0
+query I
+SELECT COUNT(DISTINCT R2) FROM plink_ld('test/data/large_example.pgen',
+    region := '1:100-1000', window_kb := 1, r2_threshold := 0.0);
+----
+1
+
+query R
+SELECT DISTINCT R2 FROM plink_ld('test/data/large_example.pgen',
+    region := '1:100-1000', window_kb := 1, r2_threshold := 0.0);
+----
+1.0
+
+# No duplicate pairs
+query I
+SELECT COUNT(*) FROM (
+    SELECT ID_A, ID_B, COUNT(*) as cnt
+    FROM plink_ld('test/data/large_example.pgen',
+        region := '1:100-1000', window_kb := 1, r2_threshold := 0.0)
+    GROUP BY ID_A, ID_B
+    HAVING cnt > 1
+);
+----
+0
+
+# --- Composable with SQL ---
+
+# Find variants in high LD with rs1
+query TR
+SELECT ID_B, R2 FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 1000, r2_threshold := 0.0)
+WHERE ID_A = 'rs1'
+ORDER BY R2 DESC;
+----
+rs3	1.0
+rs2	0.75
