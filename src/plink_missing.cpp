@@ -78,9 +78,10 @@ struct PlinkMissingGlobalState : public GlobalTableFunctionState {
 	// Mode
 	bool sample_mode = false;
 
-	// Sample mode: per-sample accumulation (single-threaded)
+	// Sample mode: per-sample accumulation (currently single-threaded;
+	// atomic for safety if MaxThreads is increased later)
 	vector<uint32_t> sample_missing_counts;
-	bool variant_scan_done = false;
+	std::atomic<bool> variant_scan_done {false};
 	std::atomic<uint32_t> next_sample_idx {0};
 	uint32_t total_variant_ct = 0;
 
