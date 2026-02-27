@@ -348,7 +348,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkHardyInitGlobal(ClientContext &
 	// Check if any genotype-dependent columns are projected
 	state->need_genotype_counts = false;
 	for (auto col_id : input.column_ids) {
-		if (col_id != COLUMN_IDENTIFIER_ROW_ID && col_id >= COL_HOM_REF_CT) {
+		if (col_id != COLUMN_IDENTIFIER_ROW_ID && col_id >= COL_HOM_REF_CT && col_id <= COL_P_HWE) {
 			state->need_genotype_counts = true;
 			break;
 		}

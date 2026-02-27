@@ -92,7 +92,7 @@ FROM plink_hardy('test/data/pgen_example.pgen') ORDER BY CHROM, POS;
 
 # --- Column types ---
 
-query TTTTTTTTTRRR
+query TTTTTTTTTTTT
 SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(A1),
        typeof(HOM_REF_CT), typeof(HET_CT), typeof(HOM_ALT_CT),
        typeof(O_HET), typeof(E_HET), typeof(P_HWE)

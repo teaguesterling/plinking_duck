@@ -149,6 +149,36 @@ plus scalar `genotype` (TINYINT). One row per variant x sample combination.
 **Projection pushdown:** Genotype decoding is skipped when genotype columns
 are not referenced in the query, making metadata-only queries fast.
 
+### `plink_hardy(path [, pvar, psam, samples, region, midp])`
+
+Compute per-variant Hardy-Weinberg equilibrium exact test p-values.
+Uses pgenlib's fast counting path (no genotype decompression).
+
+```sql
+-- Basic usage
+SELECT * FROM plink_hardy('data/example.pgen');
+
+-- With mid-p correction
+SELECT * FROM plink_hardy('data/example.pgen', midp := true);
+
+-- QC workflow: keep variants passing HWE filter
+SELECT * FROM plink_hardy('data/example.pgen')
+WHERE P_HWE > 1e-6;
+```
+
+**Output columns:** CHROM, POS, ID, REF, ALT, A1, HOM_REF_CT, HET_CT,
+HOM_ALT_CT, O_HET, E_HET, P_HWE.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pvar` | VARCHAR | auto-discovered | Explicit `.pvar`/`.bim` path |
+| `psam` | VARCHAR | auto-discovered | Explicit `.psam`/`.fam` path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter to specific sample IDs |
+| `region` | VARCHAR | all | Filter to genomic region (`chr:start-end`) |
+| `midp` | BOOLEAN | false | Use mid-p correction for exact test |
+
 ## Genotype Encoding
 
 All genotype data uses `TINYINT` values with the following encoding:
