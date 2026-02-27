@@ -78,7 +78,7 @@ struct PlinkScoreGlobalState : public GlobalTableFunctionState {
 
 	// Phase 1 synchronization
 	std::mutex scoring_mutex;
-	bool scoring_done = false;
+	std::atomic<bool> scoring_done {false};
 
 	// Phase 2 emission
 	std::atomic<uint32_t> next_sample_idx {0};
@@ -599,13 +599,13 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 	auto &lstate = data_p.local_state->Cast<PlinkScoreLocalState>();
 
 	// Phase 1: Score all variants (once, guarded by mutex)
-	if (!gstate.scoring_done) {
+	if (!gstate.scoring_done.load(std::memory_order_acquire)) {
 		std::lock_guard<std::mutex> lock(gstate.scoring_mutex);
-		if (!gstate.scoring_done) {
+		if (!gstate.scoring_done.load(std::memory_order_relaxed)) {
 			if (lstate.initialized && !bind_data.scored_variants.empty()) {
 				PerformScoring(bind_data, gstate, lstate);
 			}
-			gstate.scoring_done = true;
+			gstate.scoring_done.store(true, std::memory_order_release);
 		}
 	}
 

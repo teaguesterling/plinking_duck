@@ -131,15 +131,16 @@ WHERE IID = 'SAMPLE1';
 SAMPLE1	0.5
 
 # --- ID-keyed weights: unmatched variant IDs silently skipped ---
+# SAMPLE2 has rs1 ALT dosage=1, so SCORE_SUM=1.0 confirms rs_nonexistent (weight=99) didn't contribute
 
 query TR
 SELECT IID, SCORE_SUM
 FROM plink_score('test/data/pgen_example.pgen',
     weights := [{'id': 'rs1', 'allele': 'G', 'weight': 1.0},
                 {'id': 'rs_nonexistent', 'allele': 'A', 'weight': 99.0}])
-WHERE IID = 'SAMPLE1';
+WHERE IID = 'SAMPLE2';
 ----
-SAMPLE1	0.0
+SAMPLE2	1.0
 
 # --- Zero weights → all scores = 0.0, ALLELE_CT = 0 ---
 
@@ -278,6 +279,55 @@ SELECT IID, SCORE_SUM FROM plink_score('test/data/pgen_example.pgen',
 WHERE IID = 'SAMPLE1';
 ----
 SAMPLE1	-0.5
+
+# --- center mode: variance-standardized scoring ---
+# rs2 only (region '1:20000-20000'), no missing data, weight=1.0
+# rs2 genotypes: [1, 1, 0, 2], mean=1.0, freq=0.5, sd=sqrt(0.5)
+# SAMPLE1: (1-1)/sd = 0.0
+# SAMPLE2: (1-1)/sd = 0.0
+# SAMPLE3: (0-1)/sd = -sqrt(2) ≈ -1.414213562373095
+# SAMPLE4: (2-1)/sd =  sqrt(2) ≈  1.414213562373095
+# NAMED_ALLELE_DOSAGE_SUM is 0.0 in center mode (not tracked)
+
+query TIRR
+SELECT IID, ALLELE_CT, NAMED_ALLELE_DOSAGE_SUM, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0],
+    region := '1:20000-20000',
+    center := true)
+WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	2	0.0	0.0
+
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0],
+    region := '1:20000-20000',
+    center := true)
+WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	-1.414213562373095
+
+query TR
+SELECT IID, SCORE_SUM
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0],
+    region := '1:20000-20000',
+    center := true)
+WHERE IID = 'SAMPLE4';
+----
+SAMPLE4	1.414213562373095
+
+# Center mode with missing data: SAMPLE2 has rs3 missing, ALLELE_CT reflects
+query TI
+SELECT IID, ALLELE_CT
+FROM plink_score('test/data/pgen_example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0],
+    center := true)
+WHERE IID = 'SAMPLE2';
+----
+SAMPLE2	6
 
 # --- Composable with SQL filtering ---
 
