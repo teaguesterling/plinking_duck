@@ -11,6 +11,7 @@
 #include "plink_ld.hpp"
 #include "plink_score.hpp"
 #include "duckdb.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 namespace duckdb {
 
@@ -51,3 +52,12 @@ DUCKDB_EXTENSION_API const char *plinking_duck_version() {
 	return duckdb::DuckDB::LibraryVersion();
 }
 }
+
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+extern "C" {
+DUCKDB_CPP_EXTENSION_ENTRY(plinking_duck, loader) { // NOLINT
+	duckdb::PlinkingDuckExtension extension;
+	extension.Load(loader);
+}
+}
+#endif
