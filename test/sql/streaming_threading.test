@@ -1,0 +1,184 @@
+# name: test/sql/streaming_threading.test
+# description: Streaming and threading correctness tests at 50K variant scale
+# group: [plinking_duck]
+
+require plinking_duck
+
+# ===================================================================
+# Streaming behavior: LIMIT should short-circuit, not scan everything
+# ===================================================================
+
+# LIMIT 1 returns exactly 1 row
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_pgen('test/data/streaming_example.pgen') LIMIT 1
+);
+----
+1
+
+# LIMIT on plink_freq
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM plink_freq('test/data/streaming_example.pgen') LIMIT 10
+);
+----
+10
+
+# LIMIT on plink_hardy
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM plink_hardy('test/data/streaming_example.pgen') LIMIT 10
+);
+----
+10
+
+# LIMIT on plink_missing (variant mode)
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM plink_missing('test/data/streaming_example.pgen') LIMIT 10
+);
+----
+10
+
+# ===================================================================
+# Threading correctness: no duplicates, no gaps at 50K scale
+# ===================================================================
+
+# read_pgen: exact row count
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/streaming_example.pgen');
+----
+50000
+
+# read_pgen: no duplicate variant IDs
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pgen('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_freq: exact row count
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_freq: no duplicate IDs
+query I
+SELECT COUNT(DISTINCT ID) FROM plink_freq('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_hardy: exact row count
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_missing variant mode: exact row count
+query I
+SELECT COUNT(*) FROM plink_missing('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_missing sample mode: exact row count (8 samples)
+query I
+SELECT COUNT(*)
+FROM plink_missing('test/data/streaming_example.pgen', mode := 'sample');
+----
+8
+
+# plink_score: exact row count (8 samples) using ID-keyed weights for first variant
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/streaming_example.pgen',
+    weights := [{'id': 'var1', 'allele': 'G', 'weight': 1.0}]);
+----
+8
+
+# ===================================================================
+# Projection pushdown: metadata-only queries skip genotype work
+# ===================================================================
+
+# Metadata-only query on large dataset
+query I
+SELECT COUNT(*) FROM (
+    SELECT CHROM, POS, ID FROM read_pgen('test/data/streaming_example.pgen')
+);
+----
+50000
+
+# ===================================================================
+# Region filtering with large dataset
+# ===================================================================
+
+# Region on chr1: positions 100-1000 = 10 variants
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/streaming_example.pgen', region := '1:1-1000');
+----
+10
+
+# All-chromosome scan matches total
+query I
+SELECT
+    (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen', region := '1:1-100000000')) +
+    (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen', region := '2:1-100000000')) +
+    (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen', region := '3:1-100000000'));
+----
+50000
+
+# ===================================================================
+# Cross-function result consistency
+# ===================================================================
+
+# plink_freq and plink_hardy should report same variant count
+query I
+SELECT (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen'))
+     = (SELECT COUNT(*) FROM plink_hardy('test/data/streaming_example.pgen'));
+----
+true
+
+# All frequencies are in valid range
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/streaming_example.pgen')
+WHERE ALT_FREQ < 0.0 OR ALT_FREQ > 1.0;
+----
+0
+
+# All HWE p-values are in valid range
+query I
+SELECT COUNT(*)
+FROM plink_hardy('test/data/streaming_example.pgen')
+WHERE P_HWE < 0.0 OR P_HWE > 1.0;
+----
+0
+
+# All missingness rates are in valid range
+query I
+SELECT COUNT(*)
+FROM plink_missing('test/data/streaming_example.pgen')
+WHERE F_MISS < 0.0 OR F_MISS > 1.0;
+----
+0
+
+# Variant-mode and sample-mode missingness totals must agree
+query I
+SELECT (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/streaming_example.pgen'))
+     = (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/streaming_example.pgen',
+                                                    mode := 'sample'));
+----
+true
+
+# ===================================================================
+# Chromosome distribution: correct per-chromosome counts
+# ===================================================================
+
+query II
+SELECT CHROM, COUNT(*) AS n
+FROM plink_freq('test/data/streaming_example.pgen')
+GROUP BY CHROM ORDER BY CHROM;
+----
+1	20000
+2	15000
+3	15000

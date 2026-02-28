@@ -64,18 +64,53 @@ struct AlignedBuffer {
 };
 
 // ---------------------------------------------------------------------------
-// Variant metadata
+// Offset-indexed variant metadata (memory-efficient Scan-time access)
 // ---------------------------------------------------------------------------
 
-//! Pre-loaded variant metadata from .pvar/.bim, in file order.
-struct VariantMetadata {
-	vector<string> chroms;
-	vector<int32_t> positions;
-	vector<string> ids;
-	vector<string> refs;
-	vector<string> alts;
+//! Offset-indexed variant metadata for memory-efficient Scan-time access.
+//! Stores raw file content in a single buffer and line byte offsets; parses
+//! fields on demand. Thread-safe for concurrent reads (all state is immutable
+//! after construction).
+struct VariantMetadataIndex {
+	//! Raw file content (single allocation)
+	string file_content;
+
+	//! Byte offset of each data line's start within file_content.
+	//! line_offsets[vidx] = byte offset of variant vidx's line.
+	vector<uint64_t> line_offsets;
+
+	//! Whether the source is .bim format (whitespace-delimited, different column order)
+	bool is_bim = false;
+
+	//! Physical field indices for each logical field (after header parsing)
+	idx_t chrom_idx = 0;
+	idx_t pos_idx = 0;
+	idx_t id_idx = 0;
+	idx_t ref_idx = 0;
+	idx_t alt_idx = 0;
+
+	//! Total variant count
 	idx_t variant_ct = 0;
+
+	//! Find the end of line vidx (exclusive, past trailing \r\n)
+	size_t LineEnd(idx_t vidx) const;
+
+	//! Extract the N-th delimited field from a line without allocating.
+	//! For .pvar: tab-delimited. For .bim: whitespace-delimited.
+	string GetField(idx_t vidx, idx_t field_idx) const;
+
+	//! On-demand field access (thread-safe: const on file_content)
+	string GetChrom(idx_t vidx) const;
+	int32_t GetPos(idx_t vidx) const;
+	string GetId(idx_t vidx) const;
+	string GetRef(idx_t vidx) const;
+	string GetAlt(idx_t vidx) const;
 };
+
+//! Build an offset-indexed metadata index from a .pvar/.bim file.
+//! Reads the file once into a single buffer, builds line offsets, and parses
+//! the header to determine column layout. Does NOT parse data lines.
+VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const string &path, const string &func_name);
 
 // ---------------------------------------------------------------------------
 // File utilities
@@ -100,14 +135,6 @@ string ReplaceExtension(const string &path, const string &new_ext);
 //! Try to find a companion file by replacing the .pgen extension.
 //! Returns the first existing path from candidates, or empty string.
 string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions);
-
-// ---------------------------------------------------------------------------
-// Metadata loading
-// ---------------------------------------------------------------------------
-
-//! Load variant metadata from a .pvar or .bim file.
-//! func_name is used in error messages (e.g., "read_pgen", "plink_freq").
-VariantMetadata LoadVariantMetadata(ClientContext &context, const string &path, const string &func_name);
 
 // ---------------------------------------------------------------------------
 // Sample subsetting (for PgrGetCounts / PgrGet)
@@ -157,9 +184,10 @@ struct VariantRange {
 	bool has_filter = false;
 };
 
-//! Parse "chr:start-end" region string and resolve to variant index range.
+//! Parse "chr:start-end" region string and resolve to variant index range
+//! using on-demand field parsing from VariantMetadataIndex.
 //! Assumes variants are sorted by (CHROM, POS) as required by PLINK format.
 //! Returns a range with start_idx == end_idx if no variants match.
-VariantRange ParseRegion(const string &region_str, const VariantMetadata &variants, const string &func_name);
+VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &variants, const string &func_name);
 
 } // namespace duckdb

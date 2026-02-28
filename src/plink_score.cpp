@@ -41,7 +41,7 @@ struct PlinkScoreBindData : public TableFunctionData {
 	string pvar_path;
 	string psam_path;
 
-	VariantMetadata variants;
+	VariantMetadataIndex variants;
 	SampleInfo sample_info;
 
 	uint32_t raw_variant_ct = 0;
@@ -210,7 +210,7 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_score");
+	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "plink_score");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("plink_score: variant count mismatch: .pgen has %u variants, "
@@ -311,8 +311,9 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 			// Build variant ID → index map (respecting region filter)
 			unordered_map<string, uint32_t> variant_id_map;
 			for (uint32_t i = range_start; i < range_end; i++) {
-				if (!bind_data->variants.ids[i].empty()) {
-					variant_id_map[bind_data->variants.ids[i]] = i;
+				auto vid = bind_data->variants.GetId(i);
+				if (!vid.empty()) {
+					variant_id_map[vid] = i;
 				}
 			}
 
@@ -334,9 +335,9 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 
 				// Determine allele orientation
 				bool flip = false;
-				if (allele == bind_data->variants.alts[vidx]) {
+				if (allele == bind_data->variants.GetAlt(vidx)) {
 					flip = false; // ALT allele: use dosage as-is
-				} else if (allele == bind_data->variants.refs[vidx]) {
+				} else if (allele == bind_data->variants.GetRef(vidx)) {
 					flip = true; // REF allele: scored_dosage = 2 - alt_dosage
 				} else {
 					unmatched_allele_count++;

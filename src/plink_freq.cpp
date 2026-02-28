@@ -32,7 +32,7 @@ struct PlinkFreqBindData : public TableFunctionData {
 	string pvar_path;
 	string psam_path;
 
-	VariantMetadata variants;
+	VariantMetadataIndex variants;
 	SampleInfo sample_info;
 	bool has_sample_info = false;
 
@@ -175,7 +175,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_freq");
+	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "plink_freq");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("plink_freq: variant count mismatch: .pgen has %u variants, "
@@ -410,16 +410,16 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 				switch (file_col) {
 				case COL_CHROM: {
-					auto &val = bind_data.variants.chroms[vidx];
+					auto val = bind_data.variants.GetChrom(vidx);
 					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.positions[vidx];
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
-					auto &val = bind_data.variants.ids[vidx];
+					auto val = bind_data.variants.GetId(vidx);
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -428,12 +428,12 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					break;
 				}
 				case COL_REF: {
-					auto &val = bind_data.variants.refs[vidx];
+					auto val = bind_data.variants.GetRef(vidx);
 					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
-					auto &val = bind_data.variants.alts[vidx];
+					auto val = bind_data.variants.GetAlt(vidx);
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
