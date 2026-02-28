@@ -2,6 +2,8 @@
 
 A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/) genomics file formats and running common genetic analyses directly in SQL.
 
+**[Documentation](https://plinking-duck.readthedocs.io)** · **[Getting Started](https://plinking-duck.readthedocs.io/getting-started/)** · **[Tutorial](https://plinking-duck.readthedocs.io/tutorial/)**
+
 PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific command-line tools. Read files, filter variants, compute allele frequencies, test Hardy-Weinberg equilibrium, measure missingness, calculate linkage disequilibrium, and run polygenic scoring — all from a SQL prompt.
 
 > **Built on the shoulders of [DuckHTS](https://github.com/RGenomicsETL/duckhts).**
@@ -341,3 +343,13 @@ make test
 
 SQL tests live in `./test/sql/` and test data in `./test/data/`. Tests use DuckDB's
 [sqllogictest](https://duckdb.org/docs/dev/sqllogictest/intro.html) framework.
+
+## Documentation
+
+Full documentation is available at **[plinking-duck.readthedocs.io](https://plinking-duck.readthedocs.io)**, including:
+
+- [Getting Started](https://plinking-duck.readthedocs.io/getting-started/) — installation and first queries
+- [Tutorial](https://plinking-duck.readthedocs.io/tutorial/) — hands-on genomic analysis walkthrough
+- [Function Reference](https://plinking-duck.readthedocs.io/functions/) — detailed docs for every function
+- [Quality Control Guide](https://plinking-duck.readthedocs.io/guides/quality-control/) — QC workflows with SQL
+- [Performance Guide](https://plinking-duck.readthedocs.io/guides/performance/) — optimization tips
