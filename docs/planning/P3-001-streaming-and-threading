@@ -1,0 +1,838 @@
+# P3-001: Streaming Execution & Threading Audit
+
+## Goal
+
+Audit and improve how plinking_duck table functions handle large datasets,
+ensuring that:
+
+1. **Result delivery is streaming** — Scan functions emit incremental chunks,
+   never accumulating full result sets in memory before returning
+2. **Input metadata loading is proportional** — variant/sample metadata memory
+   scales gracefully at biobank scale rather than requiring full materialization
+3. **Threading is correct and verified** — parallel scan produces consistent
+   results at scale, with no duplicates or gaps from thread races
+
+This is a cross-cutting infrastructure plan, not a new function. It touches
+every reader and utility function.
+
+## Prerequisites
+
+- P2 complete (all utility functions merged)
+- Understanding of DuckDB table function lifecycle (Bind → InitGlobal →
+  InitLocal → Scan)
+- Familiarity with DESIGN-GUIDE §1 (scale guidance) and §5 (implementation
+  patterns)
+
+---
+
+## Current State Assessment
+
+### What already streams correctly
+
+The .pgen binary data path is well-designed for streaming:
+
+| Aspect | Current Behavior | Assessment |
+|--------|-----------------|------------|
+| Genotype reading | Per-variant via PgrGet/PgrGetCounts during Scan | Good — never materializes all genotypes |
+| Result emission | Up to STANDARD_VECTOR_SIZE (2048) rows per Scan call | Good — DuckDB streams chunks |
+| Batch claiming | Atomic fetch_add on variant index, 128-variant batches | Good — low contention |
+| Projection pushdown | All readers skip expensive work for unprojected columns | Good — metadata-only queries are fast |
+| Per-thread isolation | Each thread creates own PgenReader in InitLocal | Good — no shared mutable state |
+
+### What does NOT stream
+
+| Component | Current Behavior | Scale Concern |
+|-----------|-----------------|---------------|
+| **ReadFileLines** (plink_common) | Reads entire file into `string`, splits into `vector<string>` | .pvar at 170M variants ≈ 10GB text; 2× memory (raw string + split lines) |
+| **LoadVariantMetadata** | Parses all lines into 5 `vector<string>` + 1 `vector<int32_t>` | 170M × (5 strings + 1 int) ≈ 15–20GB resident |
+| **LoadSampleInfo** (psam) | Reads entire .psam into memory | 10M samples × ~10 cols ≈ 500MB — acceptable |
+| **PfileReadFileLines** (pfile_reader) | Separate bulk-read copy; duplicates ReadFileLines | Same concern as above |
+| **plink_missing sample mode** | Phase 1 scans ALL variants single-threaded before emitting any rows | Latency, not memory (accumulator is O(N_samples)); see Area 2 — deferred |
+| **plink_score** | Phase 1 scans ALL scored variants single-threaded | Same pattern; deferred (DuckDB Scan API constraint) |
+
+### Existing streaming infrastructure
+
+`pvar_reader.cpp` already has a streaming line reader:
+
+```cpp
+//! Read one line from a DuckDB FileHandle, returning false at EOF.
+//! Handles \r\n and \n line endings (strips \r). This is a streaming
+//! alternative to ReadFileLines for files too large to slurp into memory
+//! (.pvar can be ~10GB at biobank scale).
+static bool ReadLineFromHandle(FileHandle &handle, string &line);
+```
+
+This is used by `read_pvar` and `read_psam` for their own scan functions
+(which stream lines → output rows). But it's NOT used by LoadVariantMetadata
+or the P2 utility functions, which bulk-load via ReadFileLines.
+
+---
+
+## Improvement Areas
+
+### Area 1: Streaming variant metadata with offset-indexed lazy parsing
+
+**Problem**: `LoadVariantMetadata` reads the entire .pvar into memory and
+parses all lines into 5 string vectors and 1 int vector. At 170M variants,
+this is 15–20GB of resident memory before any Scan work begins.
+
+**Observation**: During Scan, variant metadata is accessed by index
+(`variants.chroms[vidx]`). Threads claim batches of variant indices
+atomically and need O(1) access to metadata for each index. This random-access
+pattern is why the metadata was pre-loaded.
+
+**Key insight**: We can preserve O(1) index-based access while dramatically
+reducing memory by:
+1. Memory-mapping the .pvar file (or reading it once into a single buffer)
+2. Building a compact offset index: one `uint64_t` per line (byte offset of
+   line start) — 170M × 8 bytes = 1.3GB
+3. Parsing individual lines on demand during Scan
+
+This trades CPU (re-parsing a line per variant) for memory (1.3GB offset
+index vs 15–20GB parsed metadata). The parsing is cheap (tab split + string
+extraction) and stateless, so it's safe for parallel access.
+
+**New type: `VariantMetadataIndex`**
+
+```cpp
+struct VariantMetadataIndex {
+    // The raw file content (single allocation, or mmap'd)
+    string file_content;
+
+    // Byte offset of each data line's start within file_content
+    vector<uint64_t> line_offsets;
+
+    // Parsed header info
+    bool is_bim;
+    idx_t chrom_idx, pos_idx, id_idx, ref_idx, alt_idx;
+    idx_t variant_ct;
+
+    // On-demand field access (thread-safe: read-only on file_content)
+    string GetChrom(idx_t vidx) const;
+    int32_t GetPos(idx_t vidx) const;
+    string GetId(idx_t vidx) const;
+    string GetRef(idx_t vidx) const;
+    string GetAlt(idx_t vidx) const;
+};
+```
+
+**Memory comparison at 170M variants:**
+
+| Approach | Memory |
+|----------|--------|
+| Current (ReadFileLines + parse) | ~10GB raw file + ~15GB parsed = ~25GB peak |
+| Offset-indexed (single buffer + offsets) | ~10GB file buffer + ~1.3GB offsets = ~11GB |
+| Offset-indexed with mmap | ~1.3GB offsets (OS pages file data on demand) |
+
+The mmap approach is the most memory-efficient but requires the file to be
+local (not S3/HTTP). For VFS compatibility, the single-buffer approach is
+safer and still cuts peak memory roughly in half.
+
+**Implementation strategy**: A two-tier approach:
+
+1. **Default**: Read file into a single `string` buffer, build offset index,
+   parse on demand. Works with all VFS backends. ~11GB at biobank scale.
+2. **Future (optional)**: For local files, use mmap to avoid the file buffer
+   entirely. ~1.3GB at biobank scale. This can be deferred.
+
+**Backward compatibility**: `LoadVariantMetadata` continues to exist for code
+that needs pre-parsed vectors (e.g., region filtering in Bind needs to scan
+positions to resolve variant ranges). However, the hot path in Scan switches
+to `VariantMetadataIndex` for on-demand access. Region resolution is a
+one-time cost in Bind and can iterate the offset index.
+
+#### Changes to LoadVariantMetadata
+
+Rename the current function to `LoadVariantMetadataEager` (for cases that
+need it, like testing or small files). Add `LoadVariantMetadataIndex` as the
+new default for Scan-time access.
+
+The `region` parameter currently resolves to a variant index range in Bind
+by scanning `variants.positions`. With `VariantMetadataIndex`, this becomes
+iteration over `line_offsets` parsing only the POS field — same complexity,
+slightly slower but only runs once.
+
+#### Impact on all callers
+
+Every function that calls `LoadVariantMetadata` in Bind would switch to
+`LoadVariantMetadataIndex`:
+- `read_pgen` (pgen_reader.cpp)
+- `plink_freq` (plink_freq.cpp)
+- `plink_hardy` (plink_hardy.cpp)
+- `plink_missing` (plink_missing.cpp)
+- `plink_ld` (plink_ld.cpp)
+- `plink_score` (plink_score.cpp)
+
+`read_pvar` and `read_psam` already use their own streaming line readers
+and are not affected.
+
+`read_pfile` (pfile_reader.cpp) has its own `PfileReadFileLines` and
+`LoadPfileVariantMetadata`. It would benefit from the same index-based
+approach.
+
+---
+
+### Area 2: Parallel per-sample accumulation (deferred)
+
+**Problem**: `plink_missing` (sample mode) and `plink_score` force
+`MaxThreads() = 1` because they accumulate per-sample counts/scores across
+all variants. A single thread scans all variants before any results are
+emitted.
+
+At biobank scale (170M variants), phase 1 takes the majority of wall-clock
+time. This is the bottleneck for these functions.
+
+**Desired solution**: Per-thread accumulators with a merge phase —
+multiple threads do phase 1 (variant scanning + accumulation), merge
+thread-local results, then one thread does phase 2 (per-sample emission).
+
+#### Why this is deferred: DuckDB table function API constraint
+
+DuckDB's table function Scan has a hard contract: when Scan writes 0 rows
+into the output chunk, that thread is marked `FINISHED` and never called
+again (`physical_table_scan.cpp:106`):
+
+```cpp
+return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+```
+
+There is no "I have no data yet but I'm not done" state. A thread cannot
+return 0 rows and be called again later.
+
+The parallel accumulation pattern requires a phase transition:
+1. Multiple threads finish phase 1 (no more variant batches to claim)
+2. One thread merges accumulators and starts phase 2 emission
+3. Other threads exit
+
+The problem: between "no more batches" and "merge complete," the
+non-emitter threads have nothing to return. If they return 0 rows,
+DuckDB considers them finished — but the emitter thread might still need
+to wait for them to register their accumulators. And the emitter thread
+can't return 0 rows while waiting either, or it too will be marked done
+before phase 2 begins.
+
+DuckDB solves this for internal operators via the Sink/Combine/Finalize
+lifecycle (used by hash aggregates, etc.), but this API is only available
+to `PhysicalOperator` implementations — not to table functions registered
+through the extension API.
+
+#### Future approach: background threads
+
+The viable path for parallel accumulation within the table function API
+would be to manage threads outside DuckDB:
+
+```
+InitGlobal or first Scan call:
+    Spawn N-1 background std::threads for phase 1
+    DuckDB's single Scan thread also participates in phase 1
+    All threads accumulate into thread-local vectors
+    Background threads merge into global accumulator and exit
+    DuckDB Scan thread waits for background threads, does final merge
+    DuckDB Scan thread proceeds to phase 2 emission
+```
+
+This works but adds complexity:
+- Manual thread lifecycle management (spawn, join, cleanup in destructors)
+- Cancellation handling (background threads must check for query
+  interruption and stop promptly)
+- Per-background-thread PgenReader initialization (pgenlib readers are
+  not thread-safe)
+- Resource management if Scan throws before join
+
+This is feasible but warrants its own plan once the core streaming
+improvements (Areas 1 and 3) are in place. For now, `MaxThreads() = 1`
+for per-sample accumulation is correct and the functions produce
+correct results.
+
+#### What this plan DOES address for per-sample functions
+
+Even without parallel accumulation, the VariantMetadataIndex migration
+(Area 1) benefits plink_missing sample mode and plink_score: their
+single-threaded phase 1 will use less memory for variant metadata access.
+
+The streaming verification tests (Area 3) validate that per-sample
+functions produce correct results and that variant-mode totals equal
+sample-mode totals.
+
+---
+
+### Area 3: Streaming verification and observability
+
+**Problem**: There's no way to verify that functions actually stream results
+rather than buffering them. The test suite validates correctness (expected
+values, row counts) but not execution behavior.
+
+**Approach**: Add tests that exercise streaming properties indirectly:
+
+1. **LIMIT short-circuits**: `SELECT ... LIMIT 1` on a large dataset should
+   return quickly (only processes one batch, not all variants). If a function
+   buffered all results first, LIMIT wouldn't help.
+
+2. **Row count consistency under parallelism**: Verify that parallel scan
+   produces exactly the expected row count with no duplicates and no gaps.
+   This is already tested for `read_pgen` with `large_example`; extend to
+   all P2 functions.
+
+3. **Chunk-wise progress**: Use `EXPLAIN ANALYZE` or DuckDB's profiling
+   to verify pipeline execution (not blocking).
+
+4. **Memory-bounded execution**: For the offset-indexed metadata approach,
+   verify that queries on larger-than-memory .pvar files succeed (the OS
+   pages data on demand rather than requiring it all resident).
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `test/data/generate_large_test_data.sh` | Script to generate 50K+ variant test data for streaming/threading tests |
+| `test/data/streaming_example.pgen` | 50,000 variants × 8 samples (streaming test fixture) |
+| `test/data/streaming_example.pvar` | Companion .pvar for streaming_example |
+| `test/data/streaming_example.psam` | Companion .psam for streaming_example |
+| `test/sql/streaming_threading.test` | Cross-function streaming and threading tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/include/plink_common.hpp` | Add `VariantMetadataIndex`, `LoadVariantMetadataIndex()` |
+| `src/plink_common.cpp` | Implement offset-indexed metadata loading |
+| `src/pgen_reader.cpp` | Switch from `VariantMetadata` to `VariantMetadataIndex` in Scan |
+| `src/plink_freq.cpp` | Switch to `VariantMetadataIndex` |
+| `src/plink_hardy.cpp` | Switch to `VariantMetadataIndex` |
+| `src/plink_missing.cpp` | Switch to `VariantMetadataIndex` |
+| `src/plink_ld.cpp` | Switch to `VariantMetadataIndex` |
+| `src/plink_score.cpp` | Switch to `VariantMetadataIndex` |
+| `src/pfile_reader.cpp` | Consider switching to shared `VariantMetadataIndex` (or defer) |
+
+---
+
+## Implementation Plan
+
+### Step 1: Streaming test data and baseline tests
+
+Before changing anything, create a larger test dataset and establish baseline
+tests that verify streaming and threading properties of the current code.
+
+**Generate test data** (50,000 variants × 8 samples, 3 chromosomes):
+
+```bash
+#!/bin/bash
+# generate_large_test_data.sh
+# Requires: plink2 binary
+# Creates streaming_example.{pgen,pvar,psam} with 50K variants
+set -euo pipefail
+cd "$(dirname "$0")"
+
+PLINK2="/mnt/aux-data/teague/Dev/spack/opt/spack/linux-zen3/plink2-2.0.0-a.6.9-e2l3wx22vy6tkmdwzhaexlml4rs3okx3/bin/plink2"
+
+# Generate VCF with 50K variants across 3 chromosomes
+python3 -c "
+import random
+random.seed(42)
+print('##fileformat=VCFv4.3')
+for c in [1, 2, 3]:
+    print(f'##contig=<ID={c},length=100000000>')
+print('##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">')
+samples = '\t'.join(f'SAMPLE{i}' for i in range(1, 9))
+print(f'#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{samples}')
+vid = 0
+for chrom in [1, 2, 3]:
+    n_vars = [20000, 15000, 15000][chrom-1]
+    for i in range(n_vars):
+        vid += 1
+        pos = (i + 1) * 100
+        ref, alt = random.choice([('A','G'), ('C','T'), ('G','A'), ('T','C')])
+        gts = []
+        for _ in range(8):
+            r = random.random()
+            if r < 0.05: gts.append('./.')
+            elif r < 0.30: gts.append('0/0')
+            elif r < 0.70: gts.append('0/1')
+            else: gts.append('1/1')
+        gt_str = '\t'.join(gts)
+        print(f'{chrom}\t{pos}\tvar{vid}\t{ref}\t{alt}\t.\t.\t.\tGT\t{gt_str}')
+" > streaming_example.vcf
+
+"$PLINK2" --vcf streaming_example.vcf --make-pgen --out streaming_example
+rm -f streaming_example.vcf streaming_example.log
+```
+
+50K variants is large enough to:
+- Trigger multi-threading (MaxThreads ≈ 50K/1000 + 1 = 51, capped at 16)
+- Require multiple Scan calls (50K rows > STANDARD_VECTOR_SIZE of 2048)
+- Exercise multi-batch claiming (50K / 128 ≈ 391 batches across 16 threads)
+- Be small enough to commit to the repo (<1MB .pgen)
+
+**Baseline streaming/threading tests** (`streaming_threading.test`):
+
+```sql
+require plinking_duck
+
+# ===================================================================
+# Streaming behavior: LIMIT should short-circuit, not scan everything
+# ===================================================================
+
+# LIMIT 1 returns exactly 1 row (basic sanity)
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_pgen('test/data/streaming_example.pgen') LIMIT 1
+);
+----
+1
+
+# LIMIT on plink_freq
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM plink_freq('test/data/streaming_example.pgen') LIMIT 10
+);
+----
+10
+
+# LIMIT on plink_hardy
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM plink_hardy('test/data/streaming_example.pgen') LIMIT 10
+);
+----
+10
+
+# LIMIT on plink_missing (variant mode)
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM plink_missing('test/data/streaming_example.pgen') LIMIT 10
+);
+----
+10
+
+# ===================================================================
+# Threading correctness: no duplicates, no gaps
+# ===================================================================
+
+# read_pgen: exact row count
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/streaming_example.pgen');
+----
+50000
+
+# read_pgen: no duplicate variant IDs
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pgen('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_freq: exact row count
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_freq: no duplicate IDs
+query I
+SELECT COUNT(DISTINCT ID) FROM plink_freq('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_hardy: exact row count
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_missing variant mode: exact row count
+query I
+SELECT COUNT(*) FROM plink_missing('test/data/streaming_example.pgen');
+----
+50000
+
+# plink_missing sample mode: exact row count
+query I
+SELECT COUNT(*)
+FROM plink_missing('test/data/streaming_example.pgen', mode := 'sample');
+----
+8
+
+# plink_score: exact row count (8 samples)
+query I
+SELECT COUNT(*)
+FROM plink_score('test/data/streaming_example.pgen',
+    weights := [1.0]);
+----
+8
+
+# ===================================================================
+# Projection pushdown: metadata-only queries skip genotype work
+# ===================================================================
+
+# Metadata-only query on large dataset should work fine
+query I
+SELECT COUNT(*) FROM (
+    SELECT CHROM, POS, ID FROM read_pgen('test/data/streaming_example.pgen')
+);
+----
+50000
+
+# ===================================================================
+# Region filtering with large dataset
+# ===================================================================
+
+# Region on chr1 returns subset
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/streaming_example.pgen', region := '1:1-1000');
+----
+10
+
+# All-chromosome scan matches total
+query I
+SELECT
+    (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen', region := '1:1-100000000')) +
+    (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen', region := '2:1-100000000')) +
+    (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen', region := '3:1-100000000'));
+----
+50000
+
+# ===================================================================
+# Cross-function result consistency
+# ===================================================================
+
+# plink_freq and plink_hardy should report same variant count
+query I
+SELECT (SELECT COUNT(*) FROM plink_freq('test/data/streaming_example.pgen'))
+     = (SELECT COUNT(*) FROM plink_hardy('test/data/streaming_example.pgen'));
+----
+true
+
+# All frequencies are in valid range
+query I
+SELECT COUNT(*)
+FROM plink_freq('test/data/streaming_example.pgen')
+WHERE ALT_FREQ < 0.0 OR ALT_FREQ > 1.0;
+----
+0
+
+# All HWE p-values are in valid range
+query I
+SELECT COUNT(*)
+FROM plink_hardy('test/data/streaming_example.pgen')
+WHERE P < 0.0 OR P > 1.0;
+----
+0
+
+# All missingness rates are in valid range
+query I
+SELECT COUNT(*)
+FROM plink_missing('test/data/streaming_example.pgen')
+WHERE F_MISS < 0.0 OR F_MISS > 1.0;
+----
+0
+
+# Variant-mode and sample-mode missingness totals must agree
+query I
+SELECT (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/streaming_example.pgen'))
+     = (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/streaming_example.pgen',
+                                                    mode := 'sample'));
+----
+true
+```
+
+**Note**: Expected values that depend on generated data (e.g., region
+count `10`) are approximate. Step 1 generates the data, runs the queries,
+and fills in actual known-answer values before committing the tests.
+
+### Step 2: Implement VariantMetadataIndex
+
+Add the offset-indexed metadata type to `plink_common.hpp/cpp`.
+
+**plink_common.hpp additions:**
+
+```cpp
+//! Offset-indexed variant metadata for memory-efficient Scan-time access.
+//! Stores raw file content and line offsets; parses fields on demand.
+//! Thread-safe for concurrent reads (all state is immutable after construction).
+struct VariantMetadataIndex {
+    //! Raw file content (single allocation)
+    string file_content;
+
+    //! Byte offset of each data line's start within file_content
+    //! line_offsets[vidx] = byte offset of variant vidx's line
+    vector<uint64_t> line_offsets;
+
+    //! Parsed header info for field extraction
+    bool is_bim = false;
+    idx_t chrom_idx = 0;
+    idx_t pos_idx = 0;
+    idx_t id_idx = 0;
+    idx_t ref_idx = 0;
+    idx_t alt_idx = 0;
+
+    //! Total variant count
+    idx_t variant_ct = 0;
+
+    //! On-demand field access (thread-safe: const on file_content)
+    string_t GetLineView(idx_t vidx) const;
+    string GetChrom(idx_t vidx) const;
+    int32_t GetPos(idx_t vidx) const;
+    string GetId(idx_t vidx) const;
+    string GetRef(idx_t vidx) const;
+    string GetAlt(idx_t vidx) const;
+};
+
+//! Build an offset-indexed metadata index from a .pvar/.bim file.
+//! Reads the file once into a single buffer, builds line offsets, and parses
+//! the header to determine column layout. Does NOT parse data lines.
+VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context,
+                                              const string &path,
+                                              const string &func_name);
+```
+
+**plink_common.cpp implementation:**
+
+```cpp
+VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context,
+                                              const string &path,
+                                              const string &func_name) {
+    auto &fs = FileSystem::GetFileSystem(context);
+    auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+    auto file_size = handle->GetFileSize();
+
+    VariantMetadataIndex idx;
+    idx.file_content.resize(file_size);
+    handle->Read(const_cast<char *>(idx.file_content.data()), file_size);
+
+    // Parse header (same logic as current LoadVariantMetadata)
+    // ... determine is_bim, column indices, skip_lines ...
+
+    // Build line offset index: one pass over the buffer
+    idx.line_offsets.reserve(estimated_variant_ct);
+    size_t pos = /* byte offset of first data line */;
+    while (pos < file_size) {
+        idx.line_offsets.push_back(pos);
+        // Scan to next newline
+        while (pos < file_size && idx.file_content[pos] != '\n') {
+            pos++;
+        }
+        pos++; // skip newline
+    }
+    idx.variant_ct = idx.line_offsets.size();
+
+    return idx;
+}
+
+string VariantMetadataIndex::GetChrom(idx_t vidx) const {
+    // Extract line from file_content using line_offsets[vidx]
+    // Split on tab/whitespace, return field at chrom_idx
+    auto start = line_offsets[vidx];
+    auto end = (vidx + 1 < variant_ct) ? line_offsets[vidx + 1] - 1
+                                        : file_content.size();
+    // Strip trailing \r\n
+    while (end > start && (file_content[end-1] == '\r' || file_content[end-1] == '\n')) {
+        end--;
+    }
+    // Find the chrom_idx-th field
+    // ... tab/whitespace splitting logic ...
+}
+```
+
+**Optimization: field extraction without full line split**
+
+For `GetChrom` / `GetPos` / etc., we don't need to split the entire line
+into a vector of strings. We can skip directly to the N-th tab-delimited
+field with a single scan:
+
+```cpp
+//! Extract the N-th tab-delimited field from a line, without allocating
+//! a vector. Returns a string_view into file_content.
+string_view GetField(idx_t vidx, idx_t field_idx) const {
+    auto start = line_offsets[vidx];
+    auto line_end = /* next newline or EOF */;
+
+    idx_t current_field = 0;
+    size_t field_start = start;
+    for (size_t i = start; i < line_end; i++) {
+        if (file_content[i] == '\t') {  // or whitespace for .bim
+            if (current_field == field_idx) {
+                return string_view(file_content.data() + field_start,
+                                   i - field_start);
+            }
+            current_field++;
+            field_start = i + 1;
+        }
+    }
+    // Last field on the line
+    if (current_field == field_idx) {
+        return string_view(file_content.data() + field_start,
+                           line_end - field_start);
+    }
+    throw InternalException("field index out of range");
+}
+```
+
+This avoids all intermediate string allocations during Scan. Each
+`GetChrom()` / `GetPos()` call is a single scan of one line to the
+target field.
+
+**For .bim files**: The field extraction needs to handle whitespace
+delimiters (spaces or tabs) and the column reordering (.bim has a
+different column order than .pvar). Store the physical field index for
+each logical field (chrom, pos, id, ref, alt) so GetField works
+uniformly.
+
+### Step 3: Migrate callers to VariantMetadataIndex
+
+For each P2 utility function and read_pgen:
+
+1. In Bind: replace `LoadVariantMetadata` with `LoadVariantMetadataIndex`
+2. Store `VariantMetadataIndex` in bind data instead of `VariantMetadata`
+3. In Scan: replace `bind_data.variants.chroms[vidx]` with
+   `bind_data.variant_index.GetChrom(vidx)`
+
+**Region filtering migration**: `ParseRegion` / `ResolveVariantRange`
+currently operates on `variants.chroms` and `variants.positions` vectors.
+With `VariantMetadataIndex`, it iterates `line_offsets` and parses only
+CHROM and POS fields. This is a one-time cost in Bind and doesn't affect
+Scan performance.
+
+**Retain VariantMetadata for edge cases**: Keep the eager-loaded
+`VariantMetadata` type and `LoadVariantMetadata` function for cases
+where they're genuinely useful:
+- plink_score weight matching (needs ID lookup by variant ID — could
+  iterate the index, but a hash map from the eager load is faster for
+  many weights)
+- Small file optimization (files under some threshold, say 10MB, can
+  use the simpler eager path)
+
+### Step 4: ReadFileLines cleanup
+
+After migrating all callers to `VariantMetadataIndex`:
+
+1. `ReadFileLines` in plink_common remains available for .psam loading
+   (where files are small and the line-vector interface is convenient)
+2. `PfileReadFileLines` in pfile_reader.cpp should be removed in favor
+   of the shared `ReadFileLines` or the index-based approach
+3. Document the decision boundary: use `ReadFileLines` for small files
+   (.psam), use `LoadVariantMetadataIndex` for .pvar
+
+---
+
+## Execution Order
+
+| Step | Description | Dependencies | Can Parallelize |
+|------|-------------|-------------|-----------------|
+| 1 | Test data generation + baseline tests | None | — |
+| 2 | Implement VariantMetadataIndex | None | With step 1 |
+| 3 | Migrate callers to VariantMetadataIndex | Steps 1 + 2 | — |
+| 4 | ReadFileLines cleanup | Step 3 | — |
+
+Steps 1 and 2 can proceed in parallel.
+
+---
+
+## Testing Strategy
+
+### Layer 1: Correctness (sqllogictest)
+
+Verify that all functions produce identical results after refactoring.
+The existing test suite (all `test/sql/*.test` files) serves as the
+regression baseline. The new `streaming_threading.test` adds:
+
+- Exact row counts at 50K scale
+- No-duplicate checks under parallel execution
+- Value range assertions (frequencies 0–1, p-values 0–1, etc.)
+- Cross-function consistency (variant-mode totals = sample-mode totals)
+- LIMIT short-circuit verification
+
+### Layer 2: Streaming behavior (sqllogictest)
+
+Indirect tests that would fail if results were buffered:
+
+- `LIMIT N` on large datasets returns exactly N rows
+- Region-filtered queries return correct subsets
+- Projection pushdown queries work on large datasets
+
+### Layer 3: Memory efficiency (manual benchmarks)
+
+Extension memory (strings, vectors, `cachealigned_malloc` buffers) is
+allocated through the system allocator, not DuckDB's buffer pool.
+`SET memory_limit` only caps DuckDB-internal buffer pool allocations and
+would NOT catch bulk-loading regressions in extension code. Memory
+efficiency must be measured externally.
+
+Possible approaches:
+
+- **Manual benchmark script**: Run queries on progressively larger
+  datasets, measure peak RSS via `/proc/self/status` or `getrusage`.
+  Verify that RSS after the VariantMetadataIndex migration is
+  substantially lower than before for the same dataset.
+- **CI memory limit via ulimit**: Run tests under `ulimit -v` to cap
+  total process virtual memory. This catches system-allocator memory
+  from the extension. If bulk-loading tries to allocate too much, the
+  process will fail.
+- **Before/after comparison**: Generate .pvar files of increasing size
+  (1K, 10K, 100K, 1M variants) and measure peak RSS for a simple
+  `SELECT COUNT(*) FROM plink_freq(...)` query. With the eager
+  `LoadVariantMetadata`, RSS should scale linearly with variant count.
+  With `VariantMetadataIndex`, RSS should be dominated by the file
+  buffer (same as before) but the parsed-metadata overhead should
+  disappear.
+
+---
+
+## Risks and Trade-offs
+
+### VariantMetadataIndex: CPU vs memory trade-off
+
+On-demand parsing adds per-variant CPU cost in Scan (one line scan per
+metadata field access). For functions that project all 5 metadata columns,
+this means 5 line scans per variant. Each scan is O(line_length) which
+is small (~50 bytes for a typical .pvar line), but it adds up at 170M
+variants × 16 threads.
+
+**Mitigation**: The field extraction (scanning to the N-th tab) is
+cache-friendly (sequential memory access) and branch-predictor-friendly
+(scanning for a fixed delimiter). At ~50 bytes per line, 5 field accesses
+per variant = ~250 bytes touched per variant. This is negligible compared
+to the pgenlib I/O cost per variant.
+
+**Fallback**: If profiling shows the parsing overhead is significant,
+add a per-thread metadata cache that pre-parses a batch of lines when
+a new batch is claimed. This amortizes the parsing overhead over batch
+size.
+
+### Per-sample accumulation remains single-threaded
+
+`plink_missing` (sample mode) and `plink_score` will continue to use
+`MaxThreads() = 1` for now. The DuckDB table function API does not support
+the parallel-accumulate-then-emit pattern cleanly (see Area 2). At biobank
+scale, these functions will be bottlenecked by single-threaded variant
+scanning. A future plan can address this via background `std::thread`
+management or by migrating to a PhysicalOperator implementation with
+Sink/Combine/Finalize lifecycle.
+
+### Ordering guarantees
+
+Parallel variant scanning does not guarantee output row order. Currently,
+this is the case for all functions (rows come out in batch-claimed order,
+which depends on thread scheduling). The refactoring doesn't change this.
+
+Functions that need deterministic order (none currently) would need a
+sort step after scanning.
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Streaming test data generated (50K variants × 8 samples)
+2. [ ] Baseline streaming/threading tests pass for all functions
+3. [ ] `VariantMetadataIndex` implemented with on-demand field extraction
+4. [ ] All P2 utility functions migrated to `VariantMetadataIndex`
+5. [ ] `read_pgen` migrated to `VariantMetadataIndex`
+6. [ ] Region filtering works with `VariantMetadataIndex`
+7. [ ] All existing tests pass (regression-free)
+8. [ ] LIMIT queries short-circuit correctly on 50K dataset
+9. [ ] Cross-function consistency tests pass
+10. [ ] `PfileReadFileLines` eliminated or replaced with shared utility
+11. [ ] `make test` passes
