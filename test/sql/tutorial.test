@@ -1,0 +1,267 @@
+# name: test/sql/tutorial.test
+# description: Validates all SQL queries from docs/tutorial.md
+# group: [sql]
+
+require plinking_duck
+
+# === Section 1: Meet the Dataset ===
+
+# read_pvar: all variant metadata
+query TITTT
+SELECT * FROM read_pvar('test/data/pgen_example.pvar');
+----
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A
+2	15000	rs4	T	C
+
+# Count variants per chromosome
+query TI
+SELECT CHROM, COUNT(*) AS n_variants
+FROM read_pvar('test/data/pgen_example.pvar')
+GROUP BY CHROM
+ORDER BY CHROM;
+----
+1	3
+2	1
+
+# read_psam: sample metadata
+query TTI
+SELECT * FROM read_psam('test/data/pfile_example.psam');
+----
+FAM001	SAMPLE1	1
+FAM001	SAMPLE2	2
+FAM002	SAMPLE3	NULL
+FAM002	SAMPLE4	1
+
+# === Section 2: Reading Genotypes ===
+
+# read_pgen: list mode
+query TITTT rowsort
+SELECT CHROM, POS, ID, REF, ALT FROM read_pgen('test/data/pgen_example.pgen');
+----
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A
+2	15000	rs4	T	C
+
+# read_pfile tidy mode: selected columns
+query TITTT
+SELECT CHROM, POS, ID, IID, CAST(genotype AS VARCHAR) AS genotype
+FROM read_pfile('test/data/pfile_example', tidy := true)
+ORDER BY ID, IID;
+----
+1	10000	rs1	SAMPLE1	0
+1	10000	rs1	SAMPLE2	1
+1	10000	rs1	SAMPLE3	2
+1	10000	rs1	SAMPLE4	NULL
+1	20000	rs2	SAMPLE1	1
+1	20000	rs2	SAMPLE2	1
+1	20000	rs2	SAMPLE3	0
+1	20000	rs2	SAMPLE4	2
+1	30000	rs3	SAMPLE1	2
+1	30000	rs3	SAMPLE2	NULL
+1	30000	rs3	SAMPLE3	1
+1	30000	rs3	SAMPLE4	0
+2	15000	rs4	SAMPLE1	0
+2	15000	rs4	SAMPLE2	0
+2	15000	rs4	SAMPLE3	1
+2	15000	rs4	SAMPLE4	2
+
+# Count alt alleles per sample
+query TI
+SELECT IID, CAST(SUM(genotype) AS INTEGER) AS total_alt_alleles
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE genotype IS NOT NULL
+GROUP BY IID
+ORDER BY IID;
+----
+SAMPLE1	3
+SAMPLE2	2
+SAMPLE3	4
+SAMPLE4	4
+
+# Find heterozygous calls
+query TT
+SELECT ID, IID
+FROM read_pfile('test/data/pfile_example', tidy := true)
+WHERE genotype = 1
+ORDER BY ID, IID;
+----
+rs1	SAMPLE2
+rs2	SAMPLE1
+rs2	SAMPLE2
+rs3	SAMPLE3
+rs4	SAMPLE3
+
+# === Section 3: Quality Control ===
+
+# Per-variant missingness
+query TIIR
+SELECT ID, MISSING_CT, OBS_CT, F_MISS
+FROM plink_missing('test/data/pgen_example.pgen');
+----
+rs1	1	3	0.25
+rs2	0	4	0.0
+rs3	1	3	0.25
+rs4	0	4	0.0
+
+# Per-sample missingness
+query TIIR
+SELECT IID, MISSING_CT, OBS_CT, F_MISS
+FROM plink_missing('test/data/pgen_example.pgen',
+    mode := 'sample', psam := 'test/data/pfile_example.psam');
+----
+SAMPLE1	0	4	0.0
+SAMPLE2	1	3	0.25
+SAMPLE3	0	4	0.0
+SAMPLE4	1	3	0.25
+
+# Allele frequencies
+query TRI
+SELECT ID, ALT_FREQ, OBS_CT
+FROM plink_freq('test/data/pgen_example.pgen');
+----
+rs1	0.5	6
+rs2	0.5	8
+rs3	0.5	6
+rs4	0.375	8
+
+# Frequency with genotype counts
+query TIIII
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT
+FROM plink_freq('test/data/pgen_example.pgen', counts := true);
+----
+rs1	1	1	1	1
+rs2	1	2	1	0
+rs3	1	1	1	1
+rs4	2	1	1	0
+
+# Hardy-Weinberg equilibrium
+query TIIIR
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT,
+       ROUND(P_HWE, 4) AS P_HWE
+FROM plink_hardy('test/data/pgen_example.pgen');
+----
+rs1	1	1	1	1.0
+rs2	1	2	1	1.0
+rs3	1	1	1	1.0
+rs4	2	1	1	0.4286
+
+# QC summary CTE
+query TRRR
+SELECT f.ID,
+       f.ALT_FREQ,
+       m.F_MISS,
+       h.P_HWE
+FROM (SELECT ID, ALT_FREQ FROM plink_freq('test/data/pgen_example.pgen')) f
+JOIN (SELECT ID, F_MISS FROM plink_missing('test/data/pgen_example.pgen')) m ON f.ID = m.ID
+JOIN (SELECT ID, P_HWE FROM plink_hardy('test/data/pgen_example.pgen')) h ON f.ID = h.ID
+ORDER BY f.ID;
+----
+rs1	0.5	0.25	1.0
+rs2	0.5	0.0	1.0
+rs3	0.5	0.25	1.0
+rs4	0.375	0.0	0.4285714285714286
+
+# === Section 4: Linkage Disequilibrium ===
+
+# Pairwise LD
+query TTRI
+SELECT ID_A, ID_B, ROUND(R2, 4) AS R2, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+rs1	rs2	0.75	3
+
+# Windowed LD (all same-chrom pairs)
+query TTRRI
+SELECT ID_A, ID_B, ROUND(R2, 4) AS R2,
+       ROUND(D_PRIME, 4) AS D_PRIME, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    r2_threshold := 0.0);
+----
+rs1	rs2	0.75	0.5	3
+rs1	rs3	1.0	1.0	2
+rs2	rs3	0.25	0.3333	3
+
+# Cross-chromosome LD
+query TTRI
+SELECT ID_A, ID_B, ROUND(R2, 4) AS R2, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen',
+    r2_threshold := 0.0, inter_chr := true);
+----
+rs1	rs2	0.75	3
+rs1	rs3	1.0	2
+rs1	rs4	0.75	3
+rs2	rs3	0.25	3
+rs2	rs4	0.1818	4
+rs3	rs4	1.0	3
+
+# === Section 5: Polygenic Risk Scoring ===
+
+# Positional weights
+query TRR
+SELECT IID, SCORE_SUM, SCORE_AVG
+FROM plink_score('test/data/pgen_example.pgen',
+    psam := 'test/data/pfile_example.psam',
+    weights := [0.5, -0.3, 1.2, 0.8]);
+----
+SAMPLE1	2.1	0.2625
+SAMPLE2	1.4	0.175
+SAMPLE3	3.0	0.375
+SAMPLE4	1.5	0.1875
+
+# ID-keyed weights
+query TRR
+SELECT IID, ROUND(SCORE_SUM, 2) AS SCORE_SUM,
+       ROUND(SCORE_AVG, 4) AS SCORE_AVG
+FROM plink_score('test/data/pgen_example.pgen',
+    psam := 'test/data/pfile_example.psam',
+    weights := [
+        {'id': 'rs1', 'allele': 'G', 'weight': 0.5},
+        {'id': 'rs2', 'allele': 'T', 'weight': -0.3},
+        {'id': 'rs4', 'allele': 'C', 'weight': 0.8}
+    ]);
+----
+SAMPLE1	-0.3	-0.05
+SAMPLE2	0.2	0.0333
+SAMPLE3	1.8	0.3
+SAMPLE4	1.5	0.25
+
+# === Section 6: Working at Scale ===
+
+# Large dataset dimensions
+query II
+SELECT
+    (SELECT COUNT(*) FROM read_pvar('test/data/large_example.pvar')) AS n_variants,
+    (SELECT COUNT(*) FROM read_psam('test/data/large_example.psam')) AS n_samples;
+----
+3000	8
+
+# Variants per chromosome
+query TI
+SELECT CHROM, COUNT(*) AS n_variants
+FROM read_pvar('test/data/large_example.pvar')
+GROUP BY CHROM
+ORDER BY CHROM;
+----
+1	1000
+2	1000
+3	1000
+
+# Region filtering
+query I
+SELECT COUNT(*) AS n_variants
+FROM plink_freq('test/data/large_example.pgen',
+    region := '1:1-50000');
+----
+500
+
+# Region filter with aggregation
+query IR
+SELECT COUNT(*) AS n_variants, ROUND(AVG(ALT_FREQ), 4) AS mean_freq
+FROM plink_freq('test/data/large_example.pgen',
+    region := '1:1-50000');
+----
+500	0.5

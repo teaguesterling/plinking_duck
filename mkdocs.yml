@@ -39,6 +39,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Tutorial: tutorial.md
   - File Formats: file-formats.md
   - Genotype Encoding: genotype-encoding.md
   - Common Parameters: common-parameters.md
