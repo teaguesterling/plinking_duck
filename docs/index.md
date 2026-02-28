@@ -1,8 +1,12 @@
 # PlinkingDuck
 
-A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/) genomics file formats directly in SQL.
+A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/) genomics file formats and running common genetic analyses directly in SQL.
 
-PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific tools.
+PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific command-line tools. Read files, filter variants, compute allele frequencies, test Hardy-Weinberg equilibrium, measure missingness, calculate linkage disequilibrium, and run polygenic scoring — all from a SQL prompt.
+
+!!! tip "Built on the shoulders of [DuckHTS](https://github.com/RGenomicsETL/duckhts)"
+
+    DuckHTS pioneered the idea of querying genomics file formats directly in DuckDB using htslib. It supports VCF, BCF, BAM, CRAM, FASTA, FASTQ, GTF, GFF, and tabix-indexed files — the sequencing side of the house. PlinkingDuck picks up where DuckHTS leaves off, covering the PLINK genotype file formats used in population genetics and GWAS. If you work with both sequencing and genotype data, you'll want both extensions.
 
 ## Quick Example
 
