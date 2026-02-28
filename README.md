@@ -19,7 +19,7 @@ PlinkingDuck provides **four file readers** and **five analysis functions**:
 | [`read_pfile`](#read_pfileprefix--pgen-pvar-psam-tidy-samples-variants-region) | Unified reader with tidy mode, filtering |
 | [`plink_freq`](#plink_freqpath--pvar-psam-samples-region-counts) | Per-variant allele frequencies |
 | [`plink_hardy`](#plink_hardypath--pvar-psam-samples-region-midp) | Hardy-Weinberg equilibrium test |
-| [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-sample_mode) | Per-variant or per-sample missingness |
+| [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-mode) | Per-variant or per-sample missingness |
 | [`plink_ld`](#plink_ldpath--variant1-variant2-window_kb-r2_threshold-inter_chr) | Pairwise linkage disequilibrium |
 | [`plink_score`](#plink_scorepath--weights-no_mean_imputation) | Polygenic risk scoring |
 
@@ -207,7 +207,7 @@ WHERE P_HWE > 1e-6;
 **Output columns:** CHROM, POS, ID, REF, ALT, A1, HOM_REF_CT, HET_CT,
 HOM_ALT_CT, O_HET, E_HET, P_HWE.
 
-### `plink_missing(path [, pvar, psam, samples, region, sample_mode])`
+### `plink_missing(path [, pvar, psam, samples, region, mode])`
 
 Compute per-variant or per-sample missingness rates.
 
@@ -216,17 +216,17 @@ Compute per-variant or per-sample missingness rates.
 SELECT * FROM plink_missing('data/example.pgen');
 
 -- Per-sample missingness
-SELECT * FROM plink_missing('data/example.pgen', sample_mode := true);
+SELECT * FROM plink_missing('data/example.pgen', mode := 'sample');
 
 -- QC: flag samples with >5% missingness
 SELECT IID, F_MISS
-FROM plink_missing('data/example.pgen', sample_mode := true)
+FROM plink_missing('data/example.pgen', mode := 'sample')
 WHERE F_MISS > 0.05;
 ```
 
 **Variant mode output (default):** CHROM, POS, ID, REF, ALT, MISSING_CT, OBS_CT, F_MISS.
 
-**Sample mode output (`sample_mode := true`):** FID, IID, MISSING_CT, OBS_CT, F_MISS.
+**Sample mode output (`mode := 'sample'`):** FID, IID, MISSING_CT, OBS_CT, F_MISS.
 
 ### `plink_ld(path [, variant1, variant2, window_kb, r2_threshold, inter_chr])`
 
