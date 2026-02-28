@@ -67,8 +67,7 @@ string VariantMetadataIndex::GetField(idx_t vidx, idx_t field_idx) const {
 	}
 
 	throw InternalException("VariantMetadataIndex::GetField: field index %llu out of range for variant %llu",
-	                        static_cast<unsigned long long>(field_idx),
-	                        static_cast<unsigned long long>(vidx));
+	                        static_cast<unsigned long long>(field_idx), static_cast<unsigned long long>(vidx));
 }
 
 string VariantMetadataIndex::GetChrom(idx_t vidx) const {
@@ -81,8 +80,8 @@ int32_t VariantMetadataIndex::GetPos(idx_t vidx) const {
 	errno = 0;
 	long val = std::strtol(field.c_str(), &end, 10);
 	if (end == field.c_str() || *end != '\0' || errno != 0) {
-		throw InternalException("VariantMetadataIndex::GetPos: invalid POS value '%s' for variant %llu",
-		                        field.c_str(), static_cast<unsigned long long>(vidx));
+		throw InternalException("VariantMetadataIndex::GetPos: invalid POS value '%s' for variant %llu", field.c_str(),
+		                        static_cast<unsigned long long>(vidx));
 	}
 	return static_cast<int32_t>(val);
 }

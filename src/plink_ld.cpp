@@ -631,8 +631,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 				bool same_chrom = (j_chrom == anchor_chrom);
 
 				if (same_chrom) {
-					int64_t dist =
-					    static_cast<int64_t>(variants.GetPos(j)) - static_cast<int64_t>(anchor_pos);
+					int64_t dist = static_cast<int64_t>(variants.GetPos(j)) - static_cast<int64_t>(anchor_pos);
 					if (dist > bind_data.window_bp) {
 						if (!bind_data.inter_chr) {
 							break; // Past window, no cross-chrom needed

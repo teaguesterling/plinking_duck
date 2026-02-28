@@ -1,6 +1,6 @@
 # name: test/sql/streaming_threading.test
 # description: Streaming and threading correctness tests at 50K variant scale
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 
