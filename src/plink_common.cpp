@@ -80,9 +80,9 @@ int32_t VariantMetadataIndex::GetPos(idx_t vidx) const {
 	char *end;
 	errno = 0;
 	long val = std::strtol(field.c_str(), &end, 10);
-	if (errno != 0) {
-		throw InternalException("VariantMetadataIndex::GetPos: invalid POS value for variant %llu",
-		                        static_cast<unsigned long long>(vidx));
+	if (end == field.c_str() || *end != '\0' || errno != 0) {
+		throw InternalException("VariantMetadataIndex::GetPos: invalid POS value '%s' for variant %llu",
+		                        field.c_str(), static_cast<unsigned long long>(vidx));
 	}
 	return static_cast<int32_t>(val);
 }

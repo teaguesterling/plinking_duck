@@ -612,6 +612,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 	// Cache anchor chrom/pos for the inner loop to avoid repeated parsing
 	string anchor_chrom;
 	int32_t anchor_pos = 0;
+	bool anchor_cached = false;
 
 	while (rows_emitted < STANDARD_VECTOR_SIZE) {
 		if (lstate.in_window) {
@@ -619,9 +620,10 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 			uint32_t ai = lstate.anchor_idx;
 			uint32_t j = lstate.next_j;
 
-			if (anchor_chrom.empty()) {
+			if (!anchor_cached) {
 				anchor_chrom = variants.GetChrom(ai);
 				anchor_pos = variants.GetPos(ai);
+				anchor_cached = true;
 			}
 
 			while (j < end_idx) {
@@ -683,6 +685,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		lstate.in_window = true;
 		anchor_chrom = variants.GetChrom(anchor_idx);
 		anchor_pos = variants.GetPos(anchor_idx);
+		anchor_cached = true;
 	}
 
 done:
