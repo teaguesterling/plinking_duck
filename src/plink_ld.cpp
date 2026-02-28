@@ -128,7 +128,7 @@ struct PlinkLdBindData : public TableFunctionData {
 	string pvar_path;
 	string psam_path;
 
-	VariantMetadata variants;
+	VariantMetadataIndex variants;
 	SampleInfo sample_info;
 	bool has_sample_info = false;
 
@@ -317,7 +317,7 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_ld");
+	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "plink_ld");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("plink_ld: variant count mismatch: .pgen has %u variants, "
@@ -363,11 +363,12 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 		// Look up variant1 by ID
 		bool found_a = false, found_b = false;
 		for (uint32_t i = 0; i < static_cast<uint32_t>(bind_data->variants.variant_ct); i++) {
-			if (bind_data->variants.ids[i] == variant1_id) {
+			auto vid = bind_data->variants.GetId(i);
+			if (vid == variant1_id) {
 				bind_data->pairwise_vidx_a = i;
 				found_a = true;
 			}
-			if (bind_data->variants.ids[i] == variant2_id) {
+			if (vid == variant2_id) {
 				bind_data->pairwise_vidx_b = i;
 				found_b = true;
 			}
@@ -504,13 +505,13 @@ static void EmitRow(DataChunk &output, idx_t row_idx, const PlinkLdBindData &bin
 
 	// CHROM_A
 	FlatVector::GetData<string_t>(output.data[COL_CHROM_A])[row_idx] =
-	    StringVector::AddString(output.data[COL_CHROM_A], variants.chroms[vidx_a]);
+	    StringVector::AddString(output.data[COL_CHROM_A], variants.GetChrom(vidx_a));
 
 	// POS_A
-	FlatVector::GetData<int32_t>(output.data[COL_POS_A])[row_idx] = variants.positions[vidx_a];
+	FlatVector::GetData<int32_t>(output.data[COL_POS_A])[row_idx] = variants.GetPos(vidx_a);
 
 	// ID_A
-	auto &id_a = variants.ids[vidx_a];
+	auto id_a = variants.GetId(vidx_a);
 	if (id_a.empty()) {
 		FlatVector::SetNull(output.data[COL_ID_A], row_idx, true);
 	} else {
@@ -520,13 +521,13 @@ static void EmitRow(DataChunk &output, idx_t row_idx, const PlinkLdBindData &bin
 
 	// CHROM_B
 	FlatVector::GetData<string_t>(output.data[COL_CHROM_B])[row_idx] =
-	    StringVector::AddString(output.data[COL_CHROM_B], variants.chroms[vidx_b]);
+	    StringVector::AddString(output.data[COL_CHROM_B], variants.GetChrom(vidx_b));
 
 	// POS_B
-	FlatVector::GetData<int32_t>(output.data[COL_POS_B])[row_idx] = variants.positions[vidx_b];
+	FlatVector::GetData<int32_t>(output.data[COL_POS_B])[row_idx] = variants.GetPos(vidx_b);
 
 	// ID_B
-	auto &id_b = variants.ids[vidx_b];
+	auto id_b = variants.GetId(vidx_b);
 	if (id_b.empty()) {
 		FlatVector::SetNull(output.data[COL_ID_B], row_idx, true);
 	} else {
@@ -608,24 +609,34 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 	uint32_t end_idx = gstate.end_variant_idx;
 	auto &variants = bind_data.variants;
 
+	// Cache anchor chrom/pos for the inner loop to avoid repeated parsing
+	string anchor_chrom;
+	int32_t anchor_pos = 0;
+
 	while (rows_emitted < STANDARD_VECTOR_SIZE) {
 		if (lstate.in_window) {
 			// Resume scanning partners for current anchor
 			uint32_t ai = lstate.anchor_idx;
 			uint32_t j = lstate.next_j;
 
+			if (anchor_chrom.empty()) {
+				anchor_chrom = variants.GetChrom(ai);
+				anchor_pos = variants.GetPos(ai);
+			}
+
 			while (j < end_idx) {
-				bool same_chrom = (variants.chroms[j] == variants.chroms[ai]);
+				auto j_chrom = variants.GetChrom(j);
+				bool same_chrom = (j_chrom == anchor_chrom);
 
 				if (same_chrom) {
 					int64_t dist =
-					    static_cast<int64_t>(variants.positions[j]) - static_cast<int64_t>(variants.positions[ai]);
+					    static_cast<int64_t>(variants.GetPos(j)) - static_cast<int64_t>(anchor_pos);
 					if (dist > bind_data.window_bp) {
 						if (!bind_data.inter_chr) {
 							break; // Past window, no cross-chrom needed
 						}
 						// Skip remaining same-chrom variants beyond window
-						while (j < end_idx && variants.chroms[j] == variants.chroms[ai]) {
+						while (j < end_idx && variants.GetChrom(j) == anchor_chrom) {
 							j++;
 						}
 						continue; // Check next chromosome
@@ -670,6 +681,8 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		lstate.anchor_idx = anchor_idx;
 		lstate.next_j = anchor_idx + 1;
 		lstate.in_window = true;
+		anchor_chrom = variants.GetChrom(anchor_idx);
+		anchor_pos = variants.GetPos(anchor_idx);
 	}
 
 done:

@@ -39,7 +39,7 @@ struct PlinkMissingBindData : public TableFunctionData {
 	string pvar_path;
 	string psam_path;
 
-	VariantMetadata variants;
+	VariantMetadataIndex variants;
 	SampleInfo sample_info;
 	bool has_sample_info = false;
 
@@ -213,7 +213,7 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_missing");
+	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "plink_missing");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("plink_missing: variant count mismatch: .pgen has %u variants, "
@@ -469,16 +469,16 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 
 				switch (file_col) {
 				case VCOL_CHROM: {
-					auto &val = bind_data.variants.chroms[vidx];
+					auto val = bind_data.variants.GetChrom(vidx);
 					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case VCOL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.positions[vidx];
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case VCOL_ID: {
-					auto &val = bind_data.variants.ids[vidx];
+					auto val = bind_data.variants.GetId(vidx);
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -487,12 +487,12 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 					break;
 				}
 				case VCOL_REF: {
-					auto &val = bind_data.variants.refs[vidx];
+					auto val = bind_data.variants.GetRef(vidx);
 					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case VCOL_ALT: {
-					auto &val = bind_data.variants.alts[vidx];
+					auto val = bind_data.variants.GetAlt(vidx);
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {

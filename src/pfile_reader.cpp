@@ -1,4 +1,5 @@
 #include "pfile_reader.hpp"
+#include "plink_common.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
@@ -13,247 +14,6 @@
 #include <unordered_set>
 
 namespace duckdb {
-
-// ---------------------------------------------------------------------------
-// RAII wrapper for cache-aligned allocations (same pattern as pgen_reader)
-// ---------------------------------------------------------------------------
-
-struct PfileAlignedBuffer {
-	void *ptr = nullptr;
-
-	~PfileAlignedBuffer() {
-		if (ptr) {
-			plink2::aligned_free(ptr);
-		}
-	}
-
-	PfileAlignedBuffer() = default;
-	PfileAlignedBuffer(const PfileAlignedBuffer &) = delete;
-	PfileAlignedBuffer &operator=(const PfileAlignedBuffer &) = delete;
-	PfileAlignedBuffer(PfileAlignedBuffer &&other) noexcept : ptr(other.ptr) {
-		other.ptr = nullptr;
-	}
-	PfileAlignedBuffer &operator=(PfileAlignedBuffer &&other) noexcept {
-		if (this != &other) {
-			if (ptr) {
-				plink2::aligned_free(ptr);
-			}
-			ptr = other.ptr;
-			other.ptr = nullptr;
-		}
-		return *this;
-	}
-
-	void Allocate(uintptr_t size) {
-		if (plink2::cachealigned_malloc(size, &ptr)) {
-			throw IOException("read_pfile: failed to allocate %llu bytes of aligned memory",
-			                  static_cast<unsigned long long>(size));
-		}
-	}
-
-	template <typename T>
-	T *As() {
-		return static_cast<T *>(ptr);
-	}
-};
-
-// ---------------------------------------------------------------------------
-// Variant metadata (same as pgen_reader, duplicated to avoid coupling)
-// ---------------------------------------------------------------------------
-
-struct PfileVariantMetadata {
-	vector<string> chroms;
-	vector<int32_t> positions;
-	vector<string> ids;
-	vector<string> refs;
-	vector<string> alts;
-	idx_t variant_ct = 0;
-
-	//! Build ID→index map for variant filtering by name
-	unordered_map<string, uint32_t> id_to_idx;
-
-	void BuildIdMap() {
-		for (idx_t i = 0; i < variant_ct; i++) {
-			if (!ids[i].empty()) {
-				id_to_idx[ids[i]] = static_cast<uint32_t>(i);
-			}
-		}
-	}
-};
-
-// ---------------------------------------------------------------------------
-// File reading and variant metadata loading (reused from pgen_reader pattern)
-// ---------------------------------------------------------------------------
-
-static vector<string> PfileReadFileLines(ClientContext &context, const string &path) {
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
-	auto file_size = handle->GetFileSize();
-
-	if (file_size == 0) {
-		return {};
-	}
-
-	string content(file_size, '\0');
-	handle->Read(const_cast<char *>(content.data()), file_size);
-
-	vector<string> lines;
-	size_t start = 0;
-	for (size_t i = 0; i < content.size(); i++) {
-		if (content[i] == '\n') {
-			size_t end = i;
-			if (end > start && content[end - 1] == '\r') {
-				end--;
-			}
-			lines.push_back(content.substr(start, end - start));
-			start = i + 1;
-		}
-	}
-	if (start < content.size()) {
-		size_t end = content.size();
-		if (end > start && content[end - 1] == '\r') {
-			end--;
-		}
-		if (end > start) {
-			lines.push_back(content.substr(start, end - start));
-		}
-	}
-
-	return lines;
-}
-
-static vector<string> PfileSplitTabLine(const string &line) {
-	vector<string> fields;
-	size_t start = 0;
-	size_t pos = line.find('\t');
-	while (pos != string::npos) {
-		fields.push_back(line.substr(start, pos - start));
-		start = pos + 1;
-		pos = line.find('\t', start);
-	}
-	fields.push_back(line.substr(start));
-	return fields;
-}
-
-static vector<string> PfileSplitWhitespaceLine(const string &line) {
-	vector<string> fields;
-	size_t i = 0;
-	while (i < line.size()) {
-		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
-			i++;
-		}
-		if (i >= line.size()) {
-			break;
-		}
-		size_t start = i;
-		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
-			i++;
-		}
-		fields.push_back(line.substr(start, i - start));
-	}
-	return fields;
-}
-
-static PfileVariantMetadata LoadPfileVariantMetadata(ClientContext &context, const string &path) {
-	auto header_info = ParsePvarHeader(context, path);
-
-	idx_t chrom_idx = DConstants::INVALID_INDEX;
-	idx_t pos_idx = DConstants::INVALID_INDEX;
-	idx_t id_idx = DConstants::INVALID_INDEX;
-	idx_t ref_idx = DConstants::INVALID_INDEX;
-	idx_t alt_idx = DConstants::INVALID_INDEX;
-
-	for (idx_t i = 0; i < header_info.column_names.size(); i++) {
-		const auto &name = header_info.column_names[i];
-		if (name == "CHROM") {
-			chrom_idx = i;
-		} else if (name == "POS") {
-			pos_idx = i;
-		} else if (name == "ID") {
-			id_idx = i;
-		} else if (name == "REF") {
-			ref_idx = i;
-		} else if (name == "ALT") {
-			alt_idx = i;
-		}
-	}
-
-	if (chrom_idx == DConstants::INVALID_INDEX || pos_idx == DConstants::INVALID_INDEX ||
-	    id_idx == DConstants::INVALID_INDEX || ref_idx == DConstants::INVALID_INDEX ||
-	    alt_idx == DConstants::INVALID_INDEX) {
-		throw InvalidInputException("read_pfile: .pvar/.bim file '%s' is missing required columns "
-		                            "(need CHROM, POS, ID, REF, ALT)",
-		                            path);
-	}
-
-	auto lines = PfileReadFileLines(context, path);
-
-	PfileVariantMetadata meta;
-	for (idx_t line_idx = header_info.skip_lines; line_idx < lines.size(); line_idx++) {
-		auto &line = lines[line_idx];
-		if (line.empty()) {
-			continue;
-		}
-
-		auto fields = header_info.is_bim ? PfileSplitWhitespaceLine(line) : PfileSplitTabLine(line);
-
-		vector<string> *source = &fields;
-		vector<string> normalized;
-		if (header_info.is_bim) {
-			if (fields.size() < 6) {
-				throw InvalidInputException("read_pfile: .bim file '%s' has line with %llu fields, expected 6", path,
-				                            static_cast<unsigned long long>(fields.size()));
-			}
-			normalized = {fields[0], fields[3], fields[1], fields[5], fields[4], fields[2]};
-			source = &normalized;
-		}
-
-		auto &src = *source;
-		if (chrom_idx >= src.size() || pos_idx >= src.size() || id_idx >= src.size() || ref_idx >= src.size() ||
-		    alt_idx >= src.size()) {
-			throw InvalidInputException("read_pfile: .pvar/.bim file '%s' has line with too few fields", path);
-		}
-
-		meta.chroms.push_back(src[chrom_idx]);
-
-		char *end;
-		errno = 0;
-		long pos_val = std::strtol(src[pos_idx].c_str(), &end, 10);
-		if (end == src[pos_idx].c_str() || *end != '\0' || errno != 0) {
-			throw InvalidInputException("read_pfile: invalid POS value '%s' in '%s'", src[pos_idx], path);
-		}
-		meta.positions.push_back(static_cast<int32_t>(pos_val));
-
-		meta.ids.push_back(src[id_idx] == "." ? "" : src[id_idx]);
-		meta.refs.push_back(src[ref_idx]);
-		meta.alts.push_back(src[alt_idx]);
-	}
-
-	meta.variant_ct = meta.chroms.size();
-	return meta;
-}
-
-// ---------------------------------------------------------------------------
-// Companion file discovery
-// ---------------------------------------------------------------------------
-
-static string PfileReplaceExtension(const string &path, const string &new_ext) {
-	auto dot = path.rfind('.');
-	if (dot == string::npos) {
-		return path + new_ext;
-	}
-	return path.substr(0, dot) + new_ext;
-}
-
-static string PfileFindCompanionFile(FileSystem &fs, const string &base_path, const vector<string> &extensions) {
-	for (auto &ext : extensions) {
-		auto candidate = PfileReplaceExtension(base_path, ext);
-		if (fs.FileExists(candidate)) {
-			return candidate;
-		}
-	}
-	return "";
-}
 
 // ---------------------------------------------------------------------------
 // Region parsing
@@ -346,7 +106,7 @@ static bool PfileIsMissingValue(const string &val) {
 //! Also populates sample_info to avoid a separate file read for LoadSampleInfo.
 static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const string &path,
                                                    SampleInfo &sample_info_out) {
-	auto lines = PfileReadFileLines(context, path);
+	auto lines = ReadFileLines(context, path);
 
 	PfileSampleMetadata meta;
 
@@ -397,9 +157,9 @@ static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const
 
 		vector<string> fields;
 		if (meta.header.format == PsamFormat::FAM) {
-			fields = PfileSplitWhitespaceLine(line);
+			fields = SplitWhitespaceLine(line);
 		} else {
-			fields = PfileSplitTabLine(line);
+			fields = SplitTabLine(line);
 		}
 
 		// Extract sample info for IID lookups
@@ -433,7 +193,7 @@ struct PfileBindData : public TableFunctionData {
 	string psam_path;
 
 	// Variant metadata
-	PfileVariantMetadata variants;
+	VariantMetadataIndex variants;
 
 	// Sample metadata (basic: for IID lookups and default mode)
 	SampleInfo sample_info;
@@ -539,13 +299,13 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 
 struct PfileLocalState : public LocalTableFunctionState {
 	plink2::PgenFileInfo pgfi;
-	PfileAlignedBuffer pgfi_alloc_buf;
+	AlignedBuffer pgfi_alloc_buf;
 
 	plink2::PgenReader pgr;
-	PfileAlignedBuffer pgr_alloc_buf;
-	PfileAlignedBuffer genovec_buf;
-	PfileAlignedBuffer sample_include_buf;
-	PfileAlignedBuffer cumulative_popcounts_buf;
+	AlignedBuffer pgr_alloc_buf;
+	AlignedBuffer genovec_buf;
+	AlignedBuffer sample_include_buf;
+	AlignedBuffer cumulative_popcounts_buf;
 
 	vector<int8_t> genotype_bytes;
 
@@ -632,7 +392,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 	if (bind_data->pvar_path.empty()) {
 		if (!prefix.empty()) {
-			bind_data->pvar_path = PfileFindCompanionFile(fs, prefix + ".pgen", {".pvar", ".bim"});
+			bind_data->pvar_path = FindCompanionFile(fs, prefix + ".pgen", {".pvar", ".bim"});
 			if (bind_data->pvar_path.empty()) {
 				// Also try prefix-based discovery
 				for (auto &ext : {".pvar", ".bim"}) {
@@ -645,7 +405,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 		}
 		if (bind_data->pvar_path.empty()) {
-			bind_data->pvar_path = PfileFindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+			bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
 		}
 		if (bind_data->pvar_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .pvar or .bim file for '%s' "
@@ -665,7 +425,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 		}
 		if (bind_data->psam_path.empty()) {
-			bind_data->psam_path = PfileFindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+			bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
 		}
 		if (bind_data->psam_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .psam or .fam file for '%s' "
@@ -695,7 +455,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_data->raw_sample_ct = pgfi.raw_sample_ct;
 
 	// Phase 2
-	PfileAlignedBuffer pgfi_alloc;
+	AlignedBuffer pgfi_alloc;
 	if (pgfi_alloc_cacheline_ct > 0) {
 		pgfi_alloc.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
 	}
@@ -714,7 +474,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadPfileVariantMetadata(context, bind_data->pvar_path);
+	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "read_pfile");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("read_pfile: variant count mismatch: .pgen has %u variants, "
@@ -816,14 +576,20 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				bind_data->variant_indices.push_back(static_cast<uint32_t>(idx));
 			}
 		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
-			// Build ID map if not already built
-			bind_data->variants.BuildIdMap();
+			// Build ID→index map from VariantMetadataIndex
+			unordered_map<string, uint32_t> id_to_idx;
+			for (idx_t i = 0; i < bind_data->variants.variant_ct; i++) {
+				auto id = bind_data->variants.GetId(i);
+				if (!id.empty()) {
+					id_to_idx[id] = static_cast<uint32_t>(i);
+				}
+			}
 
 			auto &children = ListValue::GetChildren(variants_val);
 			for (auto &child : children) {
 				auto vid = child.GetValue<string>();
-				auto it = bind_data->variants.id_to_idx.find(vid);
-				if (it == bind_data->variants.id_to_idx.end()) {
+				auto it = id_to_idx.find(vid);
+				if (it == id_to_idx.end()) {
 					throw InvalidInputException("read_pfile: variant '%s' not found in .pvar", vid);
 				}
 				bind_data->variant_indices.push_back(it->second);
@@ -864,10 +630,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			for (uint32_t vidx = 0; vidx < bind_data->raw_variant_ct; vidx++) {
 				// Check region filter
 				if (bind_data->region.active) {
-					if (bind_data->variants.chroms[vidx] != bind_data->region.chrom) {
+					if (bind_data->variants.GetChrom(vidx) != bind_data->region.chrom) {
 						continue;
 					}
-					int64_t pos = bind_data->variants.positions[vidx];
+					int64_t pos = bind_data->variants.GetPos(vidx);
 					if (pos < bind_data->region.start || pos > bind_data->region.end) {
 						continue;
 					}
@@ -1117,16 +883,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 
 				switch (file_col) {
 				case PfileBindData::CHROM_COL: {
-					auto &val = bind_data.variants.chroms[vidx];
+					auto val = bind_data.variants.GetChrom(vidx);
 					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case PfileBindData::POS_COL: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.positions[vidx];
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case PfileBindData::ID_COL: {
-					auto &val = bind_data.variants.ids[vidx];
+					auto val = bind_data.variants.GetId(vidx);
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -1135,12 +901,12 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					break;
 				}
 				case PfileBindData::REF_COL: {
-					auto &val = bind_data.variants.refs[vidx];
+					auto val = bind_data.variants.GetRef(vidx);
 					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case PfileBindData::ALT_COL: {
-					auto &val = bind_data.variants.alts[vidx];
+					auto val = bind_data.variants.GetAlt(vidx);
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -1301,16 +1067,16 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					// Variant metadata columns
 					switch (file_col) {
 					case PfileBindData::CHROM_COL: {
-						auto &val = bind_data.variants.chroms[vidx];
+						auto val = bind_data.variants.GetChrom(vidx);
 						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 						break;
 					}
 					case PfileBindData::POS_COL: {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.positions[vidx];
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 						break;
 					}
 					case PfileBindData::ID_COL: {
-						auto &val = bind_data.variants.ids[vidx];
+						auto val = bind_data.variants.GetId(vidx);
 						if (val.empty()) {
 							FlatVector::SetNull(vec, rows_emitted, true);
 						} else {
@@ -1319,12 +1085,12 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 						break;
 					}
 					case PfileBindData::REF_COL: {
-						auto &val = bind_data.variants.refs[vidx];
+						auto val = bind_data.variants.GetRef(vidx);
 						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 						break;
 					}
 					case PfileBindData::ALT_COL: {
-						auto &val = bind_data.variants.alts[vidx];
+						auto val = bind_data.variants.GetAlt(vidx);
 						if (val.empty() || val == ".") {
 							FlatVector::SetNull(vec, rows_emitted, true);
 						} else {
