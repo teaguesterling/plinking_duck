@@ -1,16 +1,37 @@
 # PlinkingDuck
 
-A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/) genomics file formats directly in SQL.
+A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/) genomics file formats and running common genetic analyses directly in SQL.
 
-PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific tools.
+PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific command-line tools. Read files, filter variants, compute allele frequencies, test Hardy-Weinberg equilibrium, measure missingness, calculate linkage disequilibrium, and run polygenic scoring — all from a SQL prompt.
 
-## Functions
+> **Built on the shoulders of [DuckHTS](https://github.com/RGenomicsETL/duckhts).**
+> DuckHTS pioneered the idea of querying genomics file formats directly in DuckDB using htslib. It supports VCF, BCF, BAM, CRAM, FASTA, FASTQ, GTF, GFF, and tabix-indexed files — the sequencing side of the house. PlinkingDuck picks up where DuckHTS leaves off, covering the PLINK genotype file formats used in population genetics and GWAS. If you work with both sequencing and genotype data, you'll want both extensions.
+
+## What's Included
+
+PlinkingDuck provides **four file readers** and **five analysis functions**:
+
+| Function | Purpose |
+|----------|---------|
+| [`read_pvar`](#read_pvarpath) | Read `.pvar` / `.bim` variant metadata |
+| [`read_psam`](#read_psampath) | Read `.psam` / `.fam` sample metadata |
+| [`read_pgen`](#read_pgenpath--pvar-psam-samples) | Read `.pgen` binary genotypes |
+| [`read_pfile`](#read_pfileprefix--pgen-pvar-psam-tidy-samples-variants-region) | Unified reader with tidy mode, filtering |
+| [`plink_freq`](#plink_freqpath--pvar-psam-samples-region-counts) | Per-variant allele frequencies |
+| [`plink_hardy`](#plink_hardypath--pvar-psam-samples-region-midp) | Hardy-Weinberg equilibrium test |
+| [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-sample_mode) | Per-variant or per-sample missingness |
+| [`plink_ld`](#plink_ldpath--variant1-variant2-window_kb-r2_threshold-inter_chr) | Pairwise linkage disequilibrium |
+| [`plink_score`](#plink_scorepath--weights-no_mean_imputation) | Polygenic risk scoring |
+
+All functions support **projection pushdown** (skip expensive genotype decoding when columns aren't referenced) and **parallel scanning** (multi-threaded variant processing with atomic batch claiming).
+
+---
+
+## File Readers
 
 ### `read_pvar(path)`
 
-Read PLINK2 `.pvar` (variant information) or legacy `.bim` files into SQL-queryable tables.
-Format is auto-detected: files with a `#CHROM` header line are parsed as `.pvar`,
-files without a header are parsed as legacy `.bim` (6-column, tab-delimited).
+Read PLINK 2 `.pvar` (variant information) or legacy `.bim` files. Format is auto-detected.
 
 ```sql
 -- Read a .pvar file
@@ -29,14 +50,13 @@ WHERE CHROM = '22';
 present in the header (QUAL, FILTER, INFO, CM).
 
 **Output columns (.bim):** CHROM, POS, ID, REF, ALT, CM (normalized from
-the .bim file order of CHROM, ID, CM, POS, ALT, REF).
+the .bim column order of CHROM, ID, CM, POS, ALT, REF).
 
-Dot values (`.`) in any column are returned as `NULL`. Projection pushdown is
-supported — only columns referenced in the query are parsed.
+Dot values (`.`) in any column are returned as `NULL`.
 
 ### `read_psam(path)`
 
-Read PLINK 2 `.psam` (sample information) or PLINK 1 `.fam` files as DuckDB tables.
+Read PLINK 2 `.psam` (sample information) or PLINK 1 `.fam` files.
 
 ```sql
 -- Read a .psam file
@@ -44,9 +64,6 @@ SELECT * FROM read_psam('samples.psam');
 
 -- Count samples per family
 SELECT FID, COUNT(*) AS n FROM read_psam('cohort.psam') GROUP BY FID;
-
--- Filter by sex
-SELECT IID FROM read_psam('cohort.psam') WHERE SEX = 2;
 
 -- Join sample info with phenotype data
 SELECT s.IID, s.SEX, p.BMI
@@ -146,13 +163,34 @@ plus scalar `genotype` (TINYINT). One row per variant x sample combination.
 | `variants` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific variants by ID or 0-based index |
 | `region` | VARCHAR | Filter to genomic region (`chr:start-end` or `chr`) |
 
-**Projection pushdown:** Genotype decoding is skipped when genotype columns
-are not referenced in the query, making metadata-only queries fast.
+---
+
+## Analysis Functions
+
+These functions use pgenlib's fast counting paths (no genotype decompression), making them efficient even on large datasets. All support sample subsetting, region filtering, and parallel execution.
+
+### `plink_freq(path [, pvar, psam, samples, region, counts])`
+
+Compute per-variant allele frequencies.
+
+```sql
+-- Basic allele frequencies
+SELECT * FROM plink_freq('data/example.pgen');
+
+-- With genotype counts
+SELECT * FROM plink_freq('data/example.pgen', counts := true);
+
+-- MAF filter
+SELECT * FROM plink_freq('data/example.pgen')
+WHERE ALT_FREQ > 0.01 AND ALT_FREQ < 0.99;
+```
+
+**Output columns:** CHROM, POS, ID, REF, ALT, ALT_FREQ, OBS_CT.
+With `counts := true`: also HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT.
 
 ### `plink_hardy(path [, pvar, psam, samples, region, midp])`
 
 Compute per-variant Hardy-Weinberg equilibrium exact test p-values.
-Uses pgenlib's fast counting path (no genotype decompression).
 
 ```sql
 -- Basic usage
@@ -169,19 +207,93 @@ WHERE P_HWE > 1e-6;
 **Output columns:** CHROM, POS, ID, REF, ALT, A1, HOM_REF_CT, HET_CT,
 HOM_ALT_CT, O_HET, E_HET, P_HWE.
 
-**Parameters:**
+### `plink_missing(path [, pvar, psam, samples, region, sample_mode])`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `pvar` | VARCHAR | auto-discovered | Explicit `.pvar`/`.bim` path |
-| `psam` | VARCHAR | auto-discovered | Explicit `.psam`/`.fam` path |
-| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter to specific sample IDs |
-| `region` | VARCHAR | all | Filter to genomic region (`chr:start-end`) |
-| `midp` | BOOLEAN | false | Use mid-p correction for exact test |
+Compute per-variant or per-sample missingness rates.
+
+```sql
+-- Per-variant missingness
+SELECT * FROM plink_missing('data/example.pgen');
+
+-- Per-sample missingness
+SELECT * FROM plink_missing('data/example.pgen', sample_mode := true);
+
+-- QC: flag samples with >5% missingness
+SELECT IID, F_MISS
+FROM plink_missing('data/example.pgen', sample_mode := true)
+WHERE F_MISS > 0.05;
+```
+
+**Variant mode output (default):** CHROM, POS, ID, REF, ALT, MISSING_CT, OBS_CT, F_MISS.
+
+**Sample mode output (`sample_mode := true`):** FID, IID, MISSING_CT, OBS_CT, F_MISS.
+
+### `plink_ld(path [, variant1, variant2, window_kb, r2_threshold, inter_chr])`
+
+Compute pairwise linkage disequilibrium (r², D').
+
+```sql
+-- LD between two specific variants
+SELECT * FROM plink_ld('data/example.pgen',
+    variant1 := 'rs123', variant2 := 'rs456');
+
+-- Windowed LD scan (1 Mb window, R² > 0.2)
+SELECT * FROM plink_ld('data/example.pgen',
+    window_kb := 1000, r2_threshold := 0.2);
+
+-- Cross-chromosome LD (rare, but sometimes needed)
+SELECT * FROM plink_ld('data/example.pgen', inter_chr := true);
+```
+
+**Output columns:** CHROM_A, POS_A, ID_A, CHROM_B, POS_B, ID_B, R2, D_PRIME, OBS_CT.
+
+**Modes:**
+- **Pairwise:** Specify `variant1` and `variant2` for a single pair.
+- **Windowed:** Scan all pairs within `window_kb` (default: 1000 kb), optionally filtered by `r2_threshold`.
+
+### `plink_score(path [, weights, no_mean_imputation])`
+
+Compute per-sample polygenic risk scores from variant weights.
+
+```sql
+-- Positional weights (one weight per variant, in file order)
+SELECT * FROM plink_score('data/example.pgen',
+    weights := [1.0, 0.5, -0.5, 2.0]);
+
+-- ID-keyed weights with allele specification
+SELECT * FROM plink_score('data/example.pgen',
+    weights := [
+      {'id': 'rs1', 'allele': 'G', 'weight': 1.0},
+      {'id': 'rs2', 'allele': 'T', 'weight': 0.5}
+    ]);
+
+-- Without mean imputation for missing genotypes
+SELECT * FROM plink_score('data/example.pgen',
+    weights := [1.0, 0.5], no_mean_imputation := true);
+```
+
+**Output columns:** FID, IID, ALLELE_CT, DENOM, NAMED_ALLELE_DOSAGE_SUM, SCORE_SUM, SCORE_AVG.
+
+**Missing genotype handling:** By default, missing genotypes are mean-imputed using
+the average dosage across non-missing samples. Use `no_mean_imputation := true` to
+skip missing samples instead.
+
+---
+
+## Common Parameters
+
+These parameters are shared across analysis functions and `read_pfile`:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `pvar` | VARCHAR | Explicit `.pvar`/`.bim` path (overrides auto-discovery) |
+| `psam` | VARCHAR | Explicit `.psam`/`.fam` path (overrides auto-discovery) |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific samples by IID or 0-based index |
+| `region` | VARCHAR | Filter to genomic region: `'chr'`, `'chr:start-end'`, or `'chr:start-'` |
 
 ## Genotype Encoding
 
-All genotype data uses `TINYINT` values with the following encoding:
+All genotype data uses `TINYINT` values:
 
 | Value | Meaning |
 |-------|---------|
@@ -199,7 +311,7 @@ PLINK 2 uses a three-file fileset to represent genotyped samples:
 
 | File | Contents | Description |
 |------|----------|-------------|
-| `.pgen` | Binary genotypes | Compressed genotype matrix (variants × samples) |
+| `.pgen` | Binary genotypes | Compressed genotype matrix (variants x samples) |
 | `.pvar` | Variant metadata | Tab-delimited: CHROM, POS, ID, REF, ALT (+ optional cols) |
 | `.psam` | Sample metadata | Tab-delimited: FID, IID, SEX (+ optional phenotypes) |
 
