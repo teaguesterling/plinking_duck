@@ -64,9 +64,11 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 ## CI / Platform Support
 
 - **Linux amd64 + arm64**: fully supported, build + all tests pass
+- **macOS amd64 + arm64**: fully supported since v0.1.1
+  - Requires `DUCKDB_CPP_EXTENSION_ENTRY` macro for loadable extension linking (macOS linker uses `-exported_symbol` for the `_duckdb_cpp_init` entry point)
+  - Hidden visibility on pgenlib/libdeflate/zstd static libs is fine on macOS (absorbed into final .dylib)
 - **Excluded platforms** (pre-existing plink-ng portability issues):
   - `linux_amd64_musl`: compiles with rawmemchr shim (`src/musl_compat.h`), but pgenlib SIMD segfaults at runtime
-  - `osx_amd64`, `osx_arm64`: linker symbol visibility issue
   - `windows_amd64`, `windows_amd64_mingw`: MSVC can't compile plink-ng libdeflate (`__attribute__` syntax)
   - `wasm_*`: plink-ng requires POSIX APIs (pthreads, file I/O)
 - Exclusions configured in `.github/workflows/MainDistributionPipeline.yml` via `exclude_archs`
