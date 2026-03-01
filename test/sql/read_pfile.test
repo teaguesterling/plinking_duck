@@ -21,9 +21,9 @@ SELECT CHROM, POS, ID, REF, ALT FROM read_pfile('test/data/pfile_example') ORDER
 1	30000	rs3	G	A
 2	15000	rs4	T	C
 
-# --- Genotype column (LIST(TINYINT), same as read_pgen) ---
+# --- Genotype column (ARRAY(TINYINT, N), same as read_pgen) ---
 
-# Genotype list length matches sample count
+# Genotype array length matches sample count
 query I
 SELECT len(genotypes) FROM read_pfile('test/data/pfile_example') LIMIT 1;
 ----
@@ -98,7 +98,7 @@ query TTTTTT
 SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(genotypes)
 FROM read_pfile('test/data/pfile_example') LIMIT 1;
 ----
-VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[]
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[4]
 
 # --- Region filtering (default mode) ---
 

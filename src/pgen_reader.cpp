@@ -219,9 +219,22 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	}
 
 	// --- Register output columns ---
+	uint32_t output_sample_ct = bind_data->has_sample_subset
+	    ? bind_data->subset_sample_ct
+	    : bind_data->sample_ct;
+
+	if (output_sample_ct > ArrayType::MAX_ARRAY_SIZE) {
+		throw InvalidInputException(
+		    "read_pgen: sample count (%u) exceeds maximum array size (%u). "
+		    "Use sample subsetting (samples := [...]) to reduce below the limit, "
+		    "or use read_pfile with tidy := true for large cohorts.",
+		    output_sample_ct, static_cast<uint32_t>(ArrayType::MAX_ARRAY_SIZE));
+	}
+
 	names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::TINYINT)};
+	                LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)};
 
 	return std::move(bind_data);
 }
@@ -441,35 +454,27 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					}
 					break;
 				}
-				case 5: { // genotypes — LIST(TINYINT)
+				case 5: { // genotypes — ARRAY(TINYINT, N)
 					if (!genotypes_read) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 						break;
 					}
 
-					// Build the LIST(TINYINT) entry
-					auto list_size = static_cast<idx_t>(output_sample_ct);
-					auto current_offset = ListVector::GetListSize(vec);
-					auto &entry = FlatVector::GetData<list_entry_t>(vec)[rows_emitted];
-					entry.offset = current_offset;
-					entry.length = list_size;
-
-					ListVector::Reserve(vec, current_offset + list_size);
-					auto &child = ListVector::GetEntry(vec);
+					auto array_size = static_cast<idx_t>(output_sample_ct);
+					auto &child = ArrayVector::GetEntry(vec);
 					auto *child_data = FlatVector::GetData<int8_t>(child);
 					auto &child_validity = FlatVector::Validity(child);
 
-					for (idx_t s = 0; s < list_size; s++) {
+					idx_t base = rows_emitted * array_size;
+					for (idx_t s = 0; s < array_size; s++) {
 						int8_t geno = lstate.genotype_bytes[s];
 						if (geno == -9) {
-							child_validity.SetInvalid(current_offset + s);
-							child_data[current_offset + s] = 0; // placeholder
+							child_validity.SetInvalid(base + s);
+							child_data[base + s] = 0;
 						} else {
-							child_data[current_offset + s] = geno;
+							child_data[base + s] = geno;
 						}
 					}
-
-					ListVector::SetListSize(vec, current_offset + list_size);
 					break;
 				}
 				default:
