@@ -19,7 +19,7 @@ Genotypes appear in two contexts depending on the function and mode:
 
 ### List Context
 
-In `read_pgen` and `read_pfile` default mode, genotypes are returned as a `LIST(TINYINT)` column named `genotypes`. Each list element corresponds to one sample, in the same order as the `.psam` file.
+In `read_pgen` and `read_pfile` default mode, genotypes are returned as an `ARRAY(TINYINT, N)` column named `genotypes`, where N is the sample count. Each array element corresponds to one sample, in the same order as the `.psam` file.
 
 ```sql
 -- Each row has a list of genotypes, one per sample

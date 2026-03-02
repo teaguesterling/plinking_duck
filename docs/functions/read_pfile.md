@@ -51,7 +51,7 @@ When both `region` and `variants` are specified, the result is the intersection 
 | `ID` | `VARCHAR` | Variant identifier |
 | `REF` | `VARCHAR` | Reference allele |
 | `ALT` | `VARCHAR` | Alternate allele |
-| `genotypes` | `LIST(TINYINT)` | Genotype calls, one per sample |
+| `genotypes` | `ARRAY(TINYINT, N)` | Genotype calls, one per sample |
 
 ### Tidy Mode (`tidy := true`)
 

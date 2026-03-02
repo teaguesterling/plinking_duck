@@ -35,7 +35,7 @@ See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, 
 | `ID` | `VARCHAR` | Variant identifier (from `.pvar`/`.bim`) |
 | `REF` | `VARCHAR` | Reference allele (from `.pvar`/`.bim`) |
 | `ALT` | `VARCHAR` | Alternate allele (from `.pvar`/`.bim`) |
-| `genotypes` | `LIST(TINYINT)` | Genotype calls, one element per sample |
+| `genotypes` | `ARRAY(TINYINT, N)` | Genotype calls, one element per sample |
 
 Each element in the `genotypes` list is a [genotype value](../genotype-encoding.md): 0 (hom ref), 1 (het), 2 (hom alt), or NULL (missing).
 

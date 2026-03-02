@@ -148,7 +148,7 @@ FROM read_pfile('data/example', tidy := true,
     region := '1:10000-50000', samples := ['SAMPLE1']);
 ```
 
-**Default mode output:** CHROM, POS, ID, REF, ALT, genotypes `LIST(TINYINT)` — same as `read_pgen`.
+**Default mode output:** CHROM, POS, ID, REF, ALT, genotypes `ARRAY(TINYINT, N)` — same as `read_pgen`.
 
 **Tidy mode output:** CHROM, POS, ID, REF, ALT, plus all `.psam` columns (FID, IID, SEX, etc.),
 plus scalar `genotype` (TINYINT). One row per variant x sample combination.
@@ -304,8 +304,8 @@ All genotype data uses `TINYINT` values:
 | 2 | Homozygous alternate (1/1) |
 | NULL | Missing (./.) |
 
-In `read_pgen` and `read_pfile` default mode, genotypes are returned as `LIST(TINYINT)`
-with one element per sample. In `read_pfile` tidy mode, genotype is a scalar `TINYINT` column.
+In `read_pgen` and `read_pfile` default mode, genotypes are returned as `ARRAY(TINYINT, N)`
+(where N is the sample count) with one element per sample. In `read_pfile` tidy mode, genotype is a scalar `TINYINT` column.
 
 ## File Format Reference
 
