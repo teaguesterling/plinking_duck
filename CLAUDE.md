@@ -8,7 +8,7 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
   - `plinking_duck_extension.cpp` — entry point, registers all table functions
   - `pvar_reader.cpp` / `.hpp` — `read_pvar()`: .pvar and .bim files
   - `psam_reader.cpp` / `.hpp` — `read_psam()`: .psam and .fam files
-  - `pgen_reader.cpp` / `.hpp` — `read_pgen()`: .pgen binary genotype files (uses pgenlib)
+  - `pgen_reader.cpp` / `.hpp` — `read_pgen()`: .pgen binary genotype files (uses pgenlib), ARRAY(TINYINT, N) output
   - `plink_common.cpp` / `.hpp` — shared P2 infrastructure: RAII wrappers, file utilities, sample subsetting, region filtering
   - `plink_freq.cpp` / `.hpp` — `plink_freq()`: per-variant allele frequencies via PgrGetCounts
   - `plink_hardy.cpp` / `.hpp` — `plink_hardy()`: per-variant HWE exact test p-values via PgrGetCounts
