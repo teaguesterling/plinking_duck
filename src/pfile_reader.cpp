@@ -677,17 +677,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		uint32_t output_sample_ct = bind_data->OutputSampleCt();
 
 		if (output_sample_ct > ArrayType::MAX_ARRAY_SIZE) {
-			throw InvalidInputException(
-			    "read_pfile: sample count (%u) exceeds maximum array size (%u). "
-			    "Use sample subsetting (samples := [...]) to reduce below the limit, "
-			    "or use tidy := true for large cohorts.",
-			    output_sample_ct, static_cast<uint32_t>(ArrayType::MAX_ARRAY_SIZE));
+			throw InvalidInputException("read_pfile: sample count (%u) exceeds maximum array size (%u). "
+			                            "Use sample subsetting (samples := [...]) to reduce below the limit, "
+			                            "or use tidy := true for large cohorts.",
+			                            output_sample_ct, static_cast<uint32_t>(ArrayType::MAX_ARRAY_SIZE));
 		}
 
 		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
-		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER,
 		                LogicalType::VARCHAR, LogicalType::VARCHAR,
-		                LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)};
+		                LogicalType::VARCHAR, LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)};
 	}
 
 	return std::move(bind_data);
