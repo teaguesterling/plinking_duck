@@ -41,7 +41,7 @@ rs4
 
 # --- Genotype column ---
 
-# Genotype list length matches sample count
+# Genotype array length matches sample count
 query I
 SELECT len(genotypes) FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
 ----
@@ -71,7 +71,7 @@ SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'r
 ----
 rs4	[0, 0, 1, 2]
 
-# Missing genotype produces NULL in list (4th sample of rs1)
+# Missing genotype produces NULL in array (4th sample of rs1)
 query I
 SELECT genotypes[4] FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs1';
 ----
@@ -103,7 +103,7 @@ SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen',
 
 # --- Optional .psam (index-only mode) ---
 
-# read_pgen works without .psam — genotype lists still work
+# read_pgen works without .psam — genotype arrays still work
 query I
 SELECT len(genotypes) FROM read_pgen('test/data/pgen_orphan.pgen') LIMIT 1;
 ----
@@ -129,7 +129,7 @@ query TTTTTT
 SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(genotypes)
 FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
 ----
-VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[]
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[4]
 
 # --- Integer sample subsetting ---
 
@@ -226,7 +226,7 @@ SELECT COUNT(*) FROM read_pgen('test/data/large_example.pgen');
 ----
 3000
 
-# Genotype list length matches 8 samples
+# Genotype array length matches 8 samples
 query I
 SELECT len(genotypes) FROM read_pgen('test/data/large_example.pgen') LIMIT 1;
 ----

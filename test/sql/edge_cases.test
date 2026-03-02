@@ -127,13 +127,13 @@ VARCHAR	INTEGER
 query T
 SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
 ----
-TINYINT[]
+TINYINT[4]
 
 # read_pfile default mode genotype type
 query T
 SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example') LIMIT 1;
 ----
-TINYINT[]
+TINYINT[4]
 
 # read_pfile tidy mode genotype type
 query T
@@ -157,7 +157,7 @@ SELECT ID FROM read_pgen('test/data/pgen_orphan.pgen') WHERE POS = 10000;
 ----
 rs1
 
-# Genotype lists still properly sized (from .pgen header)
+# Genotype arrays still properly sized (from .pgen header)
 query I
 SELECT len(genotypes) FROM read_pgen('test/data/pgen_orphan.pgen') LIMIT 1;
 ----

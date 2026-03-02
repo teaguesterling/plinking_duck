@@ -45,7 +45,7 @@ SELECT COUNT(*) FROM (
 # read_pfile default mode = read_pgen (same columns, same values)
 # ---------------------------------------------------------------------------
 
-# Same genotype lists for every variant
+# Same genotype arrays for every variant
 query I
 SELECT COUNT(*) FROM (
     SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen')
@@ -71,14 +71,14 @@ query TTTTTT
 SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(genotypes)
 FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
 ----
-VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[]
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[4]
 
 # read_pfile default mode column types match read_pgen
 query TTTTTT
 SELECT typeof(CHROM), typeof(POS), typeof(ID), typeof(REF), typeof(ALT), typeof(genotypes)
 FROM read_pfile('test/data/pfile_example') LIMIT 1;
 ----
-VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[]
+VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[4]
 
 # read_pfile tidy mode genotype is scalar TINYINT
 query T
@@ -112,7 +112,7 @@ SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true);
 # Genotype values match across readers
 # ---------------------------------------------------------------------------
 
-# rs1 genotypes: read_pgen list = read_pfile list
+# rs1 genotypes: read_pgen array = read_pfile array
 query T
 SELECT
     (SELECT genotypes FROM read_pgen('test/data/pgen_example.pgen') WHERE ID = 'rs1')
@@ -121,7 +121,7 @@ SELECT
 ----
 true
 
-# rs1 genotypes: read_pfile tidy values match the list from default mode
+# rs1 genotypes: read_pfile tidy values match the array from default mode
 # SAMPLE1=0, SAMPLE2=1, SAMPLE3=2, SAMPLE4=NULL
 query TI
 SELECT IID, genotype
@@ -134,19 +134,19 @@ SAMPLE2	1
 SAMPLE3	2
 SAMPLE4	NULL
 
-# All variants: tidy genotypes match list genotypes (unnested)
+# All variants: tidy genotypes match array genotypes (unnested)
 # Join pfile default (list) with pfile tidy (scalar) and verify agreement
 query I
 SELECT COUNT(*) FROM (
     SELECT t.ID, t.IID, t.genotype AS tidy_gt,
-           d.genotypes[s.row_num] AS list_gt
+           d.genotypes[s.row_num] AS array_gt
     FROM read_pfile('test/data/pfile_example', tidy := true) t
     JOIN read_pfile('test/data/pfile_example') d ON t.ID = d.ID
     JOIN (
         SELECT IID, ROW_NUMBER() OVER (ORDER BY IID) AS row_num
         FROM read_psam('test/data/pfile_example.psam')
     ) s ON t.IID = s.IID
-    WHERE tidy_gt IS DISTINCT FROM list_gt
+    WHERE tidy_gt IS DISTINCT FROM array_gt
 );
 ----
 0
