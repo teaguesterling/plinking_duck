@@ -15,6 +15,20 @@
 namespace duckdb {
 
 // ---------------------------------------------------------------------------
+// Genotype output mode
+// ---------------------------------------------------------------------------
+
+//! Genotype column output mode for read_pgen / read_pfile default mode.
+enum class GenotypeMode : uint8_t {
+	ARRAY, //!< ARRAY(TINYINT, N) — requires N <= MAX_ARRAY_SIZE
+	LIST   //!< LIST(TINYINT) — any sample count
+};
+
+//! Resolve a genotypes parameter string to a GenotypeMode.
+//! Case-insensitive. "auto" → ARRAY if sample_ct ≤ MAX_ARRAY_SIZE, else LIST.
+GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, const string &func_name);
+
+// ---------------------------------------------------------------------------
 // RAII wrapper for cache-aligned allocations from pgenlib
 // ---------------------------------------------------------------------------
 

@@ -211,6 +211,7 @@ struct PfileBindData : public TableFunctionData {
 	// Options
 	bool include_dosages = false;
 	bool include_phased = false;
+	GenotypeMode genotype_mode = GenotypeMode::ARRAY;
 
 	// Sample subsetting
 	bool has_sample_subset = false;
@@ -362,7 +363,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		} else if (kv.first == "region") {
 			bind_data->region = ParseRegion(kv.second.GetValue<string>());
 		}
-		// samples and variants handled after pgenlib init
+		// samples, variants, and genotypes handled after pgenlib init
 	}
 
 	if (bind_data->include_dosages) {
@@ -676,17 +677,21 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// Default mode: same as read_pgen
 		uint32_t output_sample_ct = bind_data->OutputSampleCt();
 
-		if (output_sample_ct > ArrayType::MAX_ARRAY_SIZE) {
-			throw InvalidInputException("read_pfile: sample count (%u) exceeds maximum array size (%u). "
-			                            "Use sample subsetting (samples := [...]) to reduce below the limit, "
-			                            "or use tidy := true for large cohorts.",
-			                            output_sample_ct, static_cast<uint32_t>(ArrayType::MAX_ARRAY_SIZE));
+		// Resolve genotype output mode
+		string genotypes_str = "auto";
+		auto genotypes_it = input.named_parameters.find("genotypes");
+		if (genotypes_it != input.named_parameters.end()) {
+			genotypes_str = genotypes_it->second.GetValue<string>();
 		}
+		bind_data->genotype_mode = ResolveGenotypeMode(genotypes_str, output_sample_ct, "read_pfile");
+
+		LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
+		                            ? LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)
+		                            : LogicalType::LIST(LogicalType::TINYINT);
 
 		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
-		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER,
-		                LogicalType::VARCHAR, LogicalType::VARCHAR,
-		                LogicalType::VARCHAR, LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)};
+		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::VARCHAR, geno_type};
 	}
 
 	return std::move(bind_data);
@@ -930,20 +935,42 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						break;
 					}
 
-					auto array_size = static_cast<idx_t>(output_sample_ct);
-					auto &child = ArrayVector::GetEntry(vec);
-					auto *child_data = FlatVector::GetData<int8_t>(child);
-					auto &child_validity = FlatVector::Validity(child);
+					if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
+						auto array_size = static_cast<idx_t>(output_sample_ct);
+						auto &child = ArrayVector::GetEntry(vec);
+						auto *child_data = FlatVector::GetData<int8_t>(child);
+						auto &child_validity = FlatVector::Validity(child);
 
-					idx_t base = rows_emitted * array_size;
-					for (idx_t s = 0; s < array_size; s++) {
-						int8_t geno = lstate.genotype_bytes[s];
-						if (geno == -9) {
-							child_validity.SetInvalid(base + s);
-							child_data[base + s] = 0;
-						} else {
-							child_data[base + s] = geno;
+						idx_t base = rows_emitted * array_size;
+						for (idx_t s = 0; s < array_size; s++) {
+							int8_t geno = lstate.genotype_bytes[s];
+							if (geno == -9) {
+								child_validity.SetInvalid(base + s);
+								child_data[base + s] = 0;
+							} else {
+								child_data[base + s] = geno;
+							}
 						}
+					} else {
+						// LIST path
+						auto list_offset = ListVector::GetListSize(vec);
+						ListVector::Reserve(vec, list_offset + output_sample_ct);
+						auto &child = ListVector::GetEntry(vec);
+						auto *child_data = FlatVector::GetData<int8_t>(child);
+						auto &child_validity = FlatVector::Validity(child);
+						for (idx_t s = 0; s < output_sample_ct; s++) {
+							int8_t geno = lstate.genotype_bytes[s];
+							if (geno == -9) {
+								child_validity.SetInvalid(list_offset + s);
+								child_data[list_offset + s] = 0;
+							} else {
+								child_data[list_offset + s] = geno;
+							}
+						}
+						auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+						list_data[rows_emitted].offset = list_offset;
+						list_data[rows_emitted].length = output_sample_ct;
+						ListVector::SetListSize(vec, list_offset + output_sample_ct);
 					}
 					break;
 				}
@@ -1182,6 +1209,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	// Accept ANY for samples and variants — type dispatch handled in bind
 	read_pfile.named_parameters["samples"] = LogicalType::ANY;
 	read_pfile.named_parameters["variants"] = LogicalType::ANY;
+	read_pfile.named_parameters["genotypes"] = LogicalType::VARCHAR;
 
 	loader.RegisterFunction(read_pfile);
 }

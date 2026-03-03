@@ -1,0 +1,74 @@
+# name: test/sql/read_pfile_genotypes.test
+# description: Positive tests for read_pfile genotypes parameter
+# group: [sql]
+
+require plinking_duck
+
+# --- Default (auto) resolves to ARRAY for small datasets ---
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example') LIMIT 1;
+----
+TINYINT[4]
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', genotypes := 'auto') LIMIT 1;
+----
+TINYINT[4]
+
+# --- Explicit array ---
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', genotypes := 'array') LIMIT 1;
+----
+TINYINT[4]
+
+# --- Explicit list ---
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', genotypes := 'list') LIMIT 1;
+----
+TINYINT[]
+
+# --- LIST value correctness ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotypes := 'list') WHERE ID = 'rs1';
+----
+rs1	[0, 1, 2, NULL]
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotypes := 'list') WHERE ID = 'rs4';
+----
+rs4	[0, 0, 1, 2]
+
+# --- LIST with region filtering ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', genotypes := 'list', region := '1:10000-20000');
+----
+2
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', genotypes := 'list', region := '1:10000-20000') LIMIT 1;
+----
+TINYINT[]
+
+# --- LIST with sample subsetting ---
+
+query I
+SELECT len(genotypes) FROM read_pfile('test/data/pfile_example', genotypes := 'list', samples := [0, 1]) LIMIT 1;
+----
+2
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotypes := 'list', samples := [0, 1]) WHERE ID = 'rs1';
+----
+rs1	[0, 1]
+
+# --- genotypes param with tidy mode is silently ignored ---
+
+query T
+SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', tidy := true, genotypes := 'list') LIMIT 1;
+----
+TINYINT

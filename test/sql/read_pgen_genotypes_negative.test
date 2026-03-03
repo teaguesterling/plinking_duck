@@ -1,0 +1,12 @@
+# name: test/sql/read_pgen_genotypes_negative.test
+# description: Negative tests for read_pgen genotypes parameter
+# group: [sql]
+
+require plinking_duck
+
+# --- Invalid genotypes value ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'invalid');
+----
+invalid genotypes value

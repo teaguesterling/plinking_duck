@@ -1,0 +1,120 @@
+# name: test/sql/read_pgen_genotypes.test
+# description: Positive tests for read_pgen genotypes parameter
+# group: [sql]
+
+require plinking_duck
+
+# --- Default (auto) resolves to ARRAY for small datasets ---
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen') LIMIT 1;
+----
+TINYINT[4]
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'auto') LIMIT 1;
+----
+TINYINT[4]
+
+# --- Explicit array ---
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'array') LIMIT 1;
+----
+TINYINT[4]
+
+# --- Explicit list ---
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list') LIMIT 1;
+----
+TINYINT[]
+
+# --- LIST value correctness ---
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list') WHERE ID = 'rs1';
+----
+rs1	[0, 1, 2, NULL]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list') WHERE ID = 'rs2';
+----
+rs2	[1, 1, 0, 2]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list') WHERE ID = 'rs3';
+----
+rs3	[2, NULL, 1, 0]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list') WHERE ID = 'rs4';
+----
+rs4	[0, 0, 1, 2]
+
+# --- LIST length ---
+
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list') LIMIT 1;
+----
+4
+
+# --- LIST with sample subsetting ---
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list', samples := [0, 2]) LIMIT 1;
+----
+TINYINT[]
+
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list', samples := [0, 2]) LIMIT 1;
+----
+2
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'list', samples := [0, 2]) WHERE ID = 'rs1';
+----
+rs1	[0, 2]
+
+# --- LIST with all-missing dataset ---
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/all_missing.pgen', genotypes := 'list') ORDER BY POS;
+----
+rs_miss1	[NULL, NULL]
+rs_miss2	[NULL, NULL]
+
+# --- Case insensitivity ---
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'LIST') LIMIT 1;
+----
+TINYINT[]
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'Auto') LIMIT 1;
+----
+TINYINT[4]
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'ARRAY') LIMIT 1;
+----
+TINYINT[4]
+
+# --- Multi-batch correctness (large_example: 3000 variants × 8 samples) ---
+
+# All LIST entries have consistent length
+query I
+SELECT COUNT(DISTINCT len(genotypes)) FROM read_pgen('test/data/large_example.pgen', genotypes := 'list');
+----
+1
+
+query I
+SELECT MIN(len(genotypes)) FROM read_pgen('test/data/large_example.pgen', genotypes := 'list');
+----
+8
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/large_example.pgen', genotypes := 'list');
+----
+3000

@@ -1,6 +1,32 @@
 #include "plink_common.hpp"
 
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/vector.hpp"
+
 namespace duckdb {
+
+// ---------------------------------------------------------------------------
+// Genotype output mode
+// ---------------------------------------------------------------------------
+
+GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, const string &func_name) {
+	auto mode = StringUtil::Lower(mode_str);
+	if (mode == "auto") {
+		return sample_ct <= ArrayType::MAX_ARRAY_SIZE ? GenotypeMode::ARRAY : GenotypeMode::LIST;
+	} else if (mode == "array") {
+		if (sample_ct > ArrayType::MAX_ARRAY_SIZE) {
+			throw InvalidInputException("%s: genotypes := 'array' requires sample count (%u) <= %u. "
+			                            "Use genotypes := 'list' or genotypes := 'auto' for large cohorts.",
+			                            func_name, sample_ct, static_cast<uint32_t>(ArrayType::MAX_ARRAY_SIZE));
+		}
+		return GenotypeMode::ARRAY;
+	} else if (mode == "list") {
+		return GenotypeMode::LIST;
+	} else {
+		throw InvalidInputException("%s: invalid genotypes value '%s' (expected 'auto', 'array', or 'list')", func_name,
+		                            mode_str);
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Offset-indexed variant metadata
