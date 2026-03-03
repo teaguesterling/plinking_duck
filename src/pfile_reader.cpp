@@ -931,6 +931,11 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				}
 				case PfileBindData::GENOTYPES_COL: {
 					if (!genotypes_read) {
+						if (bind_data.genotype_mode == GenotypeMode::LIST) {
+							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							list_data[rows_emitted].offset = ListVector::GetListSize(vec);
+							list_data[rows_emitted].length = 0;
+						}
 						FlatVector::SetNull(vec, rows_emitted, true);
 						break;
 					}

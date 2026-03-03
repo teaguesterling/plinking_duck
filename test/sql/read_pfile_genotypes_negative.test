@@ -1,0 +1,12 @@
+# name: test/sql/read_pfile_genotypes_negative.test
+# description: Negative tests for read_pfile genotypes parameter
+# group: [sql]
+
+require plinking_duck
+
+# --- Invalid genotypes value ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'invalid');
+----
+invalid genotypes value
