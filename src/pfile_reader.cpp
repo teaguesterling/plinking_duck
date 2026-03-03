@@ -745,14 +745,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				auto id = bind_data->variants.GetId(vidx);
 				string col_name;
 				if (id.empty()) {
-					col_name = bind_data->variants.GetChrom(vidx) + ":" + std::to_string(bind_data->variants.GetPos(vidx));
+					col_name =
+					    bind_data->variants.GetChrom(vidx) + ":" + std::to_string(bind_data->variants.GetPos(vidx));
 				} else {
 					col_name = id;
 				}
 				if (!seen_names.insert(col_name).second) {
 					throw InvalidInputException(
 					    "read_pfile: genotypes := 'columns' with orient := 'sample' requires unique variant "
-					    "identifiers, but '%s' appears more than once. Use variants := [...] to select unique variants.",
+					    "identifiers, but '%s' appears more than once. Use variants := [...] to select unique "
+					    "variants.",
 					    col_name);
 				}
 				bind_data->genotype_column_names.push_back(col_name);
@@ -762,9 +764,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 			bind_data->sample_orient_total_cols = names.size();
 		} else {
-			LogicalType sample_elem_type = bind_data->include_phased
-			                                   ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
-			                                   : LogicalType::TINYINT;
+			LogicalType sample_elem_type =
+			    bind_data->include_phased ? LogicalType::ARRAY(LogicalType::TINYINT, 2) : LogicalType::TINYINT;
 			LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
 			                            ? LogicalType::ARRAY(sample_elem_type, effective_variant_ct)
 			                            : LogicalType::LIST(sample_elem_type);
@@ -778,13 +779,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 		// --- Pre-read all genotypes into matrix ---
 		uint32_t output_sample_ct = bind_data->OutputSampleCt();
-		uint64_t matrix_size =
-		    static_cast<uint64_t>(effective_variant_ct) * static_cast<uint64_t>(output_sample_ct);
+		uint64_t matrix_size = static_cast<uint64_t>(effective_variant_ct) * static_cast<uint64_t>(output_sample_ct);
 		if (matrix_size > 128ULL * 1024 * 1024) {
-			throw InvalidInputException("read_pfile: orient := 'sample' would require %llu genotype values "
-			                            "(%u variants x %u samples). Use variants := [...] or samples := [...] to reduce.",
-			                            static_cast<unsigned long long>(matrix_size), effective_variant_ct,
-			                            output_sample_ct);
+			throw InvalidInputException(
+			    "read_pfile: orient := 'sample' would require %llu genotype values "
+			    "(%u variants x %u samples). Use variants := [...] or samples := [...] to reduce.",
+			    static_cast<unsigned long long>(matrix_size), effective_variant_ct, output_sample_ct);
 		}
 
 		// Init temporary PgenReader for pre-reading
@@ -796,8 +796,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		uintptr_t pgfi_alloc_ct2 = 0;
 
 		err = plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, bind_data->raw_variant_ct,
-		                             bind_data->raw_sample_ct, &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2,
-		                             errstr_buf2);
+		                             bind_data->raw_sample_ct, &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
 		if (err != plink2::kPglRetSuccess) {
 			plink2::PglErr ce = plink2::kPglRetSuccess;
 			plink2::CleanupPgfi(&tmp_pgfi, &ce);
@@ -875,37 +874,32 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 			if (bind_data->include_phased) {
 				uint32_t phasepresent_ct = 0;
-				err = plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-				                      genovec_buf2.As<uintptr_t>(), preread_phasepresent.As<uintptr_t>(),
-				                      preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct);
+				err = plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr, genovec_buf2.As<uintptr_t>(),
+				                      preread_phasepresent.As<uintptr_t>(), preread_phaseinfo.As<uintptr_t>(),
+				                      &phasepresent_ct);
 				if (err != plink2::kPglRetSuccess) {
 					plink2::PglErr ce = plink2::kPglRetSuccess;
 					plink2::CleanupPgr(&tmp_pgr, &ce);
 					ce = plink2::kPglRetSuccess;
 					plink2::CleanupPgfi(&tmp_pgfi, &ce);
-					throw IOException("read_pfile: PgrGetP failed for variant %u during sample-orient pre-read",
-					                  vidx);
+					throw IOException("read_pfile: PgrGetP failed for variant %u during sample-orient pre-read", vidx);
 				}
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
 				UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
-				                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct,
-				                      preread_phased_pairs.data());
+				                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct, preread_phased_pairs.data());
 				bind_data->genotype_matrix[ev].assign(preread_phased_pairs.begin(),
 				                                      preread_phased_pairs.begin() + output_sample_ct * 2);
 			} else {
-				err = plink2::PgrGet(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-				                     genovec_buf2.As<uintptr_t>());
+				err = plink2::PgrGet(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr, genovec_buf2.As<uintptr_t>());
 				if (err != plink2::kPglRetSuccess) {
 					plink2::PglErr ce = plink2::kPglRetSuccess;
 					plink2::CleanupPgr(&tmp_pgr, &ce);
 					ce = plink2::kPglRetSuccess;
 					plink2::CleanupPgfi(&tmp_pgfi, &ce);
-					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read",
-					                  vidx);
+					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read", vidx);
 				}
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
-				bind_data->genotype_matrix[ev].assign(tmp_bytes.begin(),
-				                                      tmp_bytes.begin() + output_sample_ct);
+				bind_data->genotype_matrix[ev].assign(tmp_bytes.begin(), tmp_bytes.begin() + output_sample_ct);
 			}
 		}
 
@@ -931,15 +925,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		if (bind_data->genotype_mode == GenotypeMode::COLUMNS) {
 			// Columns mode: one scalar TINYINT column per output sample
 			if (output_sample_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_sample_subset) {
-				throw InvalidInputException(
-				    "read_pfile: genotypes := 'columns' would create %u columns (limit: %u). "
-				    "Use samples := [...] to select a subset of samples.",
-				    output_sample_ct, MAX_GENOTYPE_COLUMNS);
+				throw InvalidInputException("read_pfile: genotypes := 'columns' would create %u columns (limit: %u). "
+				                            "Use samples := [...] to select a subset of samples.",
+				                            output_sample_ct, MAX_GENOTYPE_COLUMNS);
 			}
 
 			names = {"CHROM", "POS", "ID", "REF", "ALT"};
-			return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-			                LogicalType::VARCHAR, LogicalType::VARCHAR};
+			return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+			                LogicalType::VARCHAR};
 
 			bind_data->columns_mode_first_geno_col = names.size();
 			bind_data->columns_mode_geno_col_count = output_sample_ct;
@@ -952,9 +945,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				return_types.push_back(LogicalType::TINYINT);
 			}
 		} else {
-			LogicalType variant_elem_type = bind_data->include_phased
-			                                    ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
-			                                    : LogicalType::TINYINT;
+			LogicalType variant_elem_type =
+			    bind_data->include_phased ? LogicalType::ARRAY(LogicalType::TINYINT, 2) : LogicalType::TINYINT;
 			LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
 			                            ? LogicalType::ARRAY(variant_elem_type, output_sample_ct)
 			                            : LogicalType::LIST(variant_elem_type);
@@ -1186,10 +1178,10 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
 				if (bind_data.include_phased) {
-					plink2::PglErr err = plink2::PgrGetP(
-					    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-					    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
-					    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
+					plink2::PglErr err =
+					    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+					                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
+					                    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("read_pfile: PgrGetP failed for variant %u", vidx);
 					}
@@ -1199,9 +1191,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
 					                      lstate.phased_pairs.data());
 				} else {
-					plink2::PglErr err =
-					    plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-					                   lstate.genovec_buf.As<uintptr_t>());
+					plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx,
+					                                    &lstate.pgr, lstate.genovec_buf.As<uintptr_t>());
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
 					}
@@ -1473,10 +1464,10 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
 			if (bind_data.include_phased) {
-				plink2::PglErr err = plink2::PgrGetP(
-				    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
-				    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
+				plink2::PglErr err =
+				    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
+				                    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetP failed for variant %u", vidx);
 				}
@@ -1486,9 +1477,8 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
 				                      lstate.phased_pairs.data());
 			} else {
-				plink2::PglErr err =
-				    plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                   lstate.genovec_buf.As<uintptr_t>());
+				plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                                    lstate.genovec_buf.As<uintptr_t>());
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
 				}
@@ -1568,8 +1558,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 								allele_data[allele_base + 1] = 0;
 							} else {
 								allele_data[allele_base] = a1;
-								allele_data[allele_base + 1] =
-								    lstate.phased_pairs[lstate.tidy_current_sample * 2 + 1];
+								allele_data[allele_base + 1] = lstate.phased_pairs[lstate.tidy_current_sample * 2 + 1];
 							}
 						} else {
 							// Scalar TINYINT
@@ -1642,8 +1631,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 
 		for (uint32_t sample_pos = batch_start; sample_pos < batch_end; sample_pos++) {
 			// Map scan-order sample index to file-order sample index
-			uint32_t sample_file_idx =
-			    bind_data.has_sample_subset ? bind_data.sample_indices[sample_pos] : sample_pos;
+			uint32_t sample_file_idx = bind_data.has_sample_subset ? bind_data.sample_indices[sample_pos] : sample_pos;
 
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 				auto file_col = column_ids[out_col];
@@ -1692,8 +1680,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] =
-									    bind_data.genotype_matrix[v][sample_pos * 2 + 1];
+									allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
 								}
 							}
 						} else {
@@ -1715,8 +1702,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] =
-									    bind_data.genotype_matrix[v][sample_pos * 2 + 1];
+									allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
 								}
 							}
 

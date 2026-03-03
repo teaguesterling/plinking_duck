@@ -543,8 +543,8 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
 
-void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent,
-                           const uintptr_t *phaseinfo, uint32_t sample_ct, int8_t *output_pairs) {
+void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent, const uintptr_t *phaseinfo,
+                           uint32_t sample_ct, int8_t *output_pairs) {
 	for (uint32_t s = 0; s < sample_ct; s++) {
 		int8_t geno = genotype_bytes[s];
 		idx_t out_idx = static_cast<idx_t>(s) * 2;
