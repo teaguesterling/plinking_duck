@@ -69,9 +69,26 @@ done
 "$PLINK2" --vcf "$LARGE_VCF" --make-pgen --out large_example --allow-extra-chr
 rm -f "$LARGE_VCF"
 
+# Generate phased test data: 4 variants × 4 samples with phase information
+# Mix of phased (|), unphased (/), and missing (./.) genotypes
+cat > phased_example.vcf <<'EOF'
+##fileformat=VCFv4.3
+##contig=<ID=1,length=100000>
+##contig=<ID=2,length=100000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE1	SAMPLE2	SAMPLE3	SAMPLE4
+1	10000	rs1	A	T	.	.	.	GT	0|0	0|1	1|0	./.
+1	20000	rs2	G	C	.	.	.	GT	0/1	1|0	0|0	1|1
+1	30000	rs3	C	A	.	.	.	GT	1|1	./.	1|0	0|0
+2	15000	rs4	T	G	.	.	.	GT	0|0	0|0	0|1	1|1
+EOF
+"$PLINK2" --vcf phased_example.vcf --make-pgen --out phased_example --allow-extra-chr
+rm -f phased_example.vcf
+
 echo "Test data generated successfully."
 echo "Generated files:"
 ls -la pgen_example.pgen pgen_example.pvar pgen_example.psam \
        all_missing.pgen all_missing.pvar all_missing.psam \
        pgen_orphan.pgen pgen_orphan.pvar \
-       large_example.pgen large_example.pvar large_example.psam
+       large_example.pgen large_example.pvar large_example.psam \
+       phased_example.pgen phased_example.pvar phased_example.psam

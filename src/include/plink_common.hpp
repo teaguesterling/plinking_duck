@@ -219,4 +219,17 @@ struct VariantRange {
 //! Returns a range with start_idx == end_idx if no variants match.
 VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &variants, const string &func_name);
 
+// ---------------------------------------------------------------------------
+// Phased genotype unpacking
+// ---------------------------------------------------------------------------
+
+//! Unpack genotype bytes + phase bitarrays into haplotype pairs.
+//! Takes already-unpacked genotype bytes (from GenoarrToBytesMinus9) plus
+//! phasepresent/phaseinfo bitarrays from PgrGetP. Writes sample_ct * 2
+//! int8_t values to output_pairs with stride-2 layout:
+//!   [allele1_s0, allele2_s0, allele1_s1, allele2_s1, ...]
+//! Missing genotypes (-9) produce [-9, -9] pairs; caller handles NULL at vector level.
+void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent,
+                           const uintptr_t *phaseinfo, uint32_t sample_ct, int8_t *output_pairs);
+
 } // namespace duckdb

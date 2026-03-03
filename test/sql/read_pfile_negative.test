@@ -142,12 +142,7 @@ SELECT * FROM read_pfile('test/data/pfile_example', dosages := true);
 ----
 not yet implemented
 
-# --- Phased not yet implemented ---
-
-statement error
-SELECT * FROM read_pfile('test/data/pfile_example', phased := true);
-----
-not yet implemented
+# (phased := true is now implemented — see read_pfile_phased.test)
 
 # --- Edge cases ---
 
