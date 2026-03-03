@@ -1,0 +1,23 @@
+# name: test/sql/read_pfile_genotypes_columns_negative.test
+# description: Negative tests for read_pfile genotypes := 'columns' mode
+# group: [sql]
+
+require plinking_duck
+
+# ===================================================================
+# genotypes := 'columns' + orient := 'genotype' → error
+# ===================================================================
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotypes := 'columns');
+----
+genotypes := 'columns' is not compatible with orient := 'genotype'
+
+# ===================================================================
+# Column count guard: sample-orient on large_example (3000 variants, no filter)
+# ===================================================================
+
+statement error
+SELECT * FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns');
+----
+would create 3000 columns

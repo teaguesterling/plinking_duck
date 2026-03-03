@@ -4,6 +4,7 @@
 #include "psam_reader.hpp"
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
@@ -237,10 +238,15 @@ struct PfileBindData : public TableFunctionData {
 
 	// Sample-orient column layout
 	// Sample metadata columns start at index 0, genotypes column is last
-	idx_t sample_orient_genotypes_col = 0; // computed in bind
+	idx_t sample_orient_genotypes_col = 0; // computed in bind (ARRAY/LIST only)
 	idx_t sample_orient_total_cols = 0;    // computed in bind
 	// Mapping from sample-orient output column index to psam file column index
 	vector<idx_t> sample_orient_col_to_psam_col;
+
+	// Columns mode layout (genotypes := 'columns')
+	vector<string> genotype_column_names;     // IIDs (variant orient) or variant IDs (sample orient)
+	idx_t columns_mode_first_geno_col = 0;    // first genotype column index in schema
+	uint32_t columns_mode_geno_col_count = 0; // number of genotype columns
 
 	//! Number of output samples (after subsetting)
 	uint32_t OutputSampleCt() const {
@@ -668,6 +674,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 	// --- Build output schema ---
 	if (bind_data->orient_mode == OrientMode::GENOTYPE) {
+		// Check for incompatible genotypes := 'columns' before building schema
+		auto genotypes_it_geno = input.named_parameters.find("genotypes");
+		if (genotypes_it_geno != input.named_parameters.end()) {
+			auto gval = StringUtil::Lower(genotypes_it_geno->second.GetValue<string>());
+			if (gval == "columns") {
+				throw InvalidInputException(
+				    "read_pfile: genotypes := 'columns' is not compatible with orient := 'genotype' "
+				    "(genotype mode already produces scalar output)");
+			}
+		}
+
 		// Genotype mode: variant columns + sample columns + genotype
 		// Variant metadata
 		names = {"CHROM", "POS", "ID", "REF", "ALT"};
@@ -708,18 +725,56 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 		bind_data->genotype_mode = ResolveGenotypeMode(genotypes_str, effective_variant_ct, "read_pfile");
 
-		LogicalType sample_elem_type = bind_data->include_phased
-		                                   ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
-		                                   : LogicalType::TINYINT;
-		LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
-		                            ? LogicalType::ARRAY(sample_elem_type, effective_variant_ct)
-		                            : LogicalType::LIST(sample_elem_type);
+		if (bind_data->genotype_mode == GenotypeMode::COLUMNS) {
+			// Columns mode: one scalar TINYINT column per effective variant
+			if (effective_variant_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_variant_filter &&
+			    !bind_data->region.active) {
+				throw InvalidInputException(
+				    "read_pfile: genotypes := 'columns' with orient := 'sample' would create %u columns (limit: %u). "
+				    "Use variants := [...] or region := '...' to select a subset of variants.",
+				    effective_variant_ct, MAX_GENOTYPE_COLUMNS);
+			}
 
-		names.push_back("genotypes");
-		return_types.push_back(geno_type);
+			bind_data->columns_mode_first_geno_col = names.size();
+			bind_data->columns_mode_geno_col_count = effective_variant_ct;
 
-		bind_data->sample_orient_genotypes_col = names.size() - 1;
-		bind_data->sample_orient_total_cols = names.size();
+			// Check for duplicate variant IDs (variant IDs can duplicate unlike sample IIDs)
+			std::unordered_set<string> seen_names;
+			for (uint32_t ev = 0; ev < effective_variant_ct; ev++) {
+				uint32_t vidx = bind_data->has_effective_variant_list ? bind_data->effective_variant_indices[ev] : ev;
+				auto id = bind_data->variants.GetId(vidx);
+				string col_name;
+				if (id.empty()) {
+					col_name = bind_data->variants.GetChrom(vidx) + ":" + std::to_string(bind_data->variants.GetPos(vidx));
+				} else {
+					col_name = id;
+				}
+				if (!seen_names.insert(col_name).second) {
+					throw InvalidInputException(
+					    "read_pfile: genotypes := 'columns' with orient := 'sample' requires unique variant "
+					    "identifiers, but '%s' appears more than once. Use variants := [...] to select unique variants.",
+					    col_name);
+				}
+				bind_data->genotype_column_names.push_back(col_name);
+				names.push_back(col_name);
+				return_types.push_back(LogicalType::TINYINT);
+			}
+
+			bind_data->sample_orient_total_cols = names.size();
+		} else {
+			LogicalType sample_elem_type = bind_data->include_phased
+			                                   ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
+			                                   : LogicalType::TINYINT;
+			LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
+			                            ? LogicalType::ARRAY(sample_elem_type, effective_variant_ct)
+			                            : LogicalType::LIST(sample_elem_type);
+
+			names.push_back("genotypes");
+			return_types.push_back(geno_type);
+
+			bind_data->sample_orient_genotypes_col = names.size() - 1;
+			bind_data->sample_orient_total_cols = names.size();
+		}
 
 		// --- Pre-read all genotypes into matrix ---
 		uint32_t output_sample_ct = bind_data->OutputSampleCt();
@@ -873,16 +928,41 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 		bind_data->genotype_mode = ResolveGenotypeMode(genotypes_str, output_sample_ct, "read_pfile");
 
-		LogicalType variant_elem_type = bind_data->include_phased
-		                                    ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
-		                                    : LogicalType::TINYINT;
-		LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
-		                            ? LogicalType::ARRAY(variant_elem_type, output_sample_ct)
-		                            : LogicalType::LIST(variant_elem_type);
+		if (bind_data->genotype_mode == GenotypeMode::COLUMNS) {
+			// Columns mode: one scalar TINYINT column per output sample
+			if (output_sample_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_sample_subset) {
+				throw InvalidInputException(
+				    "read_pfile: genotypes := 'columns' would create %u columns (limit: %u). "
+				    "Use samples := [...] to select a subset of samples.",
+				    output_sample_ct, MAX_GENOTYPE_COLUMNS);
+			}
 
-		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
-		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-		                LogicalType::VARCHAR, LogicalType::VARCHAR, geno_type};
+			names = {"CHROM", "POS", "ID", "REF", "ALT"};
+			return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+			                LogicalType::VARCHAR, LogicalType::VARCHAR};
+
+			bind_data->columns_mode_first_geno_col = names.size();
+			bind_data->columns_mode_geno_col_count = output_sample_ct;
+
+			for (uint32_t s = 0; s < output_sample_ct; s++) {
+				uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
+				string col_name = bind_data->sample_info.iids[file_idx];
+				bind_data->genotype_column_names.push_back(col_name);
+				names.push_back(col_name);
+				return_types.push_back(LogicalType::TINYINT);
+			}
+		} else {
+			LogicalType variant_elem_type = bind_data->include_phased
+			                                    ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
+			                                    : LogicalType::TINYINT;
+			LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
+			                            ? LogicalType::ARRAY(variant_elem_type, output_sample_ct)
+			                            : LogicalType::LIST(variant_elem_type);
+
+			names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
+			return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+			                LogicalType::VARCHAR, LogicalType::VARCHAR, geno_type};
+		}
 	}
 
 	return std::move(bind_data);
@@ -911,10 +991,19 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 		}
 	} else if (bind_data.orient_mode == OrientMode::SAMPLE) {
 		state->total_count = bind_data.OutputSampleCt();
-		// Check if genotypes column is projected
+		// Check if genotypes column(s) are projected
 		state->need_genotypes = false;
 		for (auto col_id : input.column_ids) {
-			if (col_id == bind_data.sample_orient_genotypes_col) {
+			if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+			if (bind_data.genotype_mode == GenotypeMode::COLUMNS) {
+				if (col_id >= bind_data.columns_mode_first_geno_col &&
+				    col_id < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+					state->need_genotypes = true;
+					break;
+				}
+			} else if (col_id == bind_data.sample_orient_genotypes_col) {
 				state->need_genotypes = true;
 				break;
 			}
@@ -923,7 +1012,17 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 		state->total_count = bind_data.EffectiveVariantCt();
 		state->need_genotypes = false;
 		for (auto col_id : input.column_ids) {
-			if (col_id == PfileBindData::GENOTYPES_COL) {
+			if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+			if (bind_data.genotype_mode == GenotypeMode::COLUMNS) {
+				// In columns mode, any column in the genotype range triggers genotype reading
+				if (col_id >= bind_data.columns_mode_first_geno_col &&
+				    col_id < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+					state->need_genotypes = true;
+					break;
+				}
+			} else if (col_id == PfileBindData::GENOTYPES_COL) {
 				state->need_genotypes = true;
 				break;
 			}
@@ -1155,6 +1254,21 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					break;
 				}
 				case PfileBindData::GENOTYPES_COL: {
+					if (bind_data.genotype_mode == GenotypeMode::COLUMNS) {
+						// In COLUMNS mode, file_col 5 is the first genotype column (sample_pos 0)
+						if (genotypes_read) {
+							idx_t sample_pos = file_col - bind_data.columns_mode_first_geno_col;
+							int8_t geno = lstate.genotype_bytes[sample_pos];
+							if (geno == -9) {
+								FlatVector::SetNull(vec, rows_emitted, true);
+							} else {
+								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+							}
+						} else {
+							FlatVector::SetNull(vec, rows_emitted, true);
+						}
+						break;
+					}
 					if (!genotypes_read) {
 						if (bind_data.genotype_mode == GenotypeMode::LIST) {
 							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
@@ -1253,8 +1367,25 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					}
 					break;
 				}
-				default:
+				default: {
+					// Columns mode: individual genotype columns
+					if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
+					    file_col >= bind_data.columns_mode_first_geno_col &&
+					    file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+						if (genotypes_read) {
+							idx_t sample_pos = file_col - bind_data.columns_mode_first_geno_col;
+							int8_t geno = lstate.genotype_bytes[sample_pos];
+							if (geno == -9) {
+								FlatVector::SetNull(vec, rows_emitted, true);
+							} else {
+								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+							}
+						} else {
+							FlatVector::SetNull(vec, rows_emitted, true);
+						}
+					}
 					break;
+				}
 				}
 			}
 
@@ -1522,7 +1653,23 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 
 				auto &vec = output.data[out_col];
 
-				if (file_col == bind_data.sample_orient_genotypes_col) {
+				if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
+				    file_col >= bind_data.columns_mode_first_geno_col &&
+				    file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+					// Columns mode: individual variant genotype columns
+					if (gstate.need_genotypes) {
+						idx_t variant_pos = file_col - bind_data.columns_mode_first_geno_col;
+						int8_t geno = bind_data.genotype_matrix[variant_pos][sample_pos];
+						if (geno == -9) {
+							FlatVector::SetNull(vec, rows_emitted, true);
+						} else {
+							FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+						}
+					} else {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					}
+				} else if (bind_data.genotype_mode != GenotypeMode::COLUMNS &&
+				           file_col == bind_data.sample_orient_genotypes_col) {
 					// Genotypes column — ARRAY or LIST of genotypes across variants
 					if (!gstate.need_genotypes) {
 						FlatVector::SetNull(vec, rows_emitted, true);

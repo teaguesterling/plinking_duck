@@ -22,9 +22,11 @@ GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, con
 		return GenotypeMode::ARRAY;
 	} else if (mode == "list") {
 		return GenotypeMode::LIST;
+	} else if (mode == "columns") {
+		return GenotypeMode::COLUMNS;
 	} else {
-		throw InvalidInputException("%s: invalid genotypes value '%s' (expected 'auto', 'array', or 'list')", func_name,
-		                            mode_str);
+		throw InvalidInputException("%s: invalid genotypes value '%s' (expected 'auto', 'array', 'list', or 'columns')",
+		                            func_name, mode_str);
 	}
 }
 
