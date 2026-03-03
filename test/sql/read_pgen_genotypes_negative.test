@@ -10,3 +10,17 @@ statement error
 SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'invalid');
 ----
 invalid genotypes value
+
+# --- Empty string ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotypes := '');
+----
+invalid genotypes value
+
+# --- Misspelling ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'arrays');
+----
+invalid genotypes value

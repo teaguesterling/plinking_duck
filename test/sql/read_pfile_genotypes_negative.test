@@ -10,3 +10,17 @@ statement error
 SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'invalid');
 ----
 invalid genotypes value
+
+# --- Empty string ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotypes := '');
+----
+invalid genotypes value
+
+# --- Misspelling ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'arrays');
+----
+invalid genotypes value
