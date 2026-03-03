@@ -1,0 +1,211 @@
+# P4-001: Flexible genotype output — orient + genotypes parameters
+
+Issue: #21 — Flexible genotype output: orient + genotypes parameters
+
+## Status
+
+- [x] Phase 1: `genotypes` parameter + LIST fallback (PR #22)
+- [ ] Phase 2: `orient` parameter
+- [ ] Phase 3: `genotypes := 'columns'` pivot mode
+- [ ] Phase 4: `phased := true` haplotype output
+
+---
+
+## Phase 2: `orient` parameter
+
+### Goal
+
+Replace the `tidy` boolean with `orient := 'variant'|'sample'|'genotype'` while
+keeping `tidy := true` as a deprecated alias for `orient := 'genotype'`.
+
+### New mode: `orient := 'sample'`
+
+Sample-oriented output: one row per sample, genotypes packed across variants.
+
+```
+IID      | FID    | SEX | genotypes
+SAMPLE1  | FAM1   | 1   | [0, 1, 2, 0]     ← 4 variants packed per sample
+SAMPLE2  | FAM1   | 2   | [1, 1, NULL, 0]
+```
+
+Schema: sample metadata columns + `genotypes` (ARRAY or LIST of TINYINT, one
+element per effective variant).
+
+### Design decisions
+
+**Threading model for `orient := 'sample'`:**
+
+Option A — Pre-load all variant genotypes at bind time, parallel scan over
+samples. This is the approach described in the issue. Trade-off: memory usage
+is O(variants × samples) for the genotype matrix, but for the intended use case
+(small variant selections via `variants` param + `genotypes := 'columns'`) this
+is fine. For large variant counts without filtering, we need a memory guard.
+
+Option B — Parallel scan over variant batches, transpose in-memory. Similar
+memory but more complex coordination.
+
+**Recommendation: Option A** with a memory cap. If effective_variants × samples
+exceeds ~1GB, error with a message suggesting `variants := [...]` to reduce.
+
+**`tidy` deprecation:**
+
+- `tidy := true` continues to work, mapped to `orient := 'genotype'` internally
+- `tidy := true` + `orient := 'variant'` → error (conflicting)
+- `tidy := false` (explicit) is ignored when `orient` is set
+- No deprecation warning in phase 2 (add later if desired)
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `plink_common.hpp` | Add `OrientMode` enum, `ResolveOrientMode` declaration |
+| `plink_common.cpp` | Implement `ResolveOrientMode` with tidy compat logic |
+| `pfile_reader.cpp` | Replace `tidy_mode` bool with `OrientMode orient_mode`; add sample-orient bind/scan; adjust genotype mode resolution for sample orient (variants become the packed dimension) |
+| `pgen_reader.cpp` | Add `orient` param (only `'variant'` and `'genotype'` valid for read_pgen — no sample metadata); parse and validate |
+| Tests | New `read_pfile_orient.test`, update tidy tests for alias compat |
+
+### Implementation sketch for sample-orient scan
+
+```
+PfileBind (orient := 'sample'):
+  1. Resolve effective variants (region + variants filter)
+  2. Pre-read all effective variant genotypes into a matrix:
+     genotype_matrix[vidx_idx][sample_idx] = int8 (0/1/2/-9)
+     Stored in bind_data as shared read-only state
+  3. Build schema: sample metadata cols + genotypes col
+     genotypes type: ARRAY(TINYINT, effective_variant_ct) or LIST
+
+PfileSampleOrientScan:
+  1. Atomic claim over sample index range (like variant batching)
+  2. For each sample in batch:
+     - Emit sample metadata columns
+     - Fill genotypes from pre-loaded matrix column
+```
+
+### Estimated scope
+
+~200-300 lines of new code in pfile_reader, ~30 lines in plink_common,
+~50 lines test updates. Medium complexity — the new scan function is
+structurally similar to PfileDefaultScan but iterates sample dimension.
+
+---
+
+## Phase 3: `genotypes := 'columns'` pivot mode
+
+### Goal
+
+One output column per sample (variant orient) or per variant (sample orient),
+enabling SQL joins without array unpacking.
+
+```sql
+-- Variant orient, columns mode
+SELECT ID, SAMPLE1, SAMPLE2 FROM read_pfile('data',
+    genotypes := 'columns', samples := ['SAMPLE1', 'SAMPLE2']);
+```
+
+Output:
+```
+ID   | SAMPLE1 | SAMPLE2
+rs1  | 0       | 1
+rs2  | 1       | 1
+```
+
+### Design decisions
+
+- Requires `samples` param (variant orient) or `variants` param (sample orient)
+  to define the column set. Without it, error if >256 columns would be generated.
+- Column names come from sample IIDs or variant IDs.
+- Each column is scalar TINYINT (nullable).
+- `genotypes := 'columns'` with `orient := 'genotype'` → error (genotype orient
+  already produces scalar output).
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `pfile_reader.cpp` | New schema construction path in bind (dynamic column names from sample IIDs or variant IDs); new scan code path that indexes into genotype_bytes by column |
+| `pgen_reader.cpp` | Same for variant-orient columns mode |
+| Tests | New tests for columns pivot |
+
+### Key challenges
+
+- Dynamic column count determined at bind time from sample/variant params
+- Column names must be valid SQL identifiers (IIDs may need quoting)
+- Projection pushdown needs to map column indices to sample/variant indices
+
+### Estimated scope
+
+~150-200 lines new code per reader. Medium complexity — schema construction
+is the interesting part; scan is straightforward indexing.
+
+---
+
+## Phase 4: `phased := true` haplotype output
+
+### Goal
+
+Output phased haplotype pairs from .pgen files that store phasing information.
+
+With `phased := true`, each genotype element becomes `ARRAY(TINYINT, 2)`:
+- `[0, 1]` = ref|alt heterozygote
+- `[1, 0]` = alt|ref heterozygote
+- `[0, 0]` = hom ref
+- `[1, 1]` = hom alt
+
+### pgenlib API
+
+- `PgrGetP()` instead of `PgrGet()` — returns genovec + phasepresent + phaseinfo
+- `phasepresent`: bitarray, 1 = het site has phase info
+- `phaseinfo`: bitarray, 0 = REF|ALT, 1 = ALT|REF (only meaningful where phasepresent=1)
+- Unphased hets: output as `[0, 1]` by convention (or NULL pair for truly missing)
+
+### Type mapping
+
+| Orient | genotypes | Type |
+|--------|-----------|------|
+| variant | array | `ARRAY(ARRAY(TINYINT, 2), N)` |
+| variant | list | `LIST(ARRAY(TINYINT, 2))` |
+| genotype | *(scalar)* | `ARRAY(TINYINT, 2)` |
+| sample | array | `ARRAY(ARRAY(TINYINT, 2), M)` |
+
+### Implementation sketch
+
+1. In bind: check `phased := true`, adjust output types
+2. In local state: allocate `phasepresent_buf` and `phaseinfo_buf`
+3. In scan: call `PgrGetP()`, unpack genovec + phase bits into pairs
+4. New helper: `UnpackPhasedGenotypes(genovec, phasepresent, phaseinfo, sample_ct, output_pairs)`
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `plink_common.hpp` | Phased genotype unpacking helper declaration |
+| `plink_common.cpp` | Implement `UnpackPhasedGenotypes` |
+| `pgen_reader.cpp` | Add phaseinfo buffers to local state, branch on phased in scan |
+| `pfile_reader.cpp` | Same for all orient modes |
+| Tests | New test data (phased .pgen), test files |
+
+### Prerequisites
+
+- Need phased test data. Either generate with `plink2 --make-pgen` from a
+  phased VCF, or use the pgenlib write path to create a small fixture.
+- Verify pgenlib's `PgrGetP` behavior with the pinned submodule version.
+
+### Estimated scope
+
+~200 lines new code. The pgenlib API work is well-defined but the nested
+ARRAY type construction and population requires careful handling of DuckDB's
+vector layout for nested fixed-size arrays.
+
+---
+
+## Suggested ordering
+
+Phases 2 and 3 have a natural dependency: `genotypes := 'columns'` is most
+useful with `orient := 'sample'` for the GWAS join pattern shown in the issue.
+Phase 4 is independent and can be done anytime after phase 1.
+
+**Recommended sequence: 2 → 3 → 4**
+
+Phase 2 is the largest single piece of work. Phases 3 and 4 are roughly equal
+and independent of each other once phase 2 lands.
