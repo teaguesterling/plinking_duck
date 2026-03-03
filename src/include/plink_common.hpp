@@ -20,9 +20,9 @@ namespace duckdb {
 
 //! Genotype column output mode for read_pgen / read_pfile default mode.
 enum class GenotypeMode : uint8_t {
-	ARRAY,   //!< ARRAY(TINYINT, N) — requires N <= MAX_ARRAY_SIZE
-	LIST,    //!< LIST(TINYINT) — any sample count
-	COLUMNS  //!< One scalar TINYINT column per sample (variant orient) or per variant (sample orient)
+	ARRAY,  //!< ARRAY(TINYINT, N) — requires N <= MAX_ARRAY_SIZE
+	LIST,   //!< LIST(TINYINT) — any sample count
+	COLUMNS //!< One scalar TINYINT column per sample (variant orient) or per variant (sample orient)
 };
 
 //! Maximum number of genotype columns in COLUMNS mode (without explicit sample/variant filter)
@@ -233,7 +233,7 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 //! int8_t values to output_pairs with stride-2 layout:
 //!   [allele1_s0, allele2_s0, allele1_s1, allele2_s1, ...]
 //! Missing genotypes (-9) produce [-9, -9] pairs; caller handles NULL at vector level.
-void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent,
-                           const uintptr_t *phaseinfo, uint32_t sample_ct, int8_t *output_pairs);
+void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent, const uintptr_t *phaseinfo,
+                           uint32_t sample_ct, int8_t *output_pairs);
 
 } // namespace duckdb

@@ -254,15 +254,13 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	if (bind_data->genotype_mode == GenotypeMode::COLUMNS) {
 		// Columns mode: one scalar TINYINT column per output sample
 		if (!bind_data->has_sample_info) {
-			throw InvalidInputException(
-			    "read_pgen: genotypes := 'columns' requires a .psam/.fam file for sample IDs "
-			    "(no companion file found)");
+			throw InvalidInputException("read_pgen: genotypes := 'columns' requires a .psam/.fam file for sample IDs "
+			                            "(no companion file found)");
 		}
 		if (output_sample_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_sample_subset) {
-			throw InvalidInputException(
-			    "read_pgen: genotypes := 'columns' would create %u columns (limit: %u). "
-			    "Use samples := [...] to select a subset of samples.",
-			    output_sample_ct, MAX_GENOTYPE_COLUMNS);
+			throw InvalidInputException("read_pgen: genotypes := 'columns' would create %u columns (limit: %u). "
+			                            "Use samples := [...] to select a subset of samples.",
+			                            output_sample_ct, MAX_GENOTYPE_COLUMNS);
 		}
 
 		// Sort sample_indices for consistent pgenlib output order
@@ -271,8 +269,8 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		}
 
 		names = {"CHROM", "POS", "ID", "REF", "ALT"};
-		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-		                LogicalType::VARCHAR, LogicalType::VARCHAR};
+		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR};
 
 		bind_data->columns_mode_first_geno_col = names.size();
 		bind_data->columns_mode_geno_col_count = output_sample_ct;
@@ -285,8 +283,8 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			return_types.push_back(LogicalType::TINYINT);
 		}
 	} else {
-		LogicalType elem_type = bind_data->include_phased ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
-		                                                  : LogicalType::TINYINT;
+		LogicalType elem_type =
+		    bind_data->include_phased ? LogicalType::ARRAY(LogicalType::TINYINT, 2) : LogicalType::TINYINT;
 		LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
 		                            ? LogicalType::ARRAY(elem_type, output_sample_ct)
 		                            : LogicalType::LIST(elem_type);
@@ -406,8 +404,7 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 
 	// Allocate phase buffers if phased output requested
 	if (bind_data.include_phased) {
-		uint32_t output_sample_ct =
-		    bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
+		uint32_t output_sample_ct = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
 		uintptr_t phase_wc = plink2::BitCtToAlignedWordCt(output_sample_ct);
 		state->phasepresent_buf.Allocate(phase_wc * sizeof(uintptr_t));
 		state->phaseinfo_buf.Allocate(phase_wc * sizeof(uintptr_t));
@@ -479,10 +476,10 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
 				if (bind_data.include_phased) {
-					plink2::PglErr err = plink2::PgrGetP(
-					    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-					    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
-					    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
+					plink2::PglErr err =
+					    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+					                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
+					                    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("read_pgen: PgrGetP failed for variant %u", vidx);
 					}
@@ -492,9 +489,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
 					                      lstate.phased_pairs.data());
 				} else {
-					plink2::PglErr err =
-					    plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-					                   lstate.genovec_buf.As<uintptr_t>());
+					plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx,
+					                                    &lstate.pgr, lstate.genovec_buf.As<uintptr_t>());
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("read_pgen: PgrGet failed for variant %u", vidx);
 					}
