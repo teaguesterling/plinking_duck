@@ -1,0 +1,14 @@
+# name: test/sql/read_pgen_genotypes_columns_negative.test
+# description: Negative tests for read_pgen genotypes := 'columns' mode
+# group: [sql]
+
+require plinking_duck
+
+# ===================================================================
+# Orphan mode (no .psam) → error
+# ===================================================================
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_orphan.pgen', genotypes := 'columns');
+----
+genotypes := 'columns' requires a .psam/.fam file

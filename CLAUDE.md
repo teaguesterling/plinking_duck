@@ -87,6 +87,9 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - `orient := 'sample'` pre-reads all genotypes into a matrix at bind time; genotypes array dimension = effective variant count (not sample count)
 - `tidy := true` still works as an alias for `orient := 'genotype'`; specifying both `orient` and `tidy` is an error
 - `read_pgen` accepts `orient` parameter but only `'variant'` is valid (no sample metadata for other modes)
+- `genotypes := 'columns'` outputs one scalar TINYINT column per sample (variant orient) or per variant (sample orient); column names from IIDs or variant IDs
+- `genotypes := 'columns'` has a 256-column limit without explicit `samples :=` / `variants :=` / `region :=` filter
+- `genotypes := 'columns'` + `orient := 'genotype'` is an error (genotype mode already produces scalar output)
 
 <!-- blq:agent-instructions -->
 ## blq - Build Log Query

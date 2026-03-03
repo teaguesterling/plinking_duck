@@ -3,6 +3,7 @@
 
 #include "duckdb/common/string_util.hpp"
 
+#include <algorithm>
 #include <atomic>
 
 namespace duckdb {
@@ -41,6 +42,11 @@ struct PgenBindData : public TableFunctionData {
 	bool has_sample_subset = false;
 	vector<uint32_t> sample_indices; // 0-based indices into .pgen sample order
 	uint32_t subset_sample_ct = 0;
+
+	// Columns mode layout (genotypes := 'columns')
+	vector<string> genotype_column_names;     // IIDs for column names
+	idx_t columns_mode_first_geno_col = 0;    // first genotype column index in schema
+	uint32_t columns_mode_geno_col_count = 0; // number of genotype columns
 };
 
 // ---------------------------------------------------------------------------
@@ -242,13 +248,48 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	bind_data->genotype_mode = ResolveGenotypeMode(genotypes_str, output_sample_ct, "read_pgen");
 
 	// --- Register output columns ---
-	LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
-	                            ? LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)
-	                            : LogicalType::LIST(LogicalType::TINYINT);
+	if (bind_data->genotype_mode == GenotypeMode::COLUMNS) {
+		// Columns mode: one scalar TINYINT column per output sample
+		if (!bind_data->has_sample_info) {
+			throw InvalidInputException(
+			    "read_pgen: genotypes := 'columns' requires a .psam/.fam file for sample IDs "
+			    "(no companion file found)");
+		}
+		if (output_sample_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_sample_subset) {
+			throw InvalidInputException(
+			    "read_pgen: genotypes := 'columns' would create %u columns (limit: %u). "
+			    "Use samples := [...] to select a subset of samples.",
+			    output_sample_ct, MAX_GENOTYPE_COLUMNS);
+		}
 
-	names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, geno_type};
+		// Sort sample_indices for consistent pgenlib output order
+		if (bind_data->has_sample_subset) {
+			std::sort(bind_data->sample_indices.begin(), bind_data->sample_indices.end());
+		}
+
+		names = {"CHROM", "POS", "ID", "REF", "ALT"};
+		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::VARCHAR};
+
+		bind_data->columns_mode_first_geno_col = names.size();
+		bind_data->columns_mode_geno_col_count = output_sample_ct;
+
+		for (uint32_t s = 0; s < output_sample_ct; s++) {
+			uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
+			string col_name = bind_data->sample_info.iids[file_idx];
+			bind_data->genotype_column_names.push_back(col_name);
+			names.push_back(col_name);
+			return_types.push_back(LogicalType::TINYINT);
+		}
+	} else {
+		LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
+		                            ? LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)
+		                            : LogicalType::LIST(LogicalType::TINYINT);
+
+		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
+		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::VARCHAR, geno_type};
+	}
 
 	return std::move(bind_data);
 }
@@ -264,10 +305,19 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 	state->total_variants = bind_data.raw_variant_ct;
 	state->column_ids = input.column_ids;
 
-	// Check if genotypes column is in the projection
+	// Check if genotypes column(s) are in the projection
 	state->need_genotypes = false;
 	for (auto col_id : input.column_ids) {
-		if (col_id == PgenBindData::GENOTYPES_COL_IDX) {
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		if (bind_data.genotype_mode == GenotypeMode::COLUMNS) {
+			if (col_id >= bind_data.columns_mode_first_geno_col &&
+			    col_id < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+				state->need_genotypes = true;
+				break;
+			}
+		} else if (col_id == PgenBindData::GENOTYPES_COL_IDX) {
 			state->need_genotypes = true;
 			break;
 		}
@@ -469,6 +519,21 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					break;
 				}
 				case 5: { // genotypes — ARRAY(TINYINT, N) or LIST(TINYINT)
+					if (bind_data.genotype_mode == GenotypeMode::COLUMNS) {
+						// In COLUMNS mode, file_col 5 is the first genotype column (sample_pos 0)
+						if (genotypes_read) {
+							idx_t sample_pos = file_col - bind_data.columns_mode_first_geno_col;
+							int8_t geno = lstate.genotype_bytes[sample_pos];
+							if (geno == -9) {
+								FlatVector::SetNull(vec, rows_emitted, true);
+							} else {
+								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+							}
+						} else {
+							FlatVector::SetNull(vec, rows_emitted, true);
+						}
+						break;
+					}
 					if (!genotypes_read) {
 						if (bind_data.genotype_mode == GenotypeMode::LIST) {
 							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
@@ -518,8 +583,25 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					}
 					break;
 				}
-				default:
+				default: {
+					// Columns mode: individual genotype columns
+					if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
+					    file_col >= bind_data.columns_mode_first_geno_col &&
+					    file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+						if (genotypes_read) {
+							idx_t sample_pos = file_col - bind_data.columns_mode_first_geno_col;
+							int8_t geno = lstate.genotype_bytes[sample_pos];
+							if (geno == -9) {
+								FlatVector::SetNull(vec, rows_emitted, true);
+							} else {
+								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+							}
+						} else {
+							FlatVector::SetNull(vec, rows_emitted, true);
+						}
+					}
 					break;
+				}
 				}
 			}
 
