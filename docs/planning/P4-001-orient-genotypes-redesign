@@ -5,9 +5,9 @@ Issue: #21 — Flexible genotype output: orient + genotypes parameters
 ## Status
 
 - [x] Phase 1: `genotypes` parameter + LIST fallback (PR #22)
-- [ ] Phase 2: `orient` parameter
-- [ ] Phase 3: `genotypes := 'columns'` pivot mode
-- [ ] Phase 4: `phased := true` haplotype output
+- [x] Phase 2: `orient` parameter (PR #23)
+- [x] Phase 3: `genotypes := 'columns'` pivot mode (PR #24)
+- [x] Phase 4: `phased := true` haplotype output (PR #21 phase 4)
 
 ---
 
