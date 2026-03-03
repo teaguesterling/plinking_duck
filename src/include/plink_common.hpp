@@ -29,6 +29,21 @@ enum class GenotypeMode : uint8_t {
 GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, const string &func_name);
 
 // ---------------------------------------------------------------------------
+// Orient mode
+// ---------------------------------------------------------------------------
+
+//! Orientation mode for read_pfile / read_pgen output.
+enum class OrientMode : uint8_t {
+	VARIANT,  //!< One row per variant (default)
+	GENOTYPE, //!< One row per variant×sample (was "tidy")
+	SAMPLE    //!< One row per sample, genotypes across variants
+};
+
+//! Resolve orient parameter + tidy flag to an OrientMode.
+//! Errors if both orient and tidy are specified, or if orient value is invalid.
+OrientMode ResolveOrientMode(const string &orient_str, bool tidy_flag, const string &func_name);
+
+// ---------------------------------------------------------------------------
 // RAII wrapper for cache-aligned allocations from pgenlib
 // ---------------------------------------------------------------------------
 
