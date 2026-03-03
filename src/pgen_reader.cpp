@@ -1,6 +1,8 @@
 #include "pgen_reader.hpp"
 #include "plink_common.hpp"
 
+#include "duckdb/common/string_util.hpp"
+
 #include <atomic>
 
 namespace duckdb {
@@ -114,6 +116,14 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			bind_data->include_dosages = kv.second.GetValue<bool>();
 		} else if (kv.first == "phased") {
 			bind_data->include_phased = kv.second.GetValue<bool>();
+		} else if (kv.first == "orient") {
+			auto orient_val = StringUtil::Lower(kv.second.GetValue<string>());
+			if (orient_val != "variant") {
+				throw InvalidInputException("read_pgen: orient := '%s' is not supported "
+				                            "(read_pgen only supports orient := 'variant'; "
+				                            "use read_pfile for orient := 'genotype' or 'sample')",
+				                            kv.second.GetValue<string>());
+			}
 		} else if (kv.first == "samples") {
 			// Handled after pgenlib init (need raw_sample_ct)
 		} else if (kv.first == "genotypes") {
@@ -537,6 +547,7 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 	// is handled in PgenBind based on the actual value type.
 	read_pgen.named_parameters["samples"] = LogicalType::ANY;
 	read_pgen.named_parameters["genotypes"] = LogicalType::VARCHAR;
+	read_pgen.named_parameters["orient"] = LogicalType::VARCHAR;
 
 	loader.RegisterFunction(read_pgen);
 }

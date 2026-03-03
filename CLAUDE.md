@@ -9,7 +9,8 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
   - `pvar_reader.cpp` / `.hpp` — `read_pvar()`: .pvar and .bim files
   - `psam_reader.cpp` / `.hpp` — `read_psam()`: .psam and .fam files
   - `pgen_reader.cpp` / `.hpp` — `read_pgen()`: .pgen binary genotype files (uses pgenlib), ARRAY(TINYINT, N) output
-  - `plink_common.cpp` / `.hpp` — shared P2 infrastructure: RAII wrappers, file utilities, sample subsetting, region filtering
+  - `pfile_reader.cpp` / `.hpp` — `read_pfile()`: unified reader with orient parameter (variant/genotype/sample modes)
+  - `plink_common.cpp` / `.hpp` — shared P2 infrastructure: RAII wrappers, file utilities, sample subsetting, region filtering, OrientMode/GenotypeMode enums
   - `plink_freq.cpp` / `.hpp` — `plink_freq()`: per-variant allele frequencies via PgrGetCounts
   - `plink_hardy.cpp` / `.hpp` — `plink_hardy()`: per-variant HWE exact test p-values via PgrGetCounts
   - `plink_missing.cpp` / `.hpp` — `plink_missing()`: per-variant and per-sample missingness via PgrGetMissingness
@@ -82,6 +83,10 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - sqllogictest format specifiers: `T` = varchar, `I` = integer, `R` = real
 - DuckDB function overloads: can't register two with same positional args; use `LogicalType::ANY` for type-dispatched named params
 - Named parameters go in `read_pgen.named_parameters["key"]`
+- `read_pfile` orient parameter: `'variant'` (default, one row per variant), `'genotype'` (one row per variant×sample, replaces `tidy := true`), `'sample'` (one row per sample, genotypes across variants)
+- `orient := 'sample'` pre-reads all genotypes into a matrix at bind time; genotypes array dimension = effective variant count (not sample count)
+- `tidy := true` still works as an alias for `orient := 'genotype'`; specifying both `orient` and `tidy` is an error
+- `read_pgen` accepts `orient` parameter but only `'variant'` is valid (no sample metadata for other modes)
 
 <!-- blq:agent-instructions -->
 ## blq - Build Log Query

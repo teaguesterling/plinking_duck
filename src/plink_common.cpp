@@ -29,6 +29,32 @@ GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, con
 }
 
 // ---------------------------------------------------------------------------
+// Orient mode
+// ---------------------------------------------------------------------------
+
+OrientMode ResolveOrientMode(const string &orient_str, bool tidy_flag, const string &func_name) {
+	if (orient_str.empty()) {
+		return tidy_flag ? OrientMode::GENOTYPE : OrientMode::VARIANT;
+	}
+
+	if (tidy_flag) {
+		throw InvalidInputException("%s: cannot specify both orient and tidy parameters", func_name);
+	}
+
+	auto mode = StringUtil::Lower(orient_str);
+	if (mode == "variant") {
+		return OrientMode::VARIANT;
+	} else if (mode == "genotype") {
+		return OrientMode::GENOTYPE;
+	} else if (mode == "sample") {
+		return OrientMode::SAMPLE;
+	} else {
+		throw InvalidInputException("%s: invalid orient value '%s' (expected 'variant', 'genotype', or 'sample')",
+		                            func_name, orient_str);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Offset-indexed variant metadata
 // ---------------------------------------------------------------------------
 
