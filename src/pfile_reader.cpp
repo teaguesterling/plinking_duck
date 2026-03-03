@@ -720,7 +720,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		    static_cast<uint64_t>(effective_variant_ct) * static_cast<uint64_t>(output_sample_ct);
 		if (matrix_size > 128ULL * 1024 * 1024) {
 			throw InvalidInputException("read_pfile: orient := 'sample' would require %llu genotype values "
-			                            "(%u variants x %u samples). Use variants := [...] to reduce.",
+			                            "(%u variants x %u samples). Use variants := [...] or samples := [...] to reduce.",
 			                            static_cast<unsigned long long>(matrix_size), effective_variant_ct,
 			                            output_sample_ct);
 		}
@@ -783,22 +783,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 		vector<int8_t> tmp_bytes(bind_data->raw_sample_ct);
 
-		// Set up sample subsetting for pre-read
-		AlignedBuffer si_buf2;
-		AlignedBuffer cp_buf2;
+		// Set up sample subsetting for pre-read (reuse BuildSampleSubset for consistency)
+		SampleSubset preread_subset;
 		plink2::PgrSampleSubsetIndex pssi2;
 		if (bind_data->has_sample_subset) {
-			uintptr_t iwc =
-			    plink2::DivUp(bind_data->raw_sample_ct, static_cast<uint32_t>(plink2::kBitsPerWord));
-			si_buf2.Allocate(iwc * sizeof(uintptr_t));
-			auto *si = si_buf2.As<uintptr_t>();
-			std::memset(si, 0, iwc * sizeof(uintptr_t));
-			for (auto idx : bind_data->sample_indices) {
-				plink2::SetBit(idx, si);
-			}
-			cp_buf2.Allocate(iwc * sizeof(uint32_t));
-			plink2::FillCumulativePopcounts(si, iwc, cp_buf2.As<uint32_t>());
-			plink2::PgrSetSampleSubsetIndex(cp_buf2.As<uint32_t>(), &tmp_pgr, &pssi2);
+			preread_subset = BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices);
+			plink2::PgrSetSampleSubsetIndex(preread_subset.CumulativePopcounts(), &tmp_pgr, &pssi2);
 		} else {
 			plink2::PgrClearSampleSubsetIndex(&tmp_pgr, &pssi2);
 		}
@@ -808,7 +798,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		for (uint32_t ev = 0; ev < effective_variant_ct; ev++) {
 			uint32_t vidx = bind_data->has_effective_variant_list ? bind_data->effective_variant_indices[ev] : ev;
 
-			const uintptr_t *si_ptr = bind_data->has_sample_subset ? si_buf2.As<uintptr_t>() : nullptr;
+			const uintptr_t *si_ptr = bind_data->has_sample_subset ? preread_subset.SampleInclude() : nullptr;
 			err = plink2::PgrGet(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
 			                     genovec_buf2.As<uintptr_t>());
 			if (err != plink2::kPglRetSuccess) {
