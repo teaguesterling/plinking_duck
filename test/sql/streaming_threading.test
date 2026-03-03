@@ -171,6 +171,59 @@ SELECT (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/streaming_example.p
 true
 
 # ===================================================================
+# Parallel per-sample accumulation (50K triggers internal threading)
+# ===================================================================
+
+# plink_missing sample mode: variant-mode and sample-mode totals agree
+# (exercises parallel Phase 1 since 50K > 1000 threshold)
+query I
+SELECT (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/streaming_example.pgen'))
+     = (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/streaming_example.pgen',
+                                                    mode := 'sample'));
+----
+true
+
+# plink_missing sample mode: all F_MISS values valid
+query I
+SELECT COUNT(*)
+FROM plink_missing('test/data/streaming_example.pgen', mode := 'sample')
+WHERE F_MISS < 0.0 OR F_MISS > 1.0;
+----
+0
+
+# plink_missing sample mode: OBS_CT + MISSING_CT = total variants for each sample
+query I
+SELECT COUNT(*)
+FROM plink_missing('test/data/streaming_example.pgen', mode := 'sample')
+WHERE OBS_CT + MISSING_CT != 50000;
+----
+0
+
+# plink_score on 50K dataset: row count correct
+# (exercises parallel Phase 1 since scored_variants > 100 threshold)
+query I
+SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
+    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}));
+----
+8
+
+# plink_score: all values are non-null and finite
+query I
+SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
+    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
+WHERE SCORE_SUM IS NULL OR SCORE_AVG IS NULL;
+----
+0
+
+# plink_score: ALLELE_CT > 0 for all samples (variants were scored)
+query I
+SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
+    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
+WHERE ALLELE_CT <= 0;
+----
+0
+
+# ===================================================================
 # Chromosome distribution: correct per-chromosome counts
 # ===================================================================
 

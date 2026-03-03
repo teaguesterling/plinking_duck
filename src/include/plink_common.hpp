@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <thread>
 #include <unordered_set>
 
 namespace duckdb {
@@ -235,5 +236,66 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 //! Missing genotypes (-9) produce [-9, -9] pairs; caller handles NULL at vector level.
 void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent, const uintptr_t *phaseinfo,
                            uint32_t sample_ct, int8_t *output_pairs);
+
+// ---------------------------------------------------------------------------
+// Per-thread pgenlib context (for internal parallelism)
+// ---------------------------------------------------------------------------
+
+//! RAII wrapper for per-thread pgenlib state. Each background thread needs
+//! its own PgenFileInfo + PgenReader with independent FILE* handles.
+struct PgenThreadContext {
+	plink2::PgenFileInfo pgfi;
+	AlignedBuffer pgfi_alloc;
+	plink2::PgenReader pgr;
+	AlignedBuffer pgr_alloc;
+	plink2::PgrSampleSubsetIndex pssi;
+	bool initialized = false;
+
+	PgenThreadContext() {
+		plink2::PreinitPgfi(&pgfi);
+		plink2::PreinitPgr(&pgr);
+	}
+
+	~PgenThreadContext() {
+		if (initialized) {
+			plink2::PglErr reterr = plink2::kPglRetSuccess;
+			plink2::CleanupPgr(&pgr, &reterr);
+			plink2::CleanupPgfi(&pgfi, &reterr);
+		}
+	}
+
+	// Non-copyable
+	PgenThreadContext(const PgenThreadContext &) = delete;
+	PgenThreadContext &operator=(const PgenThreadContext &) = delete;
+
+	// Movable (for vector storage)
+	PgenThreadContext(PgenThreadContext &&other) noexcept
+	    : pgfi(std::move(other.pgfi)), pgfi_alloc(std::move(other.pgfi_alloc)), pgr(std::move(other.pgr)),
+	      pgr_alloc(std::move(other.pgr_alloc)), pssi(other.pssi), initialized(other.initialized) {
+		other.initialized = false;
+	}
+	PgenThreadContext &operator=(PgenThreadContext &&other) noexcept {
+		if (this != &other) {
+			if (initialized) {
+				plink2::PglErr reterr = plink2::kPglRetSuccess;
+				plink2::CleanupPgr(&pgr, &reterr);
+				plink2::CleanupPgfi(&pgfi, &reterr);
+			}
+			pgfi = std::move(other.pgfi);
+			pgfi_alloc = std::move(other.pgfi_alloc);
+			pgr = std::move(other.pgr);
+			pgr_alloc = std::move(other.pgr_alloc);
+			pssi = other.pssi;
+			initialized = other.initialized;
+			other.initialized = false;
+		}
+		return *this;
+	}
+};
+
+//! Initialize a PgenThreadContext by opening .pgen via pgenlib's fopen,
+//! running Phase 1 + Phase 2 init, and configuring sample subsetting.
+void InitPgenThreadContext(PgenThreadContext &ctx, const string &pgen_path, uint32_t raw_variant_ct,
+                           uint32_t raw_sample_ct, const SampleSubset *sample_subset);
 
 } // namespace duckdb

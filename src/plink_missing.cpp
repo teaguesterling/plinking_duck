@@ -2,6 +2,8 @@
 #include "plink_common.hpp"
 
 #include <atomic>
+#include <exception>
+#include <thread>
 
 namespace duckdb {
 
@@ -528,41 +530,156 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 // Scan — sample mode (single-threaded: scan all variants, then emit rows)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Missing-count worker: claims batches of variants and accumulates per-sample
+// missingness into a thread-local count vector.
+// ---------------------------------------------------------------------------
+
+static void MissingWorkerFunc(plink2::PgenReader *pgr, plink2::PgrSampleSubsetIndex pssi,
+                              const uintptr_t *sample_include, uint32_t sample_ct, uintptr_t *missingness_buf,
+                              uintptr_t *genovec_buf, std::atomic<uint32_t> &work_counter, uint32_t end_idx,
+                              std::atomic<bool> &stop_requested, vector<uint32_t> &local_counts,
+                              std::exception_ptr &exc_ptr) {
+	uintptr_t word_ct = plink2::BitCtToWordCt(sample_ct);
+	try {
+		while (!stop_requested.load(std::memory_order_relaxed)) {
+			uint32_t batch_start = work_counter.fetch_add(MISSING_BATCH_SIZE);
+			if (batch_start >= end_idx) {
+				break;
+			}
+			uint32_t batch_end = std::min(batch_start + MISSING_BATCH_SIZE, end_idx);
+
+			for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
+				plink2::PglErr err =
+				    plink2::PgrGetMissingness(sample_include, pssi, sample_ct, vidx, pgr, missingness_buf, genovec_buf);
+				if (err != plink2::kPglRetSuccess) {
+					throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
+				}
+
+				for (uintptr_t w = 0; w < word_ct; w++) {
+					uintptr_t word = missingness_buf[w];
+					while (word) {
+						uint32_t bit_pos = plink2::ctzw(word);
+						uint32_t sample_idx = static_cast<uint32_t>(w) * plink2::kBitsPerWord + bit_pos;
+						if (sample_idx < sample_ct) {
+							local_counts[sample_idx]++;
+						}
+						word &= word - 1;
+					}
+				}
+			}
+		}
+	} catch (...) {
+		exc_ptr = std::current_exception();
+		stop_requested.store(true, std::memory_order_relaxed);
+	}
+}
+
 static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkMissingGlobalState &gstate,
                                    PlinkMissingLocalState &lstate, DataChunk &output) {
 	uint32_t sample_ct = bind_data.effective_sample_ct;
 
 	// Phase 1: Scan all variants, accumulate per-sample missing counts
 	if (!gstate.variant_scan_done && gstate.need_missingness && lstate.initialized) {
+		uint32_t start_idx = gstate.start_variant_idx;
 		uint32_t end_idx = gstate.end_variant_idx;
+		uint32_t variant_count = end_idx - start_idx;
 
 		const uintptr_t *sample_include = nullptr;
 		if (bind_data.has_sample_subset && bind_data.sample_subset) {
 			sample_include = bind_data.sample_subset->SampleInclude();
 		}
 
-		auto *missingness = lstate.missingness_buf.As<uintptr_t>();
-		auto *genovec = lstate.genovec_buf.As<uintptr_t>();
-		uintptr_t word_ct = plink2::BitCtToWordCt(sample_ct);
+		uint32_t hw_threads = std::thread::hardware_concurrency();
+		uint32_t n_threads =
+		    (variant_count >= 1000 && hw_threads > 1)
+		        ? std::min({hw_threads, variant_count / 500 + 1, static_cast<uint32_t>(16)})
+		        : 1;
 
-		for (uint32_t vidx = gstate.start_variant_idx; vidx < end_idx; vidx++) {
-			plink2::PglErr err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
-			                                               missingness, genovec);
+		if (n_threads <= 1) {
+			// Single-threaded path (unchanged)
+			auto *missingness = lstate.missingness_buf.As<uintptr_t>();
+			auto *genovec = lstate.genovec_buf.As<uintptr_t>();
+			uintptr_t word_ct = plink2::BitCtToWordCt(sample_ct);
 
-			if (err != plink2::kPglRetSuccess) {
-				throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
+			for (uint32_t vidx = start_idx; vidx < end_idx; vidx++) {
+				plink2::PglErr err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx,
+				                                               &lstate.pgr, missingness, genovec);
+				if (err != plink2::kPglRetSuccess) {
+					throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
+				}
+
+				for (uintptr_t w = 0; w < word_ct; w++) {
+					uintptr_t word = missingness[w];
+					while (word) {
+						uint32_t bit_pos = plink2::ctzw(word);
+						uint32_t sample_idx = static_cast<uint32_t>(w) * plink2::kBitsPerWord + bit_pos;
+						if (sample_idx < sample_ct) {
+							gstate.sample_missing_counts[sample_idx]++;
+						}
+						word &= word - 1;
+					}
+				}
+			}
+		} else {
+			// Parallel path: N threads with thread-local accumulators
+			std::atomic<uint32_t> work_counter(start_idx);
+			std::atomic<bool> stop_requested(false);
+
+			// Thread-local accumulator vectors (one per thread, including main thread)
+			vector<vector<uint32_t>> local_counts(n_threads);
+			for (uint32_t t = 0; t < n_threads; t++) {
+				local_counts[t].resize(sample_ct, 0);
 			}
 
-			// Iterate set bits (missing samples) and increment per-sample counters
-			for (uintptr_t w = 0; w < word_ct; w++) {
-				uintptr_t word = missingness[w];
-				while (word) {
-					uint32_t bit_pos = plink2::ctzw(word);
-					uint32_t sample_idx = static_cast<uint32_t>(w) * plink2::kBitsPerWord + bit_pos;
-					if (sample_idx < sample_ct) {
-						gstate.sample_missing_counts[sample_idx]++;
-					}
-					word &= word - 1; // clear lowest set bit
+			// Per-thread buffers and contexts
+			uintptr_t missingness_alloc_ct = plink2::BitCtToAlignedWordCt(sample_ct);
+			uintptr_t genovec_alloc_ct = plink2::NypCtToAlignedWordCt(bind_data.raw_sample_ct);
+
+			vector<PgenThreadContext> thread_ctxs(n_threads - 1);
+			vector<AlignedBuffer> thread_missingness_bufs(n_threads - 1);
+			vector<AlignedBuffer> thread_genovec_bufs(n_threads - 1);
+			vector<std::exception_ptr> exc_ptrs(n_threads, nullptr);
+
+			for (uint32_t t = 0; t < n_threads - 1; t++) {
+				InitPgenThreadContext(thread_ctxs[t], bind_data.pgen_path, bind_data.raw_variant_ct,
+				                      bind_data.raw_sample_ct,
+				                      bind_data.has_sample_subset ? bind_data.sample_subset.get() : nullptr);
+				thread_missingness_bufs[t].Allocate(missingness_alloc_ct * sizeof(uintptr_t));
+				thread_genovec_bufs[t].Allocate(genovec_alloc_ct * sizeof(uintptr_t));
+			}
+
+			// Launch N-1 background threads
+			vector<std::thread> threads;
+			threads.reserve(n_threads - 1);
+			for (uint32_t t = 0; t < n_threads - 1; t++) {
+				threads.emplace_back(MissingWorkerFunc, &thread_ctxs[t].pgr, thread_ctxs[t].pssi, sample_include,
+				                     sample_ct, thread_missingness_bufs[t].As<uintptr_t>(),
+				                     thread_genovec_bufs[t].As<uintptr_t>(), std::ref(work_counter), end_idx,
+				                     std::ref(stop_requested), std::ref(local_counts[t + 1]), std::ref(exc_ptrs[t + 1]));
+			}
+
+			// Main thread participates as worker 0
+			MissingWorkerFunc(&lstate.pgr, lstate.pssi, sample_include, sample_ct,
+			                  lstate.missingness_buf.As<uintptr_t>(), lstate.genovec_buf.As<uintptr_t>(), work_counter,
+			                  end_idx, stop_requested, local_counts[0], exc_ptrs[0]);
+
+			// Join all threads
+			for (auto &t : threads) {
+				t.join();
+			}
+
+			// Check for exceptions
+			for (auto &eptr : exc_ptrs) {
+				if (eptr) {
+					std::rethrow_exception(eptr);
+				}
+			}
+
+			// Merge thread-local counts into global state
+			for (uint32_t t = 0; t < n_threads; t++) {
+				for (uint32_t s = 0; s < sample_ct; s++) {
+					gstate.sample_missing_counts[s] += local_counts[t][s];
 				}
 			}
 		}
