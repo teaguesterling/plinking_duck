@@ -1,0 +1,11 @@
+# name: test/sql/read_pgen_phased_negative.test
+# description: Negative tests for read_pgen phased parameter
+# group: [sql]
+
+require plinking_duck
+
+# phased + dosages → NotImplementedException
+statement error
+SELECT * FROM read_pgen('test/data/phased_example.pgen', phased := true, dosages := true);
+----
+dosages

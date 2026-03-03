@@ -85,6 +85,12 @@ struct PgenLocalState : public LocalTableFunctionState {
 	// Expanded genotype buffer (int8, one per sample, -9 = missing)
 	vector<int8_t> genotype_bytes;
 
+	// Phase buffers (for phased := true)
+	AlignedBuffer phasepresent_buf;
+	AlignedBuffer phaseinfo_buf;
+	vector<int8_t> phased_pairs; // sample_ct * 2 entries
+	uint32_t phasepresent_ct = 0;
+
 	// Sample subset index (for PgrGet)
 	plink2::PgrSampleSubsetIndex pssi;
 
@@ -139,9 +145,6 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 
 	if (bind_data->include_dosages) {
 		throw NotImplementedException("read_pgen: dosages support is not yet implemented");
-	}
-	if (bind_data->include_phased) {
-		throw NotImplementedException("read_pgen: phased support is not yet implemented");
 	}
 
 	// --- Auto-discover companion files ---
@@ -282,9 +285,11 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			return_types.push_back(LogicalType::TINYINT);
 		}
 	} else {
+		LogicalType elem_type = bind_data->include_phased ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
+		                                                  : LogicalType::TINYINT;
 		LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
-		                            ? LogicalType::ARRAY(LogicalType::TINYINT, output_sample_ct)
-		                            : LogicalType::LIST(LogicalType::TINYINT);
+		                            ? LogicalType::ARRAY(elem_type, output_sample_ct)
+		                            : LogicalType::LIST(elem_type);
 
 		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
 		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
@@ -399,6 +404,16 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	// Allocate expanded byte buffer for genotype conversion
 	state->genotype_bytes.resize(effective_sample_ct);
 
+	// Allocate phase buffers if phased output requested
+	if (bind_data.include_phased) {
+		uint32_t output_sample_ct =
+		    bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
+		uintptr_t phase_wc = plink2::BitCtToAlignedWordCt(output_sample_ct);
+		state->phasepresent_buf.Allocate(phase_wc * sizeof(uintptr_t));
+		state->phaseinfo_buf.Allocate(phase_wc * sizeof(uintptr_t));
+		state->phased_pairs.resize(static_cast<size_t>(output_sample_ct) * 2);
+	}
+
 	// Set up sample subsetting if needed
 	if (bind_data.has_sample_subset) {
 		// Build sample_include bitmask
@@ -463,16 +478,29 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				const uintptr_t *sample_include =
 				    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
-				plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                                    lstate.genovec_buf.As<uintptr_t>());
-
-				if (err != plink2::kPglRetSuccess) {
-					throw IOException("read_pgen: PgrGet failed for variant %u", vidx);
+				if (bind_data.include_phased) {
+					plink2::PglErr err = plink2::PgrGetP(
+					    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+					    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
+					    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("read_pgen: PgrGetP failed for variant %u", vidx);
+					}
+					plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
+					                             lstate.genotype_bytes.data());
+					UnpackPhasedGenotypes(lstate.genotype_bytes.data(), lstate.phasepresent_buf.As<uintptr_t>(),
+					                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
+					                      lstate.phased_pairs.data());
+				} else {
+					plink2::PglErr err =
+					    plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+					                   lstate.genovec_buf.As<uintptr_t>());
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("read_pgen: PgrGet failed for variant %u", vidx);
+					}
+					plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
+					                             lstate.genotype_bytes.data());
 				}
-
-				// Unpack 2-bit genotypes to bytes (-9 = missing)
-				plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
-				                             lstate.genotype_bytes.data());
 				genotypes_read = true;
 			}
 
@@ -518,7 +546,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					}
 					break;
 				}
-				case 5: { // genotypes — ARRAY(TINYINT, N) or LIST(TINYINT)
+				case 5: { // genotypes
 					if (bind_data.genotype_mode == GenotypeMode::COLUMNS) {
 						// In COLUMNS mode, file_col 5 is the first genotype column (sample_pos 0)
 						if (genotypes_read) {
@@ -544,42 +572,95 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 						break;
 					}
 
-					if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
-						auto array_size = static_cast<idx_t>(output_sample_ct);
-						auto &child = ArrayVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+					if (bind_data.include_phased) {
+						// Phased output: ARRAY(ARRAY(TINYINT,2), N) or LIST(ARRAY(TINYINT,2))
+						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
+							auto &pair_vec = ArrayVector::GetEntry(vec);
+							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
+							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+							auto &pair_validity = FlatVector::Validity(pair_vec);
 
-						idx_t base = rows_emitted * array_size;
-						for (idx_t s = 0; s < array_size; s++) {
-							int8_t geno = lstate.genotype_bytes[s];
-							if (geno == -9) {
-								child_validity.SetInvalid(base + s);
-								child_data[base + s] = 0;
-							} else {
-								child_data[base + s] = geno;
+							idx_t pair_base = rows_emitted * static_cast<idx_t>(output_sample_ct);
+							for (idx_t s = 0; s < output_sample_ct; s++) {
+								idx_t pair_idx = pair_base + s;
+								idx_t allele_base = pair_idx * 2;
+								int8_t a1 = lstate.phased_pairs[s * 2];
+								if (a1 == -9) {
+									pair_validity.SetInvalid(pair_idx);
+									allele_data[allele_base] = 0;
+									allele_data[allele_base + 1] = 0;
+								} else {
+									allele_data[allele_base] = a1;
+									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+								}
 							}
+						} else {
+							// LIST(ARRAY(TINYINT, 2))
+							auto list_offset = ListVector::GetListSize(vec);
+							ListVector::Reserve(vec, list_offset + output_sample_ct);
+							auto &pair_vec = ListVector::GetEntry(vec);
+							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
+							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+							auto &pair_validity = FlatVector::Validity(pair_vec);
+
+							for (idx_t s = 0; s < output_sample_ct; s++) {
+								idx_t pair_idx = list_offset + s;
+								idx_t allele_base = pair_idx * 2;
+								int8_t a1 = lstate.phased_pairs[s * 2];
+								if (a1 == -9) {
+									pair_validity.SetInvalid(pair_idx);
+									allele_data[allele_base] = 0;
+									allele_data[allele_base + 1] = 0;
+								} else {
+									allele_data[allele_base] = a1;
+									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+								}
+							}
+
+							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							list_data[rows_emitted].offset = list_offset;
+							list_data[rows_emitted].length = output_sample_ct;
+							ListVector::SetListSize(vec, list_offset + output_sample_ct);
 						}
 					} else {
-						// LIST path
-						auto list_offset = ListVector::GetListSize(vec);
-						ListVector::Reserve(vec, list_offset + output_sample_ct);
-						auto &child = ListVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
-						for (idx_t s = 0; s < output_sample_ct; s++) {
-							int8_t geno = lstate.genotype_bytes[s];
-							if (geno == -9) {
-								child_validity.SetInvalid(list_offset + s);
-								child_data[list_offset + s] = 0;
-							} else {
-								child_data[list_offset + s] = geno;
+						// Unphased output: ARRAY(TINYINT, N) or LIST(TINYINT)
+						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
+							auto array_size = static_cast<idx_t>(output_sample_ct);
+							auto &child = ArrayVector::GetEntry(vec);
+							auto *child_data = FlatVector::GetData<int8_t>(child);
+							auto &child_validity = FlatVector::Validity(child);
+
+							idx_t base = rows_emitted * array_size;
+							for (idx_t s = 0; s < array_size; s++) {
+								int8_t geno = lstate.genotype_bytes[s];
+								if (geno == -9) {
+									child_validity.SetInvalid(base + s);
+									child_data[base + s] = 0;
+								} else {
+									child_data[base + s] = geno;
+								}
 							}
+						} else {
+							// LIST path
+							auto list_offset = ListVector::GetListSize(vec);
+							ListVector::Reserve(vec, list_offset + output_sample_ct);
+							auto &child = ListVector::GetEntry(vec);
+							auto *child_data = FlatVector::GetData<int8_t>(child);
+							auto &child_validity = FlatVector::Validity(child);
+							for (idx_t s = 0; s < output_sample_ct; s++) {
+								int8_t geno = lstate.genotype_bytes[s];
+								if (geno == -9) {
+									child_validity.SetInvalid(list_offset + s);
+									child_data[list_offset + s] = 0;
+								} else {
+									child_data[list_offset + s] = geno;
+								}
+							}
+							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							list_data[rows_emitted].offset = list_offset;
+							list_data[rows_emitted].length = output_sample_ct;
+							ListVector::SetListSize(vec, list_offset + output_sample_ct);
 						}
-						auto *list_data = FlatVector::GetData<list_entry_t>(vec);
-						list_data[rows_emitted].offset = list_offset;
-						list_data[rows_emitted].length = output_sample_ct;
-						ListVector::SetListSize(vec, list_offset + output_sample_ct);
 					}
 					break;
 				}

@@ -1,0 +1,267 @@
+# name: test/sql/read_pfile_phased.test
+# description: Positive tests for read_pfile phased parameter across all orient modes
+# group: [sql]
+
+require plinking_duck
+
+# ===================================================================
+# Variant orient (default): type checks
+# ===================================================================
+
+# phased := true + default (array) → TINYINT[2][4]
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/phased_example', phased := true) LIMIT 1;
+----
+TINYINT[2][4]
+
+# phased := true + list → TINYINT[2][]
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/phased_example', phased := true, genotypes := 'list') LIMIT 1;
+----
+TINYINT[2][]
+
+# phased := false → unphased TINYINT[4]
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/phased_example', phased := false) LIMIT 1;
+----
+TINYINT[4]
+
+# ===================================================================
+# Variant orient: value correctness
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true) WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true) WHERE ID = 'rs2';
+----
+rs2	[[0, 1], [1, 0], [0, 0], [1, 1]]
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true) WHERE ID = 'rs3';
+----
+rs3	[[1, 1], NULL, [1, 0], [0, 0]]
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true) WHERE ID = 'rs4';
+----
+rs4	[[0, 0], [0, 0], [0, 1], [1, 1]]
+
+# ===================================================================
+# Variant orient: phased LIST values
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true, genotypes := 'list') WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true, genotypes := 'list') WHERE ID = 'rs3';
+----
+rs3	[[1, 1], NULL, [1, 0], [0, 0]]
+
+# ===================================================================
+# Genotype orient: type and values
+# ===================================================================
+
+# phased + genotype orient → TINYINT[2] per row
+query T
+SELECT typeof(genotype) FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype') LIMIT 1;
+----
+TINYINT[2]
+
+# rs1 SAMPLE1 = 0|0 → [0, 0]
+query TTTT
+SELECT ID, IID, genotype, typeof(genotype) FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype')
+    WHERE ID = 'rs1' AND IID = 'SAMPLE1';
+----
+rs1	SAMPLE1	[0, 0]	TINYINT[2]
+
+# rs1 SAMPLE3 = 1|0 → [1, 0]
+query TT
+SELECT IID, genotype FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype')
+    WHERE ID = 'rs1' AND IID = 'SAMPLE3';
+----
+SAMPLE3	[1, 0]
+
+# rs1 SAMPLE4 = ./. → NULL
+query TT
+SELECT IID, genotype FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype')
+    WHERE ID = 'rs1' AND IID = 'SAMPLE4';
+----
+SAMPLE4	NULL
+
+# rs2 SAMPLE2 = 1|0 → [1, 0]
+query TT
+SELECT IID, genotype FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype')
+    WHERE ID = 'rs2' AND IID = 'SAMPLE2';
+----
+SAMPLE2	[1, 0]
+
+# Total row count: 4 variants × 4 samples = 16
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype');
+----
+16
+
+# ===================================================================
+# Genotype orient + phased + sample subset
+# ===================================================================
+
+query TT
+SELECT IID, genotype FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype',
+    samples := ['SAMPLE1', 'SAMPLE3']) WHERE ID = 'rs1' ORDER BY IID;
+----
+SAMPLE1	[0, 0]
+SAMPLE3	[1, 0]
+
+# ===================================================================
+# Sample orient: type and values
+# ===================================================================
+
+# phased + sample orient + array → TINYINT[2][4] (4 variants)
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample') LIMIT 1;
+----
+TINYINT[2][4]
+
+# SAMPLE1: rs1=0|0, rs2=0/1, rs3=1|1, rs4=0|0
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample')
+    WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	[[0, 0], [0, 1], [1, 1], [0, 0]]
+
+# SAMPLE3: rs1=1|0, rs2=0|0, rs3=1|0, rs4=0|1
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample')
+    WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	[[1, 0], [0, 0], [1, 0], [0, 1]]
+
+# SAMPLE4: rs1=./., rs2=1|1, rs3=0|0, rs4=1|1
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample')
+    WHERE IID = 'SAMPLE4';
+----
+SAMPLE4	[NULL, [1, 1], [0, 0], [1, 1]]
+
+# SAMPLE2: rs1=0|1, rs2=1|0, rs3=./., rs4=0|0
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample')
+    WHERE IID = 'SAMPLE2';
+----
+SAMPLE2	[[0, 1], [1, 0], NULL, [0, 0]]
+
+# Total row count = 4 samples
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample');
+----
+4
+
+# ===================================================================
+# Sample orient + phased + list
+# ===================================================================
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample', genotypes := 'list') LIMIT 1;
+----
+TINYINT[2][]
+
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample', genotypes := 'list')
+    WHERE IID = 'SAMPLE1';
+----
+SAMPLE1	[[0, 0], [0, 1], [1, 1], [0, 0]]
+
+# ===================================================================
+# Phased × region filtering
+# ===================================================================
+
+# Only chromosome 1 variants (rs1, rs2, rs3)
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true, region := '1') ORDER BY POS;
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+rs2	[[0, 1], [1, 0], [0, 0], [1, 1]]
+rs3	[[1, 1], NULL, [1, 0], [0, 0]]
+
+# Specific region
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true, region := '1:10000-20000') ORDER BY POS;
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+rs2	[[0, 1], [1, 0], [0, 0], [1, 1]]
+
+# ===================================================================
+# Phased × variant filtering
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true, variants := ['rs1', 'rs4']) ORDER BY POS;
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+rs4	[[0, 0], [0, 0], [0, 1], [1, 1]]
+
+# ===================================================================
+# Phased × sample subsetting (variant orient)
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/phased_example', phased := true,
+    samples := ['SAMPLE1', 'SAMPLE3']) WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [1, 0]]
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/phased_example', phased := true,
+    samples := [0, 2]) LIMIT 1;
+----
+TINYINT[2][2]
+
+# ===================================================================
+# Sample orient + phased + variant subset
+# ===================================================================
+
+# Only rs1 and rs4 → 2-element arrays
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/phased_example', phased := true,
+    orient := 'sample', variants := ['rs1', 'rs4']) WHERE IID = 'SAMPLE3';
+----
+SAMPLE3	[[1, 0], [0, 1]]
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/phased_example', phased := true,
+    orient := 'sample', variants := ['rs1', 'rs4']) LIMIT 1;
+----
+TINYINT[2][2]
+
+# ===================================================================
+# Projection pushdown: metadata-only with phased
+# ===================================================================
+
+query TI
+SELECT CHROM, POS FROM read_pfile('test/data/phased_example', phased := true) ORDER BY CHROM, POS;
+----
+1	10000
+1	20000
+1	30000
+2	15000
+
+# ===================================================================
+# ARRAY vs LIST equivalence for phased (variant orient)
+# ===================================================================
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.ID, a.genotypes::TINYINT[2][] AS a_geno, l.genotypes AS l_geno
+    FROM read_pfile('test/data/phased_example', phased := true, genotypes := 'array') a
+    JOIN read_pfile('test/data/phased_example', phased := true, genotypes := 'list') l ON a.ID = l.ID
+    WHERE a_geno != l_geno OR (a_geno IS NULL AND l_geno IS NOT NULL) OR (a_geno IS NOT NULL AND l_geno IS NULL)
+);
+----
+0

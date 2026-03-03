@@ -539,4 +539,45 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 	return range;
 }
 
+// ---------------------------------------------------------------------------
+// Phased genotype unpacking
+// ---------------------------------------------------------------------------
+
+void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent,
+                           const uintptr_t *phaseinfo, uint32_t sample_ct, int8_t *output_pairs) {
+	for (uint32_t s = 0; s < sample_ct; s++) {
+		int8_t geno = genotype_bytes[s];
+		idx_t out_idx = static_cast<idx_t>(s) * 2;
+		switch (geno) {
+		case -9: // missing
+			output_pairs[out_idx] = -9;
+			output_pairs[out_idx + 1] = -9;
+			break;
+		case 0: // hom ref
+			output_pairs[out_idx] = 0;
+			output_pairs[out_idx + 1] = 0;
+			break;
+		case 2: // hom alt
+			output_pairs[out_idx] = 1;
+			output_pairs[out_idx + 1] = 1;
+			break;
+		case 1: // het — check phase
+			if (plink2::IsSet(phasepresent, s) && plink2::IsSet(phaseinfo, s)) {
+				// ALT|REF
+				output_pairs[out_idx] = 1;
+				output_pairs[out_idx + 1] = 0;
+			} else {
+				// REF|ALT (phased default) or unphased convention
+				output_pairs[out_idx] = 0;
+				output_pairs[out_idx + 1] = 1;
+			}
+			break;
+		default: // shouldn't happen
+			output_pairs[out_idx] = -9;
+			output_pairs[out_idx + 1] = -9;
+			break;
+		}
+	}
+}
+
 } // namespace duckdb

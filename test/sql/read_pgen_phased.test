@@ -1,0 +1,191 @@
+# name: test/sql/read_pgen_phased.test
+# description: Positive tests for read_pgen phased parameter
+# group: [sql]
+
+require plinking_duck
+
+# ===================================================================
+# Type checks
+# ===================================================================
+
+# phased := true + default (array) → TINYINT[2][4]
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/phased_example.pgen') LIMIT 1;
+----
+TINYINT[4]
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/phased_example.pgen', phased := true) LIMIT 1;
+----
+TINYINT[2][4]
+
+# phased := true + list → TINYINT[2][]
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/phased_example.pgen', phased := true, genotypes := 'list') LIMIT 1;
+----
+TINYINT[2][]
+
+# phased := false (explicit) → same as default
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/phased_example.pgen', phased := false) LIMIT 1;
+----
+TINYINT[4]
+
+# ===================================================================
+# Value correctness: phased ARRAY
+# Expected phased output:
+# rs1: SAMPLE1=0|0=[0,0], SAMPLE2=0|1=[0,1], SAMPLE3=1|0=[1,0], SAMPLE4=./.=NULL
+# rs2: SAMPLE1=0/1=[0,1], SAMPLE2=1|0=[1,0], SAMPLE3=0|0=[0,0], SAMPLE4=1|1=[1,1]
+# rs3: SAMPLE1=1|1=[1,1], SAMPLE2=./.=NULL, SAMPLE3=1|0=[1,0], SAMPLE4=0|0=[0,0]
+# rs4: SAMPLE1=0|0=[0,0], SAMPLE2=0|0=[0,0], SAMPLE3=0|1=[0,1], SAMPLE4=1|1=[1,1]
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true) WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true) WHERE ID = 'rs2';
+----
+rs2	[[0, 1], [1, 0], [0, 0], [1, 1]]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true) WHERE ID = 'rs3';
+----
+rs3	[[1, 1], NULL, [1, 0], [0, 0]]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true) WHERE ID = 'rs4';
+----
+rs4	[[0, 0], [0, 0], [0, 1], [1, 1]]
+
+# ===================================================================
+# Phase direction: verify [1, 0] for ALT|REF hets
+# rs1 SAMPLE3 is 1|0 → [1, 0]
+# rs2 SAMPLE2 is 1|0 → [1, 0]
+# ===================================================================
+
+query T
+SELECT genotypes[3] FROM read_pgen('test/data/phased_example.pgen', phased := true) WHERE ID = 'rs1';
+----
+[1, 0]
+
+query T
+SELECT genotypes[2] FROM read_pgen('test/data/phased_example.pgen', phased := true) WHERE ID = 'rs2';
+----
+[1, 0]
+
+# ===================================================================
+# Phased LIST: values
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true, genotypes := 'list') WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true, genotypes := 'list') WHERE ID = 'rs2';
+----
+rs2	[[0, 1], [1, 0], [0, 0], [1, 1]]
+
+# LIST length matches sample count
+query I
+SELECT len(genotypes) FROM read_pgen('test/data/phased_example.pgen', phased := true, genotypes := 'list') LIMIT 1;
+----
+4
+
+# ===================================================================
+# Phased × sample subsetting (integer)
+# ===================================================================
+
+# Subset samples [0, 2] → SAMPLE1, SAMPLE3
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/phased_example.pgen', phased := true, samples := [0, 2]) LIMIT 1;
+----
+TINYINT[2][2]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true, samples := [0, 2]) WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [1, 0]]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true, samples := [0, 2]) WHERE ID = 'rs2';
+----
+rs2	[[0, 1], [0, 0]]
+
+# ===================================================================
+# Phased × sample subsetting (VARCHAR)
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true,
+    samples := ['SAMPLE1', 'SAMPLE3']) WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [1, 0]]
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true,
+    samples := ['SAMPLE2', 'SAMPLE4']) WHERE ID = 'rs3';
+----
+rs3	[NULL, [0, 0]]
+
+# ===================================================================
+# Phased × orphan mode (no .psam)
+# ===================================================================
+
+# Create orphan phased files by using explicit pvar path
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/phased_example.pgen', phased := true,
+    pvar := 'test/data/phased_example.pvar') LIMIT 1;
+----
+TINYINT[2][4]
+
+# ===================================================================
+# Phased × projection pushdown (metadata-only query)
+# ===================================================================
+
+query TI
+SELECT CHROM, POS FROM read_pgen('test/data/phased_example.pgen', phased := true) ORDER BY CHROM, POS;
+----
+1	10000
+1	20000
+1	30000
+2	15000
+
+# ===================================================================
+# Phased × all-missing dataset
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/all_missing.pgen', phased := true) ORDER BY POS;
+----
+rs_miss1	[NULL, NULL]
+rs_miss2	[NULL, NULL]
+
+# ===================================================================
+# Phased × explicit companion paths
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/phased_example.pgen', phased := true,
+    pvar := 'test/data/phased_example.pvar',
+    psam := 'test/data/phased_example.psam') WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [0, 1], [1, 0], NULL]
+
+# ===================================================================
+# ARRAY vs LIST equivalence for phased output
+# ===================================================================
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.ID, a.genotypes::TINYINT[2][] AS a_geno, l.genotypes AS l_geno
+    FROM read_pgen('test/data/phased_example.pgen', phased := true, genotypes := 'array') a
+    JOIN read_pgen('test/data/phased_example.pgen', phased := true, genotypes := 'list') l ON a.ID = l.ID
+    WHERE a_geno != l_geno OR (a_geno IS NULL AND l_geno IS NOT NULL) OR (a_geno IS NOT NULL AND l_geno IS NULL)
+);
+----
+0

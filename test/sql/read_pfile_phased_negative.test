@@ -1,0 +1,11 @@
+# name: test/sql/read_pfile_phased_negative.test
+# description: Negative tests for read_pfile phased parameter
+# group: [sql]
+
+require plinking_duck
+
+# phased + dosages → NotImplementedException
+statement error
+SELECT * FROM read_pfile('test/data/phased_example', phased := true, dosages := true);
+----
+dosages

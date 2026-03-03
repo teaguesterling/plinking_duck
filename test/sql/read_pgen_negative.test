@@ -85,9 +85,4 @@ SELECT * FROM read_pgen('test/data/pgen_example.pgen', dosages := true);
 ----
 not yet implemented
 
-# --- Phased not yet implemented ---
-
-statement error
-SELECT * FROM read_pgen('test/data/pgen_example.pgen', phased := true);
-----
-not yet implemented
+# (phased := true is now implemented — see read_pgen_phased.test)
