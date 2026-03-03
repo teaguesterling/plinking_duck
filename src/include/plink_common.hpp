@@ -20,9 +20,13 @@ namespace duckdb {
 
 //! Genotype column output mode for read_pgen / read_pfile default mode.
 enum class GenotypeMode : uint8_t {
-	ARRAY, //!< ARRAY(TINYINT, N) — requires N <= MAX_ARRAY_SIZE
-	LIST   //!< LIST(TINYINT) — any sample count
+	ARRAY,   //!< ARRAY(TINYINT, N) — requires N <= MAX_ARRAY_SIZE
+	LIST,    //!< LIST(TINYINT) — any sample count
+	COLUMNS  //!< One scalar TINYINT column per sample (variant orient) or per variant (sample orient)
 };
+
+//! Maximum number of genotype columns in COLUMNS mode (without explicit sample/variant filter)
+static constexpr uint32_t MAX_GENOTYPE_COLUMNS = 256;
 
 //! Resolve a genotypes parameter string to a GenotypeMode.
 //! Case-insensitive. "auto" → ARRAY if sample_ct ≤ MAX_ARRAY_SIZE, else LIST.
