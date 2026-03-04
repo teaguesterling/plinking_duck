@@ -4,9 +4,7 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 
 #include <atomic>
-#include <exception>
 #include <mutex>
-#include <thread>
 
 namespace duckdb {
 
@@ -83,22 +81,20 @@ struct PlinkMissingGlobalState : public GlobalTableFunctionState {
 	// Mode
 	bool sample_mode = false;
 
-	// Sample mode: per-sample accumulation
+	// Sample mode: per-sample accumulation (merged from thread-local accumulators)
 	vector<uint32_t> sample_missing_counts;
-	std::mutex scan_mutex;
+	std::mutex merge_mutex;
+	std::atomic<uint32_t> phase1_active {0};
 	std::atomic<bool> variant_scan_done {false};
 	std::atomic<uint32_t> next_sample_idx {0};
 	uint32_t total_variant_ct = 0;
 
-	// DuckDB-configured thread count for internal parallelism
-	uint32_t max_thread_count = 1;
+	// DuckDB-configured thread count
+	uint32_t db_thread_count = 1;
 
 	idx_t MaxThreads() const override {
-		if (sample_mode) {
-			return 1;
-		}
 		uint32_t range = end_variant_idx - start_variant_idx;
-		return std::min<idx_t>(range / 500 + 1, 16);
+		return std::min<idx_t>(range / 500 + 1, db_thread_count);
 	}
 };
 
@@ -118,6 +114,9 @@ struct PlinkMissingLocalState : public LocalTableFunctionState {
 	// Buffers for PgrGetMissingness
 	AlignedBuffer missingness_buf;
 	AlignedBuffer genovec_buf;
+
+	// Thread-local accumulator for sample-mode Phase 1
+	vector<uint32_t> local_missing_counts;
 
 	bool initialized = false;
 
@@ -322,8 +321,8 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 		}
 	}
 
-	// DuckDB-configured thread count for internal parallelism
-	state->max_thread_count =
+	// DuckDB-configured thread count
+	state->db_thread_count =
 	    static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 
 	// Sample mode: pre-allocate accumulation array
@@ -415,6 +414,11 @@ static unique_ptr<LocalTableFunctionState> PlinkMissingInitLocal(ExecutionContex
 	// Allocate genovec scratch buffer (2 bits per raw sample, for pgenlib internal use)
 	uintptr_t genovec_alloc_ct = plink2::NypCtToAlignedWordCt(bind_data.raw_sample_ct);
 	state->genovec_buf.Allocate(genovec_alloc_ct * sizeof(uintptr_t));
+
+	// Sample mode: allocate thread-local accumulator
+	if (bind_data.sample_mode) {
+		state->local_missing_counts.resize(bind_data.effective_sample_ct, 0);
+	}
 
 	state->initialized = true;
 	return std::move(state);
@@ -537,88 +541,39 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 }
 
 // ---------------------------------------------------------------------------
-// Scan — sample mode (single-threaded: scan all variants, then emit rows)
+// Scan — sample mode (parallel Phase 1 via DuckDB thread pool, then Phase 2)
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Missing-count worker: claims batches of variants and accumulates per-sample
-// missingness into a thread-local count vector.
-// ---------------------------------------------------------------------------
-
-static void MissingWorkerFunc(plink2::PgenReader *pgr, plink2::PgrSampleSubsetIndex pssi,
-                              const uintptr_t *sample_include, uint32_t sample_ct, uintptr_t *missingness_buf,
-                              uintptr_t *genovec_buf, std::atomic<uint32_t> &work_counter, uint32_t end_idx,
-                              std::atomic<bool> &stop_requested, vector<uint32_t> &local_counts,
-                              std::exception_ptr &exc_ptr) {
-	uintptr_t word_ct = plink2::BitCtToWordCt(sample_ct);
-	try {
-		while (!stop_requested.load(std::memory_order_relaxed)) {
-			uint32_t batch_start = work_counter.fetch_add(MISSING_BATCH_SIZE);
-			if (batch_start >= end_idx) {
-				break;
-			}
-			uint32_t batch_end = std::min(batch_start + MISSING_BATCH_SIZE, end_idx);
-
-			for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
-				plink2::PglErr err =
-				    plink2::PgrGetMissingness(sample_include, pssi, sample_ct, vidx, pgr, missingness_buf, genovec_buf);
-				if (err != plink2::kPglRetSuccess) {
-					throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
-				}
-
-				for (uintptr_t w = 0; w < word_ct; w++) {
-					uintptr_t word = missingness_buf[w];
-					while (word) {
-						uint32_t bit_pos = plink2::ctzw(word);
-						uint32_t sample_idx = static_cast<uint32_t>(w) * plink2::kBitsPerWord + bit_pos;
-						if (sample_idx < sample_ct) {
-							local_counts[sample_idx]++;
-						}
-						word &= word - 1;
-					}
-				}
-			}
-		}
-	} catch (...) {
-		exc_ptr = std::current_exception();
-		stop_requested.store(true, std::memory_order_relaxed);
-	}
-}
 
 static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkMissingGlobalState &gstate,
                                    PlinkMissingLocalState &lstate, DataChunk &output) {
 	uint32_t sample_ct = bind_data.effective_sample_ct;
 
-	// Phase 1: Scan all variants, accumulate per-sample missing counts
-	// Double-checked lock: only one DuckDB thread runs Phase 1
+	// Phase 1: All DuckDB scan threads claim variant batches in parallel,
+	// accumulate into thread-local counts, then merge. The last thread to
+	// finish Phase 1 sets variant_scan_done and falls through to Phase 2.
 	if (!gstate.variant_scan_done.load(std::memory_order_acquire) && gstate.need_missingness && lstate.initialized) {
-		std::lock_guard<std::mutex> lock(gstate.scan_mutex);
-		if (gstate.variant_scan_done.load(std::memory_order_relaxed)) {
-			goto phase2; // Another thread completed Phase 1
-		}
+		gstate.phase1_active.fetch_add(1, std::memory_order_relaxed);
 
-		uint32_t start_idx = gstate.start_variant_idx;
 		uint32_t end_idx = gstate.end_variant_idx;
-		uint32_t variant_count = end_idx - start_idx;
 
 		const uintptr_t *sample_include = nullptr;
 		if (bind_data.has_sample_subset && bind_data.sample_subset) {
 			sample_include = bind_data.sample_subset->SampleInclude();
 		}
 
-		uint32_t db_threads = gstate.max_thread_count;
-		uint32_t n_threads =
-		    (variant_count >= 1000 && db_threads > 1)
-		        ? std::min({db_threads, variant_count / 500 + 1, static_cast<uint32_t>(16)})
-		        : 1;
+		auto *missingness = lstate.missingness_buf.As<uintptr_t>();
+		auto *genovec = lstate.genovec_buf.As<uintptr_t>();
+		uintptr_t word_ct = plink2::BitCtToWordCt(sample_ct);
 
-		if (n_threads <= 1) {
-			// Single-threaded path (unchanged)
-			auto *missingness = lstate.missingness_buf.As<uintptr_t>();
-			auto *genovec = lstate.genovec_buf.As<uintptr_t>();
-			uintptr_t word_ct = plink2::BitCtToWordCt(sample_ct);
+		// Claim and process variant batches into thread-local accumulator
+		while (true) {
+			uint32_t batch_start = gstate.next_variant_idx.fetch_add(MISSING_BATCH_SIZE);
+			if (batch_start >= end_idx) {
+				break;
+			}
+			uint32_t batch_end = std::min(batch_start + MISSING_BATCH_SIZE, end_idx);
 
-			for (uint32_t vidx = start_idx; vidx < end_idx; vidx++) {
+			for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
 				plink2::PglErr err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx,
 				                                               &lstate.pgr, missingness, genovec);
 				if (err != plink2::kPglRetSuccess) {
@@ -631,78 +586,30 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 						uint32_t bit_pos = plink2::ctzw(word);
 						uint32_t sample_idx = static_cast<uint32_t>(w) * plink2::kBitsPerWord + bit_pos;
 						if (sample_idx < sample_ct) {
-							gstate.sample_missing_counts[sample_idx]++;
+							lstate.local_missing_counts[sample_idx]++;
 						}
 						word &= word - 1;
 					}
 				}
 			}
-		} else {
-			// Parallel path: N threads with thread-local accumulators
-			std::atomic<uint32_t> work_counter(start_idx);
-			std::atomic<bool> stop_requested(false);
+		}
 
-			// Thread-local accumulator vectors (one per thread, including main thread)
-			vector<vector<uint32_t>> local_counts(n_threads);
-			for (uint32_t t = 0; t < n_threads; t++) {
-				local_counts[t].resize(sample_ct, 0);
-			}
-
-			// Per-thread buffers and contexts
-			uintptr_t missingness_alloc_ct = plink2::BitCtToAlignedWordCt(sample_ct);
-			uintptr_t genovec_alloc_ct = plink2::NypCtToAlignedWordCt(bind_data.raw_sample_ct);
-
-			vector<PgenThreadContext> thread_ctxs(n_threads - 1);
-			vector<AlignedBuffer> thread_missingness_bufs(n_threads - 1);
-			vector<AlignedBuffer> thread_genovec_bufs(n_threads - 1);
-			vector<std::exception_ptr> exc_ptrs(n_threads, nullptr);
-
-			for (uint32_t t = 0; t < n_threads - 1; t++) {
-				InitPgenThreadContext(thread_ctxs[t], bind_data.pgen_path, bind_data.raw_variant_ct,
-				                      bind_data.raw_sample_ct,
-				                      bind_data.has_sample_subset ? bind_data.sample_subset.get() : nullptr);
-				thread_missingness_bufs[t].Allocate(missingness_alloc_ct * sizeof(uintptr_t));
-				thread_genovec_bufs[t].Allocate(genovec_alloc_ct * sizeof(uintptr_t));
-			}
-
-			// Launch N-1 background threads
-			vector<std::thread> threads;
-			threads.reserve(n_threads - 1);
-			for (uint32_t t = 0; t < n_threads - 1; t++) {
-				threads.emplace_back(MissingWorkerFunc, &thread_ctxs[t].pgr, thread_ctxs[t].pssi, sample_include,
-				                     sample_ct, thread_missingness_bufs[t].As<uintptr_t>(),
-				                     thread_genovec_bufs[t].As<uintptr_t>(), std::ref(work_counter), end_idx,
-				                     std::ref(stop_requested), std::ref(local_counts[t + 1]), std::ref(exc_ptrs[t + 1]));
-			}
-
-			// Main thread participates as worker 0
-			MissingWorkerFunc(&lstate.pgr, lstate.pssi, sample_include, sample_ct,
-			                  lstate.missingness_buf.As<uintptr_t>(), lstate.genovec_buf.As<uintptr_t>(), work_counter,
-			                  end_idx, stop_requested, local_counts[0], exc_ptrs[0]);
-
-			// Join all threads
-			for (auto &t : threads) {
-				t.join();
-			}
-
-			// Check for exceptions
-			for (auto &eptr : exc_ptrs) {
-				if (eptr) {
-					std::rethrow_exception(eptr);
-				}
-			}
-
-			// Merge thread-local counts into global state
-			for (uint32_t t = 0; t < n_threads; t++) {
-				for (uint32_t s = 0; s < sample_ct; s++) {
-					gstate.sample_missing_counts[s] += local_counts[t][s];
-				}
+		// Merge thread-local accumulator into global state
+		{
+			std::lock_guard<std::mutex> lock(gstate.merge_mutex);
+			for (uint32_t s = 0; s < sample_ct; s++) {
+				gstate.sample_missing_counts[s] += lstate.local_missing_counts[s];
 			}
 		}
 
+		// Last thread to finish Phase 1 transitions to Phase 2
+		if (gstate.phase1_active.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+			// Not the last thread — we're done
+			output.SetCardinality(0);
+			return;
+		}
 		gstate.variant_scan_done.store(true, std::memory_order_release);
 	}
-phase2:
 
 	// Phase 2: Emit sample rows from accumulated counts
 	auto &column_ids = gstate.column_ids;
