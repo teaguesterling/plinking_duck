@@ -223,6 +223,15 @@ WHERE ALLELE_CT <= 0;
 ----
 0
 
+# plink_score numerical correctness: weight=1.0 → SCORE_SUM == NAMED_ALLELE_DOSAGE_SUM
+# This must hold exactly regardless of threading (same accumulation order per sample)
+query I
+SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
+    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
+WHERE SCORE_SUM != NAMED_ALLELE_DOSAGE_SUM;
+----
+0
+
 # ===================================================================
 # Chromosome distribution: correct per-chromosome counts
 # ===================================================================

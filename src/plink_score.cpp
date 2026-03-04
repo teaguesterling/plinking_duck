@@ -1,6 +1,8 @@
 #include "plink_score.hpp"
 #include "plink_common.hpp"
 
+#include "duckdb/parallel/task_scheduler.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -87,6 +89,9 @@ struct PlinkScoreGlobalState : public GlobalTableFunctionState {
 	uint32_t total_samples = 0;
 
 	vector<column_t> column_ids;
+
+	// DuckDB-configured thread count for internal parallelism
+	uint32_t max_thread_count = 1;
 
 	idx_t MaxThreads() const override {
 		return 1;
@@ -393,6 +398,8 @@ static unique_ptr<GlobalTableFunctionState> PlinkScoreInitGlobal(ClientContext &
 
 	state->total_samples = bind_data.effective_sample_ct;
 	state->column_ids = input.column_ids;
+	state->max_thread_count =
+	    static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 
 	// Initialize accumulators
 	state->score_sums.resize(state->total_samples, 0.0);
@@ -611,9 +618,9 @@ static void PerformScoring(const PlinkScoreBindData &bind_data, PlinkScoreGlobal
 		sample_include = bind_data.sample_subset->SampleInclude();
 	}
 
-	uint32_t hw_threads = std::thread::hardware_concurrency();
-	uint32_t n_threads = (scored_count >= 100 && hw_threads > 1)
-	                         ? std::min({hw_threads, scored_count / 16 + 1, static_cast<uint32_t>(16)})
+	uint32_t db_threads = gstate.max_thread_count;
+	uint32_t n_threads = (scored_count >= 100 && db_threads > 1)
+	                         ? std::min({db_threads, scored_count / 16 + 1, static_cast<uint32_t>(16)})
 	                         : 1;
 
 	if (n_threads <= 1) {

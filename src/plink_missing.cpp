@@ -1,8 +1,11 @@
 #include "plink_missing.hpp"
 #include "plink_common.hpp"
 
+#include "duckdb/parallel/task_scheduler.hpp"
+
 #include <atomic>
 #include <exception>
+#include <mutex>
 #include <thread>
 
 namespace duckdb {
@@ -80,12 +83,15 @@ struct PlinkMissingGlobalState : public GlobalTableFunctionState {
 	// Mode
 	bool sample_mode = false;
 
-	// Sample mode: per-sample accumulation (currently single-threaded;
-	// atomic for safety if MaxThreads is increased later)
+	// Sample mode: per-sample accumulation
 	vector<uint32_t> sample_missing_counts;
+	std::mutex scan_mutex;
 	std::atomic<bool> variant_scan_done {false};
 	std::atomic<uint32_t> next_sample_idx {0};
 	uint32_t total_variant_ct = 0;
+
+	// DuckDB-configured thread count for internal parallelism
+	uint32_t max_thread_count = 1;
 
 	idx_t MaxThreads() const override {
 		if (sample_mode) {
@@ -315,6 +321,10 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 			}
 		}
 	}
+
+	// DuckDB-configured thread count for internal parallelism
+	state->max_thread_count =
+	    static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 
 	// Sample mode: pre-allocate accumulation array
 	if (bind_data.sample_mode) {
@@ -580,7 +590,13 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 	uint32_t sample_ct = bind_data.effective_sample_ct;
 
 	// Phase 1: Scan all variants, accumulate per-sample missing counts
-	if (!gstate.variant_scan_done && gstate.need_missingness && lstate.initialized) {
+	// Double-checked lock: only one DuckDB thread runs Phase 1
+	if (!gstate.variant_scan_done.load(std::memory_order_acquire) && gstate.need_missingness && lstate.initialized) {
+		std::lock_guard<std::mutex> lock(gstate.scan_mutex);
+		if (gstate.variant_scan_done.load(std::memory_order_relaxed)) {
+			goto phase2; // Another thread completed Phase 1
+		}
+
 		uint32_t start_idx = gstate.start_variant_idx;
 		uint32_t end_idx = gstate.end_variant_idx;
 		uint32_t variant_count = end_idx - start_idx;
@@ -590,10 +606,10 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 			sample_include = bind_data.sample_subset->SampleInclude();
 		}
 
-		uint32_t hw_threads = std::thread::hardware_concurrency();
+		uint32_t db_threads = gstate.max_thread_count;
 		uint32_t n_threads =
-		    (variant_count >= 1000 && hw_threads > 1)
-		        ? std::min({hw_threads, variant_count / 500 + 1, static_cast<uint32_t>(16)})
+		    (variant_count >= 1000 && db_threads > 1)
+		        ? std::min({db_threads, variant_count / 500 + 1, static_cast<uint32_t>(16)})
 		        : 1;
 
 		if (n_threads <= 1) {
@@ -684,8 +700,9 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 			}
 		}
 
-		gstate.variant_scan_done = true;
+		gstate.variant_scan_done.store(true, std::memory_order_release);
 	}
+phase2:
 
 	// Phase 2: Emit sample rows from accumulated counts
 	auto &column_ids = gstate.column_ids;
