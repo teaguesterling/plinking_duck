@@ -825,14 +825,16 @@ sort step after scanning.
 
 ## Acceptance Criteria
 
-1. [ ] Streaming test data generated (50K variants × 8 samples)
-2. [ ] Baseline streaming/threading tests pass for all functions
-3. [ ] `VariantMetadataIndex` implemented with on-demand field extraction
-4. [ ] All P2 utility functions migrated to `VariantMetadataIndex`
-5. [ ] `read_pgen` migrated to `VariantMetadataIndex`
-6. [ ] Region filtering works with `VariantMetadataIndex`
-7. [ ] All existing tests pass (regression-free)
-8. [ ] LIMIT queries short-circuit correctly on 50K dataset
-9. [ ] Cross-function consistency tests pass
-10. [ ] `PfileReadFileLines` eliminated or replaced with shared utility
-11. [ ] `make test` passes
+1. [x] Streaming test data generated (50K variants × 8 samples) — PR #19
+2. [x] Baseline streaming/threading tests pass for all functions — PR #19
+3. [x] `VariantMetadataIndex` implemented with on-demand field extraction — PR #19
+4. [x] All P2 utility functions migrated to `VariantMetadataIndex` — PR #19
+5. [x] `read_pgen` migrated to `VariantMetadataIndex` — PR #19
+6. [x] Region filtering works with `VariantMetadataIndex` — PR #19
+7. [x] All existing tests pass (regression-free) — PR #19
+8. [x] LIMIT queries short-circuit correctly on 50K dataset — PR #19
+9. [x] Cross-function consistency tests pass — PR #19
+10. [x] `PfileReadFileLines` eliminated or replaced with shared utility — PR #19
+11. [x] `make test` passes — PR #19
+
+Area 2 (parallel per-sample accumulation) deferred — see plan body for rationale.
