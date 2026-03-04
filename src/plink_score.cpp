@@ -142,6 +142,7 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
 
 	// Thread-local scoring accumulator (for Phase 1)
 	ScoreAccumulator local_accum;
+	bool phase1_done = false;
 
 	bool initialized = false;
 
@@ -538,8 +539,8 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 
 	// Phase 1: Score all variants (parallel via DuckDB thread pool)
 	if (!gstate.scoring_done.load(std::memory_order_acquire)) {
-		if (lstate.initialized && !bind_data.scored_variants.empty()) {
-			gstate.phase1_active.fetch_add(1, std::memory_order_relaxed);
+		if (lstate.initialized && !bind_data.scored_variants.empty() && !lstate.phase1_done) {
+			gstate.phase1_active.fetch_add(1, std::memory_order_acq_rel);
 
 			uint32_t sample_ct = bind_data.effective_sample_ct;
 			uint32_t total_scored = static_cast<uint32_t>(bind_data.scored_variants.size());
@@ -641,6 +642,7 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 					gstate.allele_cts[s] += lstate.local_accum.allele_cts[s];
 				}
 			}
+			lstate.phase1_done = true;
 
 			// Last thread transitions to Phase 2
 			if (gstate.phase1_active.fetch_sub(1, std::memory_order_acq_rel) != 1) {

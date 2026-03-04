@@ -92,6 +92,9 @@ struct PlinkMissingGlobalState : public GlobalTableFunctionState {
 	// DuckDB-configured thread count
 	uint32_t db_thread_count = 1;
 
+	// In sample mode, MaxThreads > 1 enables parallel Phase 1 (variant scanning
+	// into per-thread accumulators). The formula matches variant mode's batch
+	// granularity but drives Phase 1 parallelism rather than row emission.
 	idx_t MaxThreads() const override {
 		uint32_t range = end_variant_idx - start_variant_idx;
 		return std::min<idx_t>(range / 500 + 1, db_thread_count);
@@ -117,6 +120,7 @@ struct PlinkMissingLocalState : public LocalTableFunctionState {
 
 	// Thread-local accumulator for sample-mode Phase 1
 	vector<uint32_t> local_missing_counts;
+	bool phase1_done = false;
 
 	bool initialized = false;
 
@@ -551,8 +555,9 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 	// Phase 1: All DuckDB scan threads claim variant batches in parallel,
 	// accumulate into thread-local counts, then merge. The last thread to
 	// finish Phase 1 sets variant_scan_done and falls through to Phase 2.
-	if (!gstate.variant_scan_done.load(std::memory_order_acquire) && gstate.need_missingness && lstate.initialized) {
-		gstate.phase1_active.fetch_add(1, std::memory_order_relaxed);
+	if (!gstate.variant_scan_done.load(std::memory_order_acquire) && gstate.need_missingness && lstate.initialized &&
+	    !lstate.phase1_done) {
+		gstate.phase1_active.fetch_add(1, std::memory_order_acq_rel);
 
 		uint32_t end_idx = gstate.end_variant_idx;
 
@@ -601,6 +606,7 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 				gstate.sample_missing_counts[s] += lstate.local_missing_counts[s];
 			}
 		}
+		lstate.phase1_done = true;
 
 		// Last thread to finish Phase 1 transitions to Phase 2
 		if (gstate.phase1_active.fetch_sub(1, std::memory_order_acq_rel) != 1) {
