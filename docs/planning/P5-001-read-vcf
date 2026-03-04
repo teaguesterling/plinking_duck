@@ -1,0 +1,326 @@
+# P5-001: read_vcf — VCF/BCF reader via plink-ng per-line parsers
+
+Issue: #11 — Faster BCF/VCF reader for 'Free'
+
+## Context
+
+A community user requested VCF/BCF reading support, noting plink-ng's parser
+is faster than htslib for genotype extraction. Rather than writing a custom
+VCF parser (risky — multi-allelic, mixed ploidy, half-calls, quality filters),
+we use plink-ng's battle-tested per-line parsing functions combined with
+plink-ng's fast I/O layer (plink2_text + libdeflate BGZF), both of which we
+already compile.
+
+**Architecture**: Script-extracted per-line parsers + plink2_text streaming.
+
+- Per-line parsers (`VcfConvertUnphasedBiallelicLine` etc.) are stateless:
+  `(config, char* line) → 2-bit genovec`. No bigstack, no ChrInfo, no files.
+- plink2_text provides streaming line reading with libdeflate BGZF
+  decompression and background read-ahead threads — already in our `pgenlib`
+  static library.
+- `GenoarrToBytesMinus9` (already compiled) converts 2-bit genovec → int8.
+- An extraction script reproducibly pulls the parser functions from the
+  submodule, enabling traceable sync after submodule pin updates.
+
+---
+
+## Parser Extraction
+
+### What we extract from `plink2_import.cc`
+
+~1,420 lines of per-line parsing functions + helpers + types:
+
+**Per-line converters** (not `static`, but not in any header):
+| Function | Lines | Purpose |
+|----------|-------|---------|
+| `VcfConvertUnphasedBiallelicLine` | ~100 | Unphased biallelic GT → genovec |
+| `VcfConvertPhasedBiallelicLine` | ~130 | Phased biallelic GT → genovec + phaseinfo |
+| `VcfConvertUnphasedMultiallelicLine` | ~380 | Multi-allelic GT → genovec + patches |
+| `VcfConvertPhasedMultiallelicLine` | ~430 | Phased multi-allelic |
+| `VcfConvertPhasedBiallelicDosageLine` | ~215 | Dosage fields (GP/DS/HDS) |
+
+**Helpers**:
+| Function | Lines | Purpose |
+|----------|-------|---------|
+| `VcfCheckQuals` | ~26 | Per-sample GQ/DP quality check |
+| `ParseVcfBiallelicGp` | ~45 | GP field parsing |
+| `ParseVcfBiallelicDosage` | ~60 | DS field parsing |
+| `ParseVcfBiallelicHds` | ~70 | HDS field parsing |
+
+**Types** (defined only in plink2_import.cc, not exported):
+- `VcfImportBaseContext` struct (~13 fields: sample_ct, halfcall_mode, etc.)
+- `VcfImportContext` struct (extends base with dosage fields)
+- `VcfParseErr` enum (6 values)
+
+**Dependencies**: Only `plink2_base.h` macros/types (already compiled):
+`R_CAST`, `S_CAST`, `kBitsPerWordD2`, `kMask5555`, `ctzw`, `Halfword`,
+`SetBit`, `IsSet`, `CTZLU`, `ctow`, etc.
+
+### Extraction script: `scripts/extract_vcf_parsers.sh`
+
+```bash
+#!/bin/bash
+# Reproducibly extract per-line VCF parsing functions from plink2_import.cc
+# Run after: git submodule update third_party/plink-ng
+# Output: src/plink2_vcf_parse.cpp (committed to repo)
+#
+# Strategy: grep for function signatures to find boundaries.
+# VCF format is stable; these functions change rarely.
+```
+
+The script:
+1. Locates each function by signature in `plink2_import.cc`
+2. Extracts function body (signature to matching closing brace)
+3. Extracts type/enum definitions
+4. Writes `src/plink2_vcf_parse.cpp` with a header comment noting:
+   - Source commit hash of plink-ng submodule
+   - Extraction date
+   - Instructions to re-run
+
+The extracted file is **committed to the repo** — it builds without running
+the script. The script is the sync tool, not a build dependency.
+
+### Sync workflow
+
+After updating the plink-ng submodule pin:
+1. Run `scripts/extract_vcf_parsers.sh`
+2. `git diff src/plink2_vcf_parse.cpp` — see exactly what changed upstream
+3. Review, test, commit
+
+---
+
+## I/O Layer: plink2_text (already compiled)
+
+We already compile these in our `pgenlib` static library:
+
+| File | Purpose |
+|------|---------|
+| `plink2_text.cc` | TextStream: streaming line reader with decompression |
+| `plink2_bgzf.cc` | BGZF decompression via libdeflate (faster than zlib) |
+| `plink2_string.cc` | Optimized string scanning |
+| `plink2_thread.cc` | Threading primitives for background decompression |
+
+**TextStream API** (zero-copy, already available):
+```cpp
+textFILE txf;
+TextFileOpen(path, &txf);       // opens file, auto-detects compression
+char* line_start;
+TextFileNextLine(&txf, &line_start);  // returns pointer into internal buffer
+char* line_end = TextFileLineEnd(&txf);
+CleanupTextFile(&txf, &reterr);
+```
+
+This gives us libdeflate BGZF decompression — the primary speed advantage
+over htslib (which uses zlib).
+
+**Limitation**: TextStream uses raw `FILE*`, not DuckDB VFS. Won't work with
+S3/HTTP URIs. For Phase 1, local files only. DuckDB VFS fallback for remote
+files is a future enhancement.
+
+---
+
+## API Design
+
+### Function: `read_vcf(path VARCHAR)`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `samples` | `ANY` | all | Subset by name or 0-based index |
+| `region` | `VARCHAR` | none | `'chr:start-end'` filter |
+| `variants` | `ANY` | all | Subset by ID or 0-based index |
+| `genotypes` | `VARCHAR` | `'array'` | `'array'`, `'list'`, `'columns'` |
+| `orient` | `VARCHAR` | `'variant'` | `'variant'`, `'genotype'`, `'sample'` |
+| `phased` | `BOOLEAN` | `false` | Haplotype pair output |
+| `vcf_half_call` | `VARCHAR` | `'missing'` | Half-call handling |
+| `vcf_min_gq` | `INTEGER` | none | Min genotype quality filter |
+| `vcf_min_dp` | `INTEGER` | none | Min read depth filter |
+
+### Output schema
+
+Same as `read_pgen` (variant orient default):
+CHROM, POS, ID, REF, ALT, genotypes ARRAY(TINYINT, N)
+
+---
+
+## Implementation Architecture
+
+### Bind phase
+
+```
+1. Open file via textFILE (plink2_text — auto-detects gzip/bgzf/plain)
+2. Parse VCF header:
+   - Skip ## meta lines
+   - Parse #CHROM line → extract sample names (columns 9+)
+   - Count header lines for later seeking
+3. Build VcfImportBaseContext:
+   - sample_ct from header
+   - halfcall_mode, qual filters from named parameters
+4. For variant-orient streaming mode:
+   - Store textFILE handle in global state
+   - File is ready to read data lines
+5. For genotype/sample orient (pre-read):
+   - Read all data lines, parse genotypes into matrix
+   - Close textFILE
+6. Resolve named parameters using existing plink_common infrastructure:
+   - ResolveSampleIndices, ResolveGenotypeMode, ResolveOrientMode
+7. Build output schema (same logic as read_pgen)
+```
+
+### Scan phase (variant orient — streaming)
+
+```
+For each line from textFILE:
+  1. Split on first 9 tabs → CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT
+  2. Apply region filter (compare CHROM/POS to bounds)
+  3. If genotypes projected:
+     a. Find GT field index in FORMAT string
+     b. Call VcfConvertUnphasedBiallelicLine(ctx, format_start, genovec)
+        (or Phased variant if phased := true)
+     c. GenoarrToBytesMinus9(genovec, sample_ct, genotype_bytes)
+     d. Fill DuckDB output vector from genotype_bytes
+  4. Fill metadata columns (CHROM, POS, ID, REF, ALT)
+  5. If sample subset: filter genotype_bytes to subset indices
+```
+
+### Threading model
+
+| Mode | Threading | Rationale |
+|------|-----------|-----------|
+| variant orient | Single-threaded (MaxThreads=1) | Sequential line reading |
+| genotype orient | Multi-threaded | Pre-read data, parallel batch claiming |
+| sample orient | Multi-threaded | Pre-read matrix, parallel sample emission |
+
+Same pattern as read_pvar (streaming) and read_pfile (pre-read for tidy/sample).
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `scripts/extract_vcf_parsers.sh` | Reproducible parser extraction from submodule |
+| `src/plink2_vcf_parse.cpp` | Extracted per-line VCF parsers (~1,420 lines) |
+| `src/include/plink2_vcf_parse.hpp` | Header declaring extracted functions + types |
+| `src/vcf_reader.cpp` | read_vcf table function (bind, scan, registration) |
+| `src/include/vcf_reader.hpp` | RegisterVcfReader declaration |
+| `test/sql/read_vcf.test` | Positive tests |
+| `test/sql/read_vcf_negative.test` | Negative/error tests |
+| `test/data/example.vcf.gz` | Gzip-compressed VCF test fixture |
+
+### Modify
+
+| File | Change |
+|------|--------|
+| `CMakeLists.txt` | Add `plink2_vcf_parse.cpp` + `vcf_reader.cpp` to EXTENSION_SOURCES |
+| `src/plinking_duck_extension.cpp` | Add `RegisterVcfReader(loader)` |
+
+---
+
+## Implementation Steps
+
+### Step 1: Extraction script + parser compilation
+
+Write `scripts/extract_vcf_parsers.sh`, run it, verify `plink2_vcf_parse.cpp`
+compiles against plink2_base.h. Add to CMakeLists.txt.
+
+**Acceptance**: `make -j4` succeeds.
+
+### Step 2: textFILE integration proof-of-concept
+
+Write a minimal test that opens a VCF via `textFILE`, reads lines, calls
+`VcfConvertUnphasedBiallelicLine`, and prints genotypes. Verify the plink2_text
+API works from our extension code.
+
+**Acceptance**: Genotype values match expected for test/data VCF.
+
+### Step 3: read_vcf bind + streaming scan (no genotypes)
+
+Register table function. Bind parses VCF header, builds schema. Scan streams
+lines via textFILE, outputs CHROM/POS/ID/REF/ALT.
+
+**Acceptance**: `SELECT CHROM, POS, ID FROM read_vcf(...)` works.
+
+### Step 4: Genotype extraction
+
+Add GT parsing to scan via extracted per-line parsers + GenoarrToBytesMinus9.
+
+**Acceptance**: Genotype output matches read_pgen for same source data.
+
+### Step 5: Parameters (samples, region, genotypes, orient, phased)
+
+Wire up named parameters using existing plink_common infrastructure.
+
+**Acceptance**: All parameter combinations match read_pgen/read_pfile behavior.
+
+### Step 6: Compression support
+
+textFILE auto-detects gzip/bgzf. Test with .vcf.gz files.
+
+**Acceptance**: Compressed and uncompressed produce identical results.
+
+### Step 7: Tests and edge cases
+
+Full test suite. Cross-validate against read_pgen output for matching data.
+
+### Step 8: BCF support (Phase 2, future)
+
+BCF binary parsing is a separate concern. Could extract BCF per-record parsers
+similarly, or add as a later phase once text VCF is solid.
+
+---
+
+## Reuse from Existing Infrastructure
+
+| Component | Source | Usage |
+|-----------|--------|-------|
+| `textFILE` / `TextStream` | plink2_text (in pgenlib lib) | Fast file I/O |
+| `GenoarrToBytesMinus9` | pgenlib_ffi_support (in pgenlib lib) | genovec → int8 |
+| `GenotypeMode` + `ResolveGenotypeMode` | plink_common.hpp | Output mode |
+| `OrientMode` + `ResolveOrientMode` | plink_common.hpp | Orient mode |
+| `SplitTabLine` | plink_common.hpp | Line splitting |
+| `ResolveSampleIndices` | plink_common.hpp | Sample subsetting |
+| `UnpackPhasedGenotypes` | plink_common.hpp | Phased output |
+| Registration pattern | pgen_reader.cpp | Table function lifecycle |
+
+---
+
+## Testing Strategy
+
+### Cross-validation with read_pgen
+
+Test data was generated from VCF → pgen via plink2. So:
+```sql
+SELECT * FROM read_vcf('test/data/example.vcf') ORDER BY POS
+-- must match --
+SELECT * FROM read_pgen('test/data/pgen_example.pgen') ORDER BY POS
+```
+
+### Test cases
+
+- Row count, column types, genotype values
+- .vcf vs .vcf.gz produce identical results
+- Parameters: samples, region, orient, genotypes, phased
+- Negative: missing file, no #CHROM header, no GT field, empty file
+- Edge cases: multi-allelic, missing genotypes, half-calls
+
+---
+
+## Risks
+
+| Risk | Mitigation |
+|------|------------|
+| Extraction script fragile (function boundaries shift) | Grep by function name, not line number. VCF format stable. |
+| textFILE uses FILE* (no S3/HTTP) | Document local-only for Phase 1. DuckDB VFS fallback later. |
+| Extracted parsers depend on plink2_base.h internals | Already compiled; pin submodule = pin ABI. |
+| Platform issues with textFILE | Already compiled on all platforms in pgenlib. |
+| BCF not covered in Phase 1 | Separate parser extraction; BCF is Phase 2. |
+
+## Future Work
+
+- **BCF support**: Extract BCF per-record parsers similarly
+- **DuckDB VFS fallback**: For S3/HTTP, fall back to DuckDB's gzip VFS
+- **Dosage import**: The extracted dosage parsers support GP/DS/HDS
+- **BGEN/Oxford**: Could extract importers using same pattern
+- **Pgen write path**: Compile pgenlib_write.cc for export functionality

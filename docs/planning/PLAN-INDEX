@@ -60,10 +60,71 @@ survey, evaluation criteria, and deferred candidates.
 infrastructure (AlignedBuffer, SampleSubset, VariantRange, companion file
 discovery) in `plink_common.hpp/cpp`. Dosage mode deferred (no test data).
 
-### P3 — Advanced Functions (Future)
+### P3 — Infrastructure & Scalability (In Progress)
 
-Deferred by P1-006. Candidates requiring external libraries (LAPACK/BLAS),
-O(N²) computation, or complex input models:
+| Plan | Title | Depends On | Branch | Status |
+|------|-------|-----------|--------|--------|
+| P3-001 | Streaming & Threading Audit | P2 | `feature/P3-001-streaming-and-threading` | In Progress |
+
+**P3-001 progress:**
+
+- [x] Area 1: VariantMetadataIndex — offset-indexed lazy parsing (PR #19)
+- [x] Area 3: Streaming verification tests — 50K variant dataset, LIMIT/threading/region tests (PR #19)
+- [x] Caller migration — all 7 callers switched to VariantMetadataIndex (PR #19)
+- [x] ReadFileLines cleanup — removed duplicate `Pfile`-prefixed utilities (PR #19)
+- [ ] Area 2: Parallel per-sample accumulation (deferred — DuckDB table function API constraint)
+
+PR #19 shipped Areas 1, 3, and the full caller migration (Steps 1–4). Area 2
+(parallel `plink_missing` sample mode / `plink_score`) remains deferred due to
+DuckDB's Scan API requiring non-zero row output per call.
+
+### P4 — Flexible Genotype Output ✓
+
+Issue: #21. Four-phase redesign of genotype output for `read_pgen` and
+`read_pfile`. See `P4-001-orient-genotypes-redesign` for full design.
+
+| Phase | Title | Branch | Status |
+|-------|-------|--------|--------|
+| Phase 1 | `genotypes` param + LIST fallback | `feature/P4-001-genotypes-parameter` | ✓ Merged (PR #22) |
+| Phase 2 | `orient` param + sample-orient mode | `feature/P4-001-orient-parameter` | ✓ Merged (PR #23) |
+| Phase 3 | `genotypes := 'columns'` pivot mode | `feature/P4-001-orient-genotypes-genotypes-parameter` | ✓ Merged (PR #24) |
+| Phase 4 | `phased := true` haplotype output | `feature/phased-haplotype-output` | ✓ Merged (PR #25) |
+
+**P4 complete** — all four phases implemented and merged. Added `orient`
+parameter (`'variant'`/`'genotype'`/`'sample'`), `genotypes` parameter
+(`'array'`/`'list'`/`'columns'`), and `phased` parameter for haplotype-pair
+output via `PgrGetP()`.
+
+### Platform & Documentation
+
+| Item | Branch | Status |
+|------|--------|--------|
+| ARRAY(TINYINT, N) genotype type | — | ✓ Merged (PR #20) |
+| MkDocs Material documentation site | `feature/docs-site` | ✓ Merged (PR #18) |
+| macOS support (amd64 + arm64) | `feature/macos-support` | ✓ Merged |
+| Windows MinGW/RTools support | `feature/windows-rtools-support` | ✓ Merged |
+
+### P5 — VCF/BCF Reader (Planned)
+
+| Plan | Title | Depends On | Status |
+|------|-------|-----------|--------|
+| P5-001 | read_vcf via plink-ng per-line parsers | P2 (shared infra) | Planned |
+
+Issue: #11. Uses plink-ng's battle-tested per-line VCF parsing functions
+(script-extracted from `plink2_import.cc`) combined with plink2_text streaming
+I/O (already compiled in pgenlib lib) for fast libdeflate BGZF decompression.
+See `P5-001-read-vcf` for full design.
+
+Key decisions:
+- **Parser**: Script-based extraction of ~1,420 lines of per-line parsers
+  from plink-ng submodule (reproducible sync on pin updates)
+- **I/O**: plink2_text + plink2_bgzf (already compiled, libdeflate > zlib)
+- **Scope**: Phase 1 = text VCF (.vcf/.vcf.gz), Phase 2 = BCF binary
+
+### Future — Deferred Candidates
+
+**Advanced utility functions** (deferred by P1-006): Candidates requiring
+external libraries, O(N²) computation, or complex input models.
 
 | Candidate | Reason Deferred | Estimated Complexity |
 |-----------|----------------|---------------------|
@@ -108,6 +169,14 @@ P0-002 ──→ P0-004 ──→ P0-005
               │       │       │       │
            P2-002  P2-003  P2-004  P2-005  ← P2 Parallel Group B
           (hardy) (missing) (ld)  (score)    (independent worktrees)
+              │       │       │       │
+              └───────┴───┬───┴───────┘
+                          │
+                ┌─────────┴─────────┐
+                │                   │
+             P3-001              P4-001         ← P3/P4 parallel
+          (streaming &        (orient +           (independent concerns)
+           threading)          genotypes)
 ```
 
 ---
