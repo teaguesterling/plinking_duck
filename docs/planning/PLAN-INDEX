@@ -104,6 +104,23 @@ output via `PgrGetP()`.
 | macOS support (amd64 + arm64) | `feature/macos-support` | ✓ Merged |
 | Windows MinGW/RTools support | `feature/windows-rtools-support` | ✓ Merged |
 
+### P5 — VCF/BCF Reader (Planned)
+
+| Plan | Title | Depends On | Status |
+|------|-------|-----------|--------|
+| P5-001 | read_vcf via plink-ng per-line parsers | P2 (shared infra) | Planned |
+
+Issue: #11. Uses plink-ng's battle-tested per-line VCF parsing functions
+(script-extracted from `plink2_import.cc`) combined with plink2_text streaming
+I/O (already compiled in pgenlib lib) for fast libdeflate BGZF decompression.
+See `P5-001-read-vcf` for full design.
+
+Key decisions:
+- **Parser**: Script-based extraction of ~1,420 lines of per-line parsers
+  from plink-ng submodule (reproducible sync on pin updates)
+- **I/O**: plink2_text + plink2_bgzf (already compiled, libdeflate > zlib)
+- **Scope**: Phase 1 = text VCF (.vcf/.vcf.gz), Phase 2 = BCF binary
+
 ### Future — Deferred Candidates
 
 **Advanced utility functions** (deferred by P1-006): Candidates requiring
@@ -116,12 +133,6 @@ external libraries, O(N²) computation, or complex input models.
 | plink_king_table (kinship) | O(N²) pairwise computation | High |
 | plink_het (heterozygosity) | Expressible via plink_freq + SQL | Low |
 | plink_fst (FST) | Specialized population genetics use | Medium |
-
-**Open feature requests:**
-
-| Issue | Title | Status |
-|-------|-------|--------|
-| #11 | Faster BCF/VCF reader via plink-ng import path | Open — community request |
 
 ---
 
