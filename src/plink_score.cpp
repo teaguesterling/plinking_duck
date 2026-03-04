@@ -94,6 +94,8 @@ struct PlinkScoreGlobalState : public GlobalTableFunctionState {
 	// DuckDB-configured thread count
 	uint32_t db_thread_count = 1;
 
+	// MaxThreads > 1 enables parallel Phase 1 (scoring into per-thread
+	// accumulators). Single-threaded for small workloads (< 100 scored variants).
 	idx_t MaxThreads() const override {
 		if (scored_variant_count < 100) {
 			return 1;
