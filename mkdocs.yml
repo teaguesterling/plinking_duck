@@ -54,6 +54,7 @@ nav:
       - plink_missing: functions/plink_missing.md
       - plink_ld: functions/plink_ld.md
       - plink_score: functions/plink_score.md
+      - plink_glm: functions/plink_glm.md
   - Guides:
       - Quality Control: guides/quality-control.md
       - Performance: guides/performance.md

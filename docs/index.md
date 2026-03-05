@@ -33,11 +33,18 @@ WHERE ALT_FREQ > 0.01;
 SELECT ID, P_HWE
 FROM plink_hardy('cohort.pgen')
 WHERE P_HWE < 1e-6;
+
+-- GWAS association testing
+SET VARIABLE pheno = (SELECT list(age) FROM 'phenotypes.parquet');
+SELECT ID, BETA, P
+FROM plink_glm('cohort.pgen',
+    phenotype := getvariable('pheno'))
+WHERE P < 5e-8;
 ```
 
 ## Functions
 
-PlinkingDuck provides **4 file readers** and **5 analysis functions**:
+PlinkingDuck provides **4 file readers** and **6 analysis functions**:
 
 ### File Readers
 
@@ -57,6 +64,7 @@ PlinkingDuck provides **4 file readers** and **5 analysis functions**:
 | [`plink_missing(path)`](functions/plink_missing.md) | Per-variant or per-sample missingness |
 | [`plink_ld(path)`](functions/plink_ld.md) | Pairwise linkage disequilibrium |
 | [`plink_score(path)`](functions/plink_score.md) | Polygenic risk scoring |
+| [`plink_glm(path)`](functions/plink_glm.md) | Per-variant association testing (GLM) |
 
 ## Features
 

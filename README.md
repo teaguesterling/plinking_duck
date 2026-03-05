@@ -4,14 +4,14 @@ A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/
 
 **[Documentation](https://plinking-duck.readthedocs.io)** · **[Getting Started](https://plinking-duck.readthedocs.io/getting-started/)** · **[Tutorial](https://plinking-duck.readthedocs.io/tutorial/)**
 
-PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific command-line tools. Read files, filter variants, compute allele frequencies, test Hardy-Weinberg equilibrium, measure missingness, calculate linkage disequilibrium, and run polygenic scoring — all from a SQL prompt.
+PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific command-line tools. Read files, filter variants, compute allele frequencies, test Hardy-Weinberg equilibrium, measure missingness, calculate linkage disequilibrium, run polygenic scoring, and perform GWAS association testing — all from a SQL prompt.
 
 > **Built on the shoulders of [DuckHTS](https://github.com/RGenomicsETL/duckhts).**
 > DuckHTS pioneered the idea of querying genomics file formats directly in DuckDB using htslib. It supports VCF, BCF, BAM, CRAM, FASTA, FASTQ, GTF, GFF, and tabix-indexed files — the sequencing side of the house. PlinkingDuck picks up where DuckHTS leaves off, covering the PLINK genotype file formats used in population genetics and GWAS. If you work with both sequencing and genotype data, you'll want both extensions.
 
 ## What's Included
 
-PlinkingDuck provides **four file readers** and **five analysis functions**:
+PlinkingDuck provides **four file readers** and **six analysis functions**:
 
 | Function | Purpose |
 |----------|---------|
@@ -24,6 +24,7 @@ PlinkingDuck provides **four file readers** and **five analysis functions**:
 | [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-mode) | Per-variant or per-sample missingness |
 | [`plink_ld`](#plink_ldpath--variant1-variant2-window_kb-r2_threshold-inter_chr) | Pairwise linkage disequilibrium |
 | [`plink_score`](#plink_scorepath--weights-no_mean_imputation) | Polygenic risk scoring |
+| [`plink_glm`](#plink_glmpath--phenotype-covariates-model) | Per-variant association testing (GLM) |
 
 All functions support **projection pushdown** (skip expensive genotype decoding when columns aren't referenced) and **parallel scanning** (multi-threaded variant processing with atomic batch claiming).
 
@@ -279,6 +280,52 @@ SELECT * FROM plink_score('data/example.pgen',
 **Missing genotype handling:** By default, missing genotypes are mean-imputed using
 the average dosage across non-missing samples. Use `no_mean_imputation := true` to
 skip missing samples instead.
+
+### `plink_glm(path [, phenotype, covariates, model])`
+
+Run per-variant association testing (linear or logistic regression) using plink2's GLM implementation. Wraps plink2's battle-tested regression code for correctness and performance.
+
+```sql
+-- Linear regression (quantitative phenotype)
+SELECT ID, BETA, SE, P
+FROM plink_glm('data/cohort.pgen',
+    phenotype := list(age));
+
+-- Logistic regression (binary phenotype, auto-detected)
+SELECT ID, OR, P
+FROM plink_glm('data/cohort.pgen',
+    phenotype := list(case_status));
+
+-- With covariates
+SELECT ID, BETA, P
+FROM plink_glm('data/cohort.pgen',
+    phenotype := list(age),
+    covariates := {'sex': list(sex), 'pc1': list(pc1)});
+
+-- Phenotype from parquet, genome-wide significant hits
+SET VARIABLE pheno = (SELECT list(age) FROM 'phenotypes.parquet');
+SELECT ID, BETA, P
+FROM plink_glm('data/cohort.pgen',
+    phenotype := getvariable('pheno'))
+WHERE P < 5e-8;
+```
+
+**Linear output columns:** CHROM, POS, ID, REF, ALT, A1, A1_FREQ, TEST, OBS_CT, BETA, SE, T_STAT, P, ERRCODE.
+
+**Logistic output columns:** Same as linear, plus OR and FIRTH_YN.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `phenotype` | LIST(DOUBLE) | Quantitative or binary phenotype (positionally aligned with `.psam`; required) |
+| `covariates` | STRUCT(LIST(DOUBLE), ...) | Named covariate vectors |
+| `model` | VARCHAR | `'auto'` (default), `'linear'`, or `'logistic'` |
+| `firth` | BOOLEAN | Use Firth correction for logistic regression (default: `true`) |
+| `pvar` | VARCHAR | Explicit `.pvar`/`.bim` path |
+| `psam` | VARCHAR | Explicit `.psam`/`.fam` path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific samples |
+| `region` | VARCHAR | Filter to genomic region |
 
 ---
 
