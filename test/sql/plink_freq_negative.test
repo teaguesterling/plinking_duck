@@ -89,9 +89,4 @@ SELECT * FROM plink_freq('test/data/pgen_example.pgen',
 ----
 sample count mismatch
 
-# --- Dosage not yet implemented ---
-
-statement error
-SELECT * FROM plink_freq('test/data/pgen_example.pgen', dosage := true);
-----
-not yet implemented
+# (dosage := true is now implemented — see plink_freq_dosage.test)

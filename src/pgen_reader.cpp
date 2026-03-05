@@ -91,6 +91,11 @@ struct PgenLocalState : public LocalTableFunctionState {
 	vector<int8_t> phased_pairs; // sample_ct * 2 entries
 	uint32_t phasepresent_ct = 0;
 
+	// Dosage buffers (for dosages := true)
+	AlignedBuffer dosage_present_buf;
+	AlignedBuffer dosage_main_buf;
+	vector<double> dosage_doubles;
+
 	// Sample subset index (for PgrGet)
 	plink2::PgrSampleSubsetIndex pssi;
 
@@ -143,8 +148,8 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		}
 	}
 
-	if (bind_data->include_dosages) {
-		throw NotImplementedException("read_pgen: dosages support is not yet implemented");
+	if (bind_data->include_dosages && bind_data->include_phased) {
+		throw InvalidInputException("read_pgen: dosages and phased cannot both be true");
 	}
 
 	// --- Auto-discover companion files ---
@@ -275,16 +280,18 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		bind_data->columns_mode_first_geno_col = names.size();
 		bind_data->columns_mode_geno_col_count = output_sample_ct;
 
+		LogicalType col_type = bind_data->include_dosages ? LogicalType::DOUBLE : LogicalType::TINYINT;
 		for (uint32_t s = 0; s < output_sample_ct; s++) {
 			uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
 			string col_name = bind_data->sample_info.iids[file_idx];
 			bind_data->genotype_column_names.push_back(col_name);
 			names.push_back(col_name);
-			return_types.push_back(LogicalType::TINYINT);
+			return_types.push_back(col_type);
 		}
 	} else {
-		LogicalType elem_type =
-		    bind_data->include_phased ? LogicalType::ARRAY(LogicalType::TINYINT, 2) : LogicalType::TINYINT;
+		LogicalType elem_type = bind_data->include_phased    ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
+		                        : bind_data->include_dosages ? LogicalType::DOUBLE
+		                                                     : LogicalType::TINYINT;
 		LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
 		                            ? LogicalType::ARRAY(elem_type, output_sample_ct)
 		                            : LogicalType::LIST(elem_type);
@@ -411,6 +418,19 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 		state->phased_pairs.resize(static_cast<size_t>(output_sample_ct) * 2);
 	}
 
+	// Allocate dosage buffers if dosage output requested
+	if (bind_data.include_dosages) {
+		uint32_t output_sample_ct = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
+		uintptr_t dosage_present_wc = plink2::BitCtToAlignedWordCt(effective_sample_ct);
+		state->dosage_present_buf.Allocate(dosage_present_wc * sizeof(uintptr_t));
+		std::memset(state->dosage_present_buf.ptr, 0, dosage_present_wc * sizeof(uintptr_t));
+
+		state->dosage_main_buf.Allocate(effective_sample_ct * sizeof(uint16_t));
+		std::memset(state->dosage_main_buf.ptr, 0, effective_sample_ct * sizeof(uint16_t));
+
+		state->dosage_doubles.resize(output_sample_ct, 0.0);
+	}
+
 	// Set up sample subsetting if needed
 	if (bind_data.has_sample_subset) {
 		// Build sample_include bitmask
@@ -475,7 +495,20 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				const uintptr_t *sample_include =
 				    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
-				if (bind_data.include_phased) {
+				if (bind_data.include_dosages) {
+					uint32_t dosage_ct = 0;
+					plink2::PglErr err = plink2::PgrGetD(
+					    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+					    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+					    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("read_pgen: PgrGetD failed for variant %u", vidx);
+					}
+					plink2::Dosage16ToDoublesMinus9(lstate.genovec_buf.As<uintptr_t>(),
+					                                lstate.dosage_present_buf.As<uintptr_t>(),
+					                                lstate.dosage_main_buf.As<uint16_t>(), output_sample_ct, dosage_ct,
+					                                lstate.dosage_doubles.data());
+				} else if (bind_data.include_phased) {
 					plink2::PglErr err =
 					    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
 					                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
@@ -547,11 +580,20 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 						// In COLUMNS mode, file_col 5 is the first genotype column (sample_pos 0)
 						if (genotypes_read) {
 							idx_t sample_pos = file_col - bind_data.columns_mode_first_geno_col;
-							int8_t geno = lstate.genotype_bytes[sample_pos];
-							if (geno == -9) {
-								FlatVector::SetNull(vec, rows_emitted, true);
+							if (bind_data.include_dosages) {
+								double dosage = lstate.dosage_doubles[sample_pos];
+								if (dosage == -9.0) {
+									FlatVector::SetNull(vec, rows_emitted, true);
+								} else {
+									FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+								}
 							} else {
-								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+								int8_t geno = lstate.genotype_bytes[sample_pos];
+								if (geno == -9) {
+									FlatVector::SetNull(vec, rows_emitted, true);
+								} else {
+									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+								}
 							}
 						} else {
 							FlatVector::SetNull(vec, rows_emitted, true);
@@ -618,6 +660,45 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							list_data[rows_emitted].length = output_sample_ct;
 							ListVector::SetListSize(vec, list_offset + output_sample_ct);
 						}
+					} else if (bind_data.include_dosages) {
+						// Dosage output: ARRAY(DOUBLE, N) or LIST(DOUBLE)
+						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
+							auto array_size = static_cast<idx_t>(output_sample_ct);
+							auto &child = ArrayVector::GetEntry(vec);
+							auto *child_data = FlatVector::GetData<double>(child);
+							auto &child_validity = FlatVector::Validity(child);
+
+							idx_t base = rows_emitted * array_size;
+							for (idx_t s = 0; s < array_size; s++) {
+								double dosage = lstate.dosage_doubles[s];
+								if (dosage == -9.0) {
+									child_validity.SetInvalid(base + s);
+									child_data[base + s] = 0.0;
+								} else {
+									child_data[base + s] = dosage;
+								}
+							}
+						} else {
+							// LIST(DOUBLE)
+							auto list_offset = ListVector::GetListSize(vec);
+							ListVector::Reserve(vec, list_offset + output_sample_ct);
+							auto &child = ListVector::GetEntry(vec);
+							auto *child_data = FlatVector::GetData<double>(child);
+							auto &child_validity = FlatVector::Validity(child);
+							for (idx_t s = 0; s < output_sample_ct; s++) {
+								double dosage = lstate.dosage_doubles[s];
+								if (dosage == -9.0) {
+									child_validity.SetInvalid(list_offset + s);
+									child_data[list_offset + s] = 0.0;
+								} else {
+									child_data[list_offset + s] = dosage;
+								}
+							}
+							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							list_data[rows_emitted].offset = list_offset;
+							list_data[rows_emitted].length = output_sample_ct;
+							ListVector::SetListSize(vec, list_offset + output_sample_ct);
+						}
 					} else {
 						// Unphased output: ARRAY(TINYINT, N) or LIST(TINYINT)
 						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
@@ -667,11 +748,20 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					    file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
 						if (genotypes_read) {
 							idx_t sample_pos = file_col - bind_data.columns_mode_first_geno_col;
-							int8_t geno = lstate.genotype_bytes[sample_pos];
-							if (geno == -9) {
-								FlatVector::SetNull(vec, rows_emitted, true);
+							if (bind_data.include_dosages) {
+								double dosage = lstate.dosage_doubles[sample_pos];
+								if (dosage == -9.0) {
+									FlatVector::SetNull(vec, rows_emitted, true);
+								} else {
+									FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+								}
 							} else {
-								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+								int8_t geno = lstate.genotype_bytes[sample_pos];
+								if (geno == -9) {
+									FlatVector::SetNull(vec, rows_emitted, true);
+								} else {
+									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+								}
 							}
 						} else {
 							FlatVector::SetNull(vec, rows_emitted, true);

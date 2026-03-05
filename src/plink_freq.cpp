@@ -11,6 +11,7 @@ namespace duckdb {
 
 // Default columns: CHROM(0) POS(1) ID(2) REF(3) ALT(4) ALT_FREQ(5) OBS_CT(6)
 // With counts := true: + HOM_REF_CT(7) HET_CT(8) HOM_ALT_CT(9) MISSING_CT(10)
+// With dosage := true: + IMP_R2(11) (only present when dosage is enabled)
 static constexpr idx_t COL_CHROM = 0;
 static constexpr idx_t COL_POS = 1;
 static constexpr idx_t COL_ID = 2;
@@ -22,6 +23,7 @@ static constexpr idx_t COL_HOM_REF_CT = 7;
 static constexpr idx_t COL_HET_CT = 8;
 static constexpr idx_t COL_HOM_ALT_CT = 9;
 static constexpr idx_t COL_MISSING_CT = 10;
+static constexpr idx_t COL_IMP_R2 = 11;
 
 // ---------------------------------------------------------------------------
 // Bind data
@@ -49,6 +51,11 @@ struct PlinkFreqBindData : public TableFunctionData {
 
 	// Options
 	bool include_counts = false;
+	bool include_dosage = false;
+	bool file_has_dosage = false; // true if pgen file contains dosage data
+
+	// Dynamic column index for IMP_R2 (depends on whether counts is enabled)
+	idx_t imp_r2_col_idx = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -112,9 +119,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 		} else if (kv.first == "counts") {
 			bind_data->include_counts = kv.second.GetValue<bool>();
 		} else if (kv.first == "dosage") {
-			if (kv.second.GetValue<bool>()) {
-				throw NotImplementedException("plink_freq: dosage mode is not yet implemented");
-			}
+			bind_data->include_dosage = kv.second.GetValue<bool>();
 		} else if (kv.first == "samples" || kv.first == "region") {
 			// Handled after pgenlib init
 		}
@@ -166,6 +171,10 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 
 	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct, &max_vrec_width, &pgfi,
 	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
+
+	// Check gflags after Phase 2 — variable-width pgen files only set
+	// kfPgenGlobalDosagePresent during Phase 2's vrtype scan
+	bind_data->file_has_dosage = (pgfi.gflags & plink2::kfPgenGlobalDosagePresent) != 0;
 
 	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 	plink2::CleanupPgfi(&pgfi, &cleanup_err);
@@ -228,6 +237,12 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 		                    {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER});
 	}
 
+	if (bind_data->include_dosage) {
+		bind_data->imp_r2_col_idx = names.size();
+		names.push_back("IMP_R2");
+		return_types.push_back(LogicalType::DOUBLE);
+	}
+
 	return std::move(bind_data);
 }
 
@@ -250,10 +265,17 @@ static unique_ptr<GlobalTableFunctionState> PlinkFreqInitGlobal(ClientContext &c
 	state->next_variant_idx.store(state->start_variant_idx);
 	state->column_ids = input.column_ids;
 
-	// Check if any frequency/count columns are projected
+	// Check if any frequency/count/dosage columns are projected
 	state->need_frequencies = false;
 	for (auto col_id : input.column_ids) {
-		if (col_id != COLUMN_IDENTIFIER_ROW_ID && col_id >= COL_ALT_FREQ && col_id <= COL_MISSING_CT) {
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		if (col_id >= COL_ALT_FREQ && col_id <= COL_MISSING_CT) {
+			state->need_frequencies = true;
+			break;
+		}
+		if (bind_data.include_dosage && col_id == bind_data.imp_r2_col_idx) {
 			state->need_frequencies = true;
 			break;
 		}
@@ -372,31 +394,61 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
 
-			// Compute genotype counts using PgrGetCounts fast-path
+			// Compute genotype counts
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			genocounts[0] = genocounts[1] = genocounts[2] = genocounts[3] = 0;
+			uint64_t all_dosages[2] = {0, 0};
+			double imp_r2 = 0.0;
 
 			if (gstate.need_frequencies && lstate.initialized) {
-				plink2::PglErr err = plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,
-				                                          &lstate.pgr, genocounts);
-
-				if (err != plink2::kPglRetSuccess) {
-					throw IOException("plink_freq: PgrGetCounts failed for variant %u", vidx);
+				if (bind_data.include_dosage) {
+					plink2::PglErr err = plink2::PgrGetDCounts(
+					    sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,
+					    0, // is_minimac3_r2 = 0 (standard R²)
+					    &lstate.pgr, &imp_r2, genocounts, all_dosages);
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("plink_freq: PgrGetDCounts failed for variant %u", vidx);
+					}
+				} else {
+					plink2::PglErr err = plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct,
+					                                          vidx, &lstate.pgr, genocounts);
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("plink_freq: PgrGetCounts failed for variant %u", vidx);
+					}
 				}
 			}
 
 			// Compute derived values
-			uint32_t obs_sample_ct = genocounts[0] + genocounts[1] + genocounts[2];
-			uint32_t obs_ct = 2 * obs_sample_ct; // allele observations
+			// kDosageMid = 16384: each non-missing sample contributes 2*kDosageMid to
+			// all_dosages total (REF + ALT always sum to 2.0 per sample)
+			static constexpr uint64_t kDosageMid = 16384;
+
+			uint32_t hardcall_obs_sample_ct = genocounts[0] + genocounts[1] + genocounts[2];
+			uint32_t obs_ct;
 			double alt_freq;
 			bool freq_is_null = false;
 
-			if (obs_sample_ct == 0) {
+			if (bind_data.include_dosage) {
+				// Dosage-weighted: all_dosages values are scaled by kDosageMid
+				uint64_t total_dosage = all_dosages[0] + all_dosages[1];
+				if (total_dosage == 0) {
+					freq_is_null = true;
+					alt_freq = 0.0;
+					obs_ct = 0;
+				} else {
+					alt_freq = static_cast<double>(all_dosages[1]) / static_cast<double>(total_dosage);
+					// Effective allele observations: total_dosage / kDosageMid
+					// Always an integer since each sample contributes exactly 2*kDosageMid
+					obs_ct = static_cast<uint32_t>(total_dosage / kDosageMid);
+				}
+			} else if (hardcall_obs_sample_ct == 0) {
 				freq_is_null = true;
 				alt_freq = 0.0;
+				obs_ct = 0;
 			} else {
+				obs_ct = 2 * hardcall_obs_sample_ct;
 				alt_freq = (static_cast<double>(genocounts[1]) + 2.0 * static_cast<double>(genocounts[2])) /
-				           (2.0 * static_cast<double>(obs_sample_ct));
+				           (2.0 * static_cast<double>(hardcall_obs_sample_ct));
 			}
 
 			// Fill projected columns
@@ -407,6 +459,23 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 				}
 
 				auto &vec = output.data[out_col];
+
+				// Handle dynamic IMP_R2 column before the switch to avoid collision
+				// with static column constants (imp_r2_col_idx may equal COL_HOM_REF_CT
+				// when counts is disabled)
+				if (bind_data.include_dosage && file_col == bind_data.imp_r2_col_idx) {
+					if (bind_data.file_has_dosage) {
+						// Note: file-level check. In files with mixed dosage/hardcall variants,
+						// PgrGetDCounts returns a hardcall-derived R² approximation for variants
+						// without dosage entries. Real imputed files typically have dosage for all
+						// variants, so this covers the common cases.
+						FlatVector::GetData<double>(vec)[rows_emitted] = imp_r2;
+					} else {
+						// No dosage data in file — IMP_R2 is not meaningful
+						FlatVector::SetNull(vec, rows_emitted, true);
+					}
+					continue;
+				}
 
 				switch (file_col) {
 				case COL_CHROM: {

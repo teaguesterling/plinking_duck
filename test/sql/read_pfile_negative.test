@@ -135,13 +135,7 @@ statement error
 SELECT * FROM read_pfile();
 ----
 
-# --- Dosages not yet implemented ---
-
-statement error
-SELECT * FROM read_pfile('test/data/pfile_example', dosages := true);
-----
-not yet implemented
-
+# (dosages := true is now implemented — see read_pfile_dosage.test)
 # (phased := true is now implemented — see read_pfile_phased.test)
 
 # --- Edge cases ---

@@ -78,11 +78,5 @@ SELECT * FROM read_pgen('test/data/pgen_example.pgen', samples := [0, 1, 0]);
 ----
 duplicate sample index
 
-# --- Dosages not yet implemented ---
-
-statement error
-SELECT * FROM read_pgen('test/data/pgen_example.pgen', dosages := true);
-----
-not yet implemented
-
+# (dosages := true is now implemented — see read_pgen_dosage.test)
 # (phased := true is now implemented — see read_pgen_phased.test)

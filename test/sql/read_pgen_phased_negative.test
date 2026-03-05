@@ -4,7 +4,7 @@
 
 require plinking_duck
 
-# phased + dosages → NotImplementedException
+# phased + dosages → incompatible
 statement error
 SELECT * FROM read_pgen('test/data/phased_example.pgen', phased := true, dosages := true);
 ----

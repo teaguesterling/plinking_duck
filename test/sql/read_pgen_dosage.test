@@ -1,0 +1,128 @@
+# name: test/sql/read_pgen_dosage.test
+# description: Tests for read_pgen dosage output
+# group: [sql]
+
+require plinking_duck
+
+# --- Basic dosage output (hardcall data → exact 0.0/1.0/2.0) ---
+# pgen_example has 4 variants × 4 samples, all hardcall
+# Dosage output should produce identical values as doubles
+
+query ITIIR
+SELECT POS, ID, REF, ALT,
+       genotypes[1]::DOUBLE AS s1
+FROM read_pgen('test/data/pgen_example.pgen', dosages := true);
+----
+10000	rs1	A	G	0.0
+20000	rs2	C	T	1.0
+30000	rs3	G	A	2.0
+15000	rs4	T	C	0.0
+
+# --- Verify output type is DOUBLE, not TINYINT ---
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', dosages := true) LIMIT 1;
+----
+DOUBLE[4]
+
+# --- Missing genotypes → NULL (not -9.0) ---
+# rs1 has sample4 missing, rs3 has sample2 missing
+
+query R
+SELECT genotypes[4] FROM read_pgen('test/data/pgen_example.pgen', dosages := true) WHERE ID = 'rs1';
+----
+NULL
+
+query R
+SELECT genotypes[2] FROM read_pgen('test/data/pgen_example.pgen', dosages := true) WHERE ID = 'rs3';
+----
+NULL
+
+# --- Full array values match hardcall expectations ---
+
+query TRRRR
+SELECT ID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pgen('test/data/pgen_example.pgen', dosages := true)
+ORDER BY CHROM, POS;
+----
+rs1	0.0	1.0	2.0	NULL
+rs2	1.0	1.0	0.0	2.0
+rs3	2.0	NULL	1.0	0.0
+rs4	0.0	0.0	1.0	2.0
+
+# --- dosages with LIST genotype mode ---
+
+query T
+SELECT typeof(genotypes) FROM read_pgen('test/data/pgen_example.pgen', dosages := true, genotypes := 'list') LIMIT 1;
+----
+DOUBLE[]
+
+query TRRRR
+SELECT ID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pgen('test/data/pgen_example.pgen', dosages := true, genotypes := 'list')
+ORDER BY CHROM, POS;
+----
+rs1	0.0	1.0	2.0	NULL
+rs2	1.0	1.0	0.0	2.0
+rs3	2.0	NULL	1.0	0.0
+rs4	0.0	0.0	1.0	2.0
+
+# --- dosages with sample subsetting ---
+
+query TRR
+SELECT ID, genotypes[1], genotypes[2]
+FROM read_pgen('test/data/pgen_example.pgen', dosages := true, samples := ['SAMPLE1', 'SAMPLE3'])
+ORDER BY CHROM, POS;
+----
+rs1	0.0	2.0
+rs2	1.0	0.0
+rs3	2.0	1.0
+rs4	0.0	1.0
+
+# --- dosages with COLUMNS genotype mode ---
+
+query T
+SELECT typeof(SAMPLE1) FROM read_pgen('test/data/pgen_example.pgen', dosages := true, genotypes := 'columns') LIMIT 1;
+----
+DOUBLE
+
+query TRRRR
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4
+FROM read_pgen('test/data/pgen_example.pgen', dosages := true, genotypes := 'columns')
+ORDER BY CHROM, POS;
+----
+rs1	0.0	1.0	2.0	NULL
+rs2	1.0	1.0	0.0	2.0
+rs3	2.0	NULL	1.0	0.0
+rs4	0.0	0.0	1.0	2.0
+
+# =============================================================================
+# Tests with actual imputed dosage data (fractional values)
+# =============================================================================
+
+# dosage_example has actual dosage data (not just hardcalls)
+# rs1: [0.0, ~0.8, ~1.95, missing], rs2: [~1.2, ~0.6, ~0.1, ~1.7]
+# rs3: [2.0, 0.0, 1.0, 1.0], rs4: [~0.3, missing, ~0.9, ~0.05]
+# Values have small precision loss from 16-bit dosage encoding (kDosageMid = 16384)
+
+query TRRRR
+SELECT ID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pgen('test/data/dosage_example.pgen', dosages := true)
+ORDER BY CHROM, POS;
+----
+rs1	0.0	0.79998779296875	1.95001220703125	NULL
+rs2	1.20001220703125	0.5999755859375	0.0999755859375	1.70001220703125
+rs3	2.0	0.0	1.0	1.0
+rs4	0.29998779296875	NULL	0.9000244140625	0.04998779296875
+
+# --- Fractional dosages differ from hardcalls ---
+# Hardcall for rs2 SAMPLE1 is NULL (dosage=1.2 too far from integer for hard_call_thresh)
+# but dosage gives the actual imputed value
+
+query RR
+SELECT h.genotypes[1] AS hardcall, d.genotypes[1] AS dosage
+FROM read_pgen('test/data/dosage_example.pgen') h
+JOIN read_pgen('test/data/dosage_example.pgen', dosages := true) d USING (ID)
+WHERE h.ID = 'rs2';
+----
+NULL	1.20001220703125
