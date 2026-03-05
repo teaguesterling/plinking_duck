@@ -25,6 +25,8 @@ static constexpr idx_t COL_SE = 10;
 static constexpr idx_t COL_T_STAT = 11;
 static constexpr idx_t COL_P = 12;
 static constexpr idx_t COL_ERRCODE = 13;
+static constexpr idx_t COL_OR = 14;
+static constexpr idx_t COL_FIRTH_YN = 15;
 
 // ---------------------------------------------------------------------------
 // T-distribution p-value via regularized incomplete beta function
@@ -125,6 +127,112 @@ static double TstatToPvalue(double t_stat, double df) {
 }
 
 // ---------------------------------------------------------------------------
+// Normal distribution p-value (for logistic regression z-statistic)
+// ---------------------------------------------------------------------------
+
+//! Standard normal CDF via error function.
+static double NormalCdf(double x) {
+	return 0.5 * (1.0 + std::erf(x / std::sqrt(2.0)));
+}
+
+//! Two-tailed p-value from z-statistic (standard normal).
+static double ZstatToPvalue(double z_stat) {
+	if (!std::isfinite(z_stat)) {
+		return NAN;
+	}
+	if (z_stat == 0.0) {
+		return 1.0;
+	}
+	return 2.0 * (1.0 - NormalCdf(std::abs(z_stat)));
+}
+
+// ---------------------------------------------------------------------------
+// Small matrix utilities (row-major, for p×p where p ≤ ~50)
+// ---------------------------------------------------------------------------
+
+//! Cholesky decomposition: A = LL' (in-place, lower triangle).
+//! Returns false if not positive definite.
+static bool CholeskyDecomp(double *A, int p) {
+	for (int j = 0; j < p; j++) {
+		double sum = 0.0;
+		for (int k = 0; k < j; k++) {
+			sum += A[j * p + k] * A[j * p + k];
+		}
+		double diag = A[j * p + j] - sum;
+		if (diag <= 1e-20) {
+			return false;
+		}
+		A[j * p + j] = std::sqrt(diag);
+
+		for (int i = j + 1; i < p; i++) {
+			sum = 0.0;
+			for (int k = 0; k < j; k++) {
+				sum += A[i * p + k] * A[j * p + k];
+			}
+			A[i * p + j] = (A[i * p + j] - sum) / A[j * p + j];
+		}
+	}
+	return true;
+}
+
+//! Forward substitution: Lx = b (L is lower triangular).
+static void ForwardSolve(const double *L, const double *b, double *x, int p) {
+	for (int i = 0; i < p; i++) {
+		double sum = 0.0;
+		for (int j = 0; j < i; j++) {
+			sum += L[i * p + j] * x[j];
+		}
+		x[i] = (b[i] - sum) / L[i * p + i];
+	}
+}
+
+//! Backward substitution: L'x = b (L is lower triangular).
+static void BackwardSolve(const double *L, const double *b, double *x, int p) {
+	for (int i = p - 1; i >= 0; i--) {
+		double sum = 0.0;
+		for (int j = i + 1; j < p; j++) {
+			sum += L[j * p + i] * x[j];
+		}
+		x[i] = (b[i] - sum) / L[i * p + i];
+	}
+}
+
+//! Solve LL'x = b in-place. b is overwritten with x.
+static void CholeskySolve(const double *L, double *b, int p) {
+	vector<double> z(p);
+	ForwardSolve(L, b, z.data(), p);
+	BackwardSolve(L, z.data(), b, p);
+}
+
+//! Compute full inverse of Cholesky-factored matrix: (LL')^{-1}.
+//! L is the lower Cholesky factor, inv is output (p×p row-major).
+static void CholeskyInverse(const double *L, double *inv, int p) {
+	vector<double> e(p);
+	for (int j = 0; j < p; j++) {
+		std::fill(e.begin(), e.end(), 0.0);
+		e[j] = 1.0;
+		CholeskySolve(L, e.data(), p);
+		for (int i = 0; i < p; i++) {
+			inv[i * p + j] = e[i];
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sigmoid and logistic regression utilities
+// ---------------------------------------------------------------------------
+
+static double Sigmoid(double x) {
+	if (x >= 0.0) {
+		double ez = std::exp(-x);
+		return 1.0 / (1.0 + ez);
+	} else {
+		double ez = std::exp(x);
+		return ez / (1.0 + ez);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Bind data
 // ---------------------------------------------------------------------------
 
@@ -148,6 +256,14 @@ struct PlinkGlmBindData : public TableFunctionData {
 
 	// Phenotype values aligned with effective samples (NaN = missing)
 	vector<double> phenotype;
+
+	// Covariates: covariate_values[covar_idx][sample_idx] for effective samples
+	vector<string> covariate_names;
+	vector<vector<double>> covariate_values;
+
+	// Model
+	bool is_logistic = false;
+	bool use_firth = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -208,12 +324,18 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 
 	auto &fs = FileSystem::GetFileSystem(context);
 
-	// --- Named parameters (first pass: file paths) ---
+	string model_str = "auto";
+
+	// --- Named parameters (first pass: file paths and options) ---
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "pvar") {
 			bind_data->pvar_path = kv.second.GetValue<string>();
 		} else if (kv.first == "psam") {
 			bind_data->psam_path = kv.second.GetValue<string>();
+		} else if (kv.first == "model") {
+			model_str = kv.second.GetValue<string>();
+		} else if (kv.first == "firth") {
+			bind_data->use_firth = kv.second.GetValue<bool>();
 		}
 	}
 
@@ -371,14 +493,106 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		throw InvalidInputException("plink_glm: constant phenotype (all values are %g)", min_val);
 	}
 
+	// --- Process covariates parameter ---
+	auto covar_it = input.named_parameters.find("covariates");
+	if (covar_it != input.named_parameters.end()) {
+		auto &covar_val = covar_it->second;
+		auto &covar_type = covar_val.type();
+
+		if (covar_type.id() != LogicalTypeId::STRUCT) {
+			throw InvalidInputException("plink_glm: covariates must be a STRUCT of named LIST(DOUBLE) "
+			                            "columns, e.g. {'age': list(age), 'sex': list(sex)}");
+		}
+
+		auto &struct_children = StructType::GetChildTypes(covar_type);
+		auto &struct_vals = StructValue::GetChildren(covar_val);
+
+		for (idx_t ci = 0; ci < struct_children.size(); ci++) {
+			auto &name = struct_children[ci].first;
+			auto &val = struct_vals[ci];
+
+			if (val.type().id() != LogicalTypeId::LIST) {
+				throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s",
+				                            name, val.type().ToString());
+			}
+
+			auto &list_children = ListValue::GetChildren(val);
+			if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
+				throw InvalidInputException(
+				    "plink_glm: covariate '%s' length (%llu) must match sample count (%u)", name,
+				    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
+			}
+
+			// Extract values for effective samples
+			vector<double> covar_vals(bind_data->effective_sample_ct);
+			if (bind_data->has_sample_subset) {
+				const uintptr_t *si = bind_data->sample_subset->SampleInclude();
+				uint32_t out_idx = 0;
+				for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+					if (plink2::IsSet(si, raw_idx)) {
+						covar_vals[out_idx] =
+						    list_children[raw_idx].IsNull() ? NAN : list_children[raw_idx].GetValue<double>();
+						out_idx++;
+					}
+				}
+			} else {
+				for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
+					covar_vals[i] = list_children[i].IsNull() ? NAN : list_children[i].GetValue<double>();
+				}
+			}
+
+			bind_data->covariate_names.push_back(name);
+			bind_data->covariate_values.push_back(std::move(covar_vals));
+		}
+	}
+
+	// --- Model detection ---
+	if (model_str == "linear") {
+		bind_data->is_logistic = false;
+	} else if (model_str == "logistic") {
+		bind_data->is_logistic = true;
+	} else if (model_str == "auto") {
+		// Auto-detect: binary if all non-missing values are 0/1 or 1/2
+		bool all_binary_01 = true;
+		bool all_binary_12 = true;
+		for (uint32_t i = 0; i < bind_data->effective_sample_ct; i++) {
+			double v = bind_data->phenotype[i];
+			if (std::isnan(v)) {
+				continue;
+			}
+			if (v != 0.0 && v != 1.0) {
+				all_binary_01 = false;
+			}
+			if (v != 1.0 && v != 2.0) {
+				all_binary_12 = false;
+			}
+		}
+
+		if (all_binary_01) {
+			bind_data->is_logistic = true;
+		} else if (all_binary_12) {
+			// Recode 1/2 → 0/1
+			bind_data->is_logistic = true;
+			for (uint32_t i = 0; i < bind_data->effective_sample_ct; i++) {
+				if (!std::isnan(bind_data->phenotype[i])) {
+					bind_data->phenotype[i] -= 1.0;
+				}
+			}
+		}
+	} else {
+		throw InvalidInputException("plink_glm: model must be 'auto', 'linear', or 'logistic', got '%s'",
+		                            model_str);
+	}
+
 	// --- Output columns ---
 	names = {"CHROM", "POS", "ID", "REF", "ALT", "A1", "A1_FREQ", "TEST", "OBS_CT",
-	         "BETA",  "SE",  "T_STAT", "P", "ERRCODE"};
+	         "BETA",  "SE",  "T_STAT", "P", "ERRCODE", "OR", "FIRTH_YN"};
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::INTEGER,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
-	                LogicalType::DOUBLE,  LogicalType::VARCHAR};
+	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,
+	                LogicalType::VARCHAR};
 
 	return std::move(bind_data);
 }
@@ -511,85 +725,385 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 }
 
 // ---------------------------------------------------------------------------
-// Per-variant OLS regression (y = alpha + beta * x)
-//
-// Computes ordinary least squares for each variant independently.
-// Missing genotypes (-9.0) and missing phenotypes (NaN) are excluded
-// per-variant, so OBS_CT may vary across variants.
+// Per-variant regression results
 // ---------------------------------------------------------------------------
 
-struct LinearResult {
+struct GlmResult {
 	double beta = NAN;
 	double se = NAN;
 	double t_stat = NAN;
 	double p_value = NAN;
 	double a1_freq = NAN;
+	double odds_ratio = NAN;
 	uint32_t obs_ct = 0;
 	const char *errcode = nullptr;
+	bool firth_applied = false;
+	bool is_logistic = false;
 };
 
-static LinearResult ComputeLinearRegression(const double *dosages, const double *phenotype,
-                                            uint32_t sample_ct) {
-	LinearResult result;
+// ---------------------------------------------------------------------------
+// Linear regression (OLS)
+//
+// Handles both simple (no covariates) and multivariate (with covariates).
+// Missing genotypes (-9.0) and missing phenotypes (NaN) are excluded
+// per-variant, so OBS_CT may vary across variants.
+// ---------------------------------------------------------------------------
 
-	// First pass: accumulate sums for non-missing pairs
-	double sum_x = 0.0, sum_y = 0.0;
-	double sum_xx = 0.0, sum_xy = 0.0, sum_yy = 0.0;
+static GlmResult ComputeLinearRegression(const double *dosages, const double *phenotype,
+                                         const vector<vector<double>> &covariates,
+                                         uint32_t sample_ct) {
+	GlmResult result;
+
+	int n_covars = static_cast<int>(covariates.size());
+	int p = 2 + n_covars; // intercept + genotype + covariates
+
+	// First pass: count non-missing and compute allele frequency
 	uint32_t n = 0;
-
+	double sum_x = 0.0;
 	for (uint32_t i = 0; i < sample_ct; i++) {
-		double x = dosages[i];
-		double y = phenotype[i];
-		if (x == -9.0 || std::isnan(y)) {
+		if (dosages[i] == -9.0 || std::isnan(phenotype[i])) {
 			continue;
 		}
-		sum_x += x;
-		sum_y += y;
-		sum_xx += x * x;
-		sum_xy += x * y;
-		sum_yy += y * y;
+		sum_x += dosages[i];
 		n++;
 	}
 
 	result.obs_ct = n;
 
-	if (n < 3) {
+	if (n < static_cast<uint32_t>(p + 1)) {
 		result.errcode = "TOO_FEW_SAMPLES";
 		return result;
 	}
 
-	// Allele frequency: mean dosage / 2 (diploid)
-	double x_mean = sum_x / static_cast<double>(n);
-	result.a1_freq = x_mean / 2.0;
+	result.a1_freq = sum_x / (2.0 * static_cast<double>(n));
 
-	// Centered sums of squares and cross products
-	double sxx = sum_xx - sum_x * sum_x / static_cast<double>(n);
-	double sxy = sum_xy - sum_x * sum_y / static_cast<double>(n);
-	double syy = sum_yy - sum_y * sum_y / static_cast<double>(n);
+	// Simple case: no covariates — use optimized formula
+	if (n_covars == 0) {
+		double sum_y = 0.0, sum_xx = 0.0, sum_xy = 0.0, sum_yy = 0.0;
+		for (uint32_t i = 0; i < sample_ct; i++) {
+			double x = dosages[i];
+			double y = phenotype[i];
+			if (x == -9.0 || std::isnan(y)) {
+				continue;
+			}
+			sum_y += y;
+			sum_xx += x * x;
+			sum_xy += x * y;
+			sum_yy += y * y;
+		}
 
-	if (sxx < 1e-20) {
+		double nd = static_cast<double>(n);
+		double sxx = sum_xx - sum_x * sum_x / nd;
+		double sxy = sum_xy - sum_x * sum_y / nd;
+		double syy = sum_yy - sum_y * sum_y / nd;
+
+		if (sxx < 1e-20) {
+			result.errcode = "CONST_ALLELE";
+			return result;
+		}
+
+		result.beta = sxy / sxx;
+		double rss = syy - sxy * sxy / sxx;
+		if (rss < 0.0) {
+			rss = 0.0;
+		}
+
+		double df = nd - 2.0;
+		double mse = rss / df;
+		double se_sq = mse / sxx;
+		if (se_sq < 1e-30) {
+			result.errcode = "ZERO_VARIANCE";
+			return result;
+		}
+
+		result.se = std::sqrt(se_sq);
+		result.t_stat = result.beta / result.se;
+		result.p_value = TstatToPvalue(result.t_stat, df);
+		return result;
+	}
+
+	// Multivariate case: build X'X and X'y, solve via Cholesky
+	vector<double> xtx(p * p, 0.0);
+	vector<double> xty(p, 0.0);
+	double yty = 0.0;
+
+	for (uint32_t i = 0; i < sample_ct; i++) {
+		double geno = dosages[i];
+		double y = phenotype[i];
+		if (geno == -9.0 || std::isnan(y)) {
+			continue;
+		}
+
+		// Build predictor row: [1, geno, cov1, cov2, ...]
+		double xi[64]; // max predictors
+		xi[0] = 1.0;
+		xi[1] = geno;
+		for (int c = 0; c < n_covars; c++) {
+			xi[2 + c] = covariates[c][i];
+		}
+
+		// Accumulate X'X (symmetric, but fill full for simplicity)
+		for (int r = 0; r < p; r++) {
+			for (int c_idx = 0; c_idx < p; c_idx++) {
+				xtx[r * p + c_idx] += xi[r] * xi[c_idx];
+			}
+			xty[r] += xi[r] * y;
+		}
+		yty += y * y;
+	}
+
+	// Check for constant genotype
+	double geno_var = xtx[1 * p + 1] - xtx[0 * p + 1] * xtx[0 * p + 1] / xtx[0 * p + 0];
+	if (geno_var < 1e-20) {
 		result.errcode = "CONST_ALLELE";
 		return result;
 	}
 
-	// OLS estimates
-	result.beta = sxy / sxx;
-	double rss = syy - sxy * sxy / sxx;
+	// Solve via Cholesky
+	vector<double> xtx_copy(xtx);
+	if (!CholeskyDecomp(xtx_copy.data(), p)) {
+		result.errcode = "SINGULAR_MATRIX";
+		return result;
+	}
+
+	// Get beta = (X'X)^{-1} X'y
+	vector<double> beta(xty);
+	CholeskySolve(xtx_copy.data(), beta.data(), p);
+
+	// Compute (X'X)^{-1} for SE
+	vector<double> xtx_inv(p * p);
+	CholeskyInverse(xtx_copy.data(), xtx_inv.data(), p);
+
+	// RSS = y'y - beta' X'y
+	double rss = yty;
+	for (int j = 0; j < p; j++) {
+		rss -= beta[j] * xty[j];
+	}
 	if (rss < 0.0) {
 		rss = 0.0;
 	}
 
-	double df = static_cast<double>(n - 2);
+	double df = static_cast<double>(n) - static_cast<double>(p);
 	double mse = rss / df;
-	double se_sq = mse / sxx;
+
+	// Extract beta and SE for genotype coefficient (index 1)
+	result.beta = beta[1];
+	double se_sq = mse * xtx_inv[1 * p + 1];
 	if (se_sq < 1e-30) {
 		result.errcode = "ZERO_VARIANCE";
 		return result;
 	}
-
 	result.se = std::sqrt(se_sq);
 	result.t_stat = result.beta / result.se;
 	result.p_value = TstatToPvalue(result.t_stat, df);
+
+	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Logistic regression (IRLS with optional Firth correction)
+// ---------------------------------------------------------------------------
+
+static GlmResult ComputeLogisticRegression(const double *dosages, const double *phenotype,
+                                           const vector<vector<double>> &covariates,
+                                           uint32_t sample_ct, bool use_firth) {
+	GlmResult result;
+	result.is_logistic = true;
+
+	int n_covars = static_cast<int>(covariates.size());
+	int p = 2 + n_covars; // intercept + genotype + covariates
+
+	// Collect non-missing samples
+	vector<uint32_t> nm_indices;
+	double sum_x = 0.0;
+	for (uint32_t i = 0; i < sample_ct; i++) {
+		if (dosages[i] == -9.0 || std::isnan(phenotype[i])) {
+			continue;
+		}
+		nm_indices.push_back(i);
+		sum_x += dosages[i];
+	}
+
+	uint32_t n = static_cast<uint32_t>(nm_indices.size());
+	result.obs_ct = n;
+
+	if (n < static_cast<uint32_t>(p + 1)) {
+		result.errcode = "TOO_FEW_SAMPLES";
+		return result;
+	}
+
+	result.a1_freq = sum_x / (2.0 * static_cast<double>(n));
+
+	// Build design matrix X (n×p) and response y
+	vector<double> X(n * p);
+	vector<double> y(n);
+	for (uint32_t idx = 0; idx < n; idx++) {
+		uint32_t i = nm_indices[idx];
+		X[idx * p + 0] = 1.0;     // intercept
+		X[idx * p + 1] = dosages[i]; // genotype
+		for (int c = 0; c < n_covars; c++) {
+			X[idx * p + 2 + c] = covariates[c][i];
+		}
+		y[idx] = phenotype[i];
+	}
+
+	// Check for constant genotype
+	double geno_mean = sum_x / static_cast<double>(n);
+	double geno_var = 0.0;
+	for (uint32_t idx = 0; idx < n; idx++) {
+		double d = X[idx * p + 1] - geno_mean;
+		geno_var += d * d;
+	}
+	if (geno_var < 1e-20) {
+		result.errcode = "CONST_ALLELE";
+		return result;
+	}
+
+	// IRLS iteration
+	static constexpr int MAX_ITER = 25;
+	static constexpr double TOL = 1e-7;
+	static constexpr double MAX_BETA = 20.0; // separation detection
+
+	vector<double> beta(p, 0.0);
+	vector<double> mu(n);
+	vector<double> w(n);
+	vector<double> xwx(p * p);
+	vector<double> xwz(p);
+	vector<double> xwx_inv(p * p);
+	bool converged = false;
+
+	for (int iter = 0; iter < MAX_ITER; iter++) {
+		// Compute linear predictor and predicted probabilities
+		for (uint32_t idx = 0; idx < n; idx++) {
+			double eta = 0.0;
+			for (int j = 0; j < p; j++) {
+				eta += X[idx * p + j] * beta[j];
+			}
+			mu[idx] = Sigmoid(eta);
+			// Clamp to avoid numerical issues
+			if (mu[idx] < 1e-10) {
+				mu[idx] = 1e-10;
+			}
+			if (mu[idx] > 1.0 - 1e-10) {
+				mu[idx] = 1.0 - 1e-10;
+			}
+			w[idx] = mu[idx] * (1.0 - mu[idx]);
+		}
+
+		// Build X'WX
+		std::fill(xwx.begin(), xwx.end(), 0.0);
+		for (uint32_t idx = 0; idx < n; idx++) {
+			for (int r = 0; r < p; r++) {
+				for (int c_idx = 0; c_idx < p; c_idx++) {
+					xwx[r * p + c_idx] += w[idx] * X[idx * p + r] * X[idx * p + c_idx];
+				}
+			}
+		}
+
+		// Cholesky decomposition of X'WX
+		vector<double> xwx_chol(xwx);
+		if (!CholeskyDecomp(xwx_chol.data(), p)) {
+			result.errcode = "SINGULAR_MATRIX";
+			return result;
+		}
+
+		// For Firth correction, compute hat matrix diagonal and modify score
+		vector<double> h_diag;
+		if (use_firth) {
+			CholeskyInverse(xwx_chol.data(), xwx_inv.data(), p);
+			h_diag.resize(n);
+			for (uint32_t idx = 0; idx < n; idx++) {
+				// h_ii = w_i * x_i' (X'WX)^{-1} x_i
+				double h = 0.0;
+				for (int r = 0; r < p; r++) {
+					for (int c_idx = 0; c_idx < p; c_idx++) {
+						h += X[idx * p + r] * xwx_inv[r * p + c_idx] * X[idx * p + c_idx];
+					}
+				}
+				h_diag[idx] = w[idx] * h;
+			}
+		}
+
+		// Build X'Wz (modified score for Firth)
+		std::fill(xwz.begin(), xwz.end(), 0.0);
+		for (uint32_t idx = 0; idx < n; idx++) {
+			double resid = y[idx] - mu[idx];
+			if (use_firth) {
+				resid += h_diag[idx] * (0.5 - mu[idx]);
+			}
+			for (int j = 0; j < p; j++) {
+				xwz[j] += X[idx * p + j] * resid;
+			}
+		}
+
+		// Newton step: delta = (X'WX)^{-1} X'Wz (as score)
+		vector<double> delta(xwz);
+		CholeskySolve(xwx_chol.data(), delta.data(), p);
+
+		// Update beta
+		double max_delta = 0.0;
+		for (int j = 0; j < p; j++) {
+			beta[j] += delta[j];
+			max_delta = std::max(max_delta, std::abs(delta[j]));
+		}
+
+		// Check convergence
+		if (max_delta < TOL) {
+			converged = true;
+			break;
+		}
+
+		// Check for separation
+		bool separated = false;
+		for (int j = 0; j < p; j++) {
+			if (std::abs(beta[j]) > MAX_BETA) {
+				separated = true;
+				break;
+			}
+		}
+		if (separated && !use_firth) {
+			result.errcode = "SEPARATION";
+			return result;
+		}
+	}
+
+	if (!converged) {
+		result.errcode = "NO_CONVERGENCE";
+		return result;
+	}
+
+	result.firth_applied = use_firth;
+
+	// Final computation of (X'WX)^{-1} for SE (if not already done by Firth)
+	if (!use_firth) {
+		// Recompute X'WX with final beta
+		std::fill(xwx.begin(), xwx.end(), 0.0);
+		for (uint32_t idx = 0; idx < n; idx++) {
+			for (int r = 0; r < p; r++) {
+				for (int c_idx = 0; c_idx < p; c_idx++) {
+					xwx[r * p + c_idx] += w[idx] * X[idx * p + r] * X[idx * p + c_idx];
+				}
+			}
+		}
+		vector<double> xwx_chol(xwx);
+		if (!CholeskyDecomp(xwx_chol.data(), p)) {
+			result.errcode = "SINGULAR_MATRIX";
+			return result;
+		}
+		CholeskyInverse(xwx_chol.data(), xwx_inv.data(), p);
+	}
+
+	// Extract results for genotype coefficient (index 1)
+	result.beta = beta[1];
+	double se_sq = xwx_inv[1 * p + 1];
+	if (se_sq < 1e-30) {
+		result.errcode = "ZERO_VARIANCE";
+		return result;
+	}
+	result.se = std::sqrt(se_sq);
+	result.t_stat = result.beta / result.se; // Wald z-statistic
+	result.p_value = ZstatToPvalue(result.t_stat);
+	result.odds_ratio = std::exp(result.beta);
 
 	return result;
 }
@@ -628,7 +1142,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
 
 			// Compute regression if needed
-			LinearResult lr;
+			GlmResult lr;
 			if (gstate.need_regression && lstate.initialized) {
 				uint32_t dosage_ct = 0;
 				plink2::PglErr err = plink2::PgrGetD(
@@ -644,8 +1158,16 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				    lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct,
 				    lstate.dosage_doubles.data());
 
-				lr = ComputeLinearRegression(lstate.dosage_doubles.data(), bind_data.phenotype.data(),
-				                             sample_ct);
+				if (bind_data.is_logistic) {
+					lr = ComputeLogisticRegression(lstate.dosage_doubles.data(),
+					                               bind_data.phenotype.data(),
+					                               bind_data.covariate_values, sample_ct,
+					                               bind_data.use_firth);
+				} else {
+					lr = ComputeLinearRegression(lstate.dosage_doubles.data(),
+					                             bind_data.phenotype.data(),
+					                             bind_data.covariate_values, sample_ct);
+				}
 			}
 
 			// Fill projected columns
@@ -765,6 +1287,23 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					}
 					break;
 				}
+				case COL_OR: {
+					if (lr.is_logistic && lr.errcode == nullptr) {
+						FlatVector::GetData<double>(vec)[rows_emitted] = lr.odds_ratio;
+					} else {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					}
+					break;
+				}
+				case COL_FIRTH_YN: {
+					if (lr.is_logistic && lr.errcode == nullptr) {
+						FlatVector::GetData<string_t>(vec)[rows_emitted] =
+						    StringVector::AddString(vec, lr.firth_applied ? "Y" : "N");
+					} else {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					}
+					break;
+				}
 				default:
 					break;
 				}
@@ -790,8 +1329,11 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 	plink_glm.named_parameters["pvar"] = LogicalType::VARCHAR;
 	plink_glm.named_parameters["psam"] = LogicalType::VARCHAR;
 	plink_glm.named_parameters["phenotype"] = LogicalType::ANY;
+	plink_glm.named_parameters["covariates"] = LogicalType::ANY;
 	plink_glm.named_parameters["samples"] = LogicalType::ANY;
 	plink_glm.named_parameters["region"] = LogicalType::VARCHAR;
+	plink_glm.named_parameters["model"] = LogicalType::VARCHAR;
+	plink_glm.named_parameters["firth"] = LogicalType::BOOLEAN;
 
 	loader.RegisterFunction(plink_glm);
 }
