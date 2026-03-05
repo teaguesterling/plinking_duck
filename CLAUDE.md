@@ -94,6 +94,11 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - `genotypes := 'columns'` has no column count limit (DuckDB has no hard column limit)
 - `genotypes := 'columns'` + `orient := 'genotype'` is an error (genotype mode already produces scalar output)
 
+## Extension Config Options
+
+- `plinking_max_matrix_elements` (BIGINT, default 16G): max genotype matrix elements for `orient := 'sample'` pre-read. Controls memory guard for variants × samples product. Set via `SET plinking_max_matrix_elements = <value>`.
+- Config options registered via `DBConfig::GetConfig(db).AddExtensionOption()` in `Load()`, read at bind time via `context.TryGetCurrentSetting()`
+
 <!-- blq:agent-instructions -->
 ## blq - Build Log Query
 

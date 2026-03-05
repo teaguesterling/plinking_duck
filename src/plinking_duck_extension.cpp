@@ -12,10 +12,35 @@
 #include "plink_score.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
 
 namespace duckdb {
 
+// ---------------------------------------------------------------------------
+// Extension config option callbacks
+// ---------------------------------------------------------------------------
+
+static void SetPlinkingMaxMatrixElements(ClientContext &, SetScope, Value &parameter) {
+	// Validation only — the value is stored by DuckDB's config system
+	// and retrieved via TryGetCurrentSetting at bind time.
+	auto val = parameter.GetValue<int64_t>();
+	if (val <= 0) {
+		throw InvalidInputException("plinking_max_matrix_elements must be positive");
+	}
+}
+
 void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
+	// Register config options
+	auto &db = loader.GetDatabaseInstance();
+	auto &config = DBConfig::GetConfig(db);
+
+	config.AddExtensionOption("plinking_max_matrix_elements",
+	    "Maximum genotype matrix elements for orient := 'sample' pre-read "
+	    "(variants x samples). Default 16 billion (~16 GB of int8).",
+	    LogicalType::BIGINT, Value::BIGINT(16LL * 1024 * 1024 * 1024),
+	    SetPlinkingMaxMatrixElements);
+
+	// Register table functions
 	RegisterPvarReader(loader);
 	RegisterPsamReader(loader);
 	RegisterPgenReader(loader);

@@ -778,11 +778,21 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// --- Pre-read all genotypes into matrix ---
 		uint32_t output_sample_ct = bind_data->OutputSampleCt();
 		uint64_t matrix_size = static_cast<uint64_t>(effective_variant_ct) * static_cast<uint64_t>(output_sample_ct);
-		if (matrix_size > 128ULL * 1024 * 1024) {
+
+		// Check configurable matrix size limit
+		int64_t max_elements = 16LL * 1024 * 1024 * 1024; // default 16G
+		Value max_elements_val;
+		if (context.TryGetCurrentSetting("plinking_max_matrix_elements", max_elements_val)) {
+			max_elements = max_elements_val.GetValue<int64_t>();
+		}
+		if (matrix_size > static_cast<uint64_t>(max_elements)) {
 			throw InvalidInputException(
 			    "read_pfile: orient := 'sample' would require %llu genotype values "
-			    "(%u variants x %u samples). Use variants := [...] or samples := [...] to reduce.",
-			    static_cast<unsigned long long>(matrix_size), effective_variant_ct, output_sample_ct);
+			    "(%u variants x %u samples, limit: %lld). "
+			    "Use variants := [...] or samples := [...] to reduce, "
+			    "or SET plinking_max_matrix_elements = <higher value>.",
+			    static_cast<unsigned long long>(matrix_size), effective_variant_ct, output_sample_ct,
+			    static_cast<long long>(max_elements));
 		}
 
 		// Init temporary PgenReader for pre-reading

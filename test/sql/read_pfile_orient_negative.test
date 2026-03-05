@@ -24,3 +24,23 @@ statement error
 SELECT * FROM read_pgen('test/data/pgen_example.pgen', orient := 'genotype');
 ----
 orient := 'genotype' is not supported
+
+# --- plinking_max_matrix_elements config option ---
+
+# Setting the limit very low triggers the guard
+statement ok
+SET plinking_max_matrix_elements = 1;
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', orient := 'sample');
+----
+would require 16 genotype values
+
+# Restoring a reasonable limit allows it to succeed
+statement ok
+SET plinking_max_matrix_elements = 1000;
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient := 'sample');
+----
+4
