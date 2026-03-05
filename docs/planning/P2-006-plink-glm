@@ -1,0 +1,481 @@
+# P2-006: plink_glm Table Function
+
+## Goal
+
+Implement `plink_glm(path)` — a DuckDB table function that runs per-variant
+association testing (linear and logistic regression) by wrapping plink2's
+battle-tested GLM implementation. Returns one row per variant with beta, SE,
+T-statistic, and p-value.
+
+**Design principle**: Same as P2-005 — the .pgen is the big streaming data;
+phenotypes and covariates are small positional DuckDB values. We wrap the
+actual plink2 GLM compute code, not a reimplementation.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+- P1-003 merged (read_pgen pgenlib integration)
+
+## Depends On
+
+P2-001 (shared infrastructure). Builds on P2-005 patterns for small-data
+parameter passing.
+
+## Branch
+
+`feature/P2-006-plink-glm`
+
+---
+
+## Why Wrap plink2's GLM Code
+
+Our SQL proof-of-concept (list_dot_product-based correlation) achieves
+1.8s for 30K variants × 10K samples. Plink2's `--glm` does it in 61ms —
+29× faster. The gap comes from:
+
+1. SIMD-optimized genotype unpacking (2-bit → dosage, no DOUBLE conversion)
+2. Precomputed regression matrices for the no-missing-data fast path
+3. Firth correction for logistic regression on rare variants
+4. Proper handling of dosage data, covariates, and sex chromosomes
+
+Reimplementing all of this would be error-prone. The plink2 GLM code is
+18K lines of thoroughly tested, peer-reviewed statistical code. Wrapping
+it gives us correctness and performance for free.
+
+---
+
+## Dependency Analysis
+
+### plink2 Source Files Required
+
+| File | Lines | Purpose | Risk |
+|------|-------|---------|------|
+| `plink2_glm_shared.cc/h` | 1.5K | Regression utilities, covariate setup, VIF/correlation checks | Low — shared math |
+| `plink2_glm_linear.cc/h` | 5.9K | Linear regression thread function, result extraction | Medium — core compute |
+| `plink2_glm_logistic.cc/h` | 7.1K | Logistic regression, Firth correction | Medium — core compute |
+| `plink2_glm.cc/h` | 4.3K | GlmMain orchestration — **NOT wrapped directly** | N/A — reference only |
+| `plink2_matrix.cc/h` | 2K | BLAS/LAPACK wrappers; has `NOLAPACK` fallback (built-in SVD/Cholesky) | Low with NOLAPACK |
+| `plink2_common.cc/h` | 7.1K | ChrInfo, PhenoCol, SampleIdInfo, allele storage | Medium — large but stable |
+| `plink2_cmdline.cc/h` | 6.4K | Utility functions (parsing, memory, string) | Low — utility code |
+| `plink2_perm.cc/h` | 575 | Permutation testing — **Phase 2** | Deferred |
+| `plink2_adjust.cc/h` | 1K | Multiple testing correction — **Phase 2** | Deferred |
+| `SFMT.c/h` | ~1K | SIMD-oriented Mersenne Twister (for permutations) | Deferred |
+| **Total** | **~36K** | | |
+
+### Key Build Decision: NOLAPACK
+
+Compile `plink2_matrix.cc` with `-DNOLAPACK`. This uses plink2's built-in
+SVD decomposition (C port of PLINK 1.x stats.cpp) instead of requiring
+BLAS/LAPACK system libraries. This avoids:
+- Platform-specific BLAS detection (MKL, Accelerate, OpenBLAS, AOCL)
+- Link-time library dependencies
+- ILP64 vs LP64 headaches
+
+For typical GWAS covariates (intercept + 1–20 covariates), the built-in
+SVD is fast enough — matrix sizes are (covar_ct+2)², not sample_ct².
+BLAS/LAPACK acceleration could be a future optimization.
+
+### Threading Model
+
+Plink2's GLM uses its own thread pool via `plink2_thread.h` with
+`THREAD_FUNC_DECL GlmLinearThread`. Two options:
+
+**Option A — Use plink2's threading**: Let plink2 manage its own thread
+pool for the regression compute. DuckDB's scan function becomes
+single-threaded (one call computes all variants), then emits results.
+Simple, correct, matches plink_score's pattern.
+
+**Option B — DuckDB-managed threading**: Extract the per-variant regression
+math and call it from DuckDB's parallel scan. More complex, potentially
+faster, but requires restructuring the thread function.
+
+**Recommendation**: Option A for Phase 1. The compute is fast enough
+(61ms for 30K variants) that threading overhead dominates. Option B is
+a future optimization.
+
+---
+
+## Wrapping Strategy
+
+### NOT Wrapping GlmMain
+
+`GlmMain` (plink2_glm.cc) is the top-level entry point with ~30 parameters.
+It orchestrates phenotype/covariate setup, sex chromosome handling, output
+file writing, and multi-phenotype batching. It's too entangled with plink2's
+I/O model to wrap directly.
+
+### Wrapping GlmLinear / GlmLogistic
+
+The mid-level functions `GlmLinear` and `GlmLogistic` (in
+plink2_glm_linear.cc / plink2_glm_logistic.cc) are the wrapping targets.
+They:
+
+1. Accept pre-built context structs (phenotype, covariates, sample masks)
+2. Set up their own thread pool and compute blocks
+3. Write results to output files via `cswritep` / overflow buffers
+4. Return per-variant beta, SE, and aux results in memory
+
+**Approach**: Build the context structs from DuckDB inputs in our bind
+phase, call into the plink2 compute functions, and extract results from
+the in-memory result arrays (`block_beta_se`, `block_aux`) rather than
+parsing output files.
+
+### Alternative: Per-Variant Compute Extraction
+
+If wrapping GlmLinear/GlmLogistic proves too entangled with file I/O,
+fall back to extracting the core per-variant compute from
+`GlmLinearThread` / `GlmLogisticThread`. These thread functions:
+
+1. Read genotype blocks via `PgrGetD` / `PgrGetDifflistOrGenovec`
+2. Build the design matrix (genotype column + covariates)
+3. Solve the regression (QR/SVD for linear, IRLS for logistic)
+4. Store beta, SE in `block_beta_se[variant_bidx * ...]`
+
+This is the fallback if the file I/O is too hard to separate.
+
+---
+
+## SQL Interface
+
+```sql
+-- Simple linear regression: quantitative phenotype, no covariates
+SELECT * FROM plink_glm('data/cohort.pgen',
+    phenotype := list(age));
+
+-- Logistic regression: binary phenotype (auto-detected)
+SELECT * FROM plink_glm('data/cohort.pgen',
+    phenotype := list(case_status));
+
+-- With covariates (positional, sample-aligned)
+SELECT * FROM plink_glm('data/cohort.pgen',
+    phenotype := list(age),
+    covariates := {'sex': list(sex), 'pc1': list(pc1), 'pc2': list(pc2)});
+
+-- With phenotype from a parquet file (positional join)
+SET VARIABLE pheno = (SELECT list(age) FROM 'phenotypes/age.parquet');
+SELECT ID, CHROM, POS, BETA, SE, P
+FROM plink_glm('data/cohort.pgen',
+    phenotype := getvariable('pheno'))
+WHERE P < 5e-8;
+
+-- Composable with other extension functions
+SELECT g.ID, g.P, f.ALT_FREQ
+FROM plink_glm('data/cohort.pgen',
+    phenotype := getvariable('pheno')) g
+JOIN plink_freq('data/cohort.pgen') f ON g.ID = f.ID
+WHERE g.P < 5e-8 AND f.ALT_FREQ > 0.01;
+```
+
+### Parameter Design
+
+Following the P2-005 "typed list" pattern:
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `phenotype` | LIST(DOUBLE) | (required) | Quantitative or binary phenotype, positionally aligned with .psam |
+| `covariates` | STRUCT(LIST(DOUBLE), ...) | none | Named covariate vectors (struct-of-lists) |
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Sample filter |
+| `region` | VARCHAR | all | Region filter (chr:start-end) |
+| `model` | VARCHAR | 'auto' | Force 'linear' or 'logistic' (auto-detect from phenotype) |
+| `firth` | BOOLEAN | true | Use Firth correction for logistic (plink2 default) |
+| `max_corr` | DOUBLE | 0.999 | Max covariate correlation before exclusion |
+| `vif_thresh` | DOUBLE | 50.0 | Max variance inflation factor |
+
+### Phenotype Type Detection
+
+- If all non-NULL values are 0 or 1 → binary → logistic regression
+- If >2 distinct values → quantitative → linear regression
+- `model := 'linear'` / `model := 'logistic'` overrides auto-detection
+
+---
+
+## Output Schema
+
+### Linear Regression
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| CHROM | VARCHAR | Chromosome |
+| POS | INTEGER | Base-pair position |
+| ID | VARCHAR | Variant ID |
+| REF | VARCHAR | Reference allele |
+| ALT | VARCHAR | Alternate allele |
+| A1 | VARCHAR | Tested allele (ALT) |
+| A1_FREQ | DOUBLE | Tested allele frequency |
+| TEST | VARCHAR | Test name ('ADD') |
+| OBS_CT | INTEGER | Non-missing sample count for this variant |
+| BETA | DOUBLE | Effect size (regression coefficient) |
+| SE | DOUBLE | Standard error of beta |
+| T_STAT | DOUBLE | T-statistic (BETA / SE) |
+| P | DOUBLE | P-value |
+| ERRCODE | VARCHAR | Error code (NULL if no error) |
+
+### Logistic Regression
+
+Same as linear, plus:
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| OR | DOUBLE | Odds ratio (exp(BETA)) |
+| FIRTH_YN | VARCHAR | 'Y' if Firth correction applied |
+
+One row per variant (for additive test). Interaction/genotypic tests
+produce multiple rows per variant (Phase 2).
+
+---
+
+## Implementation Phases
+
+### Phase 1: Linear Regression (MVP)
+
+**Goal**: `plink_glm` with quantitative phenotype, no covariates,
+additive model only. Match plink2 `--glm allow-no-covars` output.
+
+1. **Build integration**: Add plink2_glm_shared.cc, plink2_glm_linear.cc,
+   plink2_matrix.cc, plink2_common.cc, plink2_cmdline.cc to CMakeLists.txt
+   with `-DNOLAPACK` and hidden visibility.
+
+2. **Struct setup**: In bind, construct:
+   - `GlmInfo` with `kfGlmAllowNoCovars` flag
+   - `GlmCtx` / `GlmLinearCtx` with phenotype array, sample masks
+   - `ChrInfo` from .pvar metadata
+   - `PhenoCol` from the phenotype LIST(DOUBLE)
+
+3. **Compute**: Call plink2's regression compute functions with our context.
+
+4. **Result extraction**: Read beta, SE from `block_beta_se`; read
+   sample_obs_ct, a1_dosage from `LinearAuxResult`; compute T-stat and
+   P-value.
+
+5. **Tests**: Validate against plink2 `--glm` output on test datasets.
+
+### Phase 2: Covariates + Logistic
+
+- Add covariate support via struct-of-lists parameter
+- Add logistic regression (wrap GlmLogistic)
+- Firth correction
+- Sex chromosome handling
+
+### Phase 3: Advanced Features (Future)
+
+- Genotypic / dominant / recessive / hethom models
+- Interaction tests
+- Multiple phenotype batching
+- Permutation testing (plink2_perm.cc)
+- Multiple testing adjustment (plink2_adjust.cc)
+- BLAS/LAPACK acceleration (optional, behind build flag)
+
+---
+
+## Build Integration
+
+### New CMake additions
+
+```cmake
+# plink2 GLM sources (compiled with NOLAPACK, hidden visibility)
+set(PLINK2_GLM_SOURCES
+    ${PLINK2_DIR}/plink2_glm_shared.cc
+    ${PLINK2_DIR}/plink2_glm_linear.cc
+    # ${PLINK2_DIR}/plink2_glm_logistic.cc  # Phase 2
+    ${PLINK2_DIR}/plink2_matrix.cc
+    ${PLINK2_DIR}/plink2_common.cc
+    ${PLINK2_DIR}/plink2_cmdline.cc
+)
+
+# Build as static library with hidden visibility
+add_library(plink2_glm STATIC ${PLINK2_GLM_SOURCES})
+target_compile_definitions(plink2_glm PRIVATE NOLAPACK)
+target_include_directories(plink2_glm PRIVATE ${PLINK2_INCLUDE_DIRS})
+set_target_properties(plink2_glm PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    C_VISIBILITY_PRESET hidden)
+```
+
+### Expected Build Challenges
+
+1. **Symbol conflicts**: plink2_common.cc defines symbols that may conflict
+   with our plink_common.cpp (different namespaces should prevent this).
+
+2. **plink2_thread.h**: The GLM code uses plink2's own threading primitives.
+   We may need to provide stubs or adapt to single-threaded operation
+   initially.
+
+3. **BigStack allocator**: plink2_common.cc uses `bigstack_alloc_*` for
+   memory management. We may need to initialize this or provide alternatives.
+
+4. **File I/O in GLM functions**: GlmLinear writes output files. We need
+   to either redirect this or extract results before the write step.
+
+5. **plink2_cmdline.cc dependencies**: May pull in more of plink2's
+   infrastructure. Audit needed during build integration.
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_glm.cpp` | plink_glm bind, init, scan |
+| `src/include/plink_glm.hpp` | Public interface: `RegisterPlinkGlm()` |
+| `test/sql/plink_glm.test` | Positive tests (linear regression) |
+| `test/sql/plink_glm_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `CMakeLists.txt` | Add plink2 GLM sources, NOLAPACK flag |
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_glm.hpp"`, `RegisterPlinkGlm(loader)` |
+
+---
+
+## Testing
+
+### Positive Tests (plink_glm.test)
+
+Validate against plink2 `--glm` output:
+
+```sql
+require plinking_duck
+
+# Linear regression, no covariates
+# Compare BETA, SE, T_STAT, P against plink2 --glm allow-no-covars
+query TRRRR
+SELECT ID, ROUND(BETA, 4), ROUND(SE, 4), ROUND(T_STAT, 4), ROUND(P, 6)
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.0, 2.0, 3.0, 4.0])
+ORDER BY ID;
+----
+(validated against plink2 output)
+
+# Row count matches variant count
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.0, 2.0, 3.0, 4.0]);
+----
+4
+
+# Region filtering
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/large_example.pgen',
+    phenotype := [list of 8 values],
+    region := '1:1-50000');
+----
+500
+
+# Phenotype from variable (parquet workflow)
+statement ok
+SET VARIABLE pheno = (SELECT list(age) FROM 'test/data/phenotype_age.parquet');
+
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/wes_chr10.pgen',
+    phenotype := getvariable('pheno'));
+----
+30000
+```
+
+### Negative Tests (plink_glm_negative.test)
+
+```sql
+require plinking_duck
+
+# Missing phenotype parameter
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen');
+----
+phenotype parameter is required
+
+# Phenotype length mismatch
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.0, 2.0]);
+----
+phenotype length
+
+# All-constant phenotype
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [5.0, 5.0, 5.0, 5.0]);
+----
+constant phenotype
+
+# File not found
+statement error
+SELECT * FROM plink_glm('nonexistent.pgen',
+    phenotype := [1.0]);
+----
+(error)
+```
+
+### Validation Against plink2
+
+For each test case, generate plink2 reference output:
+```bash
+plink2 --pfile test/data/pgen_example \
+    --pheno phenotype_file.tsv \
+    --glm allow-no-covars \
+    --out /tmp/reference
+```
+
+Compare BETA, SE, T_STAT, P to 4+ decimal places.
+
+---
+
+## Acceptance Criteria
+
+### Phase 1 (Linear, No Covariates)
+
+1. [ ] plink2 GLM source files compile with NOLAPACK in our build
+2. [ ] `plink_glm` accepts .pgen path + phenotype LIST(DOUBLE)
+3. [ ] Auto-detects quantitative phenotype → linear regression
+4. [ ] Output columns: CHROM, POS, ID, REF, ALT, A1, A1_FREQ, OBS_CT, BETA, SE, T_STAT, P
+5. [ ] Results match plink2 `--glm allow-no-covars` within tolerance (4 decimal places)
+6. [ ] Region filtering works
+7. [ ] Sample subsetting works
+8. [ ] Phenotype via `getvariable()` works
+9. [ ] Handles missing genotypes correctly (per-variant OBS_CT reflects this)
+10. [ ] All positive and negative tests pass
+11. [ ] `make test` passes on Linux amd64
+12. [ ] Performance: ≤2× plink2's speed on WES dataset (30K variants × 10K samples)
+
+### Phase 2 (Covariates + Logistic)
+
+13. [ ] Covariate support via struct-of-lists
+14. [ ] Binary phenotype → logistic regression
+15. [ ] Firth correction for rare variants
+16. [ ] `model := 'linear'` / `model := 'logistic'` override
+17. [ ] macOS + Windows builds pass
+
+---
+
+## Risk Assessment
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| plink2_common.cc pulls in too many dependencies | Build fails | Audit includes, stub unused functions |
+| BigStack allocator required | Runtime crash | Initialize bigstack in bind or replace with aligned_malloc |
+| GlmLinear file I/O too entangled | Can't extract results | Fall back to per-variant compute extraction |
+| plink2_thread.h conflicts with DuckDB threading | Deadlocks | Use single-threaded compute in Phase 1 |
+| NOLAPACK SVD too slow for many covariates | Performance | Add optional BLAS/LAPACK in Phase 3 |
+| Symbol conflicts between plink2_common and our plink_common | Link errors | Different namespaces (plink2:: vs duckdb::) |
+
+---
+
+## Performance Targets
+
+| Dataset | plink2 --glm | plink_glm target | SQL baseline |
+|---------|-------------|-----------------|-------------|
+| 4 var × 4 samp | <1ms | <10ms | <10ms |
+| 3K var × 8 samp | ~5ms | <50ms | ~100ms |
+| 30K var × 10K samp | 61ms | <200ms | 1.8s |
+| 300K var × 500K samp | ~seconds | ~10s | infeasible |
+
+Phase 1 target: within 3× of plink2 for the NOLAPACK path.
+BLAS/LAPACK support (Phase 3) should close the remaining gap.

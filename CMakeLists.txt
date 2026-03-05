@@ -21,6 +21,7 @@ set(EXTENSION_SOURCES
     src/plink_missing.cpp
     src/plink_ld.cpp
     src/plink_score.cpp
+    src/plink_glm.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

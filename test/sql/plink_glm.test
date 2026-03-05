@@ -1,0 +1,142 @@
+# name: test/sql/plink_glm.test
+# description: Test plink_glm linear regression (validated against plink2 --glm allow-no-covars)
+# group: [plinking_duck]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# Basic linear regression (4 variants × 4 samples)
+# Reference: plink2 --pfile pgen_example --pheno pheno.tsv --glm allow-no-covars
+# ---------------------------------------------------------------------------
+
+# Full output with all columns
+query TIITTTRTIRRRRT
+SELECT CHROM, POS, ID, REF, ALT, A1, A1_FREQ, TEST, OBS_CT, BETA, SE, T_STAT, P, ERRCODE
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8])
+ORDER BY ID;
+----
+1	10000	rs1	A	G	G	0.5	ADD	3	1.1	0.17320508075688776	6.350852961085884	0.09942530566691602	NULL
+1	20000	rs2	C	T	T	0.5	ADD	4	-1.45	0.33260250429475794	-4.359548017600793	0.04879676508539067	NULL
+1	30000	rs3	G	A	A	0.5	ADD	3	0.3500000000000001	1.4722431864335457	0.23773160637676483	0.8514126919174483	NULL
+2	15000	rs4	T	C	C	0.375	ADD	4	-0.33636363636363636	0.8879360193399447	-0.37881508091390906	0.7412587024131992	NULL
+
+# Row count matches variant count
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8]);
+----
+4
+
+# ---------------------------------------------------------------------------
+# Region filtering
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    region := '1:1-100000');
+----
+3
+
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    region := '2:1-100000');
+----
+1
+
+# ---------------------------------------------------------------------------
+# Phenotype via SET VARIABLE (getvariable workflow)
+# ---------------------------------------------------------------------------
+
+statement ok
+SET VARIABLE pheno = [1.5, 2.3, 3.7, 0.8];
+
+query TR
+SELECT ID, ROUND(BETA, 4)
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := getvariable('pheno'))
+ORDER BY ID;
+----
+rs1	1.1
+rs2	-1.45
+rs3	0.35
+rs4	-0.3364
+
+# ---------------------------------------------------------------------------
+# Projection pushdown (only metadata columns)
+# ---------------------------------------------------------------------------
+
+query TI
+SELECT ID, POS
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8])
+ORDER BY ID;
+----
+rs1	10000
+rs2	20000
+rs3	30000
+rs4	15000
+
+# ---------------------------------------------------------------------------
+# Large dataset (3000 variants × 8 samples)
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/large_example.pgen',
+    phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7]);
+----
+3000
+
+# Region filter on large dataset
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/large_example.pgen',
+    phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
+    region := '1:1-500');
+----
+5
+
+# Validate first variant of large dataset against plink2
+query TRRIR
+SELECT ID, ROUND(A1_FREQ, 4), OBS_CT, ROUND(BETA, 6), ROUND(SE, 6)
+FROM plink_glm('test/data/large_example.pgen',
+    phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7])
+WHERE ID = 'var1';
+----
+var1	0.5	6	-1.0	0.878505
+
+# ---------------------------------------------------------------------------
+# Composability with other functions
+# ---------------------------------------------------------------------------
+
+query TRR
+SELECT g.ID, ROUND(g.P, 6) as P, ROUND(f.ALT_FREQ, 4) as ALT_FREQ
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8]) g
+JOIN plink_freq('test/data/pgen_example.pgen') f ON g.ID = f.ID
+WHERE g.P < 0.1
+ORDER BY g.P;
+----
+rs2	0.04880	0.5
+rs1	0.099425	0.5
+
+# ---------------------------------------------------------------------------
+# NULL phenotype values (missing samples excluded from regression)
+# ---------------------------------------------------------------------------
+
+query TIRT
+SELECT ID, OBS_CT, ROUND(BETA, 4), ERRCODE
+FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, NULL, 3.7, 0.8])
+ORDER BY ID;
+----
+rs1	2	NULL	TOO_FEW_SAMPLES
+rs2	3	-1.45	NULL
+rs3	3	0.35	NULL
+rs4	3	-0.35	NULL

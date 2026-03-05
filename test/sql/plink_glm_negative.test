@@ -1,0 +1,47 @@
+# name: test/sql/plink_glm_negative.test
+# description: Negative tests for plink_glm
+# group: [plinking_duck]
+
+require plinking_duck
+
+# Missing phenotype parameter
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen');
+----
+phenotype parameter is required
+
+# Phenotype length mismatch
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.0, 2.0]);
+----
+phenotype length
+
+# All-constant phenotype
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [5.0, 5.0, 5.0, 5.0]);
+----
+constant phenotype
+
+# Too few non-missing phenotype values
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.0, NULL, NULL, NULL]);
+----
+at least 3 non-missing
+
+# File not found (no companion files)
+statement error
+SELECT * FROM plink_glm('nonexistent.pgen',
+    phenotype := [1.0]);
+----
+cannot find
+
+# Variant count mismatch (wrong pvar)
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    pvar := 'test/data/large_example.pvar');
+----
+variant count mismatch
