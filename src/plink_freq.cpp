@@ -159,7 +159,6 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 
 	bind_data->raw_variant_ct = pgfi.raw_variant_ct;
 	bind_data->raw_sample_ct = pgfi.raw_sample_ct;
-	bind_data->file_has_dosage = (pgfi.gflags & plink2::kfPgenGlobalDosagePresent) != 0;
 
 	// Phase 2 (needed to validate the file, but per-thread readers will re-init)
 	AlignedBuffer pgfi_alloc;
@@ -172,6 +171,10 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 
 	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct, &max_vrec_width, &pgfi,
 	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
+
+	// Check gflags after Phase 2 — variable-width pgen files only set
+	// kfPgenGlobalDosagePresent during Phase 2's vrtype scan
+	bind_data->file_has_dosage = (pgfi.gflags & plink2::kfPgenGlobalDosagePresent) != 0;
 
 	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 	plink2::CleanupPgfi(&pgfi, &cleanup_err);
@@ -416,26 +419,36 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 			}
 
 			// Compute derived values
-			uint32_t obs_sample_ct = genocounts[0] + genocounts[1] + genocounts[2];
-			uint32_t obs_ct = 2 * obs_sample_ct; // allele observations
+			// kDosageMid = 16384: each non-missing sample contributes 2*kDosageMid to
+			// all_dosages total (REF + ALT always sum to 2.0 per sample)
+			static constexpr uint64_t kDosageMid = 16384;
+
+			uint32_t hardcall_obs_sample_ct = genocounts[0] + genocounts[1] + genocounts[2];
+			uint32_t obs_ct;
 			double alt_freq;
 			bool freq_is_null = false;
 
-			if (obs_sample_ct == 0) {
-				freq_is_null = true;
-				alt_freq = 0.0;
-			} else if (bind_data.include_dosage) {
-				// Dosage-weighted frequency: all_dosages values are scaled by kDosageMid (16384)
+			if (bind_data.include_dosage) {
+				// Dosage-weighted: all_dosages values are scaled by kDosageMid
 				uint64_t total_dosage = all_dosages[0] + all_dosages[1];
 				if (total_dosage == 0) {
 					freq_is_null = true;
 					alt_freq = 0.0;
+					obs_ct = 0;
 				} else {
 					alt_freq = static_cast<double>(all_dosages[1]) / static_cast<double>(total_dosage);
+					// Effective allele observations: total_dosage / kDosageMid
+					// Always an integer since each sample contributes exactly 2*kDosageMid
+					obs_ct = static_cast<uint32_t>(total_dosage / kDosageMid);
 				}
+			} else if (hardcall_obs_sample_ct == 0) {
+				freq_is_null = true;
+				alt_freq = 0.0;
+				obs_ct = 0;
 			} else {
+				obs_ct = 2 * hardcall_obs_sample_ct;
 				alt_freq = (static_cast<double>(genocounts[1]) + 2.0 * static_cast<double>(genocounts[2])) /
-				           (2.0 * static_cast<double>(obs_sample_ct));
+				           (2.0 * static_cast<double>(hardcall_obs_sample_ct));
 			}
 
 			// Fill projected columns
@@ -452,6 +465,10 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 				// when counts is disabled)
 				if (bind_data.include_dosage && file_col == bind_data.imp_r2_col_idx) {
 					if (bind_data.file_has_dosage) {
+						// Note: file-level check. In files with mixed dosage/hardcall variants,
+						// PgrGetDCounts returns a hardcall-derived R² approximation for variants
+						// without dosage entries. Real imputed files typically have dosage for all
+						// variants, so this covers the common cases.
 						FlatVector::GetData<double>(vec)[rows_emitted] = imp_r2;
 					} else {
 						// No dosage data in file — IMP_R2 is not meaningful

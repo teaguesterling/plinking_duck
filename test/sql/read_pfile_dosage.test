@@ -132,3 +132,44 @@ statement error
 SELECT * FROM read_pfile('test/data/pfile_example', dosages := true, phased := true);
 ----
 dosages and phased cannot both be true
+
+# =============================================================================
+# Tests with actual imputed dosage data (dosage_example)
+# =============================================================================
+
+# --- Fractional dosage values in variant orient ---
+
+query TRRRR
+SELECT ID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pfile('test/data/dosage_example', dosages := true)
+ORDER BY CHROM, POS;
+----
+rs1	0.0	0.79998779296875	1.95001220703125	NULL
+rs2	1.20001220703125	0.5999755859375	0.0999755859375	1.70001220703125
+rs3	2.0	0.0	1.0	1.0
+rs4	0.29998779296875	NULL	0.9000244140625	0.04998779296875
+
+# --- Fractional dosage values in genotype orient ---
+
+query TTR
+SELECT ID, IID, genotype
+FROM read_pfile('test/data/dosage_example', dosages := true, orient := 'genotype')
+WHERE ID = 'rs2'
+ORDER BY IID;
+----
+rs2	SAMPLE1	1.20001220703125
+rs2	SAMPLE2	0.5999755859375
+rs2	SAMPLE3	0.0999755859375
+rs2	SAMPLE4	1.70001220703125
+
+# --- Fractional dosage values in sample orient ---
+
+query TRRRR
+SELECT IID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pfile('test/data/dosage_example', dosages := true, orient := 'sample')
+ORDER BY IID;
+----
+SAMPLE1	0.0	1.20001220703125	2.0	0.29998779296875
+SAMPLE2	0.79998779296875	0.5999755859375	0.0	NULL
+SAMPLE3	1.95001220703125	0.0999755859375	1.0	0.9000244140625
+SAMPLE4	NULL	1.70001220703125	1.0	0.04998779296875

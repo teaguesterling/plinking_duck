@@ -85,10 +85,28 @@ EOF
 "$PLINK2" --vcf phased_example.vcf --make-pgen --out phased_example --allow-extra-chr
 rm -f phased_example.vcf
 
+# Generate dosage test data: 4 variants × 4 samples with imputed dosage values
+# FORMAT/DS provides fractional dosage (0.0–2.0), some diverge from hardcalls
+cat > dosage_example.vcf <<'EOF'
+##fileformat=VCFv4.3
+##contig=<ID=1,length=100000>
+##contig=<ID=2,length=100000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DS,Number=1,Type=Float,Description="Dosage">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE1	SAMPLE2	SAMPLE3	SAMPLE4
+1	10000	rs1	A	G	.	.	.	GT:DS	0/0:0.0	0/1:0.8	1/1:1.95	./.:.
+1	20000	rs2	C	T	.	.	.	GT:DS	0/1:1.2	0/1:0.6	0/0:0.1	1/1:1.7
+2	15000	rs3	G	A	.	.	.	GT:DS	1/1:2.0	0/0:0.0	0/1:1.0	0/1:1.0
+2	25000	rs4	T	C	.	.	.	GT:DS	0/0:0.3	./.:.	0/1:0.9	0/0:0.05
+EOF
+"$PLINK2" --vcf dosage_example.vcf dosage=HDS --make-pgen --out dosage_example --allow-extra-chr
+rm -f dosage_example.vcf
+
 echo "Test data generated successfully."
 echo "Generated files:"
 ls -la pgen_example.pgen pgen_example.pvar pgen_example.psam \
        all_missing.pgen all_missing.pvar all_missing.psam \
        pgen_orphan.pgen pgen_orphan.pvar \
        large_example.pgen large_example.pvar large_example.psam \
-       phased_example.pgen phased_example.pvar phased_example.psam
+       phased_example.pgen phased_example.pvar phased_example.psam \
+       dosage_example.pgen dosage_example.pvar dosage_example.psam

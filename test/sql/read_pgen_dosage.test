@@ -95,3 +95,34 @@ rs1	0.0	1.0	2.0	NULL
 rs2	1.0	1.0	0.0	2.0
 rs3	2.0	NULL	1.0	0.0
 rs4	0.0	0.0	1.0	2.0
+
+# =============================================================================
+# Tests with actual imputed dosage data (fractional values)
+# =============================================================================
+
+# dosage_example has actual dosage data (not just hardcalls)
+# rs1: [0.0, ~0.8, ~1.95, missing], rs2: [~1.2, ~0.6, ~0.1, ~1.7]
+# rs3: [2.0, 0.0, 1.0, 1.0], rs4: [~0.3, missing, ~0.9, ~0.05]
+# Values have small precision loss from 16-bit dosage encoding (kDosageMid = 16384)
+
+query TRRRR
+SELECT ID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pgen('test/data/dosage_example.pgen', dosages := true)
+ORDER BY CHROM, POS;
+----
+rs1	0.0	0.79998779296875	1.95001220703125	NULL
+rs2	1.20001220703125	0.5999755859375	0.0999755859375	1.70001220703125
+rs3	2.0	0.0	1.0	1.0
+rs4	0.29998779296875	NULL	0.9000244140625	0.04998779296875
+
+# --- Fractional dosages differ from hardcalls ---
+# Hardcall for rs2 SAMPLE1 is NULL (dosage=1.2 too far from integer for hard_call_thresh)
+# but dosage gives the actual imputed value
+
+query RR
+SELECT h.genotypes[1] AS hardcall, d.genotypes[1] AS dosage
+FROM read_pgen('test/data/dosage_example.pgen') h
+JOIN read_pgen('test/data/dosage_example.pgen', dosages := true) d USING (ID)
+WHERE h.ID = 'rs2';
+----
+NULL	1.20001220703125

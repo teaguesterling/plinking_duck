@@ -82,3 +82,48 @@ rs1	0.5	4
 rs2	0.25	4
 rs3	0.75	4
 rs4	0.25	4
+
+# =============================================================================
+# Tests with actual imputed dosage data (dosage_example)
+# =============================================================================
+
+# --- Dosage frequencies diverge from hardcall frequencies ---
+# With real dosage data, dosage-weighted freq differs from hardcall freq
+
+query TRRII
+SELECT h.ID,
+    h.ALT_FREQ AS hc_freq,
+    d.ALT_FREQ AS dos_freq,
+    h.OBS_CT AS hc_obs,
+    d.OBS_CT AS dos_obs
+FROM plink_freq('test/data/dosage_example.pgen') h
+JOIN plink_freq('test/data/dosage_example.pgen', dosage := true) d USING (ID)
+ORDER BY h.CHROM, h.POS;
+----
+rs1	0.5	0.4583333333333333	4	6
+rs2	0.0	0.4499969482421875	2	8
+rs3	0.5	0.5	8	8
+rs4	0.25	0.20833333333333334	4	6
+
+# --- IMP_R2 is non-NULL for files with dosage data ---
+
+query TR
+SELECT ID, IMP_R2
+FROM plink_freq('test/data/dosage_example.pgen', dosage := true)
+ORDER BY CHROM, POS;
+----
+rs1	1.2900887786091624
+rs2	0.7374153374407626
+rs3	1.0
+rs4	0.3857199844561125
+
+# --- OBS_CT reflects dosage sample count, not hardcall ---
+# rs2: hardcall has only 1 non-missing sample but dosage has 4
+
+query TII
+SELECT d.ID, h.OBS_CT AS hardcall_obs, d.OBS_CT AS dosage_obs
+FROM plink_freq('test/data/dosage_example.pgen') h
+JOIN plink_freq('test/data/dosage_example.pgen', dosage := true) d USING (ID)
+WHERE d.ID = 'rs2';
+----
+rs2	2	8
