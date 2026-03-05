@@ -101,7 +101,7 @@ FROM read_pgen('data/example.pgen', samples := [0, 2]);
 
 ## See Also
 
-- [read_pfile](read_pfile.md) -- complete fileset reader with tidy mode
+- [read_pfile](read_pfile.md) -- complete fileset reader with orient modes
 - [read_pvar](read_pvar.md) -- read variant metadata only
 - [read_psam](read_psam.md) -- read sample metadata only
 - [Genotype Encoding](../genotype-encoding.md) -- encoding reference

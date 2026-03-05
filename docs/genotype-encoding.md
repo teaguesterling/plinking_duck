@@ -30,12 +30,12 @@ SELECT ID, genotypes FROM read_pgen('data.pgen');
 
 ### Scalar Context
 
-In `read_pfile` tidy mode, each genotype is a scalar `TINYINT` column named `genotype`. There is one row per variant-sample combination.
+In `read_pfile` genotype orient mode (`orient := 'genotype'`), each genotype is a scalar `TINYINT` column named `genotype`. There is one row per variant-sample combination.
 
 ```sql
 -- Each row is one variant-sample pair
 SELECT ID, IID, genotype
-FROM read_pfile('data', tidy := true);
+FROM read_pfile('data', orient := 'genotype');
 -- rs1  SAMPLE1  0
 -- rs1  SAMPLE2  1
 -- rs1  SAMPLE3  2
@@ -48,7 +48,7 @@ FROM read_pfile('data', tidy := true);
 
 ```sql
 SELECT IID, SUM(genotype) AS total_alt_alleles
-FROM read_pfile('data', tidy := true)
+FROM read_pfile('data', orient := 'genotype')
 WHERE genotype IS NOT NULL
 GROUP BY IID;
 ```
@@ -57,7 +57,7 @@ GROUP BY IID;
 
 ```sql
 SELECT ID, IID
-FROM read_pfile('data', tidy := true)
+FROM read_pfile('data', orient := 'genotype')
 WHERE genotype = 1;
 ```
 
@@ -66,7 +66,7 @@ WHERE genotype = 1;
 ```sql
 SELECT ID,
     AVG(genotype) / 2.0 AS alt_freq
-FROM read_pfile('data', tidy := true)
+FROM read_pfile('data', orient := 'genotype')
 WHERE genotype IS NOT NULL
 GROUP BY ID;
 ```

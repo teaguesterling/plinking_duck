@@ -24,7 +24,7 @@ SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', orient := 'varia
 ----
 rs1	[0, 1, 2, NULL]
 
-# --- orient := 'genotype' produces same output as tidy := true ---
+# --- orient := 'genotype' produces one row per variant×sample ---
 
 query I
 SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient := 'genotype');
@@ -220,20 +220,3 @@ FAM001	SAMPLE2
 FAM002	SAMPLE3
 FAM002	SAMPLE4
 
-# --- tidy := true backward compat (same results as before) ---
-
-query I
-SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true);
-----
-16
-
-query TI
-SELECT IID, genotype
-FROM read_pfile('test/data/pfile_example', tidy := true)
-WHERE ID = 'rs1'
-ORDER BY IID;
-----
-SAMPLE1	0
-SAMPLE2	1
-SAMPLE3	2
-SAMPLE4	NULL

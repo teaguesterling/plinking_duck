@@ -45,10 +45,10 @@ SELECT CHROM, POS, ID, REF, ALT FROM read_pgen('test/data/pgen_example.pgen');
 1	30000	rs3	G	A
 2	15000	rs4	T	C
 
-# read_pfile tidy mode: selected columns
+# read_pfile genotype orient mode: selected columns
 query TITTT
 SELECT CHROM, POS, ID, IID, CAST(genotype AS VARCHAR) AS genotype
-FROM read_pfile('test/data/pfile_example', tidy := true)
+FROM read_pfile('test/data/pfile_example', orient := 'genotype')
 ORDER BY ID, IID;
 ----
 1	10000	rs1	SAMPLE1	0
@@ -71,7 +71,7 @@ ORDER BY ID, IID;
 # Count alt alleles per sample
 query TI
 SELECT IID, CAST(SUM(genotype) AS INTEGER) AS total_alt_alleles
-FROM read_pfile('test/data/pfile_example', tidy := true)
+FROM read_pfile('test/data/pfile_example', orient := 'genotype')
 WHERE genotype IS NOT NULL
 GROUP BY IID
 ORDER BY IID;
@@ -84,7 +84,7 @@ SAMPLE4	4
 # Find heterozygous calls
 query TT
 SELECT ID, IID
-FROM read_pfile('test/data/pfile_example', tidy := true)
+FROM read_pfile('test/data/pfile_example', orient := 'genotype')
 WHERE genotype = 1
 ORDER BY ID, IID;
 ----

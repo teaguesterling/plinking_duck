@@ -30,7 +30,7 @@ Explicit path to a `.psam` or `.fam` file containing sample metadata. When omitt
 
 The `.psam` file is **optional** for most functions -- they can operate in index-only mode using just the sample count from the `.pgen` header. It is **required** for:
 
-- `read_pfile` (needs sample IDs for tidy mode output)
+- `read_pfile` (needs sample IDs for genotype orient mode output)
 - `plink_score` (needs sample IDs for output)
 - `plink_missing` in sample mode (needs sample IDs for output)
 - Any function when `samples` uses `LIST(VARCHAR)` (needs IDs to resolve names)

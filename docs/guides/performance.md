@@ -36,7 +36,7 @@ Functions that process `.pgen` files use multi-threaded parallel scanning:
 | `read_psam` | No | Sequential text file reading; `.psam` files are small |
 | `read_pgen` | Yes | Per-thread pgenlib readers |
 | `read_pfile` (default) | Yes | Same as `read_pgen` |
-| `read_pfile` (tidy) | No | Row expansion is single-threaded |
+| `read_pfile` (genotype orient) | No | Row expansion is single-threaded |
 | `plink_freq` | Yes | Per-thread readers, atomic batch claiming |
 | `plink_hardy` | Yes | Same pattern as `plink_freq` |
 | `plink_missing` (variant) | Yes | Parallel missingness extraction |
@@ -116,7 +116,7 @@ SELECT ID, ALT_FREQ FROM plink_freq('data.pgen');
 
 -- Less efficient: decompresses genotypes, then aggregates in SQL
 SELECT ID, AVG(genotype) / 2.0 AS alt_freq
-FROM read_pfile('data', tidy := true)
+FROM read_pfile('data', orient := 'genotype')
 GROUP BY ID;
 ```
 

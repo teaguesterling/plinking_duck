@@ -83,10 +83,10 @@ SELECT COUNT(*) FROM read_pfile('test/data/pfile_example',
 
 # Explicit psam path overrides prefix: pgen_example.psam has #IID format
 # (2 columns: IID, SEX) while pfile_example.psam has #FID format
-# (3 columns: FID, IID, SEX). Using tidy mode to verify the column set.
+# (3 columns: FID, IID, SEX). Using genotype orient mode to verify the column set.
 query T
 SELECT DISTINCT IID
-FROM read_pfile('test/data/pfile_example', tidy := true,
+FROM read_pfile('test/data/pfile_example', orient := 'genotype',
     psam := 'test/data/pgen_example.psam')
 WHERE IID = 'SAMPLE1';
 ----

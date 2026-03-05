@@ -82,10 +82,10 @@ static RegionFilter ParseRegion(const string &region_str) {
 }
 
 // ---------------------------------------------------------------------------
-// Sample metadata for tidy mode output
+// Sample metadata for genotype orient mode output
 // ---------------------------------------------------------------------------
 
-//! Extended sample info for tidy mode: includes all psam columns.
+//! Extended sample info for genotype orient mode: includes all psam columns.
 struct PfileSampleMetadata {
 	PsamHeaderInfo header;
 	//! All data rows from the .psam/.fam, in file order.
@@ -103,7 +103,7 @@ static bool PfileIsMissingValue(const string &val) {
 	return val.empty() || val == "." || val == "NA" || val == "na";
 }
 
-//! Load full sample metadata including all columns for tidy mode output.
+//! Load full sample metadata including all columns for genotype orient mode output.
 //! Also populates sample_info to avoid a separate file read for LoadSampleInfo.
 static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const string &path,
                                                    SampleInfo &sample_info_out) {
@@ -199,7 +199,7 @@ struct PfileBindData : public TableFunctionData {
 	// Sample metadata (basic: for IID lookups and default mode)
 	SampleInfo sample_info;
 
-	// Full sample metadata (for tidy mode column output)
+	// Full sample metadata (for genotype orient mode column output)
 	PfileSampleMetadata sample_metadata;
 
 	// pgenlib header info
@@ -275,13 +275,13 @@ struct PfileBindData : public TableFunctionData {
 	// Variant metadata: CHROM(0), POS(1), ID(2), REF(3), ALT(4)
 	// Sample metadata: columns from .psam start at index 5
 	// Genotype: after all sample metadata columns
-	idx_t tidy_sample_col_start = 5;
-	idx_t tidy_genotype_col = 0; // computed in bind
-	idx_t tidy_total_cols = 0;   // computed in bind
+	idx_t geno_sample_col_start = 5;
+	idx_t geno_genotype_col = 0; // computed in bind
+	idx_t geno_total_cols = 0;   // computed in bind
 
-	// Mapping from tidy output sample column index (relative to tidy_sample_col_start)
+	// Mapping from genotype orient output sample column index (relative to geno_sample_col_start)
 	// to psam file column index
-	vector<idx_t> tidy_sample_col_to_psam_col;
+	vector<idx_t> geno_sample_col_to_psam_col;
 };
 
 // ---------------------------------------------------------------------------
@@ -341,10 +341,10 @@ struct PfileLocalState : public LocalTableFunctionState {
 	bool initialized = false;
 
 	// Tidy mode cursor state
-	uint32_t tidy_current_variant_pos = 0; // index into effective_variant_indices
-	uint32_t tidy_current_sample = 0;      // sample index within current variant
-	bool tidy_variant_loaded = false;      // genotypes decoded for current variant
-	bool tidy_done = false;
+	uint32_t geno_current_variant_pos = 0; // index into effective_variant_indices
+	uint32_t geno_current_sample = 0;      // sample index within current variant
+	bool geno_variant_loaded = false;      // genotypes decoded for current variant
+	bool geno_done = false;
 
 	~PfileLocalState() {
 		if (initialized) {
@@ -374,7 +374,6 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 	// Named parameters can override individual paths
 	string orient_str;
-	bool tidy_flag = false;
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "pgen") {
 			bind_data->pgen_path = kv.second.GetValue<string>();
@@ -382,8 +381,6 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			bind_data->pvar_path = kv.second.GetValue<string>();
 		} else if (kv.first == "psam") {
 			bind_data->psam_path = kv.second.GetValue<string>();
-		} else if (kv.first == "tidy") {
-			tidy_flag = kv.second.GetValue<bool>();
 		} else if (kv.first == "orient") {
 			orient_str = kv.second.GetValue<string>();
 		} else if (kv.first == "dosages") {
@@ -396,7 +393,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// samples, variants, and genotypes handled after pgenlib init
 	}
 
-	bind_data->orient_mode = ResolveOrientMode(orient_str, tidy_flag, "read_pfile");
+	bind_data->orient_mode = ResolveOrientMode(orient_str, "read_pfile");
 
 	if (bind_data->include_dosages && bind_data->include_phased) {
 		throw InvalidInputException("read_pfile: dosages and phased cannot both be true");
@@ -577,7 +574,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// Sort sample_indices to match pgenlib output order.
 		// PgrGet with sample_include returns genotypes in ascending bit order
 		// regardless of the order indices were added. Sorting ensures that
-		// genotype_bytes[i] corresponds to sample_indices[i] in tidy mode.
+		// genotype_bytes[i] corresponds to sample_indices[i] in genotype orient mode.
 		std::sort(bind_data->sample_indices.begin(), bind_data->sample_indices.end());
 
 		bind_data->has_sample_subset = true;
@@ -703,18 +700,18 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		for (idx_t i = 0; i < psam_header.column_names.size(); i++) {
 			names.push_back(psam_header.column_names[i]);
 			return_types.push_back(psam_header.column_types[i]);
-			bind_data->tidy_sample_col_to_psam_col.push_back(i);
+			bind_data->geno_sample_col_to_psam_col.push_back(i);
 		}
 
-		bind_data->tidy_sample_col_start = 5;
+		bind_data->geno_sample_col_start = 5;
 
 		// Genotype column (scalar TINYINT, ARRAY(TINYINT,2) when phased, or DOUBLE when dosages)
 		names.push_back("genotype");
 		return_types.push_back(bind_data->include_phased    ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
 		                       : bind_data->include_dosages ? LogicalType::DOUBLE
 		                                                    : LogicalType::TINYINT);
-		bind_data->tidy_genotype_col = names.size() - 1;
-		bind_data->tidy_total_cols = names.size();
+		bind_data->geno_genotype_col = names.size() - 1;
+		bind_data->geno_total_cols = names.size();
 	} else if (bind_data->orient_mode == OrientMode::SAMPLE) {
 		// Sample-orient mode: sample metadata columns + genotypes array/list
 		auto &psam_header = bind_data->sample_metadata.header;
@@ -735,14 +732,6 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 		if (bind_data->genotype_mode == GenotypeMode::COLUMNS) {
 			// Columns mode: one scalar TINYINT column per effective variant
-			if (effective_variant_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_variant_filter &&
-			    !bind_data->region.active) {
-				throw InvalidInputException(
-				    "read_pfile: genotypes := 'columns' with orient := 'sample' would create %u columns (limit: %u). "
-				    "Use variants := [...] or region := '...' to select a subset of variants.",
-				    effective_variant_ct, MAX_GENOTYPE_COLUMNS);
-			}
-
 			bind_data->columns_mode_first_geno_col = names.size();
 			bind_data->columns_mode_geno_col_count = effective_variant_ct;
 
@@ -967,12 +956,6 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 		if (bind_data->genotype_mode == GenotypeMode::COLUMNS) {
 			// Columns mode: one scalar column per output sample
-			if (output_sample_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_sample_subset) {
-				throw InvalidInputException("read_pfile: genotypes := 'columns' would create %u columns (limit: %u). "
-				                            "Use samples := [...] to select a subset of samples.",
-				                            output_sample_ct, MAX_GENOTYPE_COLUMNS);
-			}
-
 			names = {"CHROM", "POS", "ID", "REF", "ALT"};
 			return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
 			                LogicalType::VARCHAR};
@@ -1021,7 +1004,7 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 		// Check if genotype column is projected
 		state->need_genotypes = false;
 		for (auto col_id : input.column_ids) {
-			if (col_id == bind_data.tidy_genotype_col) {
+			if (col_id == bind_data.geno_genotype_col) {
 				state->need_genotypes = true;
 				break;
 			}
@@ -1567,7 +1550,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 	auto &gstate = data_p.global_state->Cast<PfileGlobalState>();
 	auto &lstate = data_p.local_state->Cast<PfileLocalState>();
 
-	if (lstate.tidy_done) {
+	if (lstate.geno_done) {
 		output.SetCardinality(0);
 		return;
 	}
@@ -1579,15 +1562,15 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 	idx_t rows_emitted = 0;
 
 	while (rows_emitted < STANDARD_VECTOR_SIZE) {
-		if (lstate.tidy_current_variant_pos >= total_effective_variants) {
-			lstate.tidy_done = true;
+		if (lstate.geno_current_variant_pos >= total_effective_variants) {
+			lstate.geno_done = true;
 			break;
 		}
 
-		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.tidy_current_variant_pos);
+		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.geno_current_variant_pos);
 
 		// Load genotypes for current variant if not yet loaded
-		if (!lstate.tidy_variant_loaded && gstate.need_genotypes && lstate.initialized) {
+		if (!lstate.geno_variant_loaded && gstate.need_genotypes && lstate.initialized) {
 			const uintptr_t *sample_include =
 			    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
@@ -1626,18 +1609,18 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
 				                             lstate.genotype_bytes.data());
 			}
-			lstate.tidy_variant_loaded = true;
+			lstate.geno_variant_loaded = true;
 		}
 
 		// Emit rows for samples within current variant
-		while (lstate.tidy_current_sample < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
+		while (lstate.geno_current_sample < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
 			// Map scan-order sample index to file-order sample index.
 			// When subsetting, sample_indices is sorted to match pgenlib's
 			// ascending-bit-order output, so genotype_bytes[i] corresponds
 			// to sample_indices[i].
 			uint32_t sample_file_idx = bind_data.has_sample_subset
-			                               ? bind_data.sample_indices[lstate.tidy_current_sample]
-			                               : lstate.tidy_current_sample;
+			                               ? bind_data.sample_indices[lstate.geno_current_sample]
+			                               : lstate.geno_current_sample;
 
 			// Fill projected columns
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
@@ -1684,26 +1667,26 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 						break;
 					}
 					}
-				} else if (file_col == bind_data.tidy_genotype_col) {
+				} else if (file_col == bind_data.geno_genotype_col) {
 					// Genotype column
-					if (gstate.need_genotypes && lstate.tidy_variant_loaded) {
+					if (gstate.need_genotypes && lstate.geno_variant_loaded) {
 						if (bind_data.include_phased) {
 							// ARRAY(TINYINT, 2) per row
 							auto &allele_vec = ArrayVector::GetEntry(vec);
 							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
 							idx_t allele_base = rows_emitted * 2;
-							int8_t a1 = lstate.phased_pairs[lstate.tidy_current_sample * 2];
+							int8_t a1 = lstate.phased_pairs[lstate.geno_current_sample * 2];
 							if (a1 == -9) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 								allele_data[allele_base] = 0;
 								allele_data[allele_base + 1] = 0;
 							} else {
 								allele_data[allele_base] = a1;
-								allele_data[allele_base + 1] = lstate.phased_pairs[lstate.tidy_current_sample * 2 + 1];
+								allele_data[allele_base + 1] = lstate.phased_pairs[lstate.geno_current_sample * 2 + 1];
 							}
 						} else if (bind_data.include_dosages) {
 							// Scalar DOUBLE
-							double dosage = lstate.dosage_doubles[lstate.tidy_current_sample];
+							double dosage = lstate.dosage_doubles[lstate.geno_current_sample];
 							if (dosage == -9.0) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
@@ -1711,7 +1694,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 							}
 						} else {
 							// Scalar TINYINT
-							int8_t geno = lstate.genotype_bytes[lstate.tidy_current_sample];
+							int8_t geno = lstate.genotype_bytes[lstate.geno_current_sample];
 							if (geno == -9) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
@@ -1721,10 +1704,10 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					}
-				} else if (file_col >= bind_data.tidy_sample_col_start && file_col < bind_data.tidy_genotype_col) {
+				} else if (file_col >= bind_data.geno_sample_col_start && file_col < bind_data.geno_genotype_col) {
 					// Sample metadata column
-					idx_t sample_col_rel = file_col - bind_data.tidy_sample_col_start;
-					idx_t psam_col_idx = bind_data.tidy_sample_col_to_psam_col[sample_col_rel];
+					idx_t sample_col_rel = file_col - bind_data.geno_sample_col_start;
+					idx_t psam_col_idx = bind_data.geno_sample_col_to_psam_col[sample_col_rel];
 
 					if (sample_file_idx < bind_data.sample_metadata.rows.size()) {
 						auto &sample_row = bind_data.sample_metadata.rows[sample_file_idx];
@@ -1741,14 +1724,14 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			}
 
 			rows_emitted++;
-			lstate.tidy_current_sample++;
+			lstate.geno_current_sample++;
 		}
 
 		// Advance to next variant if all samples emitted
-		if (lstate.tidy_current_sample >= output_sample_ct) {
-			lstate.tidy_current_variant_pos++;
-			lstate.tidy_current_sample = 0;
-			lstate.tidy_variant_loaded = false;
+		if (lstate.geno_current_sample >= output_sample_ct) {
+			lstate.geno_current_variant_pos++;
+			lstate.geno_current_sample = 0;
+			lstate.geno_variant_loaded = false;
 		}
 	}
 
@@ -2003,7 +1986,6 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	read_pfile.named_parameters["pgen"] = LogicalType::VARCHAR;
 	read_pfile.named_parameters["pvar"] = LogicalType::VARCHAR;
 	read_pfile.named_parameters["psam"] = LogicalType::VARCHAR;
-	read_pfile.named_parameters["tidy"] = LogicalType::BOOLEAN;
 	read_pfile.named_parameters["orient"] = LogicalType::VARCHAR;
 	read_pfile.named_parameters["dosages"] = LogicalType::BOOLEAN;
 	read_pfile.named_parameters["phased"] = LogicalType::BOOLEAN;

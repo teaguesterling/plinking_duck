@@ -80,20 +80,20 @@ FROM read_pfile('test/data/pfile_example') LIMIT 1;
 ----
 VARCHAR	INTEGER	VARCHAR	VARCHAR	VARCHAR	TINYINT[4]
 
-# read_pfile tidy mode genotype is scalar TINYINT
+# read_pfile genotype orient mode genotype is scalar TINYINT
 query T
 SELECT typeof(genotype)
-FROM read_pfile('test/data/pfile_example', tidy := true) LIMIT 1;
+FROM read_pfile('test/data/pfile_example', orient := 'genotype') LIMIT 1;
 ----
 TINYINT
 
 # ---------------------------------------------------------------------------
-# Tidy mode: distinct IIDs = read_psam count
+# Genotype orient mode: distinct IIDs = read_psam count
 # ---------------------------------------------------------------------------
 
 query I
 SELECT COUNT(DISTINCT IID)
-FROM read_pfile('test/data/pfile_example', tidy := true);
+FROM read_pfile('test/data/pfile_example', orient := 'genotype');
 ----
 4
 
@@ -102,9 +102,9 @@ SELECT COUNT(*) FROM read_psam('test/data/pfile_example.psam');
 ----
 4
 
-# Tidy mode row count = variants x samples = 4 x 4 = 16
+# Genotype orient mode row count = variants x samples = 4 x 4 = 16
 query I
-SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true);
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient := 'genotype');
 ----
 16
 
@@ -121,11 +121,11 @@ SELECT
 ----
 true
 
-# rs1 genotypes: read_pfile tidy values match the array from default mode
+# rs1 genotypes: read_pfile genotype orient values match the array from default mode
 # SAMPLE1=0, SAMPLE2=1, SAMPLE3=2, SAMPLE4=NULL
 query TI
 SELECT IID, genotype
-FROM read_pfile('test/data/pfile_example', tidy := true)
+FROM read_pfile('test/data/pfile_example', orient := 'genotype')
 WHERE ID = 'rs1'
 ORDER BY IID;
 ----
@@ -134,19 +134,19 @@ SAMPLE2	1
 SAMPLE3	2
 SAMPLE4	NULL
 
-# All variants: tidy genotypes match array genotypes (unnested)
-# Join pfile default (list) with pfile tidy (scalar) and verify agreement
+# All variants: genotype orient genotypes match array genotypes (unnested)
+# Join pfile default (list) with pfile genotype orient (scalar) and verify agreement
 query I
 SELECT COUNT(*) FROM (
-    SELECT t.ID, t.IID, t.genotype AS tidy_gt,
+    SELECT t.ID, t.IID, t.genotype AS geno_gt,
            d.genotypes[s.row_num] AS array_gt
-    FROM read_pfile('test/data/pfile_example', tidy := true) t
+    FROM read_pfile('test/data/pfile_example', orient := 'genotype') t
     JOIN read_pfile('test/data/pfile_example') d ON t.ID = d.ID
     JOIN (
         SELECT IID, ROW_NUMBER() OVER (ORDER BY IID) AS row_num
         FROM read_psam('test/data/pfile_example.psam')
     ) s ON t.IID = s.IID
-    WHERE tidy_gt IS DISTINCT FROM array_gt
+    WHERE geno_gt IS DISTINCT FROM array_gt
 );
 ----
 0
@@ -167,10 +167,10 @@ ORDER BY v.CHROM, v.POS;
 1	30000	rs3	G	A
 2	15000	rs4	T	C
 
-# Join sample info from read_psam with tidy genotypes from read_pfile
+# Join sample info from read_psam with genotype orient from read_pfile
 query TTI
 SELECT s.FID, t.IID, t.genotype
-FROM read_pfile('test/data/pfile_example', tidy := true) t
+FROM read_pfile('test/data/pfile_example', orient := 'genotype') t
 JOIN read_psam('test/data/pfile_example.psam') s ON t.IID = s.IID
 WHERE t.ID = 'rs1'
 ORDER BY t.IID;
@@ -181,13 +181,13 @@ FAM002	SAMPLE3	2
 FAM002	SAMPLE4	NULL
 
 # ---------------------------------------------------------------------------
-# Sample metadata in tidy mode matches read_psam
+# Sample metadata in genotype orient mode matches read_psam
 # ---------------------------------------------------------------------------
 
-# FID values from tidy mode match read_psam
+# FID values from genotype orient mode match read_psam
 query I
 SELECT COUNT(*) FROM (
-    SELECT DISTINCT FID, IID FROM read_pfile('test/data/pfile_example', tidy := true)
+    SELECT DISTINCT FID, IID FROM read_pfile('test/data/pfile_example', orient := 'genotype')
     EXCEPT
     SELECT FID, IID FROM read_psam('test/data/pfile_example.psam')
 );

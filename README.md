@@ -18,7 +18,7 @@ PlinkingDuck provides **four file readers** and **five analysis functions**:
 | [`read_pvar`](#read_pvarpath) | Read `.pvar` / `.bim` variant metadata |
 | [`read_psam`](#read_psampath) | Read `.psam` / `.fam` sample metadata |
 | [`read_pgen`](#read_pgenpath--pvar-psam-samples) | Read `.pgen` binary genotypes |
-| [`read_pfile`](#read_pfileprefix--pgen-pvar-psam-tidy-samples-variants-region) | Unified reader with tidy mode, filtering |
+| [`read_pfile`](#read_pfileprefix--pgen-pvar-psam-orient-samples-variants-region) | Unified reader with orient modes, filtering |
 | [`plink_freq`](#plink_freqpath--pvar-psam-samples-region-counts) | Per-variant allele frequencies |
 | [`plink_hardy`](#plink_hardypath--pvar-psam-samples-region-midp) | Hardy-Weinberg equilibrium test |
 | [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-mode) | Per-variant or per-sample missingness |
@@ -119,22 +119,22 @@ genotype decoding is skipped entirely, making metadata-only queries very fast.
 genotype lists are sized from the `.pgen` header and the `samples` parameter
 only accepts integer indices.
 
-### `read_pfile(prefix [, pgen, pvar, psam, tidy, samples, variants, region])`
+### `read_pfile(prefix [, pgen, pvar, psam, orient, samples, variants, region])`
 
 Read a complete PLINK 2 fileset (`.pgen` + `.pvar` + `.psam`) from a common prefix.
-Supports tidy output mode, sample subsetting, variant filtering, and region filtering.
+Supports multiple orient modes, sample subsetting, variant filtering, and region filtering.
 
 ```sql
 -- Read all variants (one row per variant, genotypes as list)
 SELECT * FROM read_pfile('data/example');
 
--- Tidy mode (one row per variant x sample)
+-- Genotype orient mode (one row per variant x sample)
 SELECT chrom, pos, iid, genotype
-FROM read_pfile('data/example', tidy := true);
+FROM read_pfile('data/example', orient := 'genotype');
 
 -- Sample subset (by name or 0-based index)
 SELECT * FROM read_pfile('data/example',
-    tidy := true, samples := ['SAMPLE1', 'SAMPLE3']);
+    orient := 'genotype', samples := ['SAMPLE1', 'SAMPLE3']);
 
 -- Region filter
 SELECT * FROM read_pfile('data/example', region := '22:1-50000000');
@@ -144,13 +144,13 @@ SELECT * FROM read_pfile('data/example', variants := ['rs1', 'rs2']);
 
 -- Combined filters
 SELECT iid, genotype
-FROM read_pfile('data/example', tidy := true,
+FROM read_pfile('data/example', orient := 'genotype',
     region := '1:10000-50000', samples := ['SAMPLE1']);
 ```
 
 **Default mode output:** CHROM, POS, ID, REF, ALT, genotypes `ARRAY(TINYINT, N)` — same as `read_pgen`.
 
-**Tidy mode output:** CHROM, POS, ID, REF, ALT, plus all `.psam` columns (FID, IID, SEX, etc.),
+**Genotype orient mode output:** CHROM, POS, ID, REF, ALT, plus all `.psam` columns (FID, IID, SEX, etc.),
 plus scalar `genotype` (TINYINT). One row per variant x sample combination.
 
 **Parameters:**
@@ -160,7 +160,7 @@ plus scalar `genotype` (TINYINT). One row per variant x sample combination.
 | `pgen` | VARCHAR | Explicit `.pgen` path (overrides prefix) |
 | `pvar` | VARCHAR | Explicit `.pvar`/`.bim` path (overrides prefix) |
 | `psam` | VARCHAR | Explicit `.psam`/`.fam` path (overrides prefix) |
-| `tidy` | BOOLEAN | Tidy output: one row per (variant, sample). Default: false |
+| `orient` | VARCHAR | Output orientation: `'variant'` (default), `'genotype'`, or `'sample'` |
 | `samples` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific samples by IID or 0-based index |
 | `variants` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific variants by ID or 0-based index |
 | `region` | VARCHAR | Filter to genomic region (`chr:start-end` or `chr`) |
@@ -305,7 +305,7 @@ All genotype data uses `TINYINT` values:
 | NULL | Missing (./.) |
 
 In `read_pgen` and `read_pfile` default mode, genotypes are returned as `ARRAY(TINYINT, N)`
-(where N is the sample count) with one element per sample. In `read_pfile` tidy mode, genotype is a scalar `TINYINT` column.
+(where N is the sample count) with one element per sample. In `read_pfile` genotype orient mode (`orient := 'genotype'`), genotype is a scalar `TINYINT` column.
 
 ## File Format Reference
 

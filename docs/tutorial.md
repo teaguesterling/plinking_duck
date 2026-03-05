@@ -98,13 +98,13 @@ Each number in the genotype list is an **alternate allele count**: 0 = homozygou
 
 For variant rs1, SAMPLE1 has genotype 0 (AA), SAMPLE2 has 1 (AG), SAMPLE3 has 2 (GG), and SAMPLE4 is missing.
 
-### Tidy Mode (One Row per Observation)
+### Genotype Orient Mode (One Row per Observation)
 
-For analysis with SQL joins and aggregations, **tidy mode** is often more convenient. It produces one row per variant-sample pair:
+For analysis with SQL joins and aggregations, **genotype orient mode** is often more convenient. It produces one row per variant-sample pair:
 
 ```sql
 SELECT CHROM, POS, ID, IID, genotype
-FROM read_pfile('test/data/pfile_example', tidy := true)
+FROM read_pfile('test/data/pfile_example', orient := 'genotype')
 ORDER BY ID, IID;
 ```
 
@@ -130,11 +130,11 @@ ORDER BY ID, IID;
 !!! note "`read_pfile` vs `read_pgen`"
     `read_pfile` takes a **prefix** (e.g., `'test/data/pfile_example'`) and auto-discovers the `.pgen`, `.pvar`, and `.psam` files. `read_pgen` takes the `.pgen` path directly. See [read_pfile](functions/read_pfile.md) and [read_pgen](functions/read_pgen.md) for details.
 
-With tidy data, standard SQL works naturally. For example, count the total alternate alleles carried by each individual:
+With genotype orient data, standard SQL works naturally. For example, count the total alternate alleles carried by each individual:
 
 ```sql
 SELECT IID, SUM(genotype) AS total_alt_alleles
-FROM read_pfile('test/data/pfile_example', tidy := true)
+FROM read_pfile('test/data/pfile_example', orient := 'genotype')
 WHERE genotype IS NOT NULL
 GROUP BY IID
 ORDER BY IID;
@@ -151,7 +151,7 @@ Or find all heterozygous calls (genotype = 1):
 
 ```sql
 SELECT ID, IID
-FROM read_pfile('test/data/pfile_example', tidy := true)
+FROM read_pfile('test/data/pfile_example', orient := 'genotype')
 WHERE genotype = 1
 ORDER BY ID, IID;
 ```

@@ -86,14 +86,14 @@ SELECT ID, genotypes FROM read_pfile('test/data/all_missing') ORDER BY POS;
 rs_miss1	[NULL, NULL]
 rs_miss2	[NULL, NULL]
 
-# Tidy mode: all genotypes NULL, row count = 2 variants x 2 samples = 4
+# Genotype orient mode: all genotypes NULL, row count = 2 variants x 2 samples = 4
 query I
-SELECT COUNT(*) FROM read_pfile('test/data/all_missing', tidy := true);
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', orient := 'genotype');
 ----
 4
 
 query I
-SELECT COUNT(*) FROM read_pfile('test/data/all_missing', tidy := true)
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', orient := 'genotype')
 WHERE genotype IS NOT NULL;
 ----
 0
@@ -135,9 +135,9 @@ SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example') LIMIT 1;
 ----
 TINYINT[4]
 
-# read_pfile tidy mode genotype type
+# read_pfile genotype orient mode genotype type
 query T
-SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', tidy := true) LIMIT 1;
+SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', orient := 'genotype') LIMIT 1;
 ----
 TINYINT
 
@@ -173,9 +173,9 @@ SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', region := '99:1-100')
 ----
 0
 
-# read_pfile tidy with region matching no variants
+# read_pfile genotype orient with region matching no variants
 query I
-SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true, region := '99:1-100');
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient := 'genotype', region := '99:1-100');
 ----
 0
 

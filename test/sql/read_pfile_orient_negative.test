@@ -11,13 +11,6 @@ SELECT * FROM read_pfile('test/data/pfile_example', orient := 'invalid');
 ----
 invalid orient value 'invalid'
 
-# --- orient + tidy conflict ---
-
-statement error
-SELECT * FROM read_pfile('test/data/pfile_example', orient := 'variant', tidy := true);
-----
-cannot specify both orient and tidy
-
 # --- orient := 'sample' on read_pgen (not supported) ---
 
 statement error

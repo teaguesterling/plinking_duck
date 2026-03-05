@@ -67,9 +67,9 @@ WHERE CHROM = '1';
 ```
 
 ```sql
--- Tidy mode: one row per variant-sample pair
+-- Genotype orient mode: one row per variant-sample pair
 SELECT chrom, pos, id, iid, genotype
-FROM read_pfile('cohort', tidy := true)
+FROM read_pfile('cohort', orient := 'genotype')
 WHERE genotype IS NOT NULL
 LIMIT 20;
 ```

@@ -84,15 +84,14 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - sqllogictest format specifiers: `T` = varchar, `I` = integer, `R` = real
 - DuckDB function overloads: can't register two with same positional args; use `LogicalType::ANY` for type-dispatched named params
 - Named parameters go in `read_pgen.named_parameters["key"]`
-- `read_pfile` orient parameter: `'variant'` (default, one row per variant), `'genotype'` (one row per variant×sample, replaces `tidy := true`), `'sample'` (one row per sample, genotypes across variants)
+- `read_pfile` orient parameter: `'variant'` (default, one row per variant), `'genotype'` (one row per variant×sample), `'sample'` (one row per sample, genotypes across variants)
 - `orient := 'sample'` pre-reads all genotypes into a matrix at bind time; genotypes array dimension = effective variant count (not sample count)
-- `tidy := true` still works as an alias for `orient := 'genotype'`; specifying both `orient` and `tidy` is an error
 - `read_pgen` accepts `orient` parameter but only `'variant'` is valid (no sample metadata for other modes)
 - `phased := true` changes genotype element type from `TINYINT` to `ARRAY(TINYINT, 2)` representing `[allele1, allele2]` haplotype pairs (0=REF, 1=ALT); missing genotypes → NULL
 - Phase direction: `[0, 1]` = REF|ALT (also the unphased het convention), `[1, 0]` = ALT|REF; hom ref = `[0, 0]`, hom alt = `[1, 1]`
 - `phased` works across all orient modes and genotypes modes (array, list); incompatible with `dosages := true`
 - `genotypes := 'columns'` outputs one scalar TINYINT column per sample (variant orient) or per variant (sample orient); column names from IIDs or variant IDs
-- `genotypes := 'columns'` has a 256-column limit without explicit `samples :=` / `variants :=` / `region :=` filter
+- `genotypes := 'columns'` has no column count limit (DuckDB has no hard column limit)
 - `genotypes := 'columns'` + `orient := 'genotype'` is an error (genotype mode already produces scalar output)
 
 <!-- blq:agent-instructions -->

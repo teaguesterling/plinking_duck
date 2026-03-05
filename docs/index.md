@@ -21,7 +21,7 @@ WHERE CHROM = '22';
 
 -- Read genotypes with sample info
 SELECT chrom, pos, iid, genotype
-FROM read_pfile('cohort', tidy := true)
+FROM read_pfile('cohort', orient := 'genotype')
 WHERE genotype = 2;
 
 -- Compute allele frequencies
@@ -46,7 +46,7 @@ PlinkingDuck provides **4 file readers** and **5 analysis functions**:
 | [`read_pvar(path)`](functions/read_pvar.md) | Read `.pvar` or `.bim` variant metadata |
 | [`read_psam(path)`](functions/read_psam.md) | Read `.psam` or `.fam` sample metadata |
 | [`read_pgen(path)`](functions/read_pgen.md) | Read `.pgen` binary genotype files |
-| [`read_pfile(prefix)`](functions/read_pfile.md) | Read a complete PLINK fileset with tidy mode |
+| [`read_pfile(prefix)`](functions/read_pfile.md) | Read a complete PLINK fileset with orient modes |
 
 ### Analysis Functions
 

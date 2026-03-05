@@ -146,8 +146,8 @@ SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', region := '99:1-100')
 ----
 0
 
-# Empty region in tidy mode also returns 0 rows
+# Empty region in genotype orient mode also returns 0 rows
 query I
-SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', tidy := true, region := '99:1-100');
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient := 'genotype', region := '99:1-100');
 ----
 0

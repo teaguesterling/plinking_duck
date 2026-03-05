@@ -24,9 +24,6 @@ enum class GenotypeMode : uint8_t {
 	COLUMNS //!< One scalar TINYINT column per sample (variant orient) or per variant (sample orient)
 };
 
-//! Maximum number of genotype columns in COLUMNS mode (without explicit sample/variant filter)
-static constexpr uint32_t MAX_GENOTYPE_COLUMNS = 256;
-
 //! Resolve a genotypes parameter string to a GenotypeMode.
 //! Case-insensitive. "auto" → ARRAY if sample_ct ≤ MAX_ARRAY_SIZE, else LIST.
 GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, const string &func_name);
@@ -38,13 +35,13 @@ GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, con
 //! Orientation mode for read_pfile / read_pgen output.
 enum class OrientMode : uint8_t {
 	VARIANT,  //!< One row per variant (default)
-	GENOTYPE, //!< One row per variant×sample (was "tidy")
+	GENOTYPE, //!< One row per variant×sample
 	SAMPLE    //!< One row per sample, genotypes across variants
 };
 
-//! Resolve orient parameter + tidy flag to an OrientMode.
-//! Errors if both orient and tidy are specified, or if orient value is invalid.
-OrientMode ResolveOrientMode(const string &orient_str, bool tidy_flag, const string &func_name);
+//! Resolve orient parameter string to an OrientMode.
+//! Errors if orient value is invalid.
+OrientMode ResolveOrientMode(const string &orient_str, const string &func_name);
 
 // ---------------------------------------------------------------------------
 // RAII wrapper for cache-aligned allocations from pgenlib

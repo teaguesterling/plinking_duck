@@ -1,12 +1,12 @@
 # read_pfile
 
-Read a complete PLINK 2 fileset (`.pgen` + `.pvar` + `.psam`) from a common prefix. Supports tidy output mode, sample subsetting, variant filtering, and region filtering.
+Read a complete PLINK 2 fileset (`.pgen` + `.pvar` + `.psam`) from a common prefix. Supports multiple orient modes, sample subsetting, variant filtering, and region filtering.
 
 ## Synopsis
 
 ```sql
 read_pfile(prefix VARCHAR [, pgen := ..., pvar := ..., psam := ...,
-           tidy := ..., samples := ..., variants := ..., region := ...]) -> TABLE
+           orient := ..., samples := ..., variants := ..., region := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -17,7 +17,7 @@ read_pfile(prefix VARCHAR [, pgen := ..., pvar := ..., psam := ...,
 | `pgen` | `VARCHAR` | `prefix.pgen` | Explicit `.pgen` path |
 | `pvar` | `VARCHAR` | `prefix.pvar` | Explicit `.pvar` or `.bim` path |
 | `psam` | `VARCHAR` | `prefix.psam` | Explicit `.psam` or `.fam` path |
-| `tidy` | `BOOLEAN` | `false` | Output one row per variant-sample pair |
+| `orient` | `VARCHAR` | `'variant'` | Output orientation: `'variant'`, `'genotype'`, or `'sample'` |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific samples |
 | `variants` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific variants |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
@@ -42,7 +42,7 @@ When both `region` and `variants` are specified, the result is the intersection 
 
 ## Output Columns
 
-### Default Mode (`tidy := false`)
+### Variant Orient Mode (Default)
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -53,7 +53,7 @@ When both `region` and `variants` are specified, the result is the intersection 
 | `ALT` | `VARCHAR` | Alternate allele |
 | `genotypes` | `ARRAY(TINYINT, N)` | Genotype calls, one per sample |
 
-### Tidy Mode (`tidy := true`)
+### Genotype Orient Mode (`orient := 'genotype'`)
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -68,7 +68,7 @@ When both `region` and `variants` are specified, the result is the intersection 
 | *additional* | varies | Any extra `.psam` columns |
 | `genotype` | `TINYINT` | Single genotype value |
 
-In tidy mode, each row represents one variant-sample combination. The sample metadata columns come from the `.psam` file and vary depending on what columns are present.
+In genotype orient mode, each row represents one variant-sample combination. The sample metadata columns come from the `.psam` file and vary depending on what columns are present.
 
 ## Description
 
@@ -84,7 +84,7 @@ Genotype decoding is skipped when genotype columns (`genotypes` or `genotype`) a
 
 ### Parallel Scan
 
-Default mode uses multi-threaded parallel scanning. Tidy mode is single-threaded because it expands each variant into multiple rows (one per sample).
+Default mode uses multi-threaded parallel scanning. Genotype orient mode is single-threaded because it expands each variant into multiple rows (one per sample).
 
 ## Examples
 
@@ -94,15 +94,15 @@ SELECT * FROM read_pfile('data/example');
 ```
 
 ```sql
--- Tidy mode: one row per variant-sample pair
+-- Genotype orient mode: one row per variant-sample pair
 SELECT chrom, pos, iid, genotype
-FROM read_pfile('data/example', tidy := true);
+FROM read_pfile('data/example', orient := 'genotype');
 ```
 
 ```sql
 -- Sample subset by name
 SELECT * FROM read_pfile('data/example',
-    tidy := true,
+    orient := 'genotype',
     samples := ['SAMPLE1', 'SAMPLE3']);
 ```
 
@@ -115,7 +115,7 @@ SELECT * FROM read_pfile('data/example',
 ```sql
 -- Variant filter by ID
 SELECT * FROM read_pfile('data/example',
-    tidy := true,
+    orient := 'genotype',
     variants := ['rs1', 'rs2']);
 ```
 
@@ -123,7 +123,7 @@ SELECT * FROM read_pfile('data/example',
 -- Combined filters
 SELECT iid, genotype
 FROM read_pfile('data/example',
-    tidy := true,
+    orient := 'genotype',
     region := '1:10000-50000',
     samples := ['SAMPLE1']);
 ```

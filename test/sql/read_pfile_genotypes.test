@@ -278,24 +278,24 @@ SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotypes := 'li
 rs1	[0, 1, 2, NULL]
 
 # ===================================================================
-# genotypes × tidy mode (silently ignored)
+# genotypes × genotype orient mode (silently ignored)
 # ===================================================================
 
-# tidy + genotypes := 'list' → still scalar TINYINT
+# orient := 'genotype' + genotypes := 'list' → still scalar TINYINT
 query T
-SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', tidy := true, genotypes := 'list') LIMIT 1;
+SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotypes := 'list') LIMIT 1;
 ----
 TINYINT
 
-# tidy + genotypes := 'array' → still scalar TINYINT
+# orient := 'genotype' + genotypes := 'array' → still scalar TINYINT
 query T
-SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', tidy := true, genotypes := 'array') LIMIT 1;
+SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotypes := 'array') LIMIT 1;
 ----
 TINYINT
 
-# tidy + genotypes := 'auto' → still scalar TINYINT
+# orient := 'genotype' + genotypes := 'auto' → still scalar TINYINT
 query T
-SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', tidy := true, genotypes := 'auto') LIMIT 1;
+SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotypes := 'auto') LIMIT 1;
 ----
 TINYINT
 

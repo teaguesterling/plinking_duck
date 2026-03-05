@@ -14,10 +14,8 @@ SELECT * FROM read_pfile('test/data/pfile_example', orient := 'genotype', genoty
 genotypes := 'columns' is not compatible with orient := 'genotype'
 
 # ===================================================================
-# Column count guard: sample-orient on large_example (3000 variants, no filter)
+# No column count guard: sample-orient on large_example (3000 variants) should succeed
 # ===================================================================
 
-statement error
-SELECT * FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns');
-----
-would create 3000 columns
+statement ok
+SELECT COUNT(*) FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns');

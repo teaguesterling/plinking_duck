@@ -262,12 +262,6 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			throw InvalidInputException("read_pgen: genotypes := 'columns' requires a .psam/.fam file for sample IDs "
 			                            "(no companion file found)");
 		}
-		if (output_sample_ct > MAX_GENOTYPE_COLUMNS && !bind_data->has_sample_subset) {
-			throw InvalidInputException("read_pgen: genotypes := 'columns' would create %u columns (limit: %u). "
-			                            "Use samples := [...] to select a subset of samples.",
-			                            output_sample_ct, MAX_GENOTYPE_COLUMNS);
-		}
-
 		// Sort sample_indices for consistent pgenlib output order
 		if (bind_data->has_sample_subset) {
 			std::sort(bind_data->sample_indices.begin(), bind_data->sample_indices.end());
