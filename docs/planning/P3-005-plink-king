@@ -1,0 +1,252 @@
+# P3-005: plink_king — Kinship Estimation (KING-robust)
+
+## Goal
+
+Implement `plink_king(path)` — a DuckDB table function that computes pairwise
+kinship coefficients using the KING-robust estimator, equivalent to plink2's
+`--make-king-table` output. Returns sample pairs with kinship estimates for
+relatedness detection and sample QC.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+
+## Depends On
+
+P2-001 (shared infrastructure).
+
+## Branch
+
+`feature/P3-005-plink-king`
+
+## Priority
+
+**High value, high complexity.** KING kinship is used in virtually every
+biobank QC pipeline to identify related samples, duplicates, and sample swaps.
+However, pairwise computation is O(N²) in sample count.
+
+---
+
+## SQL Interface
+
+```sql
+-- All sample pairs above kinship threshold
+SELECT * FROM plink_king('data/cohort.pgen');
+
+-- Custom kinship threshold (default: 2nd degree relatives)
+SELECT IID1, IID2, KINSHIP
+FROM plink_king('data/cohort.pgen', min_kinship := 0.0884);
+
+-- Identify duplicate/MZ twin pairs
+SELECT IID1, IID2, KINSHIP
+FROM plink_king('data/cohort.pgen')
+WHERE KINSHIP > 0.354;
+
+-- Sparse output: only related pairs (default)
+SELECT * FROM plink_king('data/cohort.pgen',
+    min_kinship := 0.0442);
+
+-- With sample subsetting
+SELECT * FROM plink_king('data/cohort.pgen',
+    samples := ['S1', 'S2', 'S3', 'S4', 'S5']);
+```
+
+---
+
+## Output Schema
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| FID1 | VARCHAR | Family ID of sample 1 |
+| IID1 | VARCHAR | Individual ID of sample 1 |
+| FID2 | VARCHAR | Family ID of sample 2 |
+| IID2 | VARCHAR | Individual ID of sample 2 |
+| NSNP | INTEGER | Number of variants with non-missing genotypes in both samples |
+| HETHET | DOUBLE | Proportion of variants where both samples are het |
+| IBS0 | DOUBLE | Proportion of variants with zero IBS (opposite homozygotes) |
+| KINSHIP | DOUBLE | KING-robust kinship estimate |
+
+One row per sample pair (above threshold).
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `min_kinship` | DOUBLE | 0.0442 | Minimum kinship to report (3rd degree relatives) |
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter to specific samples |
+| `region` | VARCHAR | all | Filter to genomic region |
+
+### Kinship Thresholds (reference)
+
+| Relationship | Kinship Range |
+|-------------|---------------|
+| Duplicate / MZ twin | > 0.354 |
+| 1st degree (parent-child, full sibling) | 0.177 – 0.354 |
+| 2nd degree (half-sibling, grandparent) | 0.0884 – 0.177 |
+| 3rd degree (1st cousin) | 0.0442 – 0.0884 |
+| Unrelated | < 0.0442 |
+
+---
+
+## Implementation
+
+### Algorithm: KING-robust
+
+For two samples i and j across M biallelic variants:
+
+```
+For each variant v where both i and j are non-missing:
+    N_Aa_i = count of hets in sample i
+    N_Aa_j = count of hets in sample j
+    N_AA_i_aa_j + N_aa_i_AA_j = count of opposite homozygotes (IBS0)
+    N_Aa_i_Aa_j = count of both het
+
+KING_kinship = (N_Aa_i_Aa_j - 2 * IBS0_count) / (N_Aa_i + N_Aa_j)
+```
+
+The KING-robust estimator is robust to population stratification (unlike
+method-of-moments IBS-based estimators).
+
+### Computation Pattern
+
+**Challenge**: O(N²) sample pairs. For N=10K samples: 50M pairs. For N=500K:
+125 billion pairs. Even with threshold filtering, the inner loop must evaluate
+all pairs.
+
+**Streaming approach**:
+
+```
+For each variant v:
+    genotypes = PgrGet(v)  // N genotypes
+    For each pair (i, j):  // use packed bitwise operations
+        Update IBS0, HETHET, N_Aa counters
+```
+
+This streams variants one at a time, accumulating per-pair statistics.
+
+**Memory**: O(N²) for the pairwise accumulator arrays. At N=10K with 4 doubles
+per pair: ~3.2GB. Must use threshold-based sparse accumulation for larger N.
+
+### Sparse Computation Strategy
+
+For large N, avoid O(N²) memory:
+
+1. **Block-based**: Process sample pairs in blocks. For block (A, B),
+   stream all variants and accumulate. Emit qualifying pairs. Discard block
+   accumulators.
+
+2. **Threshold-based pruning**: After processing a fraction of variants,
+   prune pairs that cannot reach the kinship threshold (based on running
+   IBS0 counts). Early termination saves compute.
+
+3. **Memory guard**: `plinking_max_king_pairs` config option to limit N.
+
+### Scale Recommendations
+
+| Samples | Pairs | Memory | Approach |
+|---------|-------|--------|----------|
+| < 1K | 500K | ~16 MB | Full matrix, fast |
+| 1K – 10K | 50M | ~1.6 GB | Full matrix, moderate |
+| 10K – 50K | 1.25B | ~40 GB | Block-based, slow |
+| > 50K | > 1B | > 40 GB | Recommend plink2 directly |
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_king.cpp` | plink_king bind, init, scan |
+| `src/include/plink_king.hpp` | Public interface: `RegisterPlinkKing()` |
+| `test/sql/plink_king.test` | Positive tests |
+| `test/sql/plink_king_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_king.hpp"`, call `RegisterPlinkKing(loader)` |
+| `CMakeLists.txt` | Add `src/plink_king.cpp` to build |
+
+---
+
+## Testing
+
+### Positive Tests
+
+```sql
+require plinking_duck
+
+# Known kinship for identical samples
+# (duplicate sample should have kinship ≈ 0.5)
+
+# All kinship values in valid range
+query I
+SELECT COUNT(*) FROM plink_king('test/data/pgen_example.pgen',
+    min_kinship := -1.0)
+WHERE KINSHIP < -0.5 OR KINSHIP > 0.5;
+----
+0
+
+# NSNP consistent across pairs
+query I
+SELECT COUNT(DISTINCT NSNP) FROM plink_king('test/data/pgen_example.pgen',
+    min_kinship := -1.0);
+----
+(expected: 1 if no missing data, >1 with missingness)
+
+# Validate against plink2 --make-king-table output
+query TTTTIRR rowsort
+SELECT IID1, FID1, IID2, FID2, NSNP, ROUND(IBS0, 4), ROUND(KINSHIP, 4)
+FROM plink_king('test/data/pgen_example.pgen', min_kinship := -1.0)
+ORDER BY IID1, IID2;
+----
+(validated against plink2 output)
+```
+
+### Negative Tests
+
+```sql
+require plinking_duck
+
+# No .psam (required for sample IDs)
+statement error
+SELECT * FROM plink_king('test/data/pgen_orphan.pgen');
+----
+(error)
+
+# Only one sample
+statement error
+SELECT * FROM plink_king('test/data/pgen_example.pgen',
+    samples := ['SAMPLE1']);
+----
+(error: need at least 2 samples)
+```
+
+---
+
+## Risk Assessment
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| O(N²) memory for large cohorts | OOM crash | Block-based computation, memory guard |
+| O(N² × M) compute time | Very slow | Threshold-based pruning, recommend plink2 for >50K |
+| Numerical precision | Test failures | Tolerance-based comparison |
+
+---
+
+## Acceptance Criteria
+
+1. [ ] KING-robust kinship matches plink2 `--make-king-table` within tolerance
+2. [ ] Kinship threshold filtering works
+3. [ ] Sample subsetting works
+4. [ ] Region filtering works
+5. [ ] Memory guard for large sample counts
+6. [ ] All positive and negative tests pass
+7. [ ] `make test` passes

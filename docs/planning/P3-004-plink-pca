@@ -1,0 +1,307 @@
+# P3-004: plink_pca — Principal Component Analysis
+
+## Goal
+
+Implement `plink_pca(path)` — a DuckDB table function that computes principal
+components from genotype data, equivalent to plink2's `--pca` output. Returns
+per-sample eigenvector scores and eigenvalues.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+- Matrix library decision (NOLAPACK built-in SVD vs optional BLAS/LAPACK)
+
+## Depends On
+
+P2-001 (shared infrastructure). Computationally the most demanding function
+in the extension.
+
+## Branch
+
+`feature/P3-004-plink-pca`
+
+## Priority
+
+**High value, high complexity.** PCA is used in virtually every GWAS pipeline
+for population stratification. However, it requires eigendecomposition of the
+GRM (genetic relationship matrix), which is O(N² × M) where N = samples,
+M = variants.
+
+---
+
+## SQL Interface
+
+```sql
+-- Default: top 10 PCs
+SELECT * FROM plink_pca('data/cohort.pgen');
+
+-- Specify number of PCs
+SELECT IID, PC1, PC2, PC3
+FROM plink_pca('data/cohort.pgen', n_pcs := 20);
+
+-- Eigenvalues (for scree plot)
+SELECT * FROM plink_pca('data/cohort.pgen', output := 'eigenvalues');
+
+-- With LD-pruned variant list
+SELECT * FROM plink_pca('data/cohort.pgen',
+    variants := (SELECT list(ID) FROM plink_ld_prune_result));
+
+-- Project new samples onto existing PCs
+-- (Phase 2: --pca-sample-wts equivalent)
+```
+
+---
+
+## Output Schema
+
+### Eigenvector mode (default)
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| FID | VARCHAR | Family ID |
+| IID | VARCHAR | Individual ID |
+| PC1 | DOUBLE | First principal component score |
+| PC2 | DOUBLE | Second principal component score |
+| ... | DOUBLE | ... |
+| PCn | DOUBLE | nth principal component score |
+
+One row per sample.
+
+### Eigenvalue mode (`output := 'eigenvalues'`)
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| PC | INTEGER | Principal component number (1-indexed) |
+| EIGENVALUE | DOUBLE | Eigenvalue |
+| VARIANCE_EXPLAINED | DOUBLE | Proportion of variance explained |
+| CUMULATIVE_VARIANCE | DOUBLE | Cumulative proportion |
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `n_pcs` | INTEGER | 10 | Number of principal components to compute |
+| `output` | VARCHAR | `'scores'` | Output mode: `'scores'` or `'eigenvalues'` |
+| `approx` | BOOLEAN | false | Use randomized SVD (faster, approximate) |
+| `variants` | LIST(VARCHAR) or LIST(INTEGER) | all | Restrict to specific variants (e.g., LD-pruned set) |
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter to specific samples |
+| `region` | VARCHAR | all | Filter to genomic region |
+
+---
+
+## Implementation
+
+### Approach Decision: NOLAPACK vs LAPACK
+
+**Phase 1: NOLAPACK** — Use plink2's built-in SVD from `plink2_matrix.cc`
+(compiled with `-DNOLAPACK`). This is a C port of the PLINK 1.x SVD code.
+Adequate for moderate sample counts (< ~10K samples).
+
+**Phase 2: Optional LAPACK** — Add optional BLAS/LAPACK support behind a
+build flag for biobank-scale PCA. Detects system BLAS at build time
+(OpenBLAS, MKL, Accelerate).
+
+### Algorithm
+
+1. **Standardize genotypes**: For each variant v, compute mean and stddev
+   from non-missing genotypes. Replace missing values with mean (mean
+   imputation). Center and scale: `x_standardized = (g - 2p) / sqrt(2p(1-p))`
+
+2. **Build GRM**: Compute the N×N genetic relationship matrix:
+   `GRM = (1/M) * X * X'` where X is the standardized N×M genotype matrix.
+
+3. **Eigendecomposition**: Compute top k eigenvectors/eigenvalues of GRM.
+
+4. **Output**: Return eigenvector scores as PC columns.
+
+### Memory Considerations
+
+- **GRM**: N×N doubles = 8*N² bytes. For N=10K: 800MB. For N=500K: 2TB
+  (requires out-of-core or randomized SVD).
+- **Standardized genotypes**: N×M doubles — too large to materialize.
+  Must stream variants and accumulate GRM incrementally.
+
+### Streaming GRM Computation
+
+```
+GRM = zeros(N, N)
+for each variant v:
+    g = PgrGet(v)  // N genotypes
+    p = allele_freq(v)
+    x = (g - 2p) / sqrt(2p(1-p))  // standardize, impute missing as 0
+    GRM += x * x'  // rank-1 update
+GRM /= M
+```
+
+This streams variants one at a time, accumulating into the N×N GRM.
+Memory: O(N²) for GRM + O(N) for one variant's genotypes.
+
+### Randomized SVD (approx mode)
+
+For large N, use the randomized SVD algorithm (Halko et al. 2011):
+
+1. Generate random projection matrix Ω (M × k, where k = n_pcs + oversampling)
+2. Form Y = X * Ω via streaming: `Y += x_v * Ω[v, :]` for each variant
+3. Compute QR factorization of Y
+4. Form B = Q' * X via second streaming pass
+5. SVD of the small k × M matrix B
+6. Recover eigenvectors
+
+This avoids forming the N×N GRM and uses O(N × k) memory.
+
+---
+
+## Complexity Assessment
+
+| Dataset | Samples | Variants | GRM Memory | Estimated Time |
+|---------|---------|----------|------------|----------------|
+| Small test | 8 | 3,000 | 512 B | < 1s |
+| Medium | 10K | 300K | 800 MB | ~minutes |
+| Biobank | 500K | 1M (LD-pruned) | 2 TB | hours (needs approx) |
+
+### Scale Recommendations
+
+- **< 10K samples**: Exact GRM + NOLAPACK SVD
+- **10K – 50K samples**: Exact GRM + LAPACK SVD (Phase 2)
+- **> 50K samples**: Randomized SVD (Phase 2)
+- **> 100K samples**: Recommend external tool (plink2 --pca, FlashPCA2)
+
+A `plinking_max_pca_samples` config option could guard against accidental
+biobank-scale PCA.
+
+---
+
+## Implementation Phases
+
+### Phase 1: Small-Scale PCA (NOLAPACK)
+
+1. Streaming GRM computation via `PgrGet()` per variant
+2. Eigendecomposition via plink2_matrix.cc built-in SVD (`NOLAPACK`)
+3. Score output (eigenvectors)
+4. Eigenvalue output mode
+5. Variant filtering support (for LD-pruned input)
+6. Tests against plink2 `--pca` output on small datasets
+
+### Phase 2: Scalable PCA
+
+1. Optional BLAS/LAPACK build integration
+2. Randomized SVD for large sample counts
+3. Sample projection (`--pca-sample-wts` equivalent)
+4. Memory guard config option
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_pca.cpp` | plink_pca bind, init, scan |
+| `src/include/plink_pca.hpp` | Public interface: `RegisterPlinkPca()` |
+| `test/sql/plink_pca.test` | Positive tests |
+| `test/sql/plink_pca_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_pca.hpp"`, call `RegisterPlinkPca(loader)` |
+| `CMakeLists.txt` | Add `src/plink_pca.cpp` to build; link plink2_matrix.cc |
+
+---
+
+## Testing
+
+### Positive Tests
+
+```sql
+require plinking_duck
+
+# Row count matches sample count
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pgen_example.pgen');
+----
+4
+
+# Default returns 10 PCs (or sample_ct - 1 if fewer samples)
+# With 4 samples, expect 3 PCs
+query I
+SELECT COUNT(COLUMNS(*)) - 2
+FROM plink_pca('test/data/pgen_example.pgen');
+----
+3
+
+# PCs are orthogonal (dot product ≈ 0)
+# Validate via plink2 --pca output comparison
+
+# Eigenvalue mode
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pgen_example.pgen',
+    output := 'eigenvalues');
+----
+3
+
+# Eigenvalues are non-negative and decreasing
+query I
+SELECT COUNT(*) FROM (
+    SELECT EIGENVALUE, LAG(EIGENVALUE) OVER (ORDER BY PC) AS prev_ev
+    FROM plink_pca('test/data/pgen_example.pgen', output := 'eigenvalues')
+) WHERE prev_ev IS NOT NULL AND EIGENVALUE > prev_ev;
+----
+0
+```
+
+### Negative Tests
+
+```sql
+require plinking_duck
+
+# No .psam (required for sample IDs)
+statement error
+SELECT * FROM plink_pca('test/data/pgen_orphan.pgen');
+----
+(error)
+
+# n_pcs > sample_ct
+statement error
+SELECT * FROM plink_pca('test/data/pgen_example.pgen', n_pcs := 100);
+----
+(error: n_pcs exceeds)
+```
+
+---
+
+## Risk Assessment
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| NOLAPACK SVD too slow for > 5K samples | Performance | Phase 2 adds optional LAPACK |
+| GRM memory for large N | OOM crash | Memory guard config option |
+| Numerical precision vs plink2 | Test failures | Tolerance-based comparison |
+| Randomized SVD implementation complexity | Scope creep | Defer to Phase 2 |
+
+---
+
+## Acceptance Criteria
+
+### Phase 1
+
+1. [ ] Eigenvector scores match plink2 `--pca` within tolerance (3 decimal places)
+2. [ ] Eigenvalues match plink2 output
+3. [ ] Variable PC count via `n_pcs` parameter
+4. [ ] Variant filtering works
+5. [ ] Sample subsetting works
+6. [ ] Region filtering works
+7. [ ] All tests pass on small datasets (< 1K samples)
+8. [ ] `make test` passes
+
+### Phase 2
+
+9. [ ] Optional LAPACK build integration
+10. [ ] Randomized SVD for large datasets
+11. [ ] Memory guard config option

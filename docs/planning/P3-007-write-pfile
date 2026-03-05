@@ -1,0 +1,281 @@
+# P3-007: write_pfile / COPY TO — Export to PLINK File Formats
+
+## Goal
+
+Implement export capability for writing PLINK filesets from DuckDB query
+results. Two interfaces:
+
+1. `COPY ... TO '...' (FORMAT plink)` — DuckDB's native COPY syntax
+2. `write_pfile(prefix, query)` — explicit table function (if COPY integration
+   is too complex for Phase 1)
+
+Supports writing `.pgen` + `.pvar` + `.psam` filesets, as well as legacy
+`.bed` + `.bim` + `.fam`.
+
+## Prerequisites
+
+- P1 complete (reader infrastructure)
+- pgenlib write path evaluation (pgenlib_write.cc — currently excluded from build)
+
+## Depends On
+
+P1 (reader infrastructure for format understanding). Independent of P2/P3
+analysis functions.
+
+## Branch
+
+`feature/P3-007-write-pfile`
+
+## Priority
+
+**Medium.** Export is a common request — users want to filter/transform in
+SQL and write results back to PLINK format for use with other tools. However,
+the write path is more complex than reading.
+
+---
+
+## SQL Interface
+
+### Option A: COPY TO (preferred)
+
+```sql
+-- Export query results to PLINK 2 fileset
+COPY (
+    SELECT CHROM, POS, ID, REF, ALT, genotypes
+    FROM read_pfile('input')
+    WHERE CHROM = '22'
+) TO 'output/chr22' (FORMAT plink);
+
+-- Export with explicit format version
+COPY (
+    SELECT * FROM read_pfile('input')
+) TO 'output/filtered' (FORMAT plink, VERSION 2);
+
+-- Export to PLINK 1 format (.bed/.bim/.fam)
+COPY (
+    SELECT * FROM read_pfile('input')
+) TO 'output/legacy' (FORMAT plink, VERSION 1);
+
+-- Export after sample QC
+COPY (
+    SELECT * FROM read_pfile('cohort',
+        orient := 'variant',
+        samples := (SELECT list(IID) FROM plink_missing('cohort.pgen',
+            mode := 'sample') WHERE F_MISS < 0.05))
+) TO 'output/qc_passed' (FORMAT plink);
+```
+
+### Option B: Table function (fallback)
+
+```sql
+-- Write a filtered fileset
+SELECT write_pfile('output/chr22',
+    pgen := 'input.pgen', pvar := 'input.pvar', psam := 'input.psam',
+    region := '22');
+```
+
+---
+
+## Output Files
+
+### PLINK 2 format (default)
+
+| File | Description |
+|------|-------------|
+| `{prefix}.pgen` | Binary genotype matrix |
+| `{prefix}.pvar` | Tab-delimited variant metadata |
+| `{prefix}.psam` | Tab-delimited sample metadata |
+
+### PLINK 1 format (`VERSION 1`)
+
+| File | Description |
+|------|-------------|
+| `{prefix}.bed` | Binary genotype matrix (PLINK 1 encoding) |
+| `{prefix}.bim` | Tab-delimited variant metadata (6 columns) |
+| `{prefix}.fam` | Tab-delimited sample metadata (6 columns) |
+
+---
+
+## Implementation Approaches
+
+### Approach 1: pgenlib Write Path
+
+pgenlib includes `pgenlib_write.cc` (currently excluded from build). This
+provides `SpgwInit`, `SpgwAppendBiallelicGenovec`, `SpgwFinish` for writing
+.pgen files.
+
+**Advantages**: Produces optimally compressed .pgen files. Battle-tested
+compression.
+
+**Challenges**: Need to integrate pgenlib_write.cc into the build. Need to
+convert from DuckDB column format back to packed 2-bit genovec format.
+
+### Approach 2: Text-Only Export (.pvar + .psam + uncompressed .pgen)
+
+Write .pvar and .psam as tab-delimited text (trivial). Write an uncompressed
+.pgen with a simple binary header + raw genotype matrix.
+
+**Advantages**: Much simpler implementation. No pgenlib_write dependency.
+
+**Challenges**: Larger file sizes (no compression). Still correct — plink2
+and pgenlib can read uncompressed .pgen files.
+
+### Approach 3: VCF Export
+
+Export as VCF text format, which plink2 and many tools can import.
+
+```sql
+COPY (...) TO 'output.vcf' (FORMAT vcf);
+```
+
+**Advantages**: Universal interchange format. Simpler than .pgen binary.
+
+**Challenges**: Much larger files. Slower to re-import. VCF is complex
+to write correctly (header, INFO fields, FORMAT fields).
+
+### Recommendation
+
+**Phase 1**: Approach 2 (text .pvar/.psam + uncompressed .pgen). Minimal
+complexity, correct output, readable by all PLINK tools.
+
+**Phase 2**: Approach 1 (pgenlib write path). Compressed .pgen for
+production use.
+
+**Phase 3**: Approach 3 (VCF export). If demand exists.
+
+---
+
+## COPY TO Integration
+
+DuckDB extensions can register custom COPY functions via
+`ExtensionLoader::RegisterCopyFunction()`. This requires implementing:
+
+1. **CopyFunction**: Bind, InitLocal, InitGlobal, Sink, Combine, Finalize
+2. **CopyToBindInput**: Parse format options (VERSION, etc.)
+3. **Sink function**: Receive DataChunks, accumulate/write data
+
+The COPY interface receives arbitrary query output, so the implementation
+must validate that the input schema matches expected PLINK format (requires
+genotype column, variant metadata columns, etc.).
+
+### Input Schema Requirements
+
+The COPY function expects specific column names:
+
+| Column | Required | Description |
+|--------|----------|-------------|
+| CHROM | Yes | Chromosome |
+| POS | Yes | Position |
+| ID | No | Variant ID (auto-generated if missing) |
+| REF | Yes | Reference allele |
+| ALT | Yes | Alternate allele |
+| genotypes | Yes | ARRAY(TINYINT, N) or LIST(TINYINT) genotype column |
+
+Sample metadata (FID, IID, SEX) is inferred from the genotype array size
+and optionally provided via format options.
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_copy.cpp` | COPY TO implementation (bind, sink, finalize) |
+| `src/include/plink_copy.hpp` | Public interface: `RegisterPlinkCopy()` |
+| `test/sql/write_pfile.test` | Positive tests (roundtrip read-write-read) |
+| `test/sql/write_pfile_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Register COPY function |
+| `CMakeLists.txt` | Add `src/plink_copy.cpp` to build |
+
+---
+
+## Testing
+
+### Roundtrip Tests
+
+The primary validation strategy is roundtrip: read → filter → write → read
+back → compare.
+
+```sql
+require plinking_duck
+
+# Write and read back variant metadata
+COPY (SELECT * FROM read_pfile('test/data/pgen_example'))
+TO '__TEST_DIR__/roundtrip' (FORMAT plink);
+
+query I
+SELECT COUNT(*) FROM read_pvar('__TEST_DIR__/roundtrip.pvar');
+----
+4
+
+# Genotypes survive roundtrip
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.genotypes AS orig, b.genotypes AS copy
+    FROM read_pfile('test/data/pgen_example') a
+    JOIN read_pfile('__TEST_DIR__/roundtrip') b ON a.ID = b.ID
+    WHERE a.genotypes != b.genotypes
+);
+----
+0
+
+# Filtered export has correct variant count
+COPY (
+    SELECT * FROM read_pfile('test/data/large_example')
+    WHERE CHROM = '1'
+) TO '__TEST_DIR__/chr1_only' (FORMAT plink);
+
+query I
+SELECT COUNT(*) FROM read_pvar('__TEST_DIR__/chr1_only.pvar');
+----
+1000
+```
+
+### Negative Tests
+
+```sql
+require plinking_duck
+
+# Missing required columns
+statement error
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/bad' (FORMAT plink);
+----
+(error: missing required columns)
+```
+
+---
+
+## Risk Assessment
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| COPY TO API complexity | Implementation difficulty | Fall back to table function |
+| pgenlib_write.cc build issues | Can't produce compressed .pgen | Phase 1 uses uncompressed |
+| Schema validation for arbitrary queries | Wrong columns silently produce bad files | Strict column name/type checking |
+| File atomicity (partial writes) | Corrupt output | Write to temp files, rename on success |
+
+---
+
+## Acceptance Criteria
+
+### Phase 1
+
+1. [ ] COPY TO ... (FORMAT plink) produces valid .pvar + .psam + .pgen
+2. [ ] Roundtrip read-write-read preserves genotypes exactly
+3. [ ] Filtered export produces correct subset
+4. [ ] PLINK 1 format export works (.bed/.bim/.fam)
+5. [ ] Error on invalid input schema
+6. [ ] All tests pass
+7. [ ] `make test` passes
+
+### Phase 2
+
+8. [ ] pgenlib_write.cc integrated for compressed .pgen output
+9. [ ] VCF export (if demand exists)

@@ -1,0 +1,224 @@
+# P3-002: plink_het — Per-Sample Heterozygosity & Inbreeding Coefficient
+
+## Goal
+
+Implement `plink_het(path)` — a DuckDB table function that computes per-sample
+observed and expected heterozygosity rates plus the inbreeding coefficient (F),
+equivalent to plink2's `--het` output.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+- P2-001 plink_freq (allele frequencies needed for expected heterozygosity)
+
+## Depends On
+
+P2-001 (shared infrastructure). Uses `PgrGetCounts()` per-variant plus allele
+frequencies to accumulate per-sample heterozygosity.
+
+## Branch
+
+`feature/P3-002-plink-het`
+
+## Priority
+
+**Low** — Expressible via plink_freq + read_pfile + SQL, but a dedicated
+function avoids full tidy expansion and is significantly faster at scale.
+
+---
+
+## SQL Interface
+
+```sql
+-- Basic per-sample heterozygosity
+SELECT * FROM plink_het('data/cohort.pgen');
+
+-- Identify samples with extreme inbreeding coefficients
+SELECT IID, F FROM plink_het('data/cohort.pgen')
+WHERE ABS(F) > 0.2;
+
+-- QC workflow: flag contaminated or inbred samples
+SELECT IID, O_HET, E_HET, F
+FROM plink_het('data/cohort.pgen')
+WHERE F < -0.15 OR F > 0.15;
+
+-- With sample subsetting
+SELECT * FROM plink_het('data/cohort.pgen',
+    samples := ['SAMPLE1', 'SAMPLE2', 'SAMPLE3']);
+
+-- Region-restricted heterozygosity (e.g., chrX for sex check)
+SELECT * FROM plink_het('data/cohort.pgen', region := 'X');
+```
+
+---
+
+## Output Schema
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| FID | VARCHAR | Family ID |
+| IID | VARCHAR | Individual ID |
+| O_HOM | INTEGER | Observed homozygous count |
+| E_HOM | DOUBLE | Expected homozygous count under HWE |
+| N_NM | INTEGER | Number of non-missing variants |
+| O_HET | INTEGER | Observed heterozygous count |
+| E_HET | DOUBLE | Expected heterozygous count under HWE |
+| F | DOUBLE | Inbreeding coefficient: `(E_HET - O_HET) / E_HET` |
+
+One row per sample.
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter to specific samples |
+| `region` | VARCHAR | all | Filter to genomic region |
+| `small_sample` | BOOLEAN | false | Use small-sample F correction |
+
+---
+
+## Implementation
+
+### Algorithm
+
+For each sample s across all V variants:
+
+```
+For each variant v:
+    If sample s is non-missing at variant v:
+        p_v = allele frequency of variant v (from PgrGetCounts across all samples)
+        E_HET_v = 2 * p_v * (1 - p_v)
+
+        If genotype(s, v) == 1 (heterozygous):
+            O_HET[s] += 1
+        N_NM[s] += 1
+        E_HET[s] += E_HET_v
+
+F[s] = 1 - O_HET[s] / E_HET[s]
+```
+
+### Implementation Strategy
+
+**Two-pass approach:**
+
+1. **Pass 1**: Compute per-variant allele frequencies using `PgrGetCounts()`
+   (reuse plink_freq logic). Store freq array.
+
+2. **Pass 2**: For each variant, decode genotypes via `PgrGet()`, iterate
+   samples, accumulate per-sample O_HET and E_HET counters.
+
+**Memory**: O(sample_ct) for per-sample accumulators — negligible.
+
+### Scan Pattern
+
+This is a per-sample accumulation function (like `plink_missing` sample mode
+and `plink_score`). All computation happens during initialization or a single
+scan call. Output is emitted as one chunk of sample_ct rows.
+
+### Alternative: SQL Expression
+
+```sql
+SELECT s.IID,
+    COUNT(*) FILTER (WHERE g.genotype = 1) AS O_HET,
+    SUM(2 * f.ALT_FREQ * (1 - f.ALT_FREQ)) AS E_HET,
+    1 - COUNT(*) FILTER (WHERE g.genotype = 1)
+        / SUM(2 * f.ALT_FREQ * (1 - f.ALT_FREQ)) AS F
+FROM read_pfile('data', orient := 'genotype') g
+JOIN plink_freq('data.pgen') f ON g.ID = f.ID
+JOIN read_psam('data.psam') s ON g.IID = s.IID
+WHERE g.genotype IS NOT NULL
+GROUP BY s.IID;
+```
+
+This works but requires materializing the full tidy genotype table — infeasible
+at biobank scale. The dedicated function streams variant-by-variant.
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_het.cpp` | plink_het bind, init, scan |
+| `src/include/plink_het.hpp` | Public interface: `RegisterPlinkHet()` |
+| `test/sql/plink_het.test` | Positive tests |
+| `test/sql/plink_het_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_het.hpp"`, call `RegisterPlinkHet(loader)` |
+| `CMakeLists.txt` | Add `src/plink_het.cpp` to build |
+
+---
+
+## Testing
+
+### Positive Tests
+
+```sql
+require plinking_duck
+
+# Row count matches sample count
+query I
+SELECT COUNT(*) FROM plink_het('test/data/pgen_example.pgen');
+----
+4
+
+# F coefficient between -1 and 1
+query I
+SELECT COUNT(*) FROM plink_het('test/data/pgen_example.pgen')
+WHERE F < -1.0 OR F > 1.0;
+----
+0
+
+# O_HET + O_HOM = N_NM
+query I
+SELECT COUNT(*) FROM plink_het('test/data/pgen_example.pgen')
+WHERE O_HET + O_HOM != N_NM;
+----
+0
+
+# Validate against plink2 --het output
+query TTRIRRI rowsort
+SELECT IID, FID, O_HOM, ROUND(E_HOM, 2), N_NM, O_HET, ROUND(F, 4)
+FROM plink_het('test/data/pgen_example.pgen');
+----
+(validated against plink2 output)
+```
+
+### Negative Tests
+
+```sql
+require plinking_duck
+
+# File not found
+statement error
+SELECT * FROM plink_het('nonexistent.pgen');
+----
+(error)
+
+# No .psam file (required for sample IDs)
+statement error
+SELECT * FROM plink_het('test/data/pgen_orphan.pgen');
+----
+(error: psam required)
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Output matches plink2 `--het` within tolerance (4 decimal places)
+2. [ ] F coefficient computed correctly for known test genotypes
+3. [ ] Sample subsetting works
+4. [ ] Region filtering works
+5. [ ] All positive and negative tests pass
+6. [ ] `make test` passes

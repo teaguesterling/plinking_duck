@@ -1,0 +1,266 @@
+# P3-003: plink_fst — Population Differentiation (FST)
+
+## Goal
+
+Implement `plink_fst(path)` — a DuckDB table function that computes Wright's
+FST (fixation index) between populations, equivalent to plink2's `--fst`
+output. Supports both per-variant FST and genome-wide weighted average.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+
+## Depends On
+
+P2-001 (shared infrastructure). Uses `PgrGetCounts()` with population-stratified
+sample subsets.
+
+## Branch
+
+`feature/P3-003-plink-fst`
+
+## Priority
+
+**Medium** — Core population genetics statistic. Not part of standard GWAS QC
+but essential for population genetics, admixture studies, and selection scans.
+
+---
+
+## SQL Interface
+
+```sql
+-- Two-population FST (population labels positionally aligned with .psam)
+SELECT * FROM plink_fst('data/cohort.pgen',
+    populations := ['EUR', 'AFR', 'EUR', 'AFR', 'EUR', 'AFR', 'AFR', 'EUR']);
+
+-- Population labels from a table
+SET VARIABLE pops = (SELECT list(ancestry) FROM 'sample_info.parquet');
+SELECT * FROM plink_fst('data/cohort.pgen',
+    populations := getvariable('pops'));
+
+-- Per-variant FST with region filter
+SELECT ID, FST FROM plink_fst('data/cohort.pgen',
+    populations := getvariable('pops'),
+    region := '22')
+WHERE FST > 0.1;
+
+-- Multi-population FST (>2 populations)
+SELECT * FROM plink_fst('data/cohort.pgen',
+    populations := ['POP_A', 'POP_B', 'POP_C', 'POP_A', ...]);
+
+-- Weir-Cockerham vs Hudson estimator
+SELECT * FROM plink_fst('data/cohort.pgen',
+    populations := getvariable('pops'),
+    method := 'wc');
+```
+
+---
+
+## Output Schema
+
+### Per-variant mode (default)
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| CHROM | VARCHAR | Chromosome |
+| POS | INTEGER | Base-pair position |
+| ID | VARCHAR | Variant ID |
+| REF | VARCHAR | Reference allele |
+| ALT | VARCHAR | Alternate allele |
+| FST | DOUBLE | Per-variant FST estimate |
+| OBS_CT | INTEGER | Total non-missing sample count |
+
+One row per variant.
+
+### Summary mode
+
+A single-row summary can be obtained via SQL aggregation:
+
+```sql
+-- Weighted mean FST (Weir-Cockerham)
+SELECT SUM(numerator) / SUM(denominator) AS WEIGHTED_FST
+FROM plink_fst('data/cohort.pgen',
+    populations := getvariable('pops'));
+```
+
+To support this, the function also exposes `NUMERATOR` and `DENOMINATOR`
+columns for the ratio estimator.
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `populations` | LIST(VARCHAR) | *(required)* | Population label per sample, positionally aligned with .psam |
+| `method` | VARCHAR | `'hudson'` | FST estimator: `'hudson'` or `'wc'` (Weir-Cockerham) |
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter to specific samples |
+| `region` | VARCHAR | all | Filter to genomic region |
+
+### Population Label Input
+
+Following the "big/small data separation" principle (P1-006 §3.1), population
+labels are small data (one label per sample). At biobank scale (10M samples),
+this is ~100MB as a DuckDB list — well within the typed-value approach.
+
+Labels can come from:
+- **Literal list**: `populations := ['POP_A', 'POP_B', ...]`
+- **Variable**: `SET VARIABLE pops = (SELECT list(pop) FROM ...)`
+- **Subquery** (when supported): `populations := (SELECT list(pop) FROM ...)`
+
+---
+
+## Implementation
+
+### Algorithm: Hudson FST (default)
+
+For two populations A and B at a biallelic variant:
+
+```
+p_A = alt allele frequency in population A
+p_B = alt allele frequency in population B
+n_A = sample count in population A (non-missing)
+n_B = sample count in population B (non-missing)
+
+numerator = (p_A - p_B)² - p_A(1-p_A)/(n_A-1) - p_B(1-p_B)/(n_B-1)
+denominator = p_A(1-p_B) + p_B(1-p_A)
+
+FST = numerator / denominator
+```
+
+For >2 populations, compute pairwise FST and report the mean.
+
+### Algorithm: Weir-Cockerham FST
+
+Uses the ANOVA-based estimator from Weir & Cockerham (1984). Decomposes
+variance into between-population (a), between-individual-within-population (b),
+and within-individual (c) components:
+
+```
+FST = a / (a + b + c)
+```
+
+More complex but handles unequal sample sizes better.
+
+### Computation Pattern
+
+1. **Bind**: Parse population labels. Build per-population sample_include
+   bitarrays using SampleSubset infrastructure.
+
+2. **Scan**: For each variant, call `PgrGetCounts()` with each population's
+   sample_include to get per-population genotype counts. Compute allele
+   frequencies per population. Calculate FST.
+
+This is a count-only computation — no full genotype decompression needed.
+
+### Multi-population Support
+
+For K populations:
+- Build K separate SampleSubset bitarrays
+- Call `PgrGetCounts()` K times per variant (one per population)
+- Compute pairwise FST or pooled FST depending on method
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_fst.cpp` | plink_fst bind, init, scan |
+| `src/include/plink_fst.hpp` | Public interface: `RegisterPlinkFst()` |
+| `test/sql/plink_fst.test` | Positive tests |
+| `test/sql/plink_fst_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_fst.hpp"`, call `RegisterPlinkFst(loader)` |
+| `CMakeLists.txt` | Add `src/plink_fst.cpp` to build |
+
+---
+
+## Testing
+
+### Positive Tests
+
+```sql
+require plinking_duck
+
+# Two populations, known genotypes
+query TTTTTRI
+SELECT CHROM, POS, ID, REF, ALT, ROUND(FST, 4), OBS_CT
+FROM plink_fst('test/data/pgen_example.pgen',
+    populations := ['POP_A', 'POP_A', 'POP_B', 'POP_B'])
+ORDER BY ID;
+----
+(validated against plink2 --fst output)
+
+# Row count matches variant count
+query I
+SELECT COUNT(*)
+FROM plink_fst('test/data/pgen_example.pgen',
+    populations := ['POP_A', 'POP_A', 'POP_B', 'POP_B']);
+----
+4
+
+# FST between identical populations should be ~0
+# (same population labeled as two groups)
+query I
+SELECT COUNT(*) FROM plink_fst('test/data/pgen_example.pgen',
+    populations := ['A', 'A', 'A', 'A'])
+WHERE ABS(FST) > 0.001;
+----
+0
+
+# Region filtering
+query I
+SELECT COUNT(*)
+FROM plink_fst('test/data/large_example.pgen',
+    populations := ['A','A','A','A','B','B','B','B'],
+    region := '1');
+----
+1000
+```
+
+### Negative Tests
+
+```sql
+require plinking_duck
+
+# Missing populations parameter
+statement error
+SELECT * FROM plink_fst('test/data/pgen_example.pgen');
+----
+populations parameter is required
+
+# Population length mismatch
+statement error
+SELECT * FROM plink_fst('test/data/pgen_example.pgen',
+    populations := ['A', 'B']);
+----
+population label count
+
+# Only one population
+statement error
+SELECT * FROM plink_fst('test/data/pgen_example.pgen',
+    populations := ['A', 'A', 'A', 'A']);
+----
+at least two populations
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Hudson FST matches plink2 `--fst` output within tolerance
+2. [ ] Weir-Cockerham FST matches plink2 `--fst method=wc` output
+3. [ ] Multi-population (>2) FST works correctly
+4. [ ] Population labels from getvariable() work
+5. [ ] Sample subsetting and region filtering work
+6. [ ] All positive and negative tests pass
+7. [ ] `make test` passes

@@ -1,0 +1,234 @@
+# P3-006: plink_indep — LD Pruning
+
+## Goal
+
+Implement `plink_indep(path)` — a DuckDB table function that performs LD-based
+variant pruning, equivalent to plink2's `--indep-pairwise` output. Returns
+a list of variants that pass the LD independence threshold, suitable for
+downstream analysis (PCA, kinship, etc.).
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+- P2-004 merged (plink_ld — reuses LD computation infrastructure)
+
+## Depends On
+
+P2-004 (plink_ld). Reuses the LD computation core (genotype pairing and
+r² calculation) from plink_ld.
+
+## Branch
+
+`feature/P3-006-plink-indep`
+
+## Priority
+
+**Medium-high.** LD pruning is a prerequisite step for PCA and kinship
+estimation. Having it in-SQL enables a fully composable QC pipeline without
+external plink2 calls.
+
+---
+
+## SQL Interface
+
+```sql
+-- Default LD pruning (window=50 variants, step=5, r²=0.5)
+SELECT * FROM plink_indep('data/cohort.pgen');
+
+-- Standard GWAS QC pruning parameters
+SELECT * FROM plink_indep('data/cohort.pgen',
+    window_size := 50, step := 5, r2_threshold := 0.2);
+
+-- Use pruned variants for PCA
+SELECT * FROM plink_pca('data/cohort.pgen',
+    variants := (SELECT list(ID) FROM plink_indep('data/cohort.pgen',
+        window_size := 50, step := 5, r2_threshold := 0.2)
+    WHERE STATUS = 'in'));
+
+-- Window in kilobases instead of variant count
+SELECT * FROM plink_indep('data/cohort.pgen',
+    window_kb := 1000, r2_threshold := 0.2);
+
+-- Only get the pruned-in set
+SELECT ID FROM plink_indep('data/cohort.pgen')
+WHERE STATUS = 'in';
+
+-- Region-restricted pruning
+SELECT * FROM plink_indep('data/cohort.pgen',
+    region := '22', r2_threshold := 0.1);
+```
+
+---
+
+## Output Schema
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| CHROM | VARCHAR | Chromosome |
+| POS | INTEGER | Base-pair position |
+| ID | VARCHAR | Variant ID |
+| REF | VARCHAR | Reference allele |
+| ALT | VARCHAR | Alternate allele |
+| STATUS | VARCHAR | `'in'` (kept) or `'out'` (pruned) |
+
+One row per variant. Users filter on `STATUS = 'in'` to get the LD-independent set.
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `window_size` | INTEGER | 50 | Window size in variant count |
+| `window_kb` | INTEGER | none | Window size in kilobases (overrides window_size) |
+| `step` | INTEGER | 5 | Step size (variants to advance window) |
+| `r2_threshold` | DOUBLE | 0.5 | Max r² before pruning |
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Filter to specific samples |
+| `region` | VARCHAR | all | Filter to genomic region |
+
+---
+
+## Implementation
+
+### Algorithm: Sliding Window Pairwise Pruning
+
+Matches plink2's `--indep-pairwise` algorithm:
+
+```
+Initialize all variants as "in" (not pruned)
+For each chromosome:
+    window_start = 0
+    While window_start < variant_count:
+        window_end = min(window_start + window_size, variant_count)
+        For each pair (i, j) in [window_start, window_end] where both "in":
+            Compute r²(i, j)
+            If r² > r2_threshold:
+                Prune the variant with higher MAF (or j if equal)
+        window_start += step
+```
+
+The variant with higher minor allele frequency is pruned because it's more
+likely to be in LD with other variants.
+
+### Computation Pattern
+
+1. **Bind**: Load variant metadata. Compute allele frequencies via
+   `PgrGetCounts()` (needed for MAF-based pruning decisions).
+
+2. **Prune**: Iterate through windows on each chromosome. For each pair
+   of non-pruned variants in the window, load genotypes via `PgrGet()`
+   and compute r². Mark pruned variants.
+
+3. **Scan**: Emit all variants with their in/out status.
+
+### Performance
+
+The sliding window bounds the computation: each variant is compared only
+against others in its window. For W=50 window and V variants:
+- Worst case: O(V × W²) genotype loads and r² computations
+- In practice, pruning reduces the effective window quickly
+
+This is single-threaded within a chromosome (pruning decisions are sequential)
+but can be parallelized across chromosomes.
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_indep.cpp` | plink_indep bind, init, scan |
+| `src/include/plink_indep.hpp` | Public interface: `RegisterPlinkIndep()` |
+| `test/sql/plink_indep.test` | Positive tests |
+| `test/sql/plink_indep_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_indep.hpp"`, call `RegisterPlinkIndep(loader)` |
+| `CMakeLists.txt` | Add `src/plink_indep.cpp` to build |
+
+---
+
+## Testing
+
+### Positive Tests
+
+```sql
+require plinking_duck
+
+# Row count matches variant count (all variants reported)
+query I
+SELECT COUNT(*) FROM plink_indep('test/data/pgen_example.pgen');
+----
+4
+
+# At least some variants kept
+query I
+SELECT COUNT(*) FROM plink_indep('test/data/pgen_example.pgen')
+WHERE STATUS = 'in';
+----
+(> 0)
+
+# in + out = total
+query I
+SELECT COUNT(*) FILTER (WHERE STATUS = 'in')
+     + COUNT(*) FILTER (WHERE STATUS = 'out')
+FROM plink_indep('test/data/pgen_example.pgen');
+----
+4
+
+# Strict threshold prunes more
+query B
+SELECT (SELECT COUNT(*) FILTER (WHERE STATUS = 'in')
+        FROM plink_indep('test/data/large_example.pgen', r2_threshold := 0.1))
+    <= (SELECT COUNT(*) FILTER (WHERE STATUS = 'in')
+        FROM plink_indep('test/data/large_example.pgen', r2_threshold := 0.5));
+----
+true
+
+# Validate against plink2 --indep-pairwise output
+query T rowsort
+SELECT ID FROM plink_indep('test/data/pgen_example.pgen',
+    window_size := 50, step := 5, r2_threshold := 0.5)
+WHERE STATUS = 'in';
+----
+(validated against plink2 .prune.in)
+```
+
+### Negative Tests
+
+```sql
+require plinking_duck
+
+# Invalid r² threshold
+statement error
+SELECT * FROM plink_indep('test/data/pgen_example.pgen',
+    r2_threshold := 1.5);
+----
+(error)
+
+# Negative window size
+statement error
+SELECT * FROM plink_indep('test/data/pgen_example.pgen',
+    window_size := -1);
+----
+(error)
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Pruned variant set matches plink2 `--indep-pairwise` output
+2. [ ] Window size, step, and r² threshold parameters work correctly
+3. [ ] KB-based window mode works
+4. [ ] MAF-based pruning decision matches plink2
+5. [ ] Region filtering works
+6. [ ] All positive and negative tests pass
+7. [ ] `make test` passes

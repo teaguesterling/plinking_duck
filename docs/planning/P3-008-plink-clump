@@ -1,0 +1,245 @@
+# P3-008: plink_clump — LD Clumping of Association Results
+
+## Goal
+
+Implement `plink_clump(path)` — a DuckDB table function that performs LD-based
+clumping of association test results, equivalent to plink2's `--clump`. Groups
+significant variants into LD-defined loci around index (lead) variants.
+
+## Prerequisites
+
+- P2-001 merged (shared infrastructure in `plink_common.hpp/cpp`)
+- P2-004 merged (plink_ld — LD computation infrastructure)
+- P2-006 or external p-values (clumping operates on pre-computed p-values)
+
+## Depends On
+
+P2-004 (LD computation). Clumping requires computing r² between variant pairs,
+reusing the same `PgrGet()` + correlation math from plink_ld.
+
+## Branch
+
+`feature/P3-008-plink-clump`
+
+## Priority
+
+**Medium-high.** Clumping is one of the most common post-GWAS steps. It
+identifies independent association signals by grouping significant variants
+that are in LD with an index SNP. Essential for downstream analyses:
+fine-mapping, pathway analysis, PRS construction.
+
+---
+
+## SQL Interface
+
+```sql
+-- Clump from plink_glm results (composable)
+SELECT * FROM plink_clump('data/cohort.pgen',
+    pvalues := (SELECT list({'id': ID, 'p': P})
+                FROM plink_glm('data/cohort.pgen',
+                    phenotype := getvariable('pheno'))
+                WHERE P < 0.01));
+
+-- Clump from external summary statistics
+SET VARIABLE pvals = (SELECT list({'id': ID, 'p': P})
+    FROM read_csv('gwas_results.tsv', columns := {'ID': 'VARCHAR', 'P': 'DOUBLE'}));
+SELECT * FROM plink_clump('data/reference.pgen',
+    pvalues := getvariable('pvals'));
+
+-- Custom clumping parameters
+SELECT * FROM plink_clump('data/cohort.pgen',
+    pvalues := getvariable('pvals'),
+    p1 := 5e-8,           -- index variant p-value threshold
+    p2 := 1e-4,           -- clump member p-value threshold
+    r2_threshold := 0.1,  -- LD threshold for clumping
+    window_kb := 250);    -- clump window
+
+-- Only index variants (one per locus)
+SELECT CHROM, POS, ID, P, SP2
+FROM plink_clump('data/cohort.pgen',
+    pvalues := getvariable('pvals'))
+ORDER BY P;
+```
+
+---
+
+## Output Schema
+
+| Column | DuckDB Type | Description |
+|--------|-------------|-------------|
+| CHROM | VARCHAR | Chromosome of index variant |
+| POS | INTEGER | Position of index variant |
+| ID | VARCHAR | ID of index variant |
+| REF | VARCHAR | Reference allele |
+| ALT | VARCHAR | Alternate allele |
+| P | DOUBLE | P-value of index variant |
+| SP2 | VARCHAR | Clumped variant IDs (comma-separated) |
+| NSIG | INTEGER | Number of significant clumped variants (p < p2) |
+| TOTAL | INTEGER | Total variants in clump |
+
+One row per clump (index variant).
+
+---
+
+## Named Parameters
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|---------|
+| `pvalues` | LIST(STRUCT(id VARCHAR, p DOUBLE)) | *(required)* | Variant IDs and p-values |
+| `p1` | DOUBLE | 5e-8 | Index variant significance threshold |
+| `p2` | DOUBLE | 1e-4 | Clump member significance threshold |
+| `r2_threshold` | DOUBLE | 0.1 | Minimum r² to clump with index |
+| `window_kb` | INTEGER | 250 | Clumping window in kilobases |
+| `pvar` | VARCHAR | auto-discovered | Explicit .pvar/.bim path |
+| `psam` | VARCHAR | auto-discovered | Explicit .psam/.fam path |
+| `samples` | LIST(VARCHAR) or LIST(INTEGER) | all | Samples for LD computation |
+| `region` | VARCHAR | all | Filter to genomic region |
+
+---
+
+## Implementation
+
+### Algorithm
+
+Matches plink2's `--clump` algorithm:
+
+```
+1. Filter pvalues to variants present in .pvar
+2. Sort remaining variants by p-value (ascending)
+3. Mark all variants as "available"
+
+4. For each variant v in p-value order:
+   If v is not available: skip
+   If p(v) > p1: stop (no more index variants possible)
+
+   v is an index variant. Create a new clump.
+   Mark v as "used" (not available)
+
+   For each variant w within window_kb of v (same chromosome):
+       If w is not available: skip
+       If p(w) > p2: skip
+       Compute r²(v, w) via PgrGet
+       If r² >= r2_threshold:
+           Add w to v's clump
+           Mark w as "used" (not available)
+```
+
+### Computation Pattern
+
+1. **Bind**: Parse pvalues parameter. Match variant IDs to .pvar indices.
+   Sort by p-value. Pre-compute allele frequencies if needed.
+
+2. **Clump**: Execute the greedy clumping algorithm. For each index-candidate
+   pair, load genotypes via `PgrGet()` and compute r².
+
+3. **Scan**: Emit one row per clump.
+
+### Performance
+
+Clumping is efficient because:
+- Only variants below p2 threshold are considered (typically a small fraction)
+- LD computation is only between index variants and their windows
+- Once a variant is claimed by a clump, it's removed from future comparisons
+
+For a typical GWAS with ~100 genome-wide significant loci, this requires
+~100 × (variants_per_window) genotype loads.
+
+---
+
+## File Manifest
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `src/plink_clump.cpp` | plink_clump bind, init, scan |
+| `src/include/plink_clump.hpp` | Public interface: `RegisterPlinkClump()` |
+| `test/sql/plink_clump.test` | Positive tests |
+| `test/sql/plink_clump_negative.test` | Negative tests |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/plinking_duck_extension.cpp` | Add `#include "plink_clump.hpp"`, call `RegisterPlinkClump(loader)` |
+| `CMakeLists.txt` | Add `src/plink_clump.cpp` to build |
+
+---
+
+## Testing
+
+### Positive Tests
+
+```sql
+require plinking_duck
+
+# Known clumping result
+query TTTRI
+SELECT CHROM, POS, ID, ROUND(P, 8), NSIG
+FROM plink_clump('test/data/pgen_example.pgen',
+    pvalues := [
+        {'id': 'rs1', 'p': 1e-10},
+        {'id': 'rs2', 'p': 1e-5},
+        {'id': 'rs3', 'p': 0.001},
+        {'id': 'rs4', 'p': 0.5}
+    ],
+    p1 := 1e-4, p2 := 0.01)
+ORDER BY P;
+----
+(validated against plink2 --clump output)
+
+# Stricter threshold produces fewer clumps
+query I
+SELECT COUNT(*) FROM plink_clump('test/data/pgen_example.pgen',
+    pvalues := [...], p1 := 1e-20);
+----
+(≤ count with p1 := 1e-4)
+
+# All index variants have p < p1
+query I
+SELECT COUNT(*) FROM plink_clump('test/data/pgen_example.pgen',
+    pvalues := [...], p1 := 1e-4)
+WHERE P >= 1e-4;
+----
+0
+```
+
+### Negative Tests
+
+```sql
+require plinking_duck
+
+# Missing pvalues parameter
+statement error
+SELECT * FROM plink_clump('test/data/pgen_example.pgen');
+----
+pvalues parameter is required
+
+# Empty pvalues list
+statement error
+SELECT * FROM plink_clump('test/data/pgen_example.pgen',
+    pvalues := []);
+----
+(error)
+
+# Invalid threshold
+statement error
+SELECT * FROM plink_clump('test/data/pgen_example.pgen',
+    pvalues := [{'id': 'rs1', 'p': 0.01}],
+    p1 := -1.0);
+----
+(error)
+```
+
+---
+
+## Acceptance Criteria
+
+1. [ ] Clumping results match plink2 `--clump` output
+2. [ ] Composable with plink_glm output
+3. [ ] External p-values via getvariable() work
+4. [ ] p1, p2, r2_threshold, window_kb parameters work correctly
+5. [ ] Greedy algorithm (strongest signals first) matches plink2 behavior
+6. [ ] Region filtering works
+7. [ ] All positive and negative tests pass
+8. [ ] `make test` passes

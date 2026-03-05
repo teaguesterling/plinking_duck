@@ -121,18 +121,61 @@ Key decisions:
 - **I/O**: plink2_text + plink2_bgzf (already compiled, libdeflate > zlib)
 - **Scope**: Phase 1 = text VCF (.vcf/.vcf.gz), Phase 2 = BCF binary
 
-### Future — Deferred Candidates
+### P2-006 — Association Testing (Planned)
 
-**Advanced utility functions** (deferred by P1-006): Candidates requiring
-external libraries, O(N²) computation, or complex input models.
+| Plan | Title | Depends On | Status |
+|------|-------|-----------|--------|
+| P2-006 | plink_glm (association testing) | P2-001, plink2 GLM sources | Planned |
 
-| Candidate | Reason Deferred | Estimated Complexity |
-|-----------|----------------|---------------------|
-| plink_glm (association) | Needs regression library | High |
-| plink_pca (PCA) | Needs LAPACK eigendecomposition | High |
-| plink_king_table (kinship) | O(N²) pairwise computation | High |
-| plink_het (heterozygosity) | Expressible via plink_freq + SQL | Low |
-| plink_fst (FST) | Specialized population genetics use | Medium |
+Wraps plink2's battle-tested GLM implementation for per-variant association
+testing (linear and logistic regression). See `P2-006-plink-glm` for full
+design. Phase 1: linear regression, no covariates. Phase 2: covariates +
+logistic + Firth correction.
+
+### Future — Analysis Functions (Planned)
+
+Additional analysis functions extending the extension's statistical toolkit.
+All build on P2 shared infrastructure (`plink_common.hpp/cpp`).
+
+| Plan | Title | Depends On | Priority | Complexity |
+|------|-------|-----------|----------|------------|
+| P3-002 | plink_het (heterozygosity) | P2-001 | Low | Low |
+| P3-003 | plink_fst (population FST) | P2-001 | Medium | Medium |
+| P3-004 | plink_pca (PCA) | P2-001, plink2_matrix.cc | High | High |
+| P3-005 | plink_king (kinship) | P2-001 | High | High |
+| P3-006 | plink_indep (LD pruning) | P2-004 | Medium-High | Medium |
+| P3-008 | plink_clump (LD clumping) | P2-004 | Medium-High | Medium |
+
+**Dependency structure:**
+
+```
+P2-001 (shared infra) ──→ P3-002 (het)      ← count-based, simple
+                     ├──→ P3-003 (fst)      ← count-based, population-stratified
+                     ├──→ P3-004 (pca)      ← full decode + eigendecomposition
+                     └──→ P3-005 (king)     ← full decode, O(N²) pairwise
+
+P2-004 (plink_ld)   ──→ P3-006 (indep)     ← reuses LD computation
+                     └──→ P3-008 (clump)    ← reuses LD computation
+```
+
+**Implementation order rationale:**
+
+1. **P3-002 (het)**: Simplest — count-based, small output
+2. **P3-003 (fst)**: Count-based with population stratification
+3. **P3-006 (indep)**: Builds on existing LD code, enables PCA workflow
+4. **P3-008 (clump)**: Builds on existing LD code, enables GWAS workflow
+5. **P3-004 (pca)**: High value but needs matrix decomposition
+6. **P3-005 (king)**: High value but O(N²) scaling challenges
+
+### Future — Export / Write (Planned)
+
+| Plan | Title | Depends On | Priority | Complexity |
+|------|-------|-----------|----------|------------|
+| P3-007 | write_pfile (COPY TO plink format) | P1 | Medium | Medium |
+
+Export filtered/transformed data back to PLINK format via DuckDB's COPY TO
+syntax. Phase 1: uncompressed .pgen + text .pvar/.psam. Phase 2: compressed
+.pgen via pgenlib_write.cc. See `P3-007-write-pfile` for full design.
 
 ---
 
