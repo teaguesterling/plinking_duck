@@ -8,7 +8,6 @@
 #include <pgenlib_ffi_support.h>
 #include <pgenlib_misc.h>
 
-#include <atomic>
 #include <cstring>
 #include <unordered_set>
 

@@ -1,6 +1,8 @@
 #include "plink_score.hpp"
 #include "plink_common.hpp"
 
+#include "duckdb/parallel/task_scheduler.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -76,9 +78,12 @@ struct PlinkScoreGlobalState : public GlobalTableFunctionState {
 	vector<double> named_allele_dosage_sums;
 	vector<uint32_t> allele_cts;
 
-	// Phase 1 synchronization
-	std::mutex scoring_mutex;
+	// Phase 1 synchronization (DuckDB thread pool pattern)
+	std::mutex merge_mutex;
 	std::atomic<bool> scoring_done {false};
+	std::atomic<uint32_t> phase1_active {0};
+	std::atomic<uint32_t> next_scored_idx {0};
+	uint32_t scored_variant_count = 0;
 
 	// Phase 2 emission
 	std::atomic<uint32_t> next_sample_idx {0};
@@ -86,8 +91,35 @@ struct PlinkScoreGlobalState : public GlobalTableFunctionState {
 
 	vector<column_t> column_ids;
 
+	// DuckDB-configured thread count
+	uint32_t db_thread_count = 1;
+
+	// MaxThreads > 1 enables parallel Phase 1 (scoring into per-thread
+	// accumulators). Single-threaded for small workloads (< 100 scored variants).
 	idx_t MaxThreads() const override {
-		return 1;
+		if (scored_variant_count < 100) {
+			return 1;
+		}
+		return std::min<idx_t>(scored_variant_count / 16 + 1, db_thread_count);
+	}
+};
+
+// ---------------------------------------------------------------------------
+// Per-thread scoring accumulators
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t SCORE_BATCH_SIZE = 16;
+
+//! Per-thread scoring accumulators.
+struct ScoreAccumulator {
+	vector<double> score_sums;
+	vector<double> dosage_sums;
+	vector<uint32_t> allele_cts;
+
+	void Init(uint32_t sample_ct) {
+		score_sums.resize(sample_ct, 0.0);
+		dosage_sums.resize(sample_ct, 0.0);
+		allele_cts.resize(sample_ct, 0);
 	}
 };
 
@@ -109,6 +141,10 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
 	AlignedBuffer dosage_present_buf;
 	AlignedBuffer dosage_main_buf;
 	vector<double> dosage_doubles;
+
+	// Thread-local scoring accumulator (for Phase 1)
+	ScoreAccumulator local_accum;
+	bool phase1_done = false;
 
 	bool initialized = false;
 
@@ -391,6 +427,9 @@ static unique_ptr<GlobalTableFunctionState> PlinkScoreInitGlobal(ClientContext &
 
 	state->total_samples = bind_data.effective_sample_ct;
 	state->column_ids = input.column_ids;
+	state->db_thread_count =
+	    static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	state->scored_variant_count = static_cast<uint32_t>(bind_data.scored_variants.size());
 
 	// Initialize accumulators
 	state->score_sums.resize(state->total_samples, 0.0);
@@ -485,103 +524,10 @@ static unique_ptr<LocalTableFunctionState> PlinkScoreInitLocal(ExecutionContext 
 
 	state->dosage_doubles.resize(bind_data.effective_sample_ct, 0.0);
 
+	state->local_accum.Init(bind_data.effective_sample_ct);
+
 	state->initialized = true;
 	return std::move(state);
-}
-
-// ---------------------------------------------------------------------------
-// Scoring phase (called once, guarded by mutex)
-// ---------------------------------------------------------------------------
-
-static void PerformScoring(const PlinkScoreBindData &bind_data, PlinkScoreGlobalState &gstate,
-                           PlinkScoreLocalState &lstate) {
-	uint32_t sample_ct = bind_data.effective_sample_ct;
-
-	const uintptr_t *sample_include = nullptr;
-	if (bind_data.has_sample_subset && bind_data.sample_subset) {
-		sample_include = bind_data.sample_subset->SampleInclude();
-	}
-
-	auto *genovec = lstate.genovec_buf.As<uintptr_t>();
-	auto *dosage_present = lstate.dosage_present_buf.As<uintptr_t>();
-	auto *dosage_main = lstate.dosage_main_buf.As<uint16_t>();
-	double *dosage_doubles = lstate.dosage_doubles.data();
-
-	for (auto &sv : bind_data.scored_variants) {
-		uint32_t dosage_ct = 0;
-
-		plink2::PglErr err = plink2::PgrGetD(sample_include, lstate.pssi, sample_ct, sv.variant_idx, &lstate.pgr,
-		                                     genovec, dosage_present, dosage_main, &dosage_ct);
-
-		if (err != plink2::kPglRetSuccess) {
-			throw IOException("plink_score: PgrGetD failed for variant %u", sv.variant_idx);
-		}
-
-		// Always use Dosage16ToDoublesMinus9 to get raw dosages with -9 sentinel.
-		// This gives us full control over missing-data handling across all modes.
-		plink2::Dosage16ToDoublesMinus9(genovec, dosage_present, dosage_main, sample_ct, dosage_ct, dosage_doubles);
-
-		// Count non-missing samples and compute sum for mean imputation / centering
-		double sum_alt = 0.0;
-		uint32_t non_missing_ct = 0;
-		for (uint32_t s = 0; s < sample_ct; s++) {
-			if (dosage_doubles[s] != -9.0) {
-				sum_alt += dosage_doubles[s];
-				non_missing_ct++;
-			}
-		}
-
-		if (non_missing_ct == 0) {
-			continue; // All missing — skip variant entirely
-		}
-
-		if (bind_data.center) {
-			// Variance-standardized scoring
-			double mean_alt = sum_alt / static_cast<double>(non_missing_ct);
-			double freq = mean_alt / 2.0;
-			double sd = std::sqrt(2.0 * freq * (1.0 - freq));
-
-			if (sd == 0.0) {
-				continue; // Monomorphic — skip variant
-			}
-
-			double mean_scored = sv.flip ? (2.0 - mean_alt) : mean_alt;
-
-			for (uint32_t s = 0; s < sample_ct; s++) {
-				if (dosage_doubles[s] == -9.0) {
-					continue; // Missing
-				}
-				double scored_dosage = sv.flip ? (2.0 - dosage_doubles[s]) : dosage_doubles[s];
-				double standardized = (scored_dosage - mean_scored) / sd;
-				gstate.score_sums[s] += sv.weight * standardized;
-				gstate.allele_cts[s] += 2;
-			}
-
-		} else if (bind_data.no_mean_imputation) {
-			// No mean imputation: skip missing samples
-			for (uint32_t s = 0; s < sample_ct; s++) {
-				if (dosage_doubles[s] == -9.0) {
-					continue; // Missing — skip
-				}
-				double scored_dosage = sv.flip ? (2.0 - dosage_doubles[s]) : dosage_doubles[s];
-				gstate.score_sums[s] += sv.weight * scored_dosage;
-				gstate.named_allele_dosage_sums[s] += scored_dosage;
-				gstate.allele_cts[s] += 2;
-			}
-
-		} else {
-			// Default: mean imputation — replace -9 with mean of non-missing
-			double mean_alt = sum_alt / static_cast<double>(non_missing_ct);
-
-			for (uint32_t s = 0; s < sample_ct; s++) {
-				double alt_dosage = (dosage_doubles[s] == -9.0) ? mean_alt : dosage_doubles[s];
-				double scored_dosage = sv.flip ? (2.0 - alt_dosage) : alt_dosage;
-				gstate.score_sums[s] += sv.weight * scored_dosage;
-				gstate.named_allele_dosage_sums[s] += scored_dosage;
-				gstate.allele_cts[s] += 2;
-			}
-		}
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -593,13 +539,121 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 	auto &gstate = data_p.global_state->Cast<PlinkScoreGlobalState>();
 	auto &lstate = data_p.local_state->Cast<PlinkScoreLocalState>();
 
-	// Phase 1: Score all variants (once, guarded by mutex)
+	// Phase 1: Score all variants (parallel via DuckDB thread pool)
 	if (!gstate.scoring_done.load(std::memory_order_acquire)) {
-		std::lock_guard<std::mutex> lock(gstate.scoring_mutex);
-		if (!gstate.scoring_done.load(std::memory_order_relaxed)) {
-			if (lstate.initialized && !bind_data.scored_variants.empty()) {
-				PerformScoring(bind_data, gstate, lstate);
+		if (lstate.initialized && !bind_data.scored_variants.empty() && !lstate.phase1_done) {
+			gstate.phase1_active.fetch_add(1, std::memory_order_acq_rel);
+
+			uint32_t sample_ct = bind_data.effective_sample_ct;
+			uint32_t total_scored = static_cast<uint32_t>(bind_data.scored_variants.size());
+
+			const uintptr_t *sample_include = nullptr;
+			if (bind_data.has_sample_subset && bind_data.sample_subset) {
+				sample_include = bind_data.sample_subset->SampleInclude();
 			}
+
+			// Claim batches of scored variants and process into thread-local accumulator
+			while (true) {
+				uint32_t batch_start = gstate.next_scored_idx.fetch_add(SCORE_BATCH_SIZE);
+				if (batch_start >= total_scored) {
+					break;
+				}
+				uint32_t batch_end = std::min(batch_start + SCORE_BATCH_SIZE, total_scored);
+
+				for (uint32_t si = batch_start; si < batch_end; si++) {
+					auto &sv = bind_data.scored_variants[si];
+					uint32_t dosage_ct = 0;
+
+					plink2::PglErr err = plink2::PgrGetD(
+					    sample_include, lstate.pssi, sample_ct, sv.variant_idx, &lstate.pgr,
+					    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+					    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("plink_score: PgrGetD failed for variant %u", sv.variant_idx);
+					}
+
+					plink2::Dosage16ToDoublesMinus9(lstate.genovec_buf.As<uintptr_t>(),
+					                                lstate.dosage_present_buf.As<uintptr_t>(),
+					                                lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct,
+					                                lstate.dosage_doubles.data());
+
+					// Per-variant statistics
+					double sum_alt = 0.0;
+					uint32_t non_missing_ct = 0;
+					for (uint32_t s = 0; s < sample_ct; s++) {
+						if (lstate.dosage_doubles[s] != -9.0) {
+							sum_alt += lstate.dosage_doubles[s];
+							non_missing_ct++;
+						}
+					}
+
+					if (non_missing_ct == 0) {
+						continue;
+					}
+
+					if (bind_data.center) {
+						double mean_alt = sum_alt / static_cast<double>(non_missing_ct);
+						double freq = mean_alt / 2.0;
+						double sd = std::sqrt(2.0 * freq * (1.0 - freq));
+						if (sd == 0.0) {
+							continue;
+						}
+						double mean_scored = sv.flip ? (2.0 - mean_alt) : mean_alt;
+
+						for (uint32_t s = 0; s < sample_ct; s++) {
+							if (lstate.dosage_doubles[s] == -9.0) {
+								continue;
+							}
+							double scored_dosage =
+							    sv.flip ? (2.0 - lstate.dosage_doubles[s]) : lstate.dosage_doubles[s];
+							double standardized = (scored_dosage - mean_scored) / sd;
+							lstate.local_accum.score_sums[s] += sv.weight * standardized;
+							lstate.local_accum.allele_cts[s] += 2;
+						}
+					} else if (bind_data.no_mean_imputation) {
+						for (uint32_t s = 0; s < sample_ct; s++) {
+							if (lstate.dosage_doubles[s] == -9.0) {
+								continue;
+							}
+							double scored_dosage =
+							    sv.flip ? (2.0 - lstate.dosage_doubles[s]) : lstate.dosage_doubles[s];
+							lstate.local_accum.score_sums[s] += sv.weight * scored_dosage;
+							lstate.local_accum.dosage_sums[s] += scored_dosage;
+							lstate.local_accum.allele_cts[s] += 2;
+						}
+					} else {
+						double mean_alt = sum_alt / static_cast<double>(non_missing_ct);
+						for (uint32_t s = 0; s < sample_ct; s++) {
+							double alt_dosage =
+							    (lstate.dosage_doubles[s] == -9.0) ? mean_alt : lstate.dosage_doubles[s];
+							double scored_dosage = sv.flip ? (2.0 - alt_dosage) : alt_dosage;
+							lstate.local_accum.score_sums[s] += sv.weight * scored_dosage;
+							lstate.local_accum.dosage_sums[s] += scored_dosage;
+							lstate.local_accum.allele_cts[s] += 2;
+						}
+					}
+				}
+			}
+
+			// Merge thread-local accumulator into global state under mutex
+			{
+				std::lock_guard<std::mutex> lock(gstate.merge_mutex);
+				for (uint32_t s = 0; s < sample_ct; s++) {
+					gstate.score_sums[s] += lstate.local_accum.score_sums[s];
+					gstate.named_allele_dosage_sums[s] += lstate.local_accum.dosage_sums[s];
+					gstate.allele_cts[s] += lstate.local_accum.allele_cts[s];
+				}
+			}
+			lstate.phase1_done = true;
+
+			// Last thread transitions to Phase 2
+			if (gstate.phase1_active.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+				output.SetCardinality(0);
+				return;
+			}
+			gstate.scoring_done.store(true, std::memory_order_release);
+		} else {
+			// No scored variants or uninitialized — mark scoring done
 			gstate.scoring_done.store(true, std::memory_order_release);
 		}
 	}
