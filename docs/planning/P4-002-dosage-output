@@ -1,0 +1,352 @@
+# P4-002: Dosage output for read_pgen and read_pfile
+
+Issue: Extends `dosages := true` parameter (currently `NotImplementedException`)
+to output dosage values as `DOUBLE` instead of hardcall `TINYINT` genotypes.
+
+## Status
+
+- [ ] Phase 1: Core dosage output for read_pgen and read_pfile (variant orient)
+- [ ] Phase 2: Dosage support across all orient + genotypes modes
+- [ ] Phase 3: Dosage-aware plink_freq
+
+---
+
+## Background
+
+### What are dosages?
+
+PLINK 2 .pgen files can store **dosage data** alongside hardcall genotypes.
+Dosages represent the expected ALT allele count as a continuous value in
+[0.0, 2.0], typically from genotype imputation or sequencing uncertainty.
+
+- Hardcall: discrete 0, 1, 2 (or missing)
+- Dosage: continuous 0.0–2.0 (e.g., 0.98, 1.03), NULL for missing
+
+When a .pgen has no dosage track, `PgrGetD` falls back to synthesizing
+dosages from hardcalls (0→0.0, 1→1.0, 2→2.0, 3→-9.0), so the feature
+works on all .pgen files — it just returns rounded values when no dosage
+data is stored.
+
+### Current state
+
+- `dosages := true` is accepted by both `read_pgen` and `read_pfile` but
+  throws `NotImplementedException`
+- `plink_score` already uses `PgrGetD` + `Dosage16ToDoublesMinus9` internally —
+  this is the reference implementation for buffer setup and API usage
+- `plink_freq` has a `dosage := true` parameter that also throws not-implemented
+- Negative tests exist confirming the error for all three functions
+- CLAUDE.md documents: `phased` + `dosages` is an incompatible combination
+
+### pgenlib API
+
+**`PgrGetD`** — primary dosage read (used by `plink_score`):
+```cpp
+PglErr PgrGetD(
+    const uintptr_t* sample_include,
+    PgrSampleSubsetIndex pssi,
+    uint32_t sample_ct,
+    uint32_t vidx,
+    PgenReader* pgr_ptr,
+    uintptr_t* genovec,          // [out] 2-bit hardcall genovec
+    uintptr_t* dosage_present,   // [out] bitarray: 1 = has explicit dosage
+    uint16_t* dosage_main,       // [out] uint16 dosage values (0..32768 = 0.0..2.0)
+    uint32_t* dosage_ct_ptr      // [out] count of explicit dosages
+);
+```
+
+**`Dosage16ToDoublesMinus9`** — converts to doubles:
+```cpp
+void Dosage16ToDoublesMinus9(
+    const uintptr_t* genoarr,
+    const uintptr_t* dosage_present,
+    const uint16_t* dosage_main,
+    uint32_t sample_ct,
+    uint32_t dosage_ct,
+    double* geno_double           // [out] one double per sample; -9.0 = missing
+);
+```
+
+For hardcall-only variants (dosage_ct=0), this synthesizes doubles from the
+genovec: 0→0.0, 1→1.0, 2→2.0, 3(missing)→-9.0.
+
+**`PgrGetDCounts`** — dosage-aware genotype counting (for plink_freq):
+```cpp
+PglErr PgrGetDCounts(
+    const uintptr_t* sample_include,
+    const uintptr_t* sample_include_interleaved_vec,
+    PgrSampleSubsetIndex pssi,
+    uint32_t sample_ct,
+    uint32_t vidx,
+    uint32_t is_minimac3_r2,
+    PgenReader* pgr_ptr,
+    double* imp_r2_ptr,
+    STD_ARRAY_REF(uint32_t, 4) genocounts,
+    uint64_t* all_dosages
+);
+```
+
+---
+
+## Phase 1: Core dosage output (variant orient)
+
+### Goal
+
+When `dosages := true`, output genotype values as `DOUBLE` instead of
+`TINYINT`. The continuous dosage values (0.0–2.0) replace the discrete
+hardcall values (0, 1, 2). Missing genotypes remain NULL.
+
+### Output type changes
+
+| Mode | Without dosages | With dosages |
+|------|----------------|-------------|
+| variant, array | `ARRAY(TINYINT, N)` | `ARRAY(DOUBLE, N)` |
+| variant, list | `LIST(TINYINT)` | `LIST(DOUBLE)` |
+| genotype | `TINYINT` | `DOUBLE` |
+
+### Buffer additions to LocalState
+
+Mirror `plink_score`'s buffer pattern (see `plink_score.cpp:473-486`):
+
+```cpp
+// In PgenLocalState / PfileLocalState:
+AlignedBuffer dosage_present_buf;   // BitCtToAlignedWordCt(raw_sample_ct) words
+AlignedBuffer dosage_main_buf;      // raw_sample_ct * sizeof(uint16_t)
+vector<double> dosage_doubles;      // effective_sample_ct doubles
+```
+
+Only allocated when `include_dosages == true`.
+
+### Scan changes
+
+Replace the genotype read path with a branching pattern:
+
+```
+if include_dosages:
+    PgrGetD(sample_include, pssi, sample_ct, vidx, &pgr,
+            genovec, dosage_present, dosage_main, &dosage_ct)
+    Dosage16ToDoublesMinus9(genovec, dosage_present, dosage_main,
+                            sample_ct, dosage_ct, dosage_doubles)
+    // Write doubles into output vectors (-9.0 → NULL)
+else:
+    PgrGet(sample_include, pssi, sample_ct, vidx, &pgr, genovec)
+    GenoarrToBytesMinus9(genovec, sample_ct, genotype_bytes)
+    // Write int8 into output vectors (-9 → NULL)
+```
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `pgen_reader.cpp` | Remove NotImplementedException; add dosage buffers to LocalState; branch scan on include_dosages; adjust output type in bind |
+| `pfile_reader.cpp` | Same for variant-orient and genotype-orient scan paths |
+| `plink_common.hpp` | (Optional) shared dosage buffer helper if pattern repeats |
+
+### Test data
+
+Need a .pgen file with actual dosage data to validate non-integer output.
+Generate with:
+```bash
+# Create a VCF with DS (dosage) field, then import
+plink2 --vcf dosage_example.vcf dosage=DS --make-pgen --out test/data/dosage_example
+```
+
+Alternatively, for phase 1 testing, use existing hardcall-only test data —
+`dosages := true` on hardcall data should produce exact 0.0/1.0/2.0 values,
+which validates the plumbing without needing imputed data.
+
+### Tests
+
+**Positive tests** (`read_pgen_dosage.test`, `read_pfile_dosage.test`):
+- `dosages := true` with hardcall data → exact 0.0/1.0/2.0 values
+- `dosages := true` with dosage test data → continuous values
+- Type check: verify output type is DOUBLE, not TINYINT
+- Missing genotypes → NULL (not -9.0)
+- `dosages := true` + `samples :=` subsetting
+
+**Negative tests** (update existing):
+- Remove or update the existing negative tests that check for NotImplementedException
+- `dosages := true` + `phased := true` → error (keep this)
+
+### Acceptance criteria
+
+- `read_pgen('file.pgen', dosages := true)` returns ARRAY(DOUBLE, N)
+- `read_pfile('prefix', dosages := true)` returns ARRAY(DOUBLE, N)
+- `read_pfile('prefix', dosages := true, orient := 'genotype')` returns DOUBLE
+- Hardcall data produces exact 0.0/1.0/2.0 values matching hardcall output
+- Missing genotypes are NULL in all modes
+- All existing tests continue to pass (no regression in non-dosage paths)
+
+---
+
+## Phase 2: Dosage support across all orient + genotypes modes
+
+### Goal
+
+Extend dosage output to work with all combinations of `orient` and
+`genotypes` parameters.
+
+### Type mapping
+
+| Orient | Genotypes | Without dosages | With dosages |
+|--------|-----------|----------------|-------------|
+| variant | array | `ARRAY(TINYINT, N)` | `ARRAY(DOUBLE, N)` |
+| variant | list | `LIST(TINYINT)` | `LIST(DOUBLE)` |
+| variant | columns | `TINYINT` per column | `DOUBLE` per column |
+| genotype | *(scalar)* | `TINYINT` | `DOUBLE` |
+| sample | array | `ARRAY(TINYINT, M)` | `ARRAY(DOUBLE, M)` |
+| sample | list | `LIST(TINYINT)` | `LIST(DOUBLE)` |
+| sample | columns | `TINYINT` per column | `DOUBLE` per column |
+
+The pattern is uniform: TINYINT → DOUBLE everywhere. The element type
+changes but the container structure stays the same.
+
+### Implementation
+
+The bind-time type construction already determines element type based on
+`include_phased`. Add `include_dosages` as another branch:
+
+```cpp
+LogicalType elem_type;
+if (bind_data->include_phased) {
+    elem_type = LogicalType::ARRAY(LogicalType::TINYINT, 2);
+} else if (bind_data->include_dosages) {
+    elem_type = LogicalType::DOUBLE;
+} else {
+    elem_type = LogicalType::TINYINT;
+}
+```
+
+Scan paths need parallel branches for writing doubles vs int8 values.
+The `columns` mode scan is straightforward — index into `dosage_doubles[s]`
+instead of `genotype_bytes[s]`, write as double, -9.0 → NULL.
+
+The `sample` orient pre-read matrix (`genotype_matrix` in bind) changes
+from `vector<vector<int8_t>>` to `vector<vector<double>>` when dosages
+are enabled. Same memory cap applies.
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `pgen_reader.cpp` | Columns-mode dosage scan path |
+| `pfile_reader.cpp` | Sample-orient + columns-mode dosage scan paths; dosage-aware pre-read matrix |
+
+### Tests
+
+- `dosages := true` + `orient := 'sample'` → ARRAY(DOUBLE, M)
+- `dosages := true` + `genotypes := 'columns'` → DOUBLE columns
+- `dosages := true` + `orient := 'sample'` + `genotypes := 'columns'` → DOUBLE columns
+- Verify identical results between orient modes for the same data
+
+### Acceptance criteria
+
+- All 7 orient × genotypes combinations work with `dosages := true`
+- `dosages := true` + `phased := true` remains an error in all modes
+
+---
+
+## Phase 3: Dosage-aware plink_freq
+
+### Goal
+
+Implement `plink_freq('file.pgen', dosage := true)` to compute allele
+frequencies using dosage data instead of hardcall counts.
+
+### Approach
+
+Use `PgrGetDCounts` instead of `PgrGetCounts`. This returns dosage-weighted
+allele counts when dosage data is present, falling back to hardcall counts
+otherwise.
+
+The `all_dosages` output from `PgrGetDCounts` is a uint64 sum of dosage
+values (scaled by 16384), which can be converted to frequency:
+
+```
+ALT_FREQ = all_dosages[1] / (double)(total_dosage_sum)
+```
+
+Also returns `imp_r2_ptr` (imputation R² / Minimac3 INFO score) which is a
+useful QC metric for imputed data — consider adding as an output column.
+
+### Output changes
+
+| Column | Current | With dosage |
+|--------|---------|------------|
+| ALT_FREQ | From hardcall counts | From dosage sums |
+| OBS_CT | Hardcall non-missing count | Same (dosage doesn't change sample count) |
+| (new) IMP_R2 | — | Imputation R² (optional, only with dosage := true) |
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `plink_freq.cpp` | Replace PgrGetCounts with PgrGetDCounts when dosage=true; add IMP_R2 column |
+
+### Tests
+
+- Validate against `plink2 --freq` on dosage test data
+- Hardcall data with dosage=true → same frequencies as without
+- IMP_R2 column present only when dosage=true
+
+### Acceptance criteria
+
+- `plink_freq('file.pgen', dosage := true)` returns dosage-weighted frequencies
+- Results match plink2 --freq output for the same data
+- IMP_R2 column included when dosage=true
+
+---
+
+## Test data generation
+
+A dosage test fixture is needed for phases 1–3. Generate from a VCF with
+dosage annotations:
+
+```bash
+# Create a small VCF with DS field (4 samples × 4 variants)
+# Then convert:
+plink2 --vcf test/data/dosage_example.vcf dosage=DS \
+       --make-pgen --out test/data/dosage_example
+```
+
+The VCF should include:
+- Variants with non-integer dosages (e.g., 0.5, 1.3, 1.98)
+- At least one variant with missing dosage
+- At least one variant with all-hardcall (no dosage track)
+
+This fixture is shared across all phases. Phase 1 can start with hardcall-only
+data for plumbing validation, then add the dosage fixture.
+
+---
+
+## Compatibility matrix
+
+| Parameter combination | Behavior |
+|----------------------|----------|
+| `dosages := true` | DOUBLE output, continuous 0.0–2.0 |
+| `dosages := true, phased := true` | Error (incompatible) |
+| `dosages := true, genotypes := 'array'` | ARRAY(DOUBLE, N) |
+| `dosages := true, genotypes := 'list'` | LIST(DOUBLE) |
+| `dosages := true, genotypes := 'columns'` | DOUBLE per column |
+| `dosages := true, orient := 'variant'` | One row per variant |
+| `dosages := true, orient := 'genotype'` | One row per variant×sample |
+| `dosages := true, orient := 'sample'` | One row per sample |
+| `dosages := true, samples := [...]` | Subsetting works as normal |
+| `dosages := true, region := '...'` | Region filtering works as normal |
+
+---
+
+## Suggested ordering
+
+**Phase 1 → Phase 2 → Phase 3**
+
+Phase 1 establishes the core pattern (PgrGetD + Dosage16ToDoublesMinus9) in
+the main scan paths. Phase 2 extends to all mode combinations — mostly
+mechanical given the element-type abstraction. Phase 3 is independent of
+phases 1–2 (different function, different pgenlib API) but benefits from
+the shared dosage test fixture.
+
+### Estimated scope
+
+- Phase 1: ~150 lines new/modified code, ~100 lines tests
+- Phase 2: ~200 lines new/modified code, ~150 lines tests
+- Phase 3: ~100 lines new/modified code, ~80 lines tests
