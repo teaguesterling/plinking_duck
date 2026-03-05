@@ -1,0 +1,134 @@
+# name: test/sql/read_pfile_dosage.test
+# description: Tests for read_pfile dosage output across all orient/genotypes modes
+# group: [sql]
+
+require plinking_duck
+
+# --- Variant orient, array mode (default) ---
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', dosages := true) LIMIT 1;
+----
+DOUBLE[4]
+
+query TRRRR
+SELECT ID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pfile('test/data/pfile_example', dosages := true)
+ORDER BY CHROM, POS;
+----
+rs1	0.0	1.0	2.0	NULL
+rs2	1.0	1.0	0.0	2.0
+rs3	2.0	NULL	1.0	0.0
+rs4	0.0	0.0	1.0	2.0
+
+# --- Variant orient, list mode ---
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', dosages := true, genotypes := 'list') LIMIT 1;
+----
+DOUBLE[]
+
+query TRRRR
+SELECT ID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pfile('test/data/pfile_example', dosages := true, genotypes := 'list')
+ORDER BY CHROM, POS;
+----
+rs1	0.0	1.0	2.0	NULL
+rs2	1.0	1.0	0.0	2.0
+rs3	2.0	NULL	1.0	0.0
+rs4	0.0	0.0	1.0	2.0
+
+# --- Variant orient, columns mode ---
+
+query T
+SELECT typeof(SAMPLE1) FROM read_pfile('test/data/pfile_example', dosages := true, genotypes := 'columns') LIMIT 1;
+----
+DOUBLE
+
+query TRRRR
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4
+FROM read_pfile('test/data/pfile_example', dosages := true, genotypes := 'columns')
+ORDER BY CHROM, POS;
+----
+rs1	0.0	1.0	2.0	NULL
+rs2	1.0	1.0	0.0	2.0
+rs3	2.0	NULL	1.0	0.0
+rs4	0.0	0.0	1.0	2.0
+
+# --- Genotype orient (one row per variant × sample) ---
+
+query T
+SELECT typeof(genotype) FROM read_pfile('test/data/pfile_example', dosages := true, orient := 'genotype') LIMIT 1;
+----
+DOUBLE
+
+query TTR
+SELECT ID, IID, genotype
+FROM read_pfile('test/data/pfile_example', dosages := true, orient := 'genotype')
+WHERE ID = 'rs1'
+ORDER BY IID;
+----
+rs1	SAMPLE1	0.0
+rs1	SAMPLE2	1.0
+rs1	SAMPLE3	2.0
+rs1	SAMPLE4	NULL
+
+# --- Sample orient, array mode ---
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', dosages := true, orient := 'sample') LIMIT 1;
+----
+DOUBLE[4]
+
+query TRRRR
+SELECT IID, genotypes[1], genotypes[2], genotypes[3], genotypes[4]
+FROM read_pfile('test/data/pfile_example', dosages := true, orient := 'sample')
+ORDER BY IID;
+----
+SAMPLE1	0.0	1.0	2.0	0.0
+SAMPLE2	1.0	1.0	NULL	0.0
+SAMPLE3	2.0	0.0	1.0	1.0
+SAMPLE4	NULL	2.0	0.0	2.0
+
+# --- Sample orient, list mode ---
+
+query T
+SELECT typeof(genotypes) FROM read_pfile('test/data/pfile_example', dosages := true, orient := 'sample', genotypes := 'list') LIMIT 1;
+----
+DOUBLE[]
+
+# --- Sample orient, columns mode ---
+
+query T
+SELECT typeof(rs1) FROM read_pfile('test/data/pfile_example', dosages := true, orient := 'sample', genotypes := 'columns') LIMIT 1;
+----
+DOUBLE
+
+query TRRRR
+SELECT IID, rs1, rs2, rs3, rs4
+FROM read_pfile('test/data/pfile_example', dosages := true, orient := 'sample', genotypes := 'columns')
+ORDER BY IID;
+----
+SAMPLE1	0.0	1.0	2.0	0.0
+SAMPLE2	1.0	1.0	NULL	0.0
+SAMPLE3	2.0	0.0	1.0	1.0
+SAMPLE4	NULL	2.0	0.0	2.0
+
+# --- Dosages + sample subsetting ---
+
+query TRR
+SELECT ID, genotypes[1], genotypes[2]
+FROM read_pfile('test/data/pfile_example', dosages := true, samples := ['SAMPLE1', 'SAMPLE3'])
+ORDER BY CHROM, POS;
+----
+rs1	0.0	2.0
+rs2	1.0	0.0
+rs3	2.0	1.0
+rs4	0.0	1.0
+
+# --- Dosages + phased → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', dosages := true, phased := true);
+----
+dosages and phased cannot both be true

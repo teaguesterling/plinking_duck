@@ -1,0 +1,84 @@
+# name: test/sql/plink_freq_dosage.test
+# description: Tests for plink_freq dosage mode
+# group: [sql]
+
+require plinking_duck
+
+# --- Dosage frequencies match hardcall frequencies on hardcall-only data ---
+# pgen_example: rs1 (genos: 0,1,2,missing), rs2 (1,1,0,2), rs3 (2,missing,1,0), rs4 (0,0,1,2)
+
+query TRI
+SELECT ID, ALT_FREQ, OBS_CT
+FROM plink_freq('test/data/pgen_example.pgen', dosage := true)
+ORDER BY CHROM, POS;
+----
+rs1	0.5	6
+rs2	0.5	8
+rs3	0.5	6
+rs4	0.375	8
+
+# --- Dosage frequencies should be identical to hardcall frequencies ---
+
+query TRR
+SELECT
+    hc.ID,
+    hc.ALT_FREQ AS hardcall_freq,
+    dos.ALT_FREQ AS dosage_freq
+FROM plink_freq('test/data/pgen_example.pgen') hc
+JOIN plink_freq('test/data/pgen_example.pgen', dosage := true) dos USING (ID)
+ORDER BY hc.CHROM, hc.POS;
+----
+rs1	0.5	0.5
+rs2	0.5	0.5
+rs3	0.5	0.5
+rs4	0.375	0.375
+
+# --- IMP_R2 column present when dosage := true ---
+
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM plink_freq('test/data/pgen_example.pgen', dosage := true)) WHERE column_name = 'IMP_R2';
+----
+IMP_R2
+
+# --- IMP_R2 column NOT present without dosage ---
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM plink_freq('test/data/pgen_example.pgen')) WHERE column_name = 'IMP_R2';
+----
+0
+
+# --- IMP_R2 is NULL for hardcall-only data (no dosage data in file) ---
+
+query TR
+SELECT ID, IMP_R2
+FROM plink_freq('test/data/pgen_example.pgen', dosage := true)
+ORDER BY CHROM, POS;
+----
+rs1	NULL
+rs2	NULL
+rs3	NULL
+rs4	NULL
+
+# --- Dosage + counts ---
+
+query TRIIII
+SELECT ID, ALT_FREQ, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT
+FROM plink_freq('test/data/pgen_example.pgen', dosage := true, counts := true)
+ORDER BY CHROM, POS;
+----
+rs1	0.5	1	1	1	1
+rs2	0.5	1	2	1	0
+rs3	0.5	1	1	1	1
+rs4	0.375	2	1	1	0
+
+# --- Dosage + sample subsetting ---
+
+query TRI
+SELECT ID, ALT_FREQ, OBS_CT
+FROM plink_freq('test/data/pgen_example.pgen', dosage := true, samples := ['SAMPLE1', 'SAMPLE3'])
+ORDER BY CHROM, POS;
+----
+rs1	0.5	4
+rs2	0.25	4
+rs3	0.75	4
+rs4	0.25	4
