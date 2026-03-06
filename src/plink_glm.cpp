@@ -523,21 +523,28 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
 			}
 
-			// Extract values for effective samples
+			// Extract values for effective samples (NULLs not allowed in covariates)
 			vector<double> covar_vals(bind_data->effective_sample_ct);
 			if (bind_data->has_sample_subset) {
 				const uintptr_t *si = bind_data->sample_subset->SampleInclude();
 				uint32_t out_idx = 0;
 				for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
 					if (plink2::IsSet(si, raw_idx)) {
-						covar_vals[out_idx] =
-						    list_children[raw_idx].IsNull() ? NAN : list_children[raw_idx].GetValue<double>();
+						if (list_children[raw_idx].IsNull()) {
+							throw InvalidInputException(
+							    "plink_glm: covariate '%s' contains NULL at index %u", name, raw_idx);
+						}
+						covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
 						out_idx++;
 					}
 				}
 			} else {
 				for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
-					covar_vals[i] = list_children[i].IsNull() ? NAN : list_children[i].GetValue<double>();
+					if (list_children[i].IsNull()) {
+						throw InvalidInputException(
+						    "plink_glm: covariate '%s' contains NULL at index %u", name, i);
+					}
+					covar_vals[i] = list_children[i].GetValue<double>();
 				}
 			}
 
@@ -835,7 +842,7 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 		}
 
 		// Build predictor row: [1, geno, cov1, cov2, ...]
-		double xi[64]; // max predictors
+		vector<double> xi(p);
 		xi[0] = 1.0;
 		xi[1] = geno;
 		for (int c = 0; c < n_covars; c++) {
@@ -1076,7 +1083,8 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 
 	// Final computation of (X'WX)^{-1} for SE (if not already done by Firth)
 	if (!use_firth) {
-		// Recompute X'WX with final beta
+		// Use X'WX from last iteration (w computed before final beta update;
+		// negligible difference since convergence requires max_delta < 1e-7)
 		std::fill(xwx.begin(), xwx.end(), 0.0);
 		for (uint32_t idx = 0; idx < n; idx++) {
 			for (int r = 0; r < p; r++) {

@@ -61,3 +61,11 @@ SELECT * FROM plink_glm('test/data/pgen_example.pgen',
     covariates := {'age': [25.0, 30.0]});
 ----
 covariate 'age' length
+
+# NULL values in covariates
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    covariates := {'age': [25.0, NULL, 35.0, 40.0]});
+----
+covariate 'age' contains NULL
