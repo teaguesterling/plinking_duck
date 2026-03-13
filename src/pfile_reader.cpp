@@ -757,7 +757,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	} else if (bind_data->orient_mode == OrientMode::SAMPLE) {
 		// Apply count filter in sample-orient mode before building schema,
 		// so ARRAY dimension reflects filtered variant count.
-		if (bind_data->count_filter.HasFilter()) {
+		vector<bool> genotype_range_all_pass;
+		if (bind_data->count_filter.HasFilter() || bind_data->genotype_filter.active) {
 			// Init temporary PgenReader for count filtering
 			plink2::PgenFileInfo cf_pgfi;
 			plink2::PreinitPgfi(&cf_pgfi);
@@ -840,9 +841,22 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					throw IOException("read_pfile: PgrGetCounts failed for variant %u during count filter", vidx);
 				}
 
-				if (VariantPassesCountFilter(bind_data->count_filter, genocounts, cf_sc)) {
-					filtered_indices.push_back(vidx);
+				if (bind_data->count_filter.HasFilter() &&
+				    !VariantPassesCountFilter(bind_data->count_filter, genocounts, cf_sc)) {
+					continue;
 				}
+
+				bool all_pass = true;
+				if (bind_data->genotype_filter.active) {
+					auto gr = CheckGenotypeRange(bind_data->genotype_filter.range, genocounts);
+					if (!gr.any_pass) {
+						continue;
+					}
+					all_pass = gr.all_pass;
+				}
+
+				filtered_indices.push_back(vidx);
+				genotype_range_all_pass.push_back(all_pass);
 			}
 
 			bind_data->effective_variant_indices = std::move(filtered_indices);
@@ -1073,6 +1087,18 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
 				UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
 				                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct, preread_phased_pairs.data());
+				// Apply genotype_range per-element filtering (phased: check diploid sum)
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() && !genotype_range_all_pass[ev]) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t a1 = preread_phased_pairs[s * 2];
+						int8_t a2 = preread_phased_pairs[s * 2 + 1];
+						if (a1 != -9 &&
+						    !bind_data->genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+							preread_phased_pairs[s * 2] = -9;
+							preread_phased_pairs[s * 2 + 1] = -9;
+						}
+					}
+				}
 				bind_data->genotype_matrix[ev].assign(preread_phased_pairs.begin(),
 				                                      preread_phased_pairs.begin() + output_sample_ct * 2);
 			} else {
@@ -1085,6 +1111,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read", vidx);
 				}
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
+				// Apply genotype_range per-element filtering
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() && !genotype_range_all_pass[ev]) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t geno = tmp_bytes[s];
+						if (geno != -9 &&
+						    !bind_data->genotype_filter.range.Passes(static_cast<double>(geno))) {
+							tmp_bytes[s] = -9;
+						}
+					}
+				}
 				bind_data->genotype_matrix[ev].assign(tmp_bytes.begin(), tmp_bytes.begin() + output_sample_ct);
 			}
 		}

@@ -229,3 +229,19 @@ rs1	2	SAMPLE3
 rs2	2	SAMPLE4
 rs3	2	SAMPLE1
 rs4	2	SAMPLE4
+
+# --- Sample orient with genotype_range ---
+
+query I
+SELECT len(genotypes) FROM read_pfile('test/data/pfile_example', orient := 'sample', genotype_range := {min: 1}) LIMIT 1;
+----
+4
+
+# Verify NULLs in correct positions for sample orient
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/pfile_example', orient := 'sample', genotype_range := {min: 1}) ORDER BY IID;
+----
+SAMPLE1	[NULL, 1, 2, NULL]
+SAMPLE2	[1, 1, NULL, NULL]
+SAMPLE3	[2, NULL, 1, 1]
+SAMPLE4	[NULL, 2, NULL, 2]
