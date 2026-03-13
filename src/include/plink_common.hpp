@@ -249,6 +249,23 @@ bool VariantPassesCountFilter(const CountFilter &filter,
                                uint32_t effective_sample_ct);
 
 // ---------------------------------------------------------------------------
+// Genotype range filtering (genotype_range)
+// ---------------------------------------------------------------------------
+
+struct GenotypeRangeResult {
+	bool any_pass;  // at least one non-missing sample has value in [min, max]
+	bool all_pass;  // every non-missing sample has value in [min, max]
+};
+
+struct GenotypeRangeFilter {
+	RangeFilter range;  // reuses Phase 1 RangeFilter
+	bool active = false;
+};
+
+GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter,
+                                        const STD_ARRAY_REF(uint32_t, 4) genocounts);
+
+// ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
 

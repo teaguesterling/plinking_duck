@@ -615,6 +615,31 @@ bool VariantPassesCountFilter(const CountFilter &filter,
 }
 
 // ---------------------------------------------------------------------------
+// Genotype range filtering (genotype_range)
+// ---------------------------------------------------------------------------
+
+GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter,
+                                        const STD_ARRAY_REF(uint32_t, 4) genocounts) {
+	GenotypeRangeResult result;
+	result.any_pass = false;
+	result.all_pass = true;
+
+	// genocounts: [hom_ref(0), het(1), hom_alt(2), missing(3)]
+	// Genotype values map directly to array indices 0, 1, 2
+	for (int g = 0; g <= 2; g++) {
+		bool in_range = filter.Passes(static_cast<double>(g));
+		if (in_range && genocounts[g] > 0) {
+			result.any_pass = true;
+		}
+		if (!in_range && genocounts[g] > 0) {
+			result.all_pass = false;
+		}
+	}
+
+	return result;
+}
+
+// ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
 
