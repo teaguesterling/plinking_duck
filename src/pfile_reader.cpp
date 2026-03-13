@@ -1370,8 +1370,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 		for (uint32_t effective_pos = batch_start; effective_pos < batch_end; effective_pos++) {
 			uint32_t vidx = ResolveVariantIdx(bind_data, effective_pos);
 
-			// Count filter: skip variants that don't pass af_range/ac_range
-			if (bind_data.count_filter.HasFilter() && lstate.initialized) {
+			// Count filter + genotype range pre-decompression check
+			bool geno_range_all_pass = true;
+			if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active) && lstate.initialized) {
 				STD_ARRAY_DECL(uint32_t, 4, genocounts);
 				const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
 				                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
@@ -1383,8 +1384,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				if (cf_err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 				}
-				if (!VariantPassesCountFilter(bind_data.count_filter, genocounts, cf_sc)) {
+				if (bind_data.count_filter.HasFilter() &&
+				    !VariantPassesCountFilter(bind_data.count_filter, genocounts, cf_sc)) {
 					continue;
+				}
+				if (bind_data.genotype_filter.active) {
+					auto gr = CheckGenotypeRange(bind_data.genotype_filter.range, genocounts);
+					if (!gr.any_pass) {
+						continue;
+					}
+					geno_range_all_pass = gr.all_pass;
 				}
 			}
 
@@ -1488,7 +1497,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -1521,13 +1532,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t pair_idx = pair_base + s;
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
-								if (a1 == -9) {
+								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
+								if (a1 == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+									allele_data[allele_base + 1] = a2;
 								}
 							}
 						} else {
@@ -1542,13 +1556,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t pair_idx = list_offset + s;
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
-								if (a1 == -9) {
+								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
+								if (a1 == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+									allele_data[allele_base + 1] = a2;
 								}
 							}
 
@@ -1606,7 +1623,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(base + s);
 									child_data[base + s] = 0;
 								} else {
@@ -1621,7 +1640,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(list_offset + s);
 									child_data[list_offset + s] = 0;
 								} else {
@@ -1652,7 +1673,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;

@@ -156,3 +156,51 @@ statement error
 SELECT * FROM read_pfile('test/data/pfile_example', af_range := {minimum: 0.1});
 ----
 unknown field 'minimum'
+
+# ========== genotype_range tests ==========
+
+# --- Test data reference (pgen_example, 4 variants x 4 samples) ---
+# rs1: genotypes [0, 1, 2, NULL]
+# rs2: genotypes [1, 1, 0, 2]
+# rs3: genotypes [2, NULL, 1, 0]
+# rs4: genotypes [0, 0, 1, 2]
+
+# --- Carriers only (min: 1): all 4 variants survive, hom-ref and missing NULLed ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	[NULL, 1, 2, NULL]
+rs2	[1, 1, NULL, 2]
+rs3	[2, NULL, 1, NULL]
+rs4	[NULL, NULL, 1, 2]
+
+# --- Hets only (min: 1, max: 1) ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 1, max: 1}) ORDER BY ID;
+----
+rs1	[NULL, 1, NULL, NULL]
+rs2	[1, 1, NULL, NULL]
+rs3	[NULL, NULL, 1, NULL]
+rs4	[NULL, NULL, 1, NULL]
+
+# --- Hom-alt only (min: 2, max: 2) ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 2, max: 2}) ORDER BY ID;
+----
+rs1	[NULL, NULL, 2, NULL]
+rs2	[NULL, NULL, NULL, 2]
+rs3	[2, NULL, NULL, NULL]
+rs4	[NULL, NULL, NULL, 2]
+
+# --- Hom-ref only (min: 0, max: 0): missing excluded ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 0, max: 0}) ORDER BY ID;
+----
+rs1	[0, NULL, NULL, NULL]
+rs2	[NULL, NULL, 0, NULL]
+rs3	[NULL, NULL, NULL, 0]
+rs4	[0, 0, NULL, NULL]
