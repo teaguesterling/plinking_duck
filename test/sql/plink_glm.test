@@ -171,13 +171,14 @@ var1	0.020132	0.247427	0.942561
 # ===========================================================================
 
 # Binary 0/1 phenotype → auto-detects logistic
+# plink2's LogisticRegressionF converges for balanced phenotypes, so no Firth needed
 query TRRRT
 SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND("OR", 6), FIRTH_YN
 FROM plink_glm('test/data/large_example.pgen',
     phenotype := [0, 1, 0, 1, 1, 0, 1, 0])
 WHERE ID = 'var1';
 ----
-var1	0.0	1.0	1.0	Y
+var1	0.0	1.0	1.0	N
 
 # Binary 1/2 phenotype → auto-remaps to 0/1, uses logistic
 query TRRRT
@@ -186,16 +187,17 @@ FROM plink_glm('test/data/large_example.pgen',
     phenotype := [1, 2, 1, 2, 2, 1, 2, 1])
 WHERE ID = 'var1';
 ----
-var1	0.0	1.0	1.0	Y
+var1	0.0	1.0	1.0	N
 
 # Logistic with correlated phenotype (non-trivial result)
+# plink2's FirthRegressionF uses different variance-covariance than our old impl
 query TRRRRRT
 SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND(T_STAT, 6), ROUND(P, 6), ROUND("OR", 6), FIRTH_YN
 FROM plink_glm('test/data/large_example.pgen',
     phenotype := [0, 1, 0, 0, 1, 1, 0, 0])
 WHERE ID = 'var1';
 ----
-var1	1.855206	1.461971	1.268976	0.20445	6.393015	Y
+var1	1.855205	1.248652	1.485766	0.137341	6.393007	Y
 
 # Row count for logistic
 query I
@@ -209,7 +211,9 @@ FROM plink_glm('test/data/large_example.pgen',
 # Phase 2: Firth correction
 # ===========================================================================
 
-# Without Firth, separation is detected (var1 with correlated phenotype)
+# Without Firth, convergence fails (var1 with correlated phenotype)
+# plink2's LogisticRegressionF hits iteration limit (is_unfinished) rather
+# than hard-failing, so we report NO_CONVERGENCE instead of SEPARATION
 query TRT
 SELECT ID, BETA, ERRCODE
 FROM plink_glm('test/data/large_example.pgen',
@@ -217,7 +221,7 @@ FROM plink_glm('test/data/large_example.pgen',
     firth := false)
 WHERE ID = 'var1';
 ----
-var1	NULL	SEPARATION
+var1	NULL	NO_CONVERGENCE
 
 # With Firth (default), the same variant converges
 query TRRT

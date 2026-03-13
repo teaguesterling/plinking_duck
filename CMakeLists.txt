@@ -22,6 +22,7 @@ set(EXTENSION_SOURCES
     src/plink_ld.cpp
     src/plink_score.cpp
     src/plink_glm.cpp
+    src/plink2_glm_logistic_math.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -107,12 +108,13 @@ set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 check_symbol_exists(rawmemchr "string.h" HAVE_RAWMEMCHR)
 
 # --- pgenlib (C++ library) ---
-# Read-path only — pgenlib_write.cc, plink2_bitmap.cc, plink2_fmath.cc,
-# plink2_stats.cc are intentionally excluded.
+# Read-path only — pgenlib_write.cc, plink2_bitmap.cc, plink2_stats.cc
+# are intentionally excluded. plink2_fmath.cc is included for LogisticSseF.
 add_library(pgenlib STATIC
     ${PGENLIB_DIR}/plink2_base.cc
     ${PGENLIB_DIR}/plink2_bits.cc
     ${PGENLIB_DIR}/plink2_bgzf.cc
+    ${PGENLIB_DIR}/plink2_fmath.cc
     ${PGENLIB_DIR}/plink2_htable.cc
     ${PGENLIB_DIR}/plink2_memory.cc
     ${PGENLIB_DIR}/plink2_string.cc
@@ -154,17 +156,41 @@ if(NOT HAVE_RAWMEMCHR)
     )
 endif()
 
+# --- plink2_glm_math (C++ library for GLM regression) ---
+# Compiled with -DNOLAPACK so we use plink2's own matrix routines (Cholesky,
+# SVD) instead of requiring a system LAPACK. This provides LinearRegressionInv,
+# matrix inversion, and all the float-precision matrix helpers needed by the
+# logistic/Firth regression functions.
+add_library(plink2_glm_math STATIC ${PLINK_NG_DIR}/plink2_matrix.cc)
+target_include_directories(plink2_glm_math PUBLIC ${PGENLIB_DIR} ${SIMDE_DIR})
+target_compile_definitions(plink2_glm_math PRIVATE NOLAPACK)
+# plink2_matrix.h uses fabs() in inline functions before <math.h> is included
+# by the .cc file. Force-include <cmath> so it's available in the header.
+target_compile_options(plink2_glm_math PRIVATE -include cmath)
+set_target_properties(plink2_glm_math PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    POSITION_INDEPENDENT_CODE ON
+    CXX_STANDARD 17
+)
+if(NOT HAVE_RAWMEMCHR)
+    target_compile_options(plink2_glm_math PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h
+    )
+endif()
+
 # --- Link pgenlib and its dependencies to extension targets ---
 # Deps are listed explicitly because pgenlib links them PRIVATE (won't propagate
 # in static builds) and DuckDB's macros require the plain target_link_libraries
 # signature (no PRIVATE/PUBLIC keyword).
-target_link_libraries(${EXTENSION_NAME} pgenlib plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} pgenlib plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
-target_include_directories(${EXTENSION_NAME} PRIVATE ${PGENLIB_DIR})
-target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PGENLIB_DIR})
+target_link_libraries(${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
+target_include_directories(${EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_DIR})
+target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_DIR})
+target_compile_definitions(${EXTENSION_NAME} PRIVATE NOLAPACK)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE NOLAPACK)
 
 install(
-  TARGETS ${EXTENSION_NAME} pgenlib plink_libdeflate plink_zstd
+  TARGETS ${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

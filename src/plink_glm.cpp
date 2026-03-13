@@ -1,5 +1,6 @@
 #include "plink_glm.hpp"
 #include "plink_common.hpp"
+#include "plink2_glm_logistic_math.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -146,91 +147,15 @@ static double ZstatToPvalue(double z_stat) {
 	return 2.0 * (1.0 - NormalCdf(std::abs(z_stat)));
 }
 
-// ---------------------------------------------------------------------------
-// Small matrix utilities (row-major, for p×p where p ≤ ~50)
-// ---------------------------------------------------------------------------
-
-//! Cholesky decomposition: A = LL' (in-place, lower triangle).
-//! Returns false if not positive definite.
-static bool CholeskyDecomp(double *A, int p) {
-	for (int j = 0; j < p; j++) {
-		double sum = 0.0;
-		for (int k = 0; k < j; k++) {
-			sum += A[j * p + k] * A[j * p + k];
-		}
-		double diag = A[j * p + j] - sum;
-		if (diag <= 1e-20) {
-			return false;
-		}
-		A[j * p + j] = std::sqrt(diag);
-
-		for (int i = j + 1; i < p; i++) {
-			sum = 0.0;
-			for (int k = 0; k < j; k++) {
-				sum += A[i * p + k] * A[j * p + k];
-			}
-			A[i * p + j] = (A[i * p + j] - sum) / A[j * p + j];
-		}
-	}
-	return true;
-}
-
-//! Forward substitution: Lx = b (L is lower triangular).
-static void ForwardSolve(const double *L, const double *b, double *x, int p) {
-	for (int i = 0; i < p; i++) {
-		double sum = 0.0;
-		for (int j = 0; j < i; j++) {
-			sum += L[i * p + j] * x[j];
-		}
-		x[i] = (b[i] - sum) / L[i * p + i];
-	}
-}
-
-//! Backward substitution: L'x = b (L is lower triangular).
-static void BackwardSolve(const double *L, const double *b, double *x, int p) {
-	for (int i = p - 1; i >= 0; i--) {
-		double sum = 0.0;
-		for (int j = i + 1; j < p; j++) {
-			sum += L[j * p + i] * x[j];
-		}
-		x[i] = (b[i] - sum) / L[i * p + i];
-	}
-}
-
-//! Solve LL'x = b in-place. b is overwritten with x.
-static void CholeskySolve(const double *L, double *b, int p) {
-	vector<double> z(p);
-	ForwardSolve(L, b, z.data(), p);
-	BackwardSolve(L, z.data(), b, p);
-}
-
-//! Compute full inverse of Cholesky-factored matrix: (LL')^{-1}.
-//! L is the lower Cholesky factor, inv is output (p×p row-major).
-static void CholeskyInverse(const double *L, double *inv, int p) {
-	vector<double> e(p);
-	for (int j = 0; j < p; j++) {
-		std::fill(e.begin(), e.end(), 0.0);
-		e[j] = 1.0;
-		CholeskySolve(L, e.data(), p);
-		for (int i = 0; i < p; i++) {
-			inv[i * p + j] = e[i];
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Sigmoid and logistic regression utilities
-// ---------------------------------------------------------------------------
-
-static double Sigmoid(double x) {
-	if (x >= 0.0) {
-		double ez = std::exp(-x);
-		return 1.0 / (1.0 + ez);
-	} else {
-		double ez = std::exp(x);
-		return ez / (1.0 + ez);
-	}
-}
+// plink2's LinearRegressionInv is a header-inline that calls into plink2_matrix.
+// Under NOLAPACK, MatrixInvertBuf1 is a typedef in global scope (not in plink2::).
+using plink2::LinearRegressionInv;
+using plink2::MultiplySelfTranspose;
+using plink2::RoundUpPow2;
+using plink2::kFloatPerFVec;
+using plink2::InvertSymmdefFmatrixFirstHalf;
+using plink2::InvertSymmdefFmatrixSecondHalf;
+using plink2::ReflectFmatrix0;
 
 // ---------------------------------------------------------------------------
 // Bind data
@@ -829,62 +754,66 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 		return result;
 	}
 
-	// Multivariate case: build X'X and X'y, solve via Cholesky
-	vector<double> xtx(p * p, 0.0);
-	vector<double> xty(p, 0.0);
-	double yty = 0.0;
+	// Multivariate case: use plink2's LinearRegressionInv
+	uint32_t up = static_cast<uint32_t>(p);
 
+	// Build predictor-major double matrix: predictors_pmaj[p × n]
+	// Row 0: intercept (all 1.0)
+	// Row 1: genotype dosages (non-missing only)
+	// Rows 2+: covariates (non-missing only)
+	vector<double> predictors_pmaj(up * n);
+	vector<double> pheno_d(n);
+	double pheno_ssq = 0.0;
+
+	uint32_t nm_idx = 0;
 	for (uint32_t i = 0; i < sample_ct; i++) {
-		double geno = dosages[i];
-		double y = phenotype[i];
-		if (geno == -9.0 || std::isnan(y)) {
+		if (dosages[i] == -9.0 || std::isnan(phenotype[i])) {
 			continue;
 		}
-
-		// Build predictor row: [1, geno, cov1, cov2, ...]
-		vector<double> xi(p);
-		xi[0] = 1.0;
-		xi[1] = geno;
+		predictors_pmaj[0 * n + nm_idx] = 1.0;           // intercept
+		predictors_pmaj[1 * n + nm_idx] = dosages[i];     // genotype
 		for (int c = 0; c < n_covars; c++) {
-			xi[2 + c] = covariates[c][i];
+			predictors_pmaj[(2 + c) * n + nm_idx] = covariates[c][i];
 		}
-
-		// Accumulate X'X (symmetric, but fill full for simplicity)
-		for (int r = 0; r < p; r++) {
-			for (int c_idx = 0; c_idx < p; c_idx++) {
-				xtx[r * p + c_idx] += xi[r] * xi[c_idx];
-			}
-			xty[r] += xi[r] * y;
-		}
-		yty += y * y;
+		pheno_d[nm_idx] = phenotype[i];
+		pheno_ssq += phenotype[i] * phenotype[i];
+		nm_idx++;
 	}
 
 	// Check for constant genotype
-	double geno_var = xtx[1 * p + 1] - xtx[0 * p + 1] * xtx[0 * p + 1] / xtx[0 * p + 0];
+	double geno_mean = sum_x / static_cast<double>(n);
+	double geno_var = 0.0;
+	for (uint32_t idx = 0; idx < n; idx++) {
+		double d = predictors_pmaj[1 * n + idx] - geno_mean;
+		geno_var += d * d;
+	}
 	if (geno_var < 1e-20) {
 		result.errcode = "CONST_ALLELE";
 		return result;
 	}
 
-	// Solve via Cholesky
-	vector<double> xtx_copy(xtx);
-	if (!CholeskyDecomp(xtx_copy.data(), p)) {
+	// Compute X'X (predictors_pmaj * transpose)
+	vector<double> xtx_inv(up * up);
+	MultiplySelfTranspose(predictors_pmaj.data(), up, n, xtx_inv.data());
+
+	// Allocate workspace
+	vector<double> fitted_coefs(up);
+	vector<double> xt_y(up);
+	vector<MatrixInvertBuf1> mi_buf(2 * up);
+	vector<double> dbl_2d_buf(up * std::max(up, 7u));
+
+	// Call plink2's LinearRegressionInv
+	if (LinearRegressionInv(pheno_d.data(), predictors_pmaj.data(), up, n, 1,
+	                        xtx_inv.data(), fitted_coefs.data(), xt_y.data(),
+	                        mi_buf.data(), dbl_2d_buf.data())) {
 		result.errcode = "SINGULAR_MATRIX";
 		return result;
 	}
 
-	// Get beta = (X'X)^{-1} X'y
-	vector<double> beta(xty);
-	CholeskySolve(xtx_copy.data(), beta.data(), p);
-
-	// Compute (X'X)^{-1} for SE
-	vector<double> xtx_inv(p * p);
-	CholeskyInverse(xtx_copy.data(), xtx_inv.data(), p);
-
-	// RSS = y'y - beta' X'y
-	double rss = yty;
-	for (int j = 0; j < p; j++) {
-		rss -= beta[j] * xty[j];
+	// RSS = pheno_ssq - dot(xt_y, fitted_coefs)
+	double rss = pheno_ssq;
+	for (uint32_t j = 0; j < up; j++) {
+		rss -= xt_y[j] * fitted_coefs[j];
 	}
 	if (rss < 0.0) {
 		rss = 0.0;
@@ -894,8 +823,9 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 	double mse = rss / df;
 
 	// Extract beta and SE for genotype coefficient (index 1)
-	result.beta = beta[1];
-	double se_sq = mse * xtx_inv[1 * p + 1];
+	// xtx_inv is now (X'X)^{-1}, row-major p×p
+	result.beta = fitted_coefs[1];
+	double se_sq = mse * xtx_inv[1 * up + 1];
 	if (se_sq < 1e-30) {
 		result.errcode = "ZERO_VARIANCE";
 		return result;
@@ -918,7 +848,7 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 	result.is_logistic = true;
 
 	int n_covars = static_cast<int>(covariates.size());
-	int p = 2 + n_covars; // intercept + genotype + covariates
+	uint32_t p = static_cast<uint32_t>(2 + n_covars); // intercept + genotype + covariates
 
 	// Collect non-missing samples
 	vector<uint32_t> nm_indices;
@@ -934,31 +864,18 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 	uint32_t n = static_cast<uint32_t>(nm_indices.size());
 	result.obs_ct = n;
 
-	if (n < static_cast<uint32_t>(p + 1)) {
+	if (n < p + 1) {
 		result.errcode = "TOO_FEW_SAMPLES";
 		return result;
 	}
 
 	result.a1_freq = sum_x / (2.0 * static_cast<double>(n));
 
-	// Build design matrix X (n×p) and response y
-	vector<double> X(n * p);
-	vector<double> y(n);
-	for (uint32_t idx = 0; idx < n; idx++) {
-		uint32_t i = nm_indices[idx];
-		X[idx * p + 0] = 1.0;     // intercept
-		X[idx * p + 1] = dosages[i]; // genotype
-		for (int c = 0; c < n_covars; c++) {
-			X[idx * p + 2 + c] = covariates[c][i];
-		}
-		y[idx] = phenotype[i];
-	}
-
 	// Check for constant genotype
 	double geno_mean = sum_x / static_cast<double>(n);
 	double geno_var = 0.0;
 	for (uint32_t idx = 0; idx < n; idx++) {
-		double d = X[idx * p + 1] - geno_mean;
+		double d = dosages[nm_indices[idx]] - geno_mean;
 		geno_var += d * d;
 	}
 	if (geno_var < 1e-20) {
@@ -966,144 +883,112 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 		return result;
 	}
 
-	// IRLS iteration
-	static constexpr int MAX_ITER = 25;
-	static constexpr double TOL = 1e-7;
-	static constexpr double MAX_BETA = 20.0; // separation detection
+	// Vector-aligned sizes for plink2's SIMD code
+	uint32_t sample_ctav = RoundUpPow2(n, kFloatPerFVec);
+	uint32_t predictor_ctav = RoundUpPow2(p, kFloatPerFVec);
 
-	vector<double> beta(p, 0.0);
-	vector<double> mu(n);
-	vector<double> w(n);
-	vector<double> xwx(p * p);
-	vector<double> xwz(p);
-	vector<double> xwx_inv(p * p);
-	bool converged = false;
+	// Build covariate-major float matrix xx[p × sample_ctav]:
+	// Row 0: intercept (1.0f), zero-padded to sample_ctav
+	// Row 1: genotype dosages (float), zero-padded
+	// Rows 2+: covariates (float), zero-padded
+	vector<float> xx(p * sample_ctav, 0.0f);
+	vector<float> yy(sample_ctav, 0.0f);
 
-	for (int iter = 0; iter < MAX_ITER; iter++) {
-		// Compute linear predictor and predicted probabilities
-		for (uint32_t idx = 0; idx < n; idx++) {
-			double eta = 0.0;
-			for (int j = 0; j < p; j++) {
-				eta += X[idx * p + j] * beta[j];
-			}
-			mu[idx] = Sigmoid(eta);
-			// Clamp to avoid numerical issues
-			if (mu[idx] < 1e-10) {
-				mu[idx] = 1e-10;
-			}
-			if (mu[idx] > 1.0 - 1e-10) {
-				mu[idx] = 1.0 - 1e-10;
-			}
-			w[idx] = mu[idx] * (1.0 - mu[idx]);
+	for (uint32_t idx = 0; idx < n; idx++) {
+		uint32_t i = nm_indices[idx];
+		xx[0 * sample_ctav + idx] = 1.0f;                          // intercept
+		xx[1 * sample_ctav + idx] = static_cast<float>(dosages[i]); // genotype
+		for (int c = 0; c < n_covars; c++) {
+			xx[(2 + c) * sample_ctav + idx] = static_cast<float>(covariates[c][i]);
 		}
-
-		// Build X'WX
-		std::fill(xwx.begin(), xwx.end(), 0.0);
-		for (uint32_t idx = 0; idx < n; idx++) {
-			for (int r = 0; r < p; r++) {
-				for (int c_idx = 0; c_idx < p; c_idx++) {
-					xwx[r * p + c_idx] += w[idx] * X[idx * p + r] * X[idx * p + c_idx];
-				}
-			}
-		}
-
-		// Cholesky decomposition of X'WX
-		vector<double> xwx_chol(xwx);
-		if (!CholeskyDecomp(xwx_chol.data(), p)) {
-			result.errcode = "SINGULAR_MATRIX";
-			return result;
-		}
-
-		// For Firth correction, compute hat matrix diagonal and modify score
-		vector<double> h_diag;
-		if (use_firth) {
-			CholeskyInverse(xwx_chol.data(), xwx_inv.data(), p);
-			h_diag.resize(n);
-			for (uint32_t idx = 0; idx < n; idx++) {
-				// h_ii = w_i * x_i' (X'WX)^{-1} x_i
-				double h = 0.0;
-				for (int r = 0; r < p; r++) {
-					for (int c_idx = 0; c_idx < p; c_idx++) {
-						h += X[idx * p + r] * xwx_inv[r * p + c_idx] * X[idx * p + c_idx];
-					}
-				}
-				h_diag[idx] = w[idx] * h;
-			}
-		}
-
-		// Build X'Wz (modified score for Firth)
-		std::fill(xwz.begin(), xwz.end(), 0.0);
-		for (uint32_t idx = 0; idx < n; idx++) {
-			double resid = y[idx] - mu[idx];
-			if (use_firth) {
-				resid += h_diag[idx] * (0.5 - mu[idx]);
-			}
-			for (int j = 0; j < p; j++) {
-				xwz[j] += X[idx * p + j] * resid;
-			}
-		}
-
-		// Newton step: delta = (X'WX)^{-1} X'Wz (as score)
-		vector<double> delta(xwz);
-		CholeskySolve(xwx_chol.data(), delta.data(), p);
-
-		// Update beta
-		double max_delta = 0.0;
-		for (int j = 0; j < p; j++) {
-			beta[j] += delta[j];
-			max_delta = std::max(max_delta, std::abs(delta[j]));
-		}
-
-		// Check convergence
-		if (max_delta < TOL) {
-			converged = true;
-			break;
-		}
-
-		// Check for separation
-		bool separated = false;
-		for (int j = 0; j < p; j++) {
-			if (std::abs(beta[j]) > MAX_BETA) {
-				separated = true;
-				break;
-			}
-		}
-		if (separated && !use_firth) {
-			result.errcode = "SEPARATION";
-			return result;
-		}
+		yy[idx] = static_cast<float>(phenotype[i]);
 	}
 
-	if (!converged) {
-		result.errcode = "NO_CONVERGENCE";
+	// Allocate scratch buffers (all zero-initialized)
+	vector<float> coef(predictor_ctav, 0.0f);
+	vector<float> ll(p * predictor_ctav, 0.0f);
+	vector<float> pp(sample_ctav, 0.0f);
+	vector<float> vv(sample_ctav, 0.0f);
+	vector<float> hh(p * predictor_ctav, 0.0f);
+	vector<float> grad(predictor_ctav, 0.0f);
+	vector<float> dcoef(predictor_ctav, 0.0f);
+
+	uint32_t is_unfinished = 0;
+	plink2::BoolErr logistic_failed = plink2::LogisticRegressionF(
+	    yy.data(), xx.data(), nullptr, n, p, coef.data(), &is_unfinished,
+	    ll.data(), pp.data(), vv.data(), hh.data(), grad.data(), dcoef.data());
+
+	// Treat "unfinished" (hit iteration limit) as failure for Firth fallback
+	bool needs_firth_fallback = logistic_failed || is_unfinished;
+	bool firth_applied = false;
+
+	if (needs_firth_fallback && use_firth) {
+		// Logistic failed — try Firth correction
+		// Allocate additional buffers
+		vector<double> half_inverted_buf(p * p, 0.0);
+		vector<MatrixInvertBuf1> inv_1d_buf(2 * p);
+		vector<double> dbl_2d_buf(p * p, 0.0);
+		vector<float> ustar(predictor_ctav, 0.0f);
+		vector<float> delta(predictor_ctav, 0.0f);
+		vector<float> hdiag(sample_ctav, 0.0f);
+		vector<float> ww(sample_ctav, 0.0f);
+		vector<float> hh0(p * predictor_ctav, 0.0f);
+		vector<float> tmpnxk_buf(p * sample_ctav, 0.0f);
+
+		// Reset coef to 0
+		std::fill(coef.begin(), coef.end(), 0.0f);
+		is_unfinished = 0;
+
+		plink2::BoolErr firth_failed = plink2::FirthRegressionF(
+		    yy.data(), xx.data(), nullptr, n, p, coef.data(), &is_unfinished,
+		    hh.data(), half_inverted_buf.data(), inv_1d_buf.data(),
+		    dbl_2d_buf.data(), pp.data(), vv.data(), ustar.data(), delta.data(),
+		    hdiag.data(), ww.data(), hh0.data(), tmpnxk_buf.data());
+
+		if (firth_failed) {
+			result.errcode = "NO_CONVERGENCE";
+			return result;
+		}
+		firth_applied = true;
+		// After Firth, hh contains the inverted variance-covariance matrix
+	} else if (needs_firth_fallback) {
+		// Logistic failed/unfinished, no Firth
+		result.errcode = logistic_failed ? "SEPARATION" : "NO_CONVERGENCE";
 		return result;
-	}
-
-	result.firth_applied = use_firth;
-
-	// Final computation of (X'WX)^{-1} for SE (if not already done by Firth)
-	if (!use_firth) {
-		// Use X'WX from last iteration (w computed before final beta update;
-		// negligible difference since convergence requires max_delta < 1e-7)
-		std::fill(xwx.begin(), xwx.end(), 0.0);
-		for (uint32_t idx = 0; idx < n; idx++) {
-			for (int r = 0; r < p; r++) {
-				for (int c_idx = 0; c_idx < p; c_idx++) {
-					xwx[r * p + c_idx] += w[idx] * X[idx * p + r] * X[idx * p + c_idx];
-				}
-			}
-		}
-		vector<double> xwx_chol(xwx);
-		if (!CholeskyDecomp(xwx_chol.data(), p)) {
+	} else if (!use_firth) {
+		// Logistic succeeded without Firth — need to invert hh for SE
+		// hh currently contains the Hessian (from last iteration)
+		vector<double> half_inv(p * p, 0.0);
+		vector<MatrixInvertBuf1> inv_1d(2 * p);
+		vector<double> dbl_2d(p * p, 0.0);
+		if (InvertSymmdefFmatrixFirstHalf(p, predictor_ctav, hh.data(),
+		                                  half_inv.data(), inv_1d.data(), dbl_2d.data())) {
 			result.errcode = "SINGULAR_MATRIX";
 			return result;
 		}
-		CholeskyInverse(xwx_chol.data(), xwx_inv.data(), p);
+		InvertSymmdefFmatrixSecondHalf(p, predictor_ctav, half_inv.data(),
+		                               hh.data(), inv_1d.data(), dbl_2d.data());
+	} else {
+		// Logistic succeeded with Firth enabled but didn't need it
+		// Still need to invert hh for SE
+		vector<double> half_inv(p * p, 0.0);
+		vector<MatrixInvertBuf1> inv_1d(2 * p);
+		vector<double> dbl_2d(p * p, 0.0);
+		if (InvertSymmdefFmatrixFirstHalf(p, predictor_ctav, hh.data(),
+		                                  half_inv.data(), inv_1d.data(), dbl_2d.data())) {
+			result.errcode = "SINGULAR_MATRIX";
+			return result;
+		}
+		InvertSymmdefFmatrixSecondHalf(p, predictor_ctav, half_inv.data(),
+		                               hh.data(), inv_1d.data(), dbl_2d.data());
 	}
+
+	result.firth_applied = firth_applied;
 
 	// Extract results for genotype coefficient (index 1)
-	result.beta = beta[1];
-	double se_sq = xwx_inv[1 * p + 1];
+	// hh is now inverted variance-covariance, covariate-major with stride predictor_ctav
+	result.beta = static_cast<double>(coef[1]);
+	double se_sq = static_cast<double>(hh[1 * predictor_ctav + 1]);
 	if (se_sq < 1e-30) {
 		result.errcode = "ZERO_VARIANCE";
 		return result;
