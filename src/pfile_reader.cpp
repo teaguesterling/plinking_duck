@@ -226,6 +226,13 @@ struct PfileBindData : public TableFunctionData {
 	bool has_variant_filter = false;
 	vector<uint32_t> variant_indices; // sorted indices of variants to include
 
+	// Count-based filtering (af_range, ac_range)
+	CountFilter count_filter;
+	unique_ptr<SampleSubset> count_filter_subset; // shared bind-time subset for PgrGetCounts
+
+	// Genotype range filtering (genotype_range)
+	GenotypeRangeFilter genotype_filter;
+
 	// Effective variant list (after region + variant filter intersection)
 	// If empty and no filters active, scan all variants sequentially.
 	// If non-empty, these are the specific variant indices to scan.
@@ -295,6 +302,7 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 
 	// Projection
 	bool need_genotypes = false;
+	bool need_pgen_reader = false; // genotypes OR count filter
 	vector<column_t> column_ids;
 	OrientMode orient_mode = OrientMode::VARIANT;
 
@@ -344,6 +352,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 	uint32_t geno_current_variant_pos = 0; // index into effective_variant_indices
 	uint32_t geno_current_sample = 0;      // sample index within current variant
 	bool geno_variant_loaded = false;      // genotypes decoded for current variant
+	bool geno_range_all_pass = true;       // persists across chunk boundaries for genotype_range
 	bool geno_done = false;
 
 	~PfileLocalState() {
@@ -390,7 +399,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		} else if (kv.first == "region") {
 			bind_data->region = ParseRegion(kv.second.GetValue<string>());
 		}
-		// samples, variants, and genotypes handled after pgenlib init
+		// samples, variants, genotypes, af_range, ac_range handled after pgenlib init
 	}
 
 	bind_data->orient_mode = ResolveOrientMode(orient_str, "read_pfile");
@@ -676,6 +685,40 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
+	// --- Parse count filters (af_range, ac_range) ---
+	{
+		auto af_it = input.named_parameters.find("af_range");
+		if (af_it != input.named_parameters.end()) {
+			bind_data->count_filter.af_filter = ParseRangeFilter(
+			    af_it->second, "af_range", 0.0, 1.0, "read_pfile");
+		}
+		auto ac_it = input.named_parameters.find("ac_range");
+		if (ac_it != input.named_parameters.end()) {
+			bind_data->count_filter.ac_filter = ParseRangeFilter(
+			    ac_it->second, "ac_range", 0.0,
+			    static_cast<double>(2 * bind_data->OutputSampleCt()), "read_pfile");
+		}
+
+		// Build shared SampleSubset for PgrGetCounts if needed
+		if (bind_data->count_filter.HasFilter() && bind_data->has_sample_subset) {
+			bind_data->count_filter_subset = make_uniq<SampleSubset>(
+			    BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
+		}
+	}
+
+	// --- Parse genotype_range filter ---
+	{
+		auto gr_it = input.named_parameters.find("genotype_range");
+		if (gr_it != input.named_parameters.end()) {
+			if (bind_data->include_dosages) {
+				throw InvalidInputException("read_pfile: genotype_range is incompatible with dosages := true");
+			}
+			bind_data->genotype_filter.range = ParseRangeFilter(
+			    gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile");
+			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
+		}
+	}
+
 	// --- Build output schema ---
 	if (bind_data->orient_mode == OrientMode::GENOTYPE) {
 		// Check for incompatible genotypes := 'columns' before building schema
@@ -713,6 +756,114 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		bind_data->geno_genotype_col = names.size() - 1;
 		bind_data->geno_total_cols = names.size();
 	} else if (bind_data->orient_mode == OrientMode::SAMPLE) {
+		// Apply count filter in sample-orient mode before building schema,
+		// so ARRAY dimension reflects filtered variant count.
+		vector<bool> genotype_range_all_pass;
+		if (bind_data->count_filter.HasFilter() || bind_data->genotype_filter.active) {
+			// Init temporary PgenReader for count filtering
+			plink2::PgenFileInfo cf_pgfi;
+			plink2::PreinitPgfi(&cf_pgfi);
+
+			char cf_errstr[plink2::kPglErrstrBufBlen];
+			plink2::PgenHeaderCtrl cf_hdr;
+			uintptr_t cf_pgfi_alloc_ct = 0;
+
+			err = plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, bind_data->raw_variant_ct,
+			                             bind_data->raw_sample_ct, &cf_hdr, &cf_pgfi, &cf_pgfi_alloc_ct, cf_errstr);
+			if (err != plink2::kPglRetSuccess) {
+				plink2::PglErr ce = plink2::kPglRetSuccess;
+				plink2::CleanupPgfi(&cf_pgfi, &ce);
+				throw IOException("read_pfile: failed to init PgenReader for count filter: %s", cf_errstr);
+			}
+
+			AlignedBuffer cf_pgfi_alloc;
+			if (cf_pgfi_alloc_ct > 0) {
+				cf_pgfi_alloc.Allocate(cf_pgfi_alloc_ct * plink2::kCacheline);
+			}
+
+			uint32_t cf_max_vrec = 0;
+			uintptr_t cf_pgr_alloc_ct = 0;
+			err = plink2::PgfiInitPhase2(cf_hdr, 0, 0, 0, 0, cf_pgfi.raw_variant_ct, &cf_max_vrec, &cf_pgfi,
+			                             cf_pgfi_alloc.As<unsigned char>(), &cf_pgr_alloc_ct, cf_errstr);
+			if (err != plink2::kPglRetSuccess) {
+				plink2::PglErr ce = plink2::kPglRetSuccess;
+				plink2::CleanupPgfi(&cf_pgfi, &ce);
+				throw IOException("read_pfile: count filter PgenReader init failed (phase 2): %s", cf_errstr);
+			}
+
+			plink2::PgenReader cf_pgr;
+			plink2::PreinitPgr(&cf_pgr);
+			AlignedBuffer cf_pgr_alloc;
+			if (cf_pgr_alloc_ct > 0) {
+				cf_pgr_alloc.Allocate(cf_pgr_alloc_ct * plink2::kCacheline);
+			}
+
+			err = plink2::PgrInit(bind_data->pgen_path.c_str(), cf_max_vrec, &cf_pgfi, &cf_pgr,
+			                      cf_pgr_alloc.As<unsigned char>());
+			if (err != plink2::kPglRetSuccess) {
+				plink2::PglErr ce = plink2::kPglRetSuccess;
+				plink2::CleanupPgr(&cf_pgr, &ce);
+				ce = plink2::kPglRetSuccess;
+				plink2::CleanupPgfi(&cf_pgfi, &ce);
+				throw IOException("read_pfile: PgrInit failed for count filter");
+			}
+
+			// Set up sample subsetting for PgrGetCounts
+			plink2::PgrSampleSubsetIndex cf_pssi;
+			if (bind_data->has_sample_subset && bind_data->count_filter_subset) {
+				plink2::PgrSetSampleSubsetIndex(bind_data->count_filter_subset->CumulativePopcounts(),
+				                                &cf_pgr, &cf_pssi);
+			} else {
+				plink2::PgrClearSampleSubsetIndex(&cf_pgr, &cf_pssi);
+			}
+
+			const uintptr_t *cf_si = (bind_data->has_sample_subset && bind_data->count_filter_subset)
+			                             ? bind_data->count_filter_subset->SampleInclude() : nullptr;
+			const uintptr_t *cf_iv = (bind_data->has_sample_subset && bind_data->count_filter_subset)
+			                             ? bind_data->count_filter_subset->InterleavedVec() : nullptr;
+			uint32_t cf_sc = bind_data->has_sample_subset ? bind_data->subset_sample_ct : bind_data->raw_sample_ct;
+
+			// Iterate effective variants and filter by count
+			uint32_t pre_filter_ct = bind_data->EffectiveVariantCt();
+			vector<uint32_t> filtered_indices;
+			filtered_indices.reserve(pre_filter_ct);
+
+			for (uint32_t ev = 0; ev < pre_filter_ct; ev++) {
+				uint32_t vidx = bind_data->has_effective_variant_list
+				                    ? bind_data->effective_variant_indices[ev] : ev;
+
+				STD_ARRAY_DECL(uint32_t, 4, genocounts);
+				plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, cf_pssi, cf_sc, vidx, &cf_pgr, genocounts);
+				if (cf_err != plink2::kPglRetSuccess) {
+					plink2::PglErr ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgr(&cf_pgr, &ce);
+					ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgfi(&cf_pgfi, &ce);
+					throw IOException("read_pfile: PgrGetCounts failed for variant %u during count filter", vidx);
+				}
+
+				auto pf = CheckPreDecompFilters(bind_data->count_filter, bind_data->genotype_filter, genocounts, cf_sc);
+				if (pf.skip) {
+					continue;
+				}
+				bool all_pass = pf.all_pass;
+
+				filtered_indices.push_back(vidx);
+				genotype_range_all_pass.push_back(all_pass);
+			}
+
+			bind_data->effective_variant_indices = std::move(filtered_indices);
+			bind_data->has_effective_variant_list = true;
+
+			// Cleanup
+			{
+				plink2::PglErr ce = plink2::kPglRetSuccess;
+				plink2::CleanupPgr(&cf_pgr, &ce);
+				ce = plink2::kPglRetSuccess;
+				plink2::CleanupPgfi(&cf_pgfi, &ce);
+			}
+		}
+
 		// Sample-orient mode: sample metadata columns + genotypes array/list
 		auto &psam_header = bind_data->sample_metadata.header;
 		for (idx_t i = 0; i < psam_header.column_names.size(); i++) {
@@ -928,6 +1079,18 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
 				UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
 				                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct, preread_phased_pairs.data());
+				// Apply genotype_range per-element filtering (phased: check diploid sum)
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() && !genotype_range_all_pass[ev]) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t a1 = preread_phased_pairs[s * 2];
+						int8_t a2 = preread_phased_pairs[s * 2 + 1];
+						if (a1 != -9 &&
+						    !bind_data->genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+							preread_phased_pairs[s * 2] = -9;
+							preread_phased_pairs[s * 2 + 1] = -9;
+						}
+					}
+				}
 				bind_data->genotype_matrix[ev].assign(preread_phased_pairs.begin(),
 				                                      preread_phased_pairs.begin() + output_sample_ct * 2);
 			} else {
@@ -940,6 +1103,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read", vidx);
 				}
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
+				// Apply genotype_range per-element filtering
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() && !genotype_range_all_pass[ev]) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t geno = tmp_bytes[s];
+						if (geno != -9 &&
+						    !bind_data->genotype_filter.range.Passes(static_cast<double>(geno))) {
+							tmp_bytes[s] = -9;
+						}
+					}
+				}
 				bind_data->genotype_matrix[ev].assign(tmp_bytes.begin(), tmp_bytes.begin() + output_sample_ct);
 			}
 		}
@@ -1058,6 +1231,10 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 		}
 	}
 
+	state->need_pgen_reader = state->need_genotypes
+	                       || bind_data.count_filter.HasFilter()
+	                       || bind_data.genotype_filter.active;
+
 	return std::move(state);
 }
 
@@ -1071,7 +1248,7 @@ static unique_ptr<LocalTableFunctionState> PfileInitLocal(ExecutionContext &cont
 	auto &gstate = global_state->Cast<PfileGlobalState>();
 	auto state = make_uniq<PfileLocalState>();
 
-	if (!gstate.need_genotypes || bind_data.orient_mode == OrientMode::SAMPLE) {
+	if (!gstate.need_pgen_reader || bind_data.orient_mode == OrientMode::SAMPLE) {
 		// Sample-orient mode uses pre-read genotype matrix — no per-thread PgenReader needed
 		return std::move(state);
 	}
@@ -1221,6 +1398,27 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 		for (uint32_t effective_pos = batch_start; effective_pos < batch_end; effective_pos++) {
 			uint32_t vidx = ResolveVariantIdx(bind_data, effective_pos);
 
+			// Count filter + genotype range pre-decompression check
+			bool geno_range_all_pass = true;
+			if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active) && lstate.initialized) {
+				STD_ARRAY_DECL(uint32_t, 4, genocounts);
+				const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+				                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
+				const uintptr_t *cf_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+				                             ? bind_data.count_filter_subset->InterleavedVec() : nullptr;
+				uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
+				plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx,
+				                                              &lstate.pgr, genocounts);
+				if (cf_err != plink2::kPglRetSuccess) {
+					throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
+				}
+				auto pf = CheckPreDecompFilters(bind_data.count_filter, bind_data.genotype_filter, genocounts, cf_sc);
+				if (pf.skip) {
+					continue;
+				}
+				geno_range_all_pass = pf.all_pass;
+			}
+
 			// Read genotype data if needed
 			bool genotypes_read = false;
 			if (gstate.need_genotypes && lstate.initialized) {
@@ -1321,7 +1519,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -1354,13 +1554,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t pair_idx = pair_base + s;
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
-								if (a1 == -9) {
+								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
+								if (a1 == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+									allele_data[allele_base + 1] = a2;
 								}
 							}
 						} else {
@@ -1375,13 +1578,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t pair_idx = list_offset + s;
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
-								if (a1 == -9) {
+								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
+								if (a1 == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+									allele_data[allele_base + 1] = a2;
 								}
 							}
 
@@ -1439,7 +1645,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(base + s);
 									child_data[base + s] = 0;
 								} else {
@@ -1454,7 +1662,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(list_offset + s);
 									child_data[list_offset + s] = 0;
 								} else {
@@ -1485,7 +1695,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -1578,6 +1790,29 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.geno_current_variant_pos);
 
+		// Count filter + genotype range pre-decompression check
+		if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active)
+		    && lstate.initialized && !lstate.geno_variant_loaded) {
+			STD_ARRAY_DECL(uint32_t, 4, genocounts);
+			const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+			                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
+			const uintptr_t *cf_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+			                             ? bind_data.count_filter_subset->InterleavedVec() : nullptr;
+			uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
+			plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx,
+			                                              &lstate.pgr, genocounts);
+			if (cf_err != plink2::kPglRetSuccess) {
+				throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
+			}
+			auto pf = CheckPreDecompFilters(bind_data.count_filter, bind_data.genotype_filter, genocounts, cf_sc);
+			if (pf.skip) {
+				lstate.geno_current_variant_pos++;
+				lstate.geno_current_sample = 0;
+				continue;
+			}
+			lstate.geno_range_all_pass = pf.all_pass;
+		}
+
 		// Load genotypes for current variant if not yet loaded
 		if (!lstate.geno_variant_loaded && gstate.need_genotypes && lstate.initialized) {
 			const uintptr_t *sample_include =
@@ -1622,6 +1857,35 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 		// Emit rows for samples within current variant
 		while (lstate.geno_current_sample < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
+			// When genotype_range is active, skip rows for missing/out-of-range genotypes
+			if (bind_data.genotype_filter.active && gstate.need_genotypes && lstate.geno_variant_loaded) {
+				if (bind_data.include_phased) {
+					int8_t a1 = lstate.phased_pairs[lstate.geno_current_sample * 2];
+					if (a1 == -9) {
+						lstate.geno_current_sample++;
+						continue;
+					}
+					if (!lstate.geno_range_all_pass) {
+						int8_t a2 = lstate.phased_pairs[lstate.geno_current_sample * 2 + 1];
+						if (!bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+							lstate.geno_current_sample++;
+							continue;
+						}
+					}
+				} else if (!bind_data.include_dosages) {
+					int8_t geno = lstate.genotype_bytes[lstate.geno_current_sample];
+					if (geno == -9) {
+						lstate.geno_current_sample++;
+						continue;
+					}
+					if (!lstate.geno_range_all_pass &&
+					    !bind_data.genotype_filter.range.Passes(static_cast<double>(geno))) {
+						lstate.geno_current_sample++;
+						continue;
+					}
+				}
+			}
+
 			// Map scan-order sample index to file-order sample index.
 			// When subsetting, sample_indices is sorted to match pgenlib's
 			// ascending-bit-order output, so genotype_bytes[i] corresponds
@@ -2002,6 +2266,9 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	read_pfile.named_parameters["samples"] = LogicalType::ANY;
 	read_pfile.named_parameters["variants"] = LogicalType::ANY;
 	read_pfile.named_parameters["genotypes"] = LogicalType::VARCHAR;
+	read_pfile.named_parameters["af_range"] = LogicalType::ANY;
+	read_pfile.named_parameters["ac_range"] = LogicalType::ANY;
+	read_pfile.named_parameters["genotype_range"] = LogicalType::ANY;
 
 	loader.RegisterFunction(read_pfile);
 }

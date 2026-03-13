@@ -43,6 +43,13 @@ struct PgenBindData : public TableFunctionData {
 	vector<uint32_t> sample_indices; // 0-based indices into .pgen sample order
 	uint32_t subset_sample_ct = 0;
 
+	// Count-based filtering (af_range, ac_range)
+	CountFilter count_filter;
+	unique_ptr<SampleSubset> count_filter_subset;
+
+	// Genotype range filtering (genotype_range)
+	GenotypeRangeFilter genotype_filter;
+
 	// Columns mode layout (genotypes := 'columns')
 	vector<string> genotype_column_names;     // IIDs for column names
 	idx_t columns_mode_first_geno_col = 0;    // first genotype column index in schema
@@ -59,6 +66,7 @@ struct PgenGlobalState : public GlobalTableFunctionState {
 
 	// Projection flags (computed once in init)
 	bool need_genotypes = false;
+	bool need_pgen_reader = false;
 	vector<column_t> column_ids;
 
 	idx_t MaxThreads() const override {
@@ -146,6 +154,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		} else if (kv.first == "genotypes") {
 			// Handled after sample count is known
 		}
+		// af_range, ac_range handled after pgenlib init
 	}
 
 	if (bind_data->include_dosages && bind_data->include_phased) {
@@ -245,6 +254,40 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		bind_data->subset_sample_ct = static_cast<uint32_t>(bind_data->sample_indices.size());
 	}
 
+	// --- Parse count filters (af_range, ac_range) ---
+	{
+		auto af_it = input.named_parameters.find("af_range");
+		if (af_it != input.named_parameters.end()) {
+			bind_data->count_filter.af_filter = ParseRangeFilter(
+			    af_it->second, "af_range", 0.0, 1.0, "read_pgen");
+		}
+		uint32_t pgen_output_sc = bind_data->has_sample_subset ? bind_data->subset_sample_ct : bind_data->sample_ct;
+		auto ac_it = input.named_parameters.find("ac_range");
+		if (ac_it != input.named_parameters.end()) {
+			bind_data->count_filter.ac_filter = ParseRangeFilter(
+			    ac_it->second, "ac_range", 0.0,
+			    static_cast<double>(2 * pgen_output_sc), "read_pgen");
+		}
+
+		if (bind_data->count_filter.HasFilter() && bind_data->has_sample_subset) {
+			bind_data->count_filter_subset = make_uniq<SampleSubset>(
+			    BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
+		}
+	}
+
+	// --- Parse genotype_range filter ---
+	{
+		auto gr_it = input.named_parameters.find("genotype_range");
+		if (gr_it != input.named_parameters.end()) {
+			if (bind_data->include_dosages) {
+				throw InvalidInputException("read_pgen: genotype_range is incompatible with dosages := true");
+			}
+			bind_data->genotype_filter.range = ParseRangeFilter(
+			    gr_it->second, "genotype_range", 0.0, 2.0, "read_pgen");
+			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
+		}
+	}
+
 	// --- Resolve genotype output mode ---
 	uint32_t output_sample_ct = bind_data->has_sample_subset ? bind_data->subset_sample_ct : bind_data->sample_ct;
 
@@ -327,6 +370,10 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 		}
 	}
 
+	state->need_pgen_reader = state->need_genotypes
+	                       || bind_data.count_filter.HasFilter()
+	                       || bind_data.genotype_filter.active;
+
 	return std::move(state);
 }
 
@@ -340,8 +387,8 @@ static unique_ptr<LocalTableFunctionState> PgenInitLocal(ExecutionContext &conte
 	auto &gstate = global_state->Cast<PgenGlobalState>();
 	auto state = make_uniq<PgenLocalState>();
 
-	if (!gstate.need_genotypes) {
-		// No genotype columns needed — skip pgenlib initialization entirely
+	if (!gstate.need_pgen_reader) {
+		// No genotype columns or count filter needed — skip pgenlib initialization entirely
 		return std::move(state);
 	}
 
@@ -482,6 +529,27 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
 
+			// Count filter + genotype range pre-decompression check
+			bool geno_range_all_pass = true;
+			if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active) && lstate.initialized) {
+				STD_ARRAY_DECL(uint32_t, 4, genocounts);
+				const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+				                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
+				const uintptr_t *cf_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+				                             ? bind_data.count_filter_subset->InterleavedVec() : nullptr;
+				uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
+				plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx,
+				                                              &lstate.pgr, genocounts);
+				if (cf_err != plink2::kPglRetSuccess) {
+					throw IOException("read_pgen: PgrGetCounts failed for variant %u", vidx);
+				}
+				auto pf = CheckPreDecompFilters(bind_data.count_filter, bind_data.genotype_filter, genocounts, cf_sc);
+				if (pf.skip) {
+					continue;
+				}
+				geno_range_all_pass = pf.all_pass;
+			}
+
 			// Read genotype data if needed (before filling columns, since
 			// we need it for the genotypes column)
 			bool genotypes_read = false;
@@ -583,7 +651,9 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -617,13 +687,16 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								idx_t pair_idx = pair_base + s;
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
-								if (a1 == -9) {
+								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
+								if (a1 == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+									allele_data[allele_base + 1] = a2;
 								}
 							}
 						} else {
@@ -639,13 +712,16 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								idx_t pair_idx = list_offset + s;
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
-								if (a1 == -9) {
+								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
+								if (a1 == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
 								} else {
 									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = lstate.phased_pairs[s * 2 + 1];
+									allele_data[allele_base + 1] = a2;
 								}
 							}
 
@@ -704,7 +780,9 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(base + s);
 									child_data[base + s] = 0;
 								} else {
@@ -720,7 +798,9 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(list_offset + s);
 									child_data[list_offset + s] = 0;
 								} else {
@@ -751,7 +831,9 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9) {
+								if (geno == -9 ||
+								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -791,6 +873,9 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 	read_pgen.named_parameters["samples"] = LogicalType::ANY;
 	read_pgen.named_parameters["genotypes"] = LogicalType::VARCHAR;
 	read_pgen.named_parameters["orient"] = LogicalType::VARCHAR;
+	read_pgen.named_parameters["af_range"] = LogicalType::ANY;
+	read_pgen.named_parameters["ac_range"] = LogicalType::ANY;
+	read_pgen.named_parameters["genotype_range"] = LogicalType::ANY;
 
 	loader.RegisterFunction(read_pgen);
 }

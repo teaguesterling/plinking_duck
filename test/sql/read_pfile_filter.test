@@ -1,0 +1,339 @@
+# name: test/sql/read_pfile_filter.test
+# description: Tests for af_range, ac_range, and genotype_range filter pushdown on read_pfile
+# group: [sql]
+
+require plinking_duck
+
+# --- Test data reference (pgen_example, 4 variants x 4 samples) ---
+# rs1: genotypes [0, 1, 2, NULL], AC=3, non_missing=3, AF=0.500
+# rs2: genotypes [1, 1, 0, 2],   AC=4, non_missing=4, AF=0.500
+# rs3: genotypes [2, NULL, 1, 0], AC=3, non_missing=3, AF=0.500
+# rs4: genotypes [0, 0, 1, 2],   AC=3, non_missing=4, AF=0.375
+
+# --- Sanity: verify expected AF values via plink_freq ---
+
+query TR
+SELECT ID, ALT_FREQ FROM plink_freq('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	0.5
+rs2	0.5
+rs3	0.5
+rs4	0.375
+
+# --- af_range basic: max: 0.4 → only rs4 (AF=0.375) ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', af_range := {max: 0.4});
+----
+1
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example', af_range := {max: 0.4});
+----
+rs4
+
+# --- af_range boundary: min: 0.5, max: 0.5 → rs1, rs2, rs3 ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', af_range := {min: 0.5, max: 0.5});
+----
+3
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example', af_range := {min: 0.5, max: 0.5}) ORDER BY ID;
+----
+rs1
+rs2
+rs3
+
+# --- af_range all pass: min: 0.0, max: 1.0 → all 4 ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', af_range := {min: 0.0, max: 1.0});
+----
+4
+
+# --- af_range none pass: min: 0.9 → 0 rows ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', af_range := {min: 0.9});
+----
+0
+
+# --- ac_range basic: min: 4 → only rs2 (AC=4) ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', ac_range := {min: 4});
+----
+1
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example', ac_range := {min: 4});
+----
+rs2
+
+# --- ac_range upper: max: 3 → rs1, rs3, rs4 ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', ac_range := {max: 3});
+----
+3
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example', ac_range := {max: 3}) ORDER BY ID;
+----
+rs1
+rs3
+rs4
+
+# --- Combined af + ac: af max: 0.4 + ac min: 3 → rs4 (only variant passing both) ---
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example', af_range := {max: 0.4}, ac_range := {min: 3});
+----
+rs4
+
+# --- With orient := 'genotype': row count = surviving_variants * samples ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient := 'genotype', af_range := {max: 0.4});
+----
+4
+
+query T
+SELECT DISTINCT ID FROM read_pfile('test/data/pfile_example', orient := 'genotype', af_range := {max: 0.4});
+----
+rs4
+
+# --- With orient := 'sample': array dimension = surviving variant count ---
+
+query I
+SELECT len(genotypes) FROM read_pfile('test/data/pfile_example', orient := 'sample', af_range := {max: 0.4}) LIMIT 1;
+----
+1
+
+# --- Genotype values preserved: filtered output has correct genotypes ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', af_range := {max: 0.4});
+----
+rs4	[0, 0, 1, 2]
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', ac_range := {min: 4});
+----
+rs2	[1, 1, 0, 2]
+
+# --- Projection pushdown: filter works even when genotypes not selected ---
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example', af_range := {max: 0.4});
+----
+rs4
+
+# --- Validation errors ---
+
+# min > max
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', af_range := {min: 0.8, max: 0.2});
+----
+min (0.8) > max (0.2)
+
+# af > 1.0
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', af_range := {max: 1.5});
+----
+out of range
+
+# negative ac
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', ac_range := {min: -1});
+----
+out of range
+
+# wrong field name
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', af_range := {minimum: 0.1});
+----
+unknown field 'minimum'
+
+# ========== genotype_range tests ==========
+
+# --- Test data reference (pgen_example, 4 variants x 4 samples) ---
+# rs1: genotypes [0, 1, 2, NULL]
+# rs2: genotypes [1, 1, 0, 2]
+# rs3: genotypes [2, NULL, 1, 0]
+# rs4: genotypes [0, 0, 1, 2]
+
+# --- Carriers only (min: 1): all 4 variants survive, hom-ref and missing NULLed ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	[NULL, 1, 2, NULL]
+rs2	[1, 1, NULL, 2]
+rs3	[2, NULL, 1, NULL]
+rs4	[NULL, NULL, 1, 2]
+
+# --- Hets only (min: 1, max: 1) ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 1, max: 1}) ORDER BY ID;
+----
+rs1	[NULL, 1, NULL, NULL]
+rs2	[1, 1, NULL, NULL]
+rs3	[NULL, NULL, 1, NULL]
+rs4	[NULL, NULL, 1, NULL]
+
+# --- Hom-alt only (min: 2, max: 2) ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 2, max: 2}) ORDER BY ID;
+----
+rs1	[NULL, NULL, 2, NULL]
+rs2	[NULL, NULL, NULL, 2]
+rs3	[2, NULL, NULL, NULL]
+rs4	[NULL, NULL, NULL, 2]
+
+# --- Hom-ref only (min: 0, max: 0): missing excluded ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotype_range := {min: 0, max: 0}) ORDER BY ID;
+----
+rs1	[0, NULL, NULL, NULL]
+rs2	[NULL, NULL, 0, NULL]
+rs3	[NULL, NULL, NULL, 0]
+rs4	[0, 0, NULL, NULL]
+
+# --- Carriers only, genotype orient ---
+
+query TIT
+SELECT ID, genotype, IID FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotype_range := {min: 1}) ORDER BY ID, IID;
+----
+rs1	1	SAMPLE2
+rs1	2	SAMPLE3
+rs2	1	SAMPLE1
+rs2	1	SAMPLE2
+rs2	2	SAMPLE4
+rs3	2	SAMPLE1
+rs3	1	SAMPLE3
+rs4	1	SAMPLE3
+rs4	2	SAMPLE4
+
+# --- Hom-alt only, genotype orient (fewer rows) ---
+
+query TIT
+SELECT ID, genotype, IID FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotype_range := {min: 2, max: 2}) ORDER BY ID, IID;
+----
+rs1	2	SAMPLE3
+rs2	2	SAMPLE4
+rs3	2	SAMPLE1
+rs4	2	SAMPLE4
+
+# --- Sample orient with genotype_range ---
+
+query I
+SELECT len(genotypes) FROM read_pfile('test/data/pfile_example', orient := 'sample', genotype_range := {min: 1}) LIMIT 1;
+----
+4
+
+# Verify NULLs in correct positions for sample orient
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/pfile_example', orient := 'sample', genotype_range := {min: 1}) ORDER BY IID;
+----
+SAMPLE1	[NULL, 1, 2, NULL]
+SAMPLE2	[1, 1, NULL, NULL]
+SAMPLE3	[2, NULL, 1, 1]
+SAMPLE4	[NULL, 2, NULL, 2]
+
+# ========== Task 8: Combined filter + phased mode tests ==========
+
+# --- Combined af_range + genotype_range ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', af_range := {max: 0.4}, genotype_range := {min: 1}) ORDER BY ID;
+----
+rs4	[NULL, NULL, 1, 2]
+
+# --- Columns mode with genotype_range ---
+
+query TIIII
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4 FROM read_pfile('test/data/pfile_example', genotypes := 'columns', genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	NULL	1	2	NULL
+rs2	1	1	NULL	2
+rs3	2	NULL	1	NULL
+rs4	NULL	NULL	1	2
+
+# --- LIST mode with genotype_range ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotypes := 'list', genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	[NULL, 1, 2, NULL]
+rs2	[1, 1, NULL, 2]
+rs3	[2, NULL, 1, NULL]
+rs4	[NULL, NULL, 1, 2]
+
+# --- Phased mode with genotype_range (spec test case 9) ---
+# Diploid sum used for range check; pair NULLed as unit
+# rs1: [0,1,2,NULL] → phased: [[0,0],[0,1],[1,1],NULL]
+# genotype_range {min: 1}: sum>=1 keeps het(sum=1) and hom_alt(sum=2), excludes hom_ref(sum=0) and missing
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', phased := true, genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	[NULL, [0, 1], [1, 1], NULL]
+rs2	[[0, 1], [0, 1], NULL, [1, 1]]
+rs3	[[1, 1], NULL, [0, 1], NULL]
+rs4	[NULL, NULL, [0, 1], [1, 1]]
+
+# ========== Task 9: Pre-decompression optimization tests ==========
+
+# --- Pre-decompression: all_missing fixture, any genotype_range → variant skipped ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', genotype_range := {min: 0, max: 2});
+----
+0
+
+# --- Pre-decompression: variant skipping verification ---
+# rs2 has genotypes [1, 1, 0, 2] — no missing, all values present
+# genotype_range {min: 2, max: 2} means only hom_alt passes
+# rs1 has hom_alt (sample 3), rs2 has hom_alt (sample 4), rs3 has hom_alt (sample 1), rs4 has hom_alt (sample 4)
+# All 4 variants have at least one hom_alt, so all survive
+
+# Use genotype orient to verify row-level skipping: only hom-alt (2) rows survive
+# Explicitly select genotype so per-row filtering fires
+query I
+SELECT COUNT(genotype) FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotype_range := {min: 2, max: 2});
+----
+4
+
+# ========== Task 10: Validation error tests ==========
+
+# --- Validation errors for genotype_range ---
+
+# min > max
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {min: 2, max: 0});
+----
+min (2) > max (0)
+
+# Value out of range [0, 2]
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {max: 3});
+----
+out of range
+
+# Negative value
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {min: -1});
+----
+out of range
+
+# Incompatible with dosages
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {min: 1}, dosages := true);
+----
+genotype_range is incompatible with dosages
