@@ -245,3 +245,85 @@ SAMPLE1	[NULL, 1, 2, NULL]
 SAMPLE2	[1, 1, NULL, NULL]
 SAMPLE3	[2, NULL, 1, 1]
 SAMPLE4	[NULL, 2, NULL, 2]
+
+# ========== Task 8: Combined filter + phased mode tests ==========
+
+# --- Combined af_range + genotype_range ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', af_range := {max: 0.4}, genotype_range := {min: 1}) ORDER BY ID;
+----
+rs4	[NULL, NULL, 1, 2]
+
+# --- Columns mode with genotype_range ---
+
+query TIIII
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4 FROM read_pfile('test/data/pfile_example', genotypes := 'columns', genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	NULL	1	2	NULL
+rs2	1	1	NULL	2
+rs3	2	NULL	1	NULL
+rs4	NULL	NULL	1	2
+
+# --- Phased mode with genotype_range (spec test case 9) ---
+# Diploid sum used for range check; pair NULLed as unit
+# rs1: [0,1,2,NULL] → phased: [[0,0],[0,1],[1,1],NULL]
+# genotype_range {min: 1}: sum>=1 keeps het(sum=1) and hom_alt(sum=2), excludes hom_ref(sum=0) and missing
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', phased := true, genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	[NULL, [0, 1], [1, 1], NULL]
+rs2	[[0, 1], [0, 1], NULL, [1, 1]]
+rs3	[[1, 1], NULL, [0, 1], NULL]
+rs4	[NULL, NULL, [0, 1], [1, 1]]
+
+# ========== Task 9: Pre-decompression optimization tests ==========
+
+# --- Pre-decompression: all_missing fixture, any genotype_range → variant skipped ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', genotype_range := {min: 0, max: 2});
+----
+0
+
+# --- Pre-decompression: variant skipping verification ---
+# rs2 has genotypes [1, 1, 0, 2] — no missing, all values present
+# genotype_range {min: 2, max: 2} means only hom_alt passes
+# rs1 has hom_alt (sample 3), rs2 has hom_alt (sample 4), rs3 has hom_alt (sample 1), rs4 has hom_alt (sample 4)
+# All 4 variants have at least one hom_alt, so all survive
+
+# Use genotype orient to verify row-level skipping: only hom-alt (2) rows survive
+# Explicitly select genotype so per-row filtering fires
+query I
+SELECT COUNT(genotype) FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotype_range := {min: 2, max: 2});
+----
+4
+
+# ========== Task 10: Validation error tests ==========
+
+# --- Validation errors for genotype_range ---
+
+# min > max
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {min: 2, max: 0});
+----
+min (2) > max (0)
+
+# Value out of range [0, 2]
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {max: 3});
+----
+out of range
+
+# Negative value
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {min: -1});
+----
+out of range
+
+# Incompatible with dosages
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {min: 1}, dosages := true);
+----
+genotype_range is incompatible with dosages

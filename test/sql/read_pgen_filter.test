@@ -124,3 +124,40 @@ rs1	[NULL, NULL, 2, NULL]
 rs2	[NULL, NULL, NULL, 2]
 rs3	[2, NULL, NULL, NULL]
 rs4	[NULL, NULL, NULL, 2]
+
+# ========== Task 8: Combined filter tests ==========
+
+# --- Combined af_range + genotype_range ---
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', af_range := {max: 0.4}, genotype_range := {min: 1}) ORDER BY ID;
+----
+rs4	[NULL, NULL, 1, 2]
+
+# ========== Task 9: Pre-decompression optimization tests ==========
+
+# --- Pre-decompression: all_missing fixture ---
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/all_missing.pgen', genotype_range := {min: 0, max: 2});
+----
+0
+
+# ========== Task 10: Validation error tests ==========
+
+# --- Validation errors for genotype_range ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotype_range := {min: 2, max: 0});
+----
+min (2) > max (0)
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotype_range := {max: 3});
+----
+out of range
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotype_range := {min: 1}, dosages := true);
+----
+genotype_range is incompatible with dosages
