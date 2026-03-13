@@ -1,0 +1,94 @@
+# name: test/sql/read_pgen_filter.test
+# description: Tests for af_range and ac_range count-based filter pushdown on read_pgen
+# group: [sql]
+
+require plinking_duck
+
+# --- Test data reference (pgen_example, 4 variants x 4 samples) ---
+# rs1: genotypes [0, 1, 2, NULL], AC=3, non_missing=3, AF=0.500
+# rs2: genotypes [1, 1, 0, 2],   AC=4, non_missing=4, AF=0.500
+# rs3: genotypes [2, NULL, 1, 0], AC=3, non_missing=3, AF=0.500
+# rs4: genotypes [0, 0, 1, 2],   AC=3, non_missing=4, AF=0.375
+
+# --- af_range basic: max: 0.4 → only rs4 ---
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', af_range := {max: 0.4});
+----
+1
+
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', af_range := {max: 0.4});
+----
+rs4
+
+# --- af_range boundary: min: 0.5, max: 0.5 → rs1, rs2, rs3 ---
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', af_range := {min: 0.5, max: 0.5});
+----
+3
+
+# --- af_range none pass ---
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', af_range := {min: 0.9});
+----
+0
+
+# --- ac_range basic: min: 4 → only rs2 ---
+
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', ac_range := {min: 4});
+----
+rs2
+
+# --- ac_range upper: max: 3 → rs1, rs3, rs4 ---
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', ac_range := {max: 3});
+----
+3
+
+# --- Combined af + ac ---
+
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', af_range := {max: 0.4}, ac_range := {min: 3});
+----
+rs4
+
+# --- Genotype values preserved ---
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen', af_range := {max: 0.4});
+----
+rs4	[0, 0, 1, 2]
+
+# --- Projection pushdown: filter works without genotypes column ---
+
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', af_range := {max: 0.4});
+----
+rs4
+
+# --- Validation errors ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', af_range := {min: 0.8, max: 0.2});
+----
+min (0.8) > max (0.2)
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', af_range := {max: 1.5});
+----
+out of range
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', ac_range := {min: -1});
+----
+out of range
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', af_range := {minimum: 0.1});
+----
+unknown field 'minimum'

@@ -220,6 +220,35 @@ struct VariantRange {
 VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &variants, const string &func_name);
 
 // ---------------------------------------------------------------------------
+// Count-based filtering (af_range, ac_range)
+// ---------------------------------------------------------------------------
+
+struct RangeFilter {
+	double min = -std::numeric_limits<double>::infinity();
+	double max = std::numeric_limits<double>::infinity();
+	bool active = false;
+	bool Passes(double value) const { return value >= min && value <= max; }
+};
+
+struct CountFilter {
+	RangeFilter af_filter;
+	RangeFilter ac_filter;
+	bool HasFilter() const { return af_filter.active || ac_filter.active; }
+};
+
+//! Parse a STRUCT value into a RangeFilter with optional min/max fields.
+//! valid_min/valid_max define the legal range for values (e.g. 0.0-1.0 for AF).
+RangeFilter ParseRangeFilter(const Value &val, const string &param_name,
+                              double valid_min, double valid_max,
+                              const string &func_name);
+
+//! Check if a variant passes count-based filters given its genotype counts.
+//! genocounts: [hom_ref, het, hom_alt, missing] from PgrGetCounts.
+bool VariantPassesCountFilter(const CountFilter &filter,
+                               const STD_ARRAY_REF(uint32_t, 4) genocounts,
+                               uint32_t effective_sample_ct);
+
+// ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
 

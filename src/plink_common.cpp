@@ -536,6 +536,85 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 }
 
 // ---------------------------------------------------------------------------
+// Count-based filtering (af_range, ac_range)
+// ---------------------------------------------------------------------------
+
+RangeFilter ParseRangeFilter(const Value &val, const string &param_name,
+                              double valid_min, double valid_max,
+                              const string &func_name) {
+	RangeFilter result;
+
+	if (val.type().id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException("%s: %s must be a STRUCT (e.g. {min: 0.0, max: 0.5})", func_name, param_name);
+	}
+
+	auto &child_types = StructType::GetChildTypes(val.type());
+	auto &children = StructValue::GetChildren(val);
+
+	if (children.empty()) {
+		// Empty struct = no filter
+		return result;
+	}
+
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		auto &field_name = child_types[i].first;
+		auto &child_val = children[i];
+
+		if (field_name != "min" && field_name != "max") {
+			throw InvalidInputException("%s: %s has unknown field '%s' (expected 'min' and/or 'max')",
+			                            func_name, param_name, field_name);
+		}
+
+		if (child_val.IsNull()) {
+			continue; // NULL = unbounded
+		}
+
+		double v = child_val.GetValue<double>();
+		if (v < valid_min || v > valid_max) {
+			throw InvalidInputException("%s: %s.%s value %g is out of range [%g, %g]",
+			                            func_name, param_name, field_name, v, valid_min, valid_max);
+		}
+
+		if (field_name == "min") {
+			result.min = v;
+		} else {
+			result.max = v;
+		}
+	}
+
+	if (result.min > result.max) {
+		throw InvalidInputException("%s: %s min (%g) > max (%g)", func_name, param_name, result.min, result.max);
+	}
+
+	result.active = true;
+	return result;
+}
+
+bool VariantPassesCountFilter(const CountFilter &filter,
+                               const STD_ARRAY_REF(uint32_t, 4) genocounts,
+                               uint32_t effective_sample_ct) {
+	uint32_t non_missing = genocounts[0] + genocounts[1] + genocounts[2];
+	if (non_missing == 0) {
+		return false;
+	}
+
+	uint32_t ac = genocounts[1] + 2 * genocounts[2];
+
+	if (filter.ac_filter.active && !filter.ac_filter.Passes(static_cast<double>(ac))) {
+		return false;
+	}
+
+	if (filter.af_filter.active) {
+		double af = static_cast<double>(ac) / (2.0 * static_cast<double>(non_missing));
+		if (!filter.af_filter.Passes(af)) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
 
