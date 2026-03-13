@@ -1768,8 +1768,10 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.geno_current_variant_pos);
 
-		// Count filter: skip variants that don't pass af_range/ac_range
-		if (bind_data.count_filter.HasFilter() && lstate.initialized && !lstate.geno_variant_loaded) {
+		// Count filter + genotype range pre-decompression check
+		bool geno_range_all_pass = true;
+		if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active)
+		    && lstate.initialized && !lstate.geno_variant_loaded) {
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
 			                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
@@ -1781,10 +1783,20 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			if (cf_err != plink2::kPglRetSuccess) {
 				throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 			}
-			if (!VariantPassesCountFilter(bind_data.count_filter, genocounts, cf_sc)) {
+			if (bind_data.count_filter.HasFilter() &&
+			    !VariantPassesCountFilter(bind_data.count_filter, genocounts, cf_sc)) {
 				lstate.geno_current_variant_pos++;
 				lstate.geno_current_sample = 0;
 				continue;
+			}
+			if (bind_data.genotype_filter.active) {
+				auto gr = CheckGenotypeRange(bind_data.genotype_filter.range, genocounts);
+				if (!gr.any_pass) {
+					lstate.geno_current_variant_pos++;
+					lstate.geno_current_sample = 0;
+					continue;
+				}
+				geno_range_all_pass = gr.all_pass;
 			}
 		}
 
@@ -1833,6 +1845,35 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 		// Emit rows for samples within current variant
 		while (lstate.geno_current_sample < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
+			// When genotype_range is active, skip rows for missing/out-of-range genotypes
+			if (bind_data.genotype_filter.active && gstate.need_genotypes && lstate.geno_variant_loaded) {
+				if (bind_data.include_phased) {
+					int8_t a1 = lstate.phased_pairs[lstate.geno_current_sample * 2];
+					if (a1 == -9) {
+						lstate.geno_current_sample++;
+						continue;
+					}
+					if (!geno_range_all_pass) {
+						int8_t a2 = lstate.phased_pairs[lstate.geno_current_sample * 2 + 1];
+						if (!bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+							lstate.geno_current_sample++;
+							continue;
+						}
+					}
+				} else if (!bind_data.include_dosages) {
+					int8_t geno = lstate.genotype_bytes[lstate.geno_current_sample];
+					if (geno == -9) {
+						lstate.geno_current_sample++;
+						continue;
+					}
+					if (!geno_range_all_pass &&
+					    !bind_data.genotype_filter.range.Passes(static_cast<double>(geno))) {
+						lstate.geno_current_sample++;
+						continue;
+					}
+				}
+			}
+
 			// Map scan-order sample index to file-order sample index.
 			// When subsetting, sample_indices is sorted to match pgenlib's
 			// ascending-bit-order output, so genotype_bytes[i] corresponds

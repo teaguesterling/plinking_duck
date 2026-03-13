@@ -204,3 +204,28 @@ rs1	[0, NULL, NULL, NULL]
 rs2	[NULL, NULL, 0, NULL]
 rs3	[NULL, NULL, NULL, 0]
 rs4	[0, 0, NULL, NULL]
+
+# --- Carriers only, genotype orient ---
+
+query TIT
+SELECT ID, genotype, IID FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotype_range := {min: 1}) ORDER BY ID, IID;
+----
+rs1	1	SAMPLE2
+rs1	2	SAMPLE3
+rs2	1	SAMPLE1
+rs2	1	SAMPLE2
+rs2	2	SAMPLE4
+rs3	2	SAMPLE1
+rs3	1	SAMPLE3
+rs4	1	SAMPLE3
+rs4	2	SAMPLE4
+
+# --- Hom-alt only, genotype orient (fewer rows) ---
+
+query TIT
+SELECT ID, genotype, IID FROM read_pfile('test/data/pfile_example', orient := 'genotype', genotype_range := {min: 2, max: 2}) ORDER BY ID, IID;
+----
+rs1	2	SAMPLE3
+rs2	2	SAMPLE4
+rs3	2	SAMPLE1
+rs4	2	SAMPLE4
