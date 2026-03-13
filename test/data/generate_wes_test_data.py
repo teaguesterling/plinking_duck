@@ -32,7 +32,7 @@ def generate_mafs(n, rng):
     n_lowfreq = int(n * 0.15)
     n_common = n - n_rare - n_lowfreq
 
-    rare = rng.beta(0.15, 30, n_rare)           # heavily skewed toward 0
+    rare = rng.beta(0.15, 30, n_rare)  # heavily skewed toward 0
     lowfreq = rng.uniform(0.01, 0.05, n_lowfreq)
     common = rng.uniform(0.05, 0.45, n_common)
 
@@ -88,8 +88,7 @@ def main():
     mafs = generate_mafs(n_generate, rng)
 
     print("  Sampling genotypes from MAF distribution...")
-    genos = rng.binomial(2, mafs[:, np.newaxis],
-                         (n_generate, N_SAMPLES)).astype(np.uint8)
+    genos = rng.binomial(2, mafs[:, np.newaxis], (n_generate, N_SAMPLES)).astype(np.uint8)
 
     # Filter monomorphic sites
     row_sums = genos.sum(axis=1)
@@ -121,8 +120,7 @@ def main():
 
         # Data lines — use numpy for fast genotype encoding
         for i in range(actual_n):
-            prefix = (f"{CHROM}\t{positions[i]}\tv{i+1}\t"
-                      f"{BASES[ref_idx[i]]}\t{BASES[alt_idx[i]]}\t.\t.\t.\tGT")
+            prefix = f"{CHROM}\t{positions[i]}\tv{i+1}\t" f"{BASES[ref_idx[i]]}\t{BASES[alt_idx[i]]}\t.\t.\t.\tGT"
             gt_encoded = GT_TABLE[genos[i]]  # (N_SAMPLES,) array of |S4
             f.write(prefix.encode() + gt_encoded.tobytes() + b"\n")
 
@@ -135,8 +133,7 @@ def main():
     # --- Convert to pgen ---
     print("Converting to pgen with plink2...")
     result = subprocess.run(
-        [plink2, "--vcf", vcf_path, "--make-pgen", "--out", out_prefix],
-        capture_output=True, text=True
+        [plink2, "--vcf", vcf_path, "--make-pgen", "--out", out_prefix], capture_output=True, text=True
     )
     if result.returncode != 0:
         print("plink2 stderr:", result.stderr, file=sys.stderr)

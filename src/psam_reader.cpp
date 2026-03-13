@@ -141,7 +141,7 @@ static vector<string> ReadFileLines(ClientContext &context, const string &path) 
 //! Core header parsing logic, operating on already-read lines.
 //! Separated from file I/O so callers that already have the lines
 //! (LoadSampleInfo, PsamInitGlobal) don't re-read the file.
-static PsamHeaderInfo ParsePsamHeaderFromLines(const vector<string> &lines, const string &path) {
+PsamHeaderInfo ParsePsamHeaderFromLines(const vector<string> &lines, const string &path) {
 	if (lines.empty()) {
 		throw IOException("read_psam: file '%s' is empty", path);
 	}
