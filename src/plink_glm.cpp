@@ -1,5 +1,6 @@
 #include "plink_glm.hpp"
 #include "plink_common.hpp"
+#include "psam_reader.hpp"
 #include "plink2_glm_logistic_math.hpp"
 
 #include <atomic>
@@ -7,6 +8,90 @@
 #include <cstring>
 
 namespace duckdb {
+
+// ---------------------------------------------------------------------------
+// Psam column extraction helper
+// ---------------------------------------------------------------------------
+
+//! Read a named column from a .psam/.fam file as a vector of doubles.
+//! Returns one value per sample in file order. "NA" and missing values
+//! become NAN. Throws on column not found or non-numeric values.
+static vector<double> LoadPsamColumnAsDouble(ClientContext &context, const string &psam_path,
+                                             const string &column_name) {
+	auto lines = ReadFileLines(context, psam_path);
+	auto header = ParsePsamHeader(context, psam_path);
+
+	// Find the column index
+	idx_t col_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < header.column_names.size(); i++) {
+		if (header.column_names[i] == column_name) {
+			col_idx = i;
+			break;
+		}
+	}
+	if (col_idx == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("plink_glm: psam file '%s' has no column '%s'", psam_path, column_name);
+	}
+
+	// Data lines start at index 1 for .psam (skip header), 0 for .fam
+	idx_t data_start = (header.format != PsamFormat::FAM) ? 1 : 0;
+
+	vector<double> values;
+	for (idx_t i = data_start; i < lines.size(); i++) {
+		auto &line = lines[i];
+		if (line.empty()) {
+			continue;
+		}
+
+		// Split by tab (psam) or whitespace (fam)
+		vector<string> fields;
+		if (header.format == PsamFormat::FAM) {
+			// Space-delimited
+			idx_t pos = 0;
+			while (pos < line.size()) {
+				while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+					pos++;
+				}
+				if (pos >= line.size()) {
+					break;
+				}
+				idx_t start = pos;
+				while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') {
+					pos++;
+				}
+				fields.push_back(line.substr(start, pos - start));
+			}
+		} else {
+			// Tab-delimited
+			idx_t start = 0;
+			for (idx_t j = 0; j <= line.size(); j++) {
+				if (j == line.size() || line[j] == '\t') {
+					fields.push_back(line.substr(start, j - start));
+					start = j + 1;
+				}
+			}
+		}
+
+		if (col_idx >= fields.size()) {
+			throw IOException("plink_glm: psam file '%s' line %d has %d fields, expected at least %d",
+			                  psam_path, i + 1, fields.size(), col_idx + 1);
+		}
+
+		auto &field = fields[col_idx];
+		if (field == "NA" || field == "na" || field == "-9") {
+			values.push_back(NAN);
+		} else {
+			try {
+				values.push_back(std::stod(field));
+			} catch (...) {
+				throw InvalidInputException("plink_glm: psam column '%s' has non-numeric value '%s' at line %d",
+				                            column_name, field, i + 1);
+			}
+		}
+	}
+
+	return values;
+}
 
 // ---------------------------------------------------------------------------
 // Column indices
@@ -389,42 +474,69 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	}
 
 	auto &pheno_val = pheno_it->second;
-	if (pheno_val.type().id() != LogicalTypeId::LIST) {
-		throw InvalidInputException("plink_glm: phenotype must be a LIST(DOUBLE)");
-	}
 
-	auto &pheno_children = ListValue::GetChildren(pheno_val);
+	// Type dispatch: VARCHAR → psam column name, LIST → direct values
+	if (pheno_val.type().id() == LogicalTypeId::VARCHAR) {
+		// --- Phenotype from psam column ---
+		if (bind_data->psam_path.empty()) {
+			throw InvalidInputException("plink_glm: phenotype as column name requires a .psam/.fam file");
+		}
+		string pheno_col = pheno_val.GetValue<string>();
+		auto raw_values = LoadPsamColumnAsDouble(context, bind_data->psam_path, pheno_col);
+		if (static_cast<uint32_t>(raw_values.size()) != bind_data->raw_sample_ct) {
+			throw InvalidInputException("plink_glm: psam has %llu samples but .pgen has %u",
+			                            static_cast<unsigned long long>(raw_values.size()),
+			                            bind_data->raw_sample_ct);
+		}
 
-	if (static_cast<uint32_t>(pheno_children.size()) != bind_data->raw_sample_ct) {
-		throw InvalidInputException("plink_glm: phenotype length (%llu) must match sample count (%u)",
-		                            static_cast<unsigned long long>(pheno_children.size()),
-		                            bind_data->raw_sample_ct);
-	}
-
-	// Extract phenotype values for effective samples
-	bind_data->phenotype.resize(bind_data->effective_sample_ct);
-
-	if (bind_data->has_sample_subset) {
-		const uintptr_t *sample_include = bind_data->sample_subset->SampleInclude();
-		uint32_t out_idx = 0;
-		for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
-			if (plink2::IsSet(sample_include, raw_idx)) {
-				if (pheno_children[raw_idx].IsNull()) {
-					bind_data->phenotype[out_idx] = NAN;
-				} else {
-					bind_data->phenotype[out_idx] = pheno_children[raw_idx].GetValue<double>();
+		bind_data->phenotype.resize(bind_data->effective_sample_ct);
+		if (bind_data->has_sample_subset) {
+			const uintptr_t *sample_include = bind_data->sample_subset->SampleInclude();
+			uint32_t out_idx = 0;
+			for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+				if (plink2::IsSet(sample_include, raw_idx)) {
+					bind_data->phenotype[out_idx] = raw_values[raw_idx];
+					out_idx++;
 				}
-				out_idx++;
+			}
+		} else {
+			bind_data->phenotype = std::move(raw_values);
+		}
+	} else if (pheno_val.type().id() == LogicalTypeId::LIST) {
+		// --- Phenotype from direct LIST(DOUBLE) ---
+		auto &pheno_children = ListValue::GetChildren(pheno_val);
+
+		if (static_cast<uint32_t>(pheno_children.size()) != bind_data->raw_sample_ct) {
+			throw InvalidInputException("plink_glm: phenotype length (%llu) must match sample count (%u)",
+			                            static_cast<unsigned long long>(pheno_children.size()),
+			                            bind_data->raw_sample_ct);
+		}
+
+		bind_data->phenotype.resize(bind_data->effective_sample_ct);
+		if (bind_data->has_sample_subset) {
+			const uintptr_t *sample_include = bind_data->sample_subset->SampleInclude();
+			uint32_t out_idx = 0;
+			for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+				if (plink2::IsSet(sample_include, raw_idx)) {
+					if (pheno_children[raw_idx].IsNull()) {
+						bind_data->phenotype[out_idx] = NAN;
+					} else {
+						bind_data->phenotype[out_idx] = pheno_children[raw_idx].GetValue<double>();
+					}
+					out_idx++;
+				}
+			}
+		} else {
+			for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
+				if (pheno_children[i].IsNull()) {
+					bind_data->phenotype[i] = NAN;
+				} else {
+					bind_data->phenotype[i] = pheno_children[i].GetValue<double>();
+				}
 			}
 		}
 	} else {
-		for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
-			if (pheno_children[i].IsNull()) {
-				bind_data->phenotype[i] = NAN;
-			} else {
-				bind_data->phenotype[i] = pheno_children[i].GetValue<double>();
-			}
-		}
+		throw InvalidInputException("plink_glm: phenotype must be a LIST(DOUBLE) or a VARCHAR column name");
 	}
 
 	// Validate phenotype
@@ -456,57 +568,102 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		auto &covar_val = covar_it->second;
 		auto &covar_type = covar_val.type();
 
-		if (covar_type.id() != LogicalTypeId::STRUCT) {
-			throw InvalidInputException("plink_glm: covariates must be a STRUCT of named LIST(DOUBLE) "
-			                            "columns, e.g. {'age': list(age), 'sex': list(sex)}");
-		}
-
-		auto &struct_children = StructType::GetChildTypes(covar_type);
-		auto &struct_vals = StructValue::GetChildren(covar_val);
-
-		for (idx_t ci = 0; ci < struct_children.size(); ci++) {
-			auto &name = struct_children[ci].first;
-			auto &val = struct_vals[ci];
-
-			if (val.type().id() != LogicalTypeId::LIST) {
-				throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s",
-				                            name, val.type().ToString());
+		if (covar_type.id() == LogicalTypeId::LIST &&
+		    ListType::GetChildType(covar_type).id() == LogicalTypeId::VARCHAR) {
+			// --- Covariates from psam column names: LIST(VARCHAR) ---
+			if (bind_data->psam_path.empty()) {
+				throw InvalidInputException("plink_glm: covariates as column names requires a .psam/.fam file");
 			}
 
-			auto &list_children = ListValue::GetChildren(val);
-			if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
-				throw InvalidInputException(
-				    "plink_glm: covariate '%s' length (%llu) must match sample count (%u)", name,
-				    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
-			}
-
-			// Extract values for effective samples (NULLs not allowed in covariates)
-			vector<double> covar_vals(bind_data->effective_sample_ct);
-			if (bind_data->has_sample_subset) {
-				const uintptr_t *si = bind_data->sample_subset->SampleInclude();
-				uint32_t out_idx = 0;
-				for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
-					if (plink2::IsSet(si, raw_idx)) {
-						if (list_children[raw_idx].IsNull()) {
-							throw InvalidInputException(
-							    "plink_glm: covariate '%s' contains NULL at index %u", name, raw_idx);
-						}
-						covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
-						out_idx++;
-					}
+			auto &list_children = ListValue::GetChildren(covar_val);
+			for (idx_t ci = 0; ci < list_children.size(); ci++) {
+				string col_name = list_children[ci].GetValue<string>();
+				auto raw_values = LoadPsamColumnAsDouble(context, bind_data->psam_path, col_name);
+				if (static_cast<uint32_t>(raw_values.size()) != bind_data->raw_sample_ct) {
+					throw InvalidInputException("plink_glm: psam has %llu samples but .pgen has %u",
+					                            static_cast<unsigned long long>(raw_values.size()),
+					                            bind_data->raw_sample_ct);
 				}
-			} else {
-				for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
-					if (list_children[i].IsNull()) {
+
+				// Check for NAN (which LoadPsamColumnAsDouble uses for NA/-9)
+				for (uint32_t i = 0; i < raw_values.size(); i++) {
+					if (std::isnan(raw_values[i])) {
 						throw InvalidInputException(
-						    "plink_glm: covariate '%s' contains NULL at index %u", name, i);
+						    "plink_glm: covariate '%s' contains NA/missing at sample %u", col_name, i);
 					}
-					covar_vals[i] = list_children[i].GetValue<double>();
 				}
-			}
 
-			bind_data->covariate_names.push_back(name);
-			bind_data->covariate_values.push_back(std::move(covar_vals));
+				// Apply sample subset
+				vector<double> covar_vals(bind_data->effective_sample_ct);
+				if (bind_data->has_sample_subset) {
+					const uintptr_t *si = bind_data->sample_subset->SampleInclude();
+					uint32_t out_idx = 0;
+					for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+						if (plink2::IsSet(si, raw_idx)) {
+							covar_vals[out_idx] = raw_values[raw_idx];
+							out_idx++;
+						}
+					}
+				} else {
+					covar_vals = std::move(raw_values);
+				}
+
+				bind_data->covariate_names.push_back(col_name);
+				bind_data->covariate_values.push_back(std::move(covar_vals));
+			}
+		} else if (covar_type.id() == LogicalTypeId::STRUCT) {
+			// --- Covariates from STRUCT of LIST(DOUBLE) ---
+			auto &struct_children = StructType::GetChildTypes(covar_type);
+			auto &struct_vals = StructValue::GetChildren(covar_val);
+
+			for (idx_t ci = 0; ci < struct_children.size(); ci++) {
+				auto &name = struct_children[ci].first;
+				auto &val = struct_vals[ci];
+
+				if (val.type().id() != LogicalTypeId::LIST) {
+					throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s",
+					                            name, val.type().ToString());
+				}
+
+				auto &list_children = ListValue::GetChildren(val);
+				if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
+					throw InvalidInputException(
+					    "plink_glm: covariate '%s' length (%llu) must match sample count (%u)", name,
+					    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
+				}
+
+				// Extract values for effective samples (NULLs not allowed in covariates)
+				vector<double> covar_vals(bind_data->effective_sample_ct);
+				if (bind_data->has_sample_subset) {
+					const uintptr_t *si = bind_data->sample_subset->SampleInclude();
+					uint32_t out_idx = 0;
+					for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+						if (plink2::IsSet(si, raw_idx)) {
+							if (list_children[raw_idx].IsNull()) {
+								throw InvalidInputException(
+								    "plink_glm: covariate '%s' contains NULL at index %u", name, raw_idx);
+							}
+							covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
+							out_idx++;
+						}
+					}
+				} else {
+					for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
+						if (list_children[i].IsNull()) {
+							throw InvalidInputException(
+							    "plink_glm: covariate '%s' contains NULL at index %u", name, i);
+						}
+						covar_vals[i] = list_children[i].GetValue<double>();
+					}
+				}
+
+				bind_data->covariate_names.push_back(name);
+				bind_data->covariate_values.push_back(std::move(covar_vals));
+			}
+		} else {
+			throw InvalidInputException("plink_glm: covariates must be a STRUCT of named LIST(DOUBLE) "
+			                            "columns (e.g. {'age': list(age)}), or a LIST(VARCHAR) of "
+			                            "psam column names (e.g. ['age', 'sex'])");
 		}
 	}
 

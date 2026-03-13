@@ -69,3 +69,27 @@ SELECT * FROM plink_glm('test/data/pgen_example',
     covariates := {'age': [25.0, NULL, 35.0, 40.0]});
 ----
 covariate 'age' contains NULL
+
+# Phenotype as column name: nonexistent column
+statement error
+SELECT * FROM plink_glm('test/data/large_example',
+    phenotype := 'nonexistent',
+    psam := 'test/data/glm_pheno_example.psam');
+----
+has no column 'nonexistent'
+
+# Phenotype as column name: no psam file
+statement error
+SELECT * FROM plink_glm('test/data/pgen_orphan',
+    phenotype := 'height');
+----
+requires a .psam
+
+# Covariates as column names: nonexistent column
+statement error
+SELECT * FROM plink_glm('test/data/large_example',
+    phenotype := 'height',
+    covariates := ['age', 'nonexistent'],
+    psam := 'test/data/glm_pheno_example.psam');
+----
+has no column 'nonexistent'

@@ -265,3 +265,49 @@ FROM plink_glm('test/data/large_example',
 WHERE ID = 'var1';
 ----
 var1	NO_CONVERGENCE
+
+# ===========================================================================
+# Phase 3: Psam column references
+# ===========================================================================
+
+# Linear with phenotype from psam column (matches Phase 1 large_example results)
+query TRRIR
+SELECT ID, ROUND(A1_FREQ, 4), OBS_CT, ROUND(BETA, 6), ROUND(SE, 6)
+FROM plink_glm('test/data/large_example',
+    phenotype := 'height',
+    psam := 'test/data/glm_pheno_example.psam')
+WHERE ID = 'var1';
+----
+var1	0.5	6	-1.0	0.878505
+
+# Covariates from psam column names
+query TRRRI
+SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND(P, 6), OBS_CT
+FROM plink_glm('test/data/large_example',
+    phenotype := 'height',
+    covariates := ['age'],
+    psam := 'test/data/glm_pheno_example.psam')
+WHERE ID = 'var1';
+----
+var1	-1.120455	1.062566	0.369083	6
+
+# Multiple covariates from psam columns
+query TRRR
+SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND(P, 6)
+FROM plink_glm('test/data/large_example',
+    phenotype := 'height',
+    covariates := ['age', 'bmi'],
+    psam := 'test/data/glm_pheno_example.psam')
+WHERE ID = 'var1';
+----
+var1	0.020132	0.247427	0.942561
+
+# Binary phenotype from psam → auto-detects logistic
+query TRRRT
+SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND("OR", 6), FIRTH_YN
+FROM plink_glm('test/data/large_example',
+    phenotype := 'case_ctrl',
+    psam := 'test/data/glm_pheno_example.psam')
+WHERE ID = 'var1';
+----
+var1	0.0	1.0	1.0	N
