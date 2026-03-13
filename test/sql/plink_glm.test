@@ -12,7 +12,7 @@ require plinking_duck
 # Full output with all columns (OR and FIRTH_YN are NULL for linear)
 query TIITTTRTIRRRRTRT
 SELECT CHROM, POS, ID, REF, ALT, A1, A1_FREQ, TEST, OBS_CT, BETA, SE, T_STAT, P, ERRCODE, "OR", FIRTH_YN
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8])
 ORDER BY ID;
 ----
@@ -24,7 +24,7 @@ ORDER BY ID;
 # Row count matches variant count
 query I
 SELECT COUNT(*)
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8]);
 ----
 4
@@ -35,7 +35,7 @@ FROM plink_glm('test/data/pgen_example.pgen',
 
 query I
 SELECT COUNT(*)
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8],
     region := '1:1-100000');
 ----
@@ -43,7 +43,7 @@ FROM plink_glm('test/data/pgen_example.pgen',
 
 query I
 SELECT COUNT(*)
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8],
     region := '2:1-100000');
 ----
@@ -58,7 +58,7 @@ SET VARIABLE pheno = [1.5, 2.3, 3.7, 0.8];
 
 query TR
 SELECT ID, ROUND(BETA, 4)
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := getvariable('pheno'))
 ORDER BY ID;
 ----
@@ -73,7 +73,7 @@ rs4	-0.3364
 
 query TI
 SELECT ID, POS
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8])
 ORDER BY ID;
 ----
@@ -88,7 +88,7 @@ rs4	15000
 
 query I
 SELECT COUNT(*)
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7]);
 ----
 3000
@@ -96,7 +96,7 @@ FROM plink_glm('test/data/large_example.pgen',
 # Region filter on large dataset
 query I
 SELECT COUNT(*)
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
     region := '1:1-500');
 ----
@@ -105,7 +105,7 @@ FROM plink_glm('test/data/large_example.pgen',
 # Validate first variant of large dataset against plink2
 query TRRIR
 SELECT ID, ROUND(A1_FREQ, 4), OBS_CT, ROUND(BETA, 6), ROUND(SE, 6)
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7])
 WHERE ID = 'var1';
 ----
@@ -117,7 +117,7 @@ var1	0.5	6	-1.0	0.878505
 
 query TRR
 SELECT g.ID, ROUND(g.P, 6) as P, ROUND(f.ALT_FREQ, 4) as ALT_FREQ
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8]) g
 JOIN plink_freq('test/data/pgen_example.pgen') f ON g.ID = f.ID
 WHERE g.P < 0.1
@@ -132,7 +132,7 @@ rs1	0.099425	0.5
 
 query TIRT
 SELECT ID, OBS_CT, ROUND(BETA, 4), ERRCODE
-FROM plink_glm('test/data/pgen_example.pgen',
+FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, NULL, 3.7, 0.8])
 ORDER BY ID;
 ----
@@ -148,7 +148,7 @@ rs4	3	-0.35	NULL
 # Linear with 1 covariate (large_example, 8 samples)
 query TRRRI
 SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND(P, 6), OBS_CT
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
     covariates := {'age': [25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0]})
 WHERE ID = 'var1';
@@ -158,7 +158,7 @@ var1	-1.120455	1.062566	0.369083	6
 # Linear with 2 covariates
 query TRRR
 SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND(P, 6)
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
     covariates := {'age': [25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0],
                    'bmi': [22.1, 24.5, 23.0, 28.3, 26.1, 21.5, 25.8, 23.2]})
@@ -174,7 +174,7 @@ var1	0.020132	0.247427	0.942561
 # plink2's LogisticRegressionF converges for balanced phenotypes, so no Firth needed
 query TRRRT
 SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND("OR", 6), FIRTH_YN
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [0, 1, 0, 1, 1, 0, 1, 0])
 WHERE ID = 'var1';
 ----
@@ -183,7 +183,7 @@ var1	0.0	1.0	1.0	N
 # Binary 1/2 phenotype → auto-remaps to 0/1, uses logistic
 query TRRRT
 SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND("OR", 6), FIRTH_YN
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [1, 2, 1, 2, 2, 1, 2, 1])
 WHERE ID = 'var1';
 ----
@@ -193,7 +193,7 @@ var1	0.0	1.0	1.0	N
 # plink2's FirthRegressionF uses different variance-covariance than our old impl
 query TRRRRRT
 SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND(T_STAT, 6), ROUND(P, 6), ROUND("OR", 6), FIRTH_YN
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [0, 1, 0, 0, 1, 1, 0, 0])
 WHERE ID = 'var1';
 ----
@@ -202,7 +202,7 @@ var1	1.855205	1.248652	1.485766	0.137341	6.393007	Y
 # Row count for logistic
 query I
 SELECT COUNT(*)
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [0, 1, 0, 1, 1, 0, 1, 0]);
 ----
 3000
@@ -216,7 +216,7 @@ FROM plink_glm('test/data/large_example.pgen',
 # than hard-failing, so we report NO_CONVERGENCE instead of SEPARATION
 query TRT
 SELECT ID, BETA, ERRCODE
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [0, 1, 0, 0, 1, 1, 0, 0],
     firth := false)
 WHERE ID = 'var1';
@@ -226,7 +226,7 @@ var1	NULL	NO_CONVERGENCE
 # With Firth (default), the same variant converges
 query TRRT
 SELECT ID, ROUND(BETA, 4), ROUND("OR", 4), FIRTH_YN
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [0, 1, 0, 0, 1, 1, 0, 0])
 WHERE ID = 'var1';
 ----
@@ -235,7 +235,7 @@ var1	1.8552	6.393	Y
 # Firth disabled explicitly: FIRTH_YN = N for converged variants
 query TRT
 SELECT ID, ROUND("OR", 6), FIRTH_YN
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [0, 1, 0, 1, 1, 0, 1, 0],
     firth := false)
 WHERE ID = 'var1';
@@ -249,7 +249,7 @@ var1	1.0	N
 # Force linear on binary phenotype (OR and FIRTH_YN are NULL)
 query TRTT
 SELECT ID, ROUND(BETA, 6), "OR", FIRTH_YN
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [0, 1, 0, 1, 1, 0, 1, 0],
     model := 'linear')
 WHERE ID = 'var1';
@@ -259,7 +259,7 @@ var1	0.0	NULL	NULL
 # Force logistic on continuous phenotype → NO_CONVERGENCE
 query TT
 SELECT ID, ERRCODE
-FROM plink_glm('test/data/large_example.pgen',
+FROM plink_glm('test/data/large_example',
     phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
     model := 'logistic')
 WHERE ID = 'var1';

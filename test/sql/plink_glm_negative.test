@@ -6,41 +6,41 @@ require plinking_duck
 
 # Missing phenotype parameter
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen');
+SELECT * FROM plink_glm('test/data/pgen_example');
 ----
 phenotype parameter is required
 
 # Phenotype length mismatch
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+SELECT * FROM plink_glm('test/data/pgen_example',
     phenotype := [1.0, 2.0]);
 ----
 phenotype length
 
 # All-constant phenotype
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+SELECT * FROM plink_glm('test/data/pgen_example',
     phenotype := [5.0, 5.0, 5.0, 5.0]);
 ----
 constant phenotype
 
 # Too few non-missing phenotype values
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+SELECT * FROM plink_glm('test/data/pgen_example',
     phenotype := [1.0, NULL, NULL, NULL]);
 ----
 at least 3 non-missing
 
 # File not found (no companion files)
 statement error
-SELECT * FROM plink_glm('nonexistent.pgen',
+SELECT * FROM plink_glm('nonexistent',
     phenotype := [1.0]);
 ----
 cannot find
 
 # Variant count mismatch (wrong pvar)
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+SELECT * FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8],
     pvar := 'test/data/large_example.pvar');
 ----
@@ -48,7 +48,7 @@ variant count mismatch
 
 # Invalid model parameter
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+SELECT * FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8],
     model := 'invalid');
 ----
@@ -56,7 +56,7 @@ model must be 'auto', 'linear', or 'logistic'
 
 # Covariate length mismatch
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+SELECT * FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8],
     covariates := {'age': [25.0, 30.0]});
 ----
@@ -64,7 +64,7 @@ covariate 'age' length
 
 # NULL values in covariates
 statement error
-SELECT * FROM plink_glm('test/data/pgen_example.pgen',
+SELECT * FROM plink_glm('test/data/pgen_example',
     phenotype := [1.5, 2.3, 3.7, 0.8],
     covariates := {'age': [25.0, NULL, 35.0, 40.0]});
 ----

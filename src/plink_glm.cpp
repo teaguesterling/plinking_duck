@@ -245,7 +245,7 @@ struct PlinkGlmLocalState : public LocalTableFunctionState {
 static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PlinkGlmBindData>();
-	bind_data->pgen_path = input.inputs[0].GetValue<string>();
+	string prefix = input.inputs[0].GetValue<string>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
 
@@ -264,18 +264,50 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		}
 	}
 
+	// --- Resolve pgen path from prefix ---
+	{
+		string candidate = prefix + ".pgen";
+		if (fs.FileExists(candidate)) {
+			bind_data->pgen_path = candidate;
+		} else if (fs.FileExists(prefix)) {
+			bind_data->pgen_path = prefix;
+		} else {
+			throw InvalidInputException("plink_glm: cannot find .pgen file for prefix '%s' (tried '%s')",
+			                            prefix, candidate);
+		}
+	}
+
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
-		bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+		// Try prefix-based discovery first, then companion file discovery
+		for (auto &ext : {".pvar", ".bim"}) {
+			auto candidate = prefix + ext;
+			if (fs.FileExists(candidate)) {
+				bind_data->pvar_path = candidate;
+				break;
+			}
+		}
 		if (bind_data->pvar_path.empty()) {
-			throw InvalidInputException("plink_glm: cannot find .pvar or .bim companion for '%s' "
+			bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+		}
+		if (bind_data->pvar_path.empty()) {
+			throw InvalidInputException("plink_glm: cannot find .pvar or .bim file for '%s' "
 			                            "(use pvar := 'path' to specify explicitly)",
-			                            bind_data->pgen_path);
+			                            prefix);
 		}
 	}
 
 	if (bind_data->psam_path.empty()) {
-		bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+		for (auto &ext : {".psam", ".fam"}) {
+			auto candidate = prefix + ext;
+			if (fs.FileExists(candidate)) {
+				bind_data->psam_path = candidate;
+				break;
+			}
+		}
+		if (bind_data->psam_path.empty()) {
+			bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+		}
 	}
 
 	// --- Initialize pgenlib (Phase 1) to get counts ---
