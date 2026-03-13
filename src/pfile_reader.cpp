@@ -230,6 +230,9 @@ struct PfileBindData : public TableFunctionData {
 	CountFilter count_filter;
 	unique_ptr<SampleSubset> count_filter_subset; // shared bind-time subset for PgrGetCounts
 
+	// Genotype range filtering (genotype_range)
+	GenotypeRangeFilter genotype_filter;
+
 	// Effective variant list (after region + variant filter intersection)
 	// If empty and no filters active, scan all variants sequentially.
 	// If non-empty, these are the specific variant indices to scan.
@@ -699,6 +702,19 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		if (bind_data->count_filter.HasFilter() && bind_data->has_sample_subset) {
 			bind_data->count_filter_subset = make_uniq<SampleSubset>(
 			    BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
+		}
+	}
+
+	// --- Parse genotype_range filter ---
+	{
+		auto gr_it = input.named_parameters.find("genotype_range");
+		if (gr_it != input.named_parameters.end()) {
+			if (bind_data->include_dosages) {
+				throw InvalidInputException("read_pfile: genotype_range is incompatible with dosages := true");
+			}
+			bind_data->genotype_filter.range = ParseRangeFilter(
+			    gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile");
+			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
 		}
 	}
 
@@ -1187,7 +1203,9 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 		}
 	}
 
-	state->need_pgen_reader = state->need_genotypes || bind_data.count_filter.HasFilter();
+	state->need_pgen_reader = state->need_genotypes
+	                       || bind_data.count_filter.HasFilter()
+	                       || bind_data.genotype_filter.active;
 
 	return std::move(state);
 }
@@ -2174,6 +2192,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	read_pfile.named_parameters["genotypes"] = LogicalType::VARCHAR;
 	read_pfile.named_parameters["af_range"] = LogicalType::ANY;
 	read_pfile.named_parameters["ac_range"] = LogicalType::ANY;
+	read_pfile.named_parameters["genotype_range"] = LogicalType::ANY;
 
 	loader.RegisterFunction(read_pfile);
 }
