@@ -430,7 +430,108 @@ The `allele` field specifies which allele the weight applies to. If it matches A
 
 ---
 
-## 6. Working at Scale
+## 6. Genome-Wide Association Testing
+
+A **genome-wide association study (GWAS)** tests every variant for association with a trait. `plink_glm` runs per-variant regression using plink2's proven regression engine — the same math that powers `plink2 --glm`.
+
+### Linear Regression (Continuous Trait)
+
+For a continuous trait like height or BMI, `plink_glm` fits a linear regression at each variant:
+
+```sql
+SELECT ID, ROUND(BETA, 4) AS BETA, ROUND(P, 6) AS P
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8])
+ORDER BY P;
+```
+
+| ID  | BETA    | P        |
+|-----|---------|----------|
+| rs2 | -1.45   | 0.04880  |
+| rs1 | 1.1     | 0.099425 |
+| rs4 | -0.3364 | 0.741259 |
+| rs3 | 0.35    | 0.851413 |
+
+Each row reports the **effect size** (BETA — how much the trait changes per copy of the ALT allele) and **p-value** (how unlikely this association is under the null hypothesis of no effect).
+
+### Logistic Regression (Case/Control)
+
+For binary traits (disease yes/no), `plink_glm` auto-detects the 0/1 phenotype and switches to logistic regression, reporting odds ratios:
+
+```sql
+SELECT ID, ROUND(BETA, 4), ROUND("OR", 4), ROUND(P, 4), FIRTH_YN
+FROM plink_glm('test/data/large_example',
+    phenotype := [0, 1, 0, 1, 1, 0, 1, 0])
+WHERE ID = 'var1';
+```
+
+| ID   | BETA | OR  | P    | FIRTH_YN |
+|------|------|-----|------|----------|
+| var1 | 0.0  | 1.0 | 1.0  | N        |
+
+The **OR** (odds ratio) is `exp(BETA)`. An OR of 1.0 means no association. When logistic regression fails to converge (common with rare variants), plink2's **Firth correction** kicks in automatically — the `FIRTH_YN` column tells you which method was used.
+
+### Adding Covariates
+
+Real GWAS always adjusts for confounders like age, sex, and ancestry principal components:
+
+```sql
+SELECT ID, ROUND(BETA, 4) AS BETA, ROUND(P, 6) AS P
+FROM plink_glm('test/data/large_example',
+    phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
+    covariates := {
+        'age': [25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0]
+    })
+WHERE ID = 'var1';
+```
+
+| ID   | BETA    | P        |
+|------|---------|----------|
+| var1 | -1.1205 | 0.369083 |
+
+### Phenotypes from External Files
+
+For real datasets, phenotypes and covariates live in external files. Use DuckDB's `SET VARIABLE` to load them, then pass with `getvariable()`.
+
+The phenotype and covariate lists must be in the same order as samples in the `.pgen` file. The safest approach is to join against the `.psam` file:
+
+```sql
+-- Join phenotype file against psam to match pgen sample order
+SET VARIABLE pheno = (
+    SELECT list(p.pheno_quant ORDER BY s.rowid)
+    FROM read_psam('data/cohort.psam') s
+    JOIN 'phenotypes.parquet' p ON s.IID = p.IID
+);
+
+SET VARIABLE covars = (
+    SELECT {
+        'age': list(p.age ORDER BY s.rowid),
+        'bmi': list(p.bmi ORDER BY s.rowid),
+        'pc1': list(p.pc1 ORDER BY s.rowid)
+    }
+    FROM read_psam('data/cohort.psam') s
+    JOIN 'covariates.parquet' p ON s.IID = p.IID
+);
+
+-- Run GWAS: top hits
+SELECT ID, CHROM, POS, ROUND(BETA, 4) AS BETA, P
+FROM plink_glm('data/cohort',
+    phenotype := getvariable('pheno'),
+    covariates := getvariable('covars'))
+WHERE P < 5e-8
+ORDER BY P;
+```
+
+The `ORDER BY s.rowid` ensures values are emitted in `.psam` row order, which matches the `.pgen` sample order.
+
+!!! tip "Pre-sorted shortcut"
+    If your parquet file is already sorted to match pgen sample order (e.g., exported from the same pipeline), you can skip the join: `SELECT list(pheno_quant) FROM 'phenotypes.parquet'`.
+
+See [plink_glm](functions/plink_glm.md) for the full parameter and output reference.
+
+---
+
+## 7. Working at Scale
 
 The examples above used a tiny 4-variant dataset. Real genomic data has millions of variants and thousands of samples. PlinkingDuck is designed for this — parallel scanning, projection pushdown, and region filtering all help keep queries fast.
 
@@ -498,7 +599,7 @@ FROM plink_freq('test/data/large_example.pgen',
 
 ## Next Steps
 
-You've now seen the complete PlinkingDuck workflow: loading data, exploring genotypes, running QC, analyzing LD, computing PRS scores, and working efficiently at scale. Here are some directions to explore next:
+You've now seen the complete PlinkingDuck workflow: loading data, exploring genotypes, running QC, analyzing LD, computing PRS scores, running GWAS, and working efficiently at scale. Here are some directions to explore next:
 
 - **[Function Reference](functions/index.md)** — full parameter and output documentation for every function
 - **[Quality Control Guide](guides/quality-control.md)** — detailed QC workflows with recommended thresholds
