@@ -1,0 +1,394 @@
+# P4-003: Genotype filter pushdown — af_range, ac_range, genotype_range
+
+Issue: Scan-level genotype filtering for biobank-scale rare variant queries.
+
+## Status
+
+- [ ] Phase 1: `af_range` + `ac_range` variant-level filtering
+- [ ] Phase 2: `genotype_range` row/element-level filtering
+- [ ] Phase 3: Test fixtures (1K×100, 30K×1K) and scale tests
+
+## Prerequisites
+
+- P4-001 (orient + genotypes modes) ✓
+- P4-002 (dosage output) — dosage-related filter behaviors deferred until
+  P4-002 lands; integer genotype filtering is fully independent
+
+## Depends On
+
+P4-001 (shared orient/genotypes infrastructure). Builds on P2-001 patterns
+for PgrGetCounts and SampleSubset.
+
+## Branch
+
+`feature/P4-003-genotype-filter-pushdown`
+
+---
+
+## Background
+
+### Motivation
+
+At biobank scale (50M variants × 10M samples), the target query pattern is:
+
+```sql
+SELECT g.IID, g.ID as variant, a.gene, a.impact, g.genotype,
+       p.phenotype_A, p.phenotype_D
+FROM read_pfile('imputation_panel',
+       orient := 'genotype',
+       region := 'chr17:43044295-43170245',
+       af_range := {max: 0.01},
+       ac_range := {min: 10},
+       genotype_range := {min: 1}
+     ) g
+JOIN annotations a ON g.ID = a.variant_id
+JOIN read_parquet('phenotypes/*.parquet') p ON g.IID = p.IID
+WHERE a.impact = 'HIGH'
+  AND a.gene IN ('BRCA1', 'TP53', 'CHEK2')
+```
+
+Without filter pushdown, every genotype in the region is decompressed and
+emitted — 99%+ of which are hom-ref for rare variants. The three filters
+form a cost-ordered pipeline that eliminates work at increasing granularity.
+
+### Current state
+
+- `region` and `variants` filter the effective variant list at bind time
+- `samples` subsets the sample set at bind time
+- No variant-level frequency filtering exists
+- No row/element-level genotype value filtering exists
+- `PgrGetCounts` is used by `plink_freq` for cheap genotype counting
+  without decompression — this is the mechanism for af/ac filtering
+- DuckDB's `filter_pushdown` and `pushdown_complex_filter` table function
+  APIs are not used by any plinking_duck function (future work)
+
+---
+
+## Parameters
+
+Three named parameters, all optional, all `STRUCT(min DOUBLE, max DOUBLE)`.
+Omitted struct fields mean unbounded on that side.
+
+| Parameter | Domain | Mechanism | Skips |
+|-----------|--------|-----------|-------|
+| `af_range` | 0.0–1.0 (alternate allele frequency) | PgrGetCounts (no decompression) | Entire variants |
+| `ac_range` | 0–2N (alternate allele count, N = effective sample count) | PgrGetCounts (no decompression) | Entire variants |
+| `genotype_range` | 0–2 (integer genotype) or 0.0–2.0 (dosage, deferred) | Post-decompression value check | Rows or elements |
+
+These are the first STRUCT-typed named parameters in the extension. At
+registration:
+
+```cpp
+auto range_type = LogicalType::STRUCT({{"min", LogicalType::DOUBLE},
+                                       {"max", LogicalType::DOUBLE}});
+read_pfile.named_parameters["af_range"] = range_type;
+read_pfile.named_parameters["ac_range"] = range_type;
+read_pfile.named_parameters["genotype_range"] = range_type;
+```
+
+At bind, extract struct fields via `StructValue::GetChildren()`, treating
+NULL children as unbounded.
+
+### SQL Examples
+
+```sql
+-- Rare variants only (AF ≤ 1%)
+SELECT * FROM read_pfile('data', af_range := {max: 0.01});
+
+-- At least 10 carriers
+SELECT * FROM read_pfile('data', ac_range := {min: 10});
+
+-- Carriers only in genotype orient
+SELECT * FROM read_pfile('data', orient := 'genotype',
+    genotype_range := {min: 1});
+
+-- Combined: rare carriers
+SELECT * FROM read_pfile('data', orient := 'genotype',
+    af_range := {max: 0.01}, ac_range := {min: 10},
+    genotype_range := {min: 1});
+
+-- No-op (empty struct is valid)
+SELECT * FROM read_pfile('data', af_range := {});
+
+-- Exact match: hets only
+SELECT * FROM read_pfile('data', orient := 'genotype',
+    genotype_range := {min: 1, max: 1});
+
+-- With read_pgen (no .psam needed for AF/AC)
+SELECT * FROM read_pgen('data.pgen', af_range := {max: 0.05});
+
+-- Combined with sample subsetting — AF computed on subset
+SELECT * FROM read_pfile('data', orient := 'genotype',
+    samples := ['CASE1', 'CASE2', 'CASE3'],
+    af_range := {max: 0.01}, genotype_range := {min: 1});
+```
+
+### Semantics
+
+- **`af_range` and `ac_range`**: variant must pass **both** (AND logic).
+  AC = het_ct + 2 × hom_alt_ct. AF = AC / (2 × effective_sample_ct).
+- **`genotype_range`**: applied after variant-level filters pass.
+- **Missing genotypes**: excluded whenever any filter parameter is active.
+  This means `genotype_range := {min: 0, max: 2}` (seemingly a no-op)
+  still excludes missing genotypes. Rationale: if the user is filtering on
+  genotype values, missing data should not silently appear as if it were a
+  valid observation. A future `include_missing` parameter could override
+  this behavior.
+- **Phased mode**: `genotype_range` applies to the diploid sum
+  (allele1 + allele2), equivalent to the unphased genotype value. When a
+  phased element is filtered, the entire `[allele1, allele2]` pair is
+  nulled or the row is skipped — individual alleles are never separated.
+- **Sample subsetting**: AF/AC computed on the subsetted samples (PgrGetCounts
+  respects `sample_include`), so filters reflect the selected population.
+- **Dosage mode** (deferred until P4-002): `genotype_range` would operate on
+  the continuous 0.0–2.0 dosage value. `af_range`/`ac_range` use hard-call
+  counts from PgrGetCounts (integer genotype counts, not dosage-based
+  frequency).
+
+### Validation (bind time)
+
+- `af_range`: values must be in [0.0, 1.0]
+- `ac_range`: values must be non-negative (no upper bound at bind time —
+  values beyond 2 × sample_ct are valid but will match everything)
+- `genotype_range`: values must be in [0, 2]
+- Error if min > max for any range
+- Empty struct `{}` is a valid no-op
+
+### Availability
+
+| Function | `af_range` | `ac_range` | `genotype_range` |
+|----------|-----------|-----------|-----------------|
+| `read_pfile` | Yes | Yes | Yes |
+| `read_pgen` | Yes | Yes | Yes |
+
+For `read_pgen`, AF/AC are computed using `raw_sample_ct` from the .pgen
+header (or the subsetted count if `samples` is active). No .psam is required
+— PgrGetCounts only needs the sample_include bitmask and sample count, both
+available from the .pgen header.
+
+---
+
+## Genotype Range Behavior by Output Format
+
+DuckDB table function schemas are fixed at bind time. This means column-level
+skipping is architecturally impossible — you cannot remove a column during
+scan. Therefore, `genotype_range` **nulls out** values in all multi-sample
+output formats and only **skips rows** in genotype orient (where each row is
+a single scalar observation).
+
+| Orient | ARRAY/LIST (positional) | COLUMNS (named) | genotype orient (scalar) |
+|--------|------------------------|-----------------|------------------------|
+| **variant** | Null out elements | Null out values | — |
+| **sample** | Null out elements | Null out values | — |
+| **genotype** | — | — | Skip rows |
+
+**Null out**: out-of-range genotype values replaced with NULL. Array/list
+length preserved, positional alignment maintained.
+
+**Skip rows**: in genotype orient, each row is one observation. Rows with
+out-of-range genotype values are simply not emitted.
+
+**af_range / ac_range** always skip entire variants regardless of output
+format — the variant either passes or doesn't. In positional modes
+(ARRAY/LIST), this shortens the array. This is a deviation from positional
+preservation, but consistent with how `region` and `variants` parameters
+already work — they also shorten the array. To recover the
+variant-to-position mapping, query the same file with `orient := 'variant'`
+and the same filter parameters — the same variants survive in the same order.
+
+**No new output columns**: these filters do not add columns to any output
+schema. They only affect which variants/rows/elements appear in existing
+columns.
+
+---
+
+## Implementation Architecture
+
+### Filter Pipeline (cost-ordered)
+
+```
+For each variant in effective_variant_indices:
+
+  1. PgrGetCounts (cheap — no decompression)
+     → Compute AC = het_ct + 2 * hom_alt_ct
+     → Compute AF = AC / (2 * effective_sample_ct)
+     → If outside af_range or ac_range → skip variant
+
+  2. PgrGet / PgrGetD (decompress — only for surviving variants)
+
+  3. genotype_range (per-element check on decompressed values)
+     → orient=genotype: skip row
+     → ARRAY/LIST/COLUMNS: null out value
+```
+
+### Where Filters Execute
+
+| Orient | af/ac check | genotype_range check |
+|--------|-------------|---------------------|
+| **variant** (parallel) | In scan loop, per thread batch | In scan loop, per element |
+| **genotype** (single-threaded) | In scan loop, same pattern as variant | In scan loop, per row |
+| **sample** (pre-read at bind) | In pre-read loop | In pre-read loop, per element |
+
+#### Scan-time evaluation (variant / genotype orient)
+
+af/ac filtering happens in the scan loop rather than InitGlobal because:
+
+1. **Parallelism**: each thread checks PgrGetCounts for its own variant batch
+   (genotype orient is single-threaded today but parallelizable in future
+   using the same pattern — it's conceptually variant orient with an inner
+   sample unnest)
+2. **No upfront latency**: first results emit immediately
+3. **PgenReader already exists** in local state (InitGlobal would need to
+   create one)
+
+#### Pre-read evaluation (sample orient)
+
+Sample orient pre-reads all genotypes into a matrix at bind time. The af/ac
+check integrates into the existing pre-read loop — skip variants that fail
+the frequency filter, don't add them to the matrix. This interacts
+beneficially with `plinking_max_matrix_elements`: the matrix size guard
+applies *after* af/ac filtering reduces the effective variant count, allowing
+larger unfiltered variant sets to fit within the memory cap.
+
+### SampleSubset for PgrGetCounts
+
+PgrGetCounts requires `sample_include_interleaved_vec`, which is built by
+`BuildSampleSubset` in `plink_common.hpp`. When `af_range` or `ac_range`
+is active, a `SampleSubset` must be available.
+
+**Approach**: build the `SampleSubset` at bind time (shared, immutable) and
+reference it from local state. This follows the pattern used by `plink_freq`
+and avoids redundant per-thread allocation. For the no-subset case (all
+samples), build an all-ones `sample_include` with its corresponding
+`interleaved_vec` — the same pattern `plink_freq` uses when no `samples`
+parameter is provided.
+
+Currently `PfileLocalState` has `sample_include_buf` and
+`cumulative_popcounts_buf` but no `interleaved_vec_buf`. Rather than adding
+per-thread buffers, reference the shared bind-time `SampleSubset`.
+
+---
+
+## Files
+
+### Create
+
+| File | Purpose |
+|------|---------|
+| `test/sql/read_pfile_filter.test` | Filter parameter tests (positive + negative) |
+| `test/sql/read_pgen_filter.test` | Filter parameter tests for read_pgen |
+| `test/data/filter_mid.*` | 1,000 variants × 100 samples fixture |
+| `test/data/filter_large.*` | 30,000 variants × 1,000 samples fixture |
+
+### Modify
+
+| File | Changes |
+|------|---------|
+| `src/pfile_reader.cpp` | Add parameters to bind, scan-time af/ac filter, genotype_range logic |
+| `src/pgen_reader.cpp` | Add parameters to bind, scan-time af/ac filter, genotype_range logic |
+| `src/include/plink_common.hpp` | Add `RangeFilter` struct, validation/parsing helpers |
+| `src/plink_common.cpp` | Range parsing and validation implementation |
+| `test/data/generate_test_data.sh` | Add mid-size and large fixture generation commands |
+
+---
+
+## Test Strategy
+
+### Test Fixtures
+
+| Fixture | Dimensions | Purpose |
+|---------|-----------|---------|
+| `pgen_example` (existing) | 4 × 4 | Correctness, edge cases, validation errors |
+| `filter_mid` (new) | 1,000 × 100 | Basic filter behavior, hand-verifiable results |
+| `filter_large` (new) | 30,000 × 1,000 | Realistic AF distributions, parallel scan |
+
+The new fixtures need variants with a range of allele frequencies:
+monomorphic, rare (AC = 1–5), low-frequency, and common. Generated with
+plink2.
+
+### Test Cases
+
+**Correctness (small + mid-size fixtures):**
+- `af_range` only: verify correct variants survive
+- `ac_range` only: verify count-based filtering
+- `genotype_range` only (genotype orient): verify rows skipped
+- `genotype_range` only (variant orient): verify elements nulled in arrays
+- Combined: af_range + ac_range + genotype_range together
+- Sample subset interaction: AF/AC computed on subset, not full sample set
+
+**Edge cases:**
+- Empty result (all variants filtered)
+- No-op filter (`{}`)
+- Unbounded one side (`{min: 1}`, `{max: 0.5}`)
+- Exact match (`{min: 1, max: 1}` — hets only)
+- All-missing dataset (`all_missing` fixture)
+- Phased mode: genotype_range applied to allele sum, pair nulled as unit
+
+**Validation errors:**
+- min > max for each parameter
+- af_range values outside [0, 1]
+- genotype_range values outside [0, 2]
+- ac_range with negative values
+- Wrong struct field names
+
+**Scale (large fixture):**
+- Verify AF filtering reduces variant count correctly
+- Parallel scan with filters active (variant orient)
+- Combined filters at scale
+
+### Validation Against plink2
+
+For `af_range`/`ac_range`, validate that the surviving variant set matches
+`plink2 --freq` output filtered to the same AF/AC thresholds.
+
+---
+
+## Acceptance Criteria
+
+### Phase 1 (af_range + ac_range)
+
+- [ ] `af_range` filters variants by allele frequency using PgrGetCounts
+- [ ] `ac_range` filters variants by allele count using PgrGetCounts
+- [ ] Both work on `read_pfile` and `read_pgen`
+- [ ] `read_pgen` computes AF/AC from .pgen header sample count (no .psam needed)
+- [ ] SampleSubset built at bind time, shared across threads
+- [ ] Sample subsetting: AF/AC computed on subsetted sample set
+- [ ] Filters compose correctly with `region`, `variants`, and `samples`
+- [ ] Validation errors for out-of-range values, min > max
+- [ ] Parallel scan works correctly with af/ac filtering active (variant orient)
+- [ ] `plinking_max_matrix_elements` guard applies after af/ac filtering (sample orient)
+- [ ] Surviving variant set matches plink2 --freq filtered equivalently
+
+### Phase 2 (genotype_range)
+
+- [ ] `genotype_range` skips rows in genotype orient
+- [ ] `genotype_range` nulls out elements in array/list modes (variant + sample orient)
+- [ ] `genotype_range` nulls out values in columns mode (variant + sample orient)
+- [ ] Missing genotypes excluded when any filter is active
+- [ ] Phased mode: genotype_range applies to allele sum, nulls entire pair
+- [ ] Works on both `read_pfile` and `read_pgen`
+
+### Phase 3 (Test fixtures + scale)
+
+- [ ] Mid-size fixture (1K×100) with hand-verified expected values
+- [ ] Large fixture (30K×1K) with realistic AF distributions
+- [ ] Scale tests pass with all filter combinations
+
+---
+
+## Future Work (Out of Scope)
+
+- **DuckDB filter pushdown**: consume WHERE clause predicates via
+  `pushdown_complex_filter` or `filter_pushdown = true` to automatically
+  apply these filters without explicit parameters
+- **`genotypes := 'struct'`**: single STRUCT column with named subfields;
+  genotype_range would skip fields (named, not positional — struct fields
+  are resolved at bind time but could be filtered if the struct is built
+  dynamically per variant)
+- **Parallel genotype orient**: multi-threaded scan for `orient := 'genotype'`
+  (same architecture as variant orient with inner sample unnest)
+- **`include_missing` parameter**: opt-in to include missing genotypes when
+  filters are active
+- **Dosage-aware AF**: use `PgrGetDCounts` for dosage-based allele frequency
+  instead of hard-call counts
+- **Dosage genotype_range**: continuous 0.0–2.0 filtering (depends on P4-002)
