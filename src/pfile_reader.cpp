@@ -689,20 +689,18 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	{
 		auto af_it = input.named_parameters.find("af_range");
 		if (af_it != input.named_parameters.end()) {
-			bind_data->count_filter.af_filter = ParseRangeFilter(
-			    af_it->second, "af_range", 0.0, 1.0, "read_pfile");
+			bind_data->count_filter.af_filter = ParseRangeFilter(af_it->second, "af_range", 0.0, 1.0, "read_pfile");
 		}
 		auto ac_it = input.named_parameters.find("ac_range");
 		if (ac_it != input.named_parameters.end()) {
 			bind_data->count_filter.ac_filter = ParseRangeFilter(
-			    ac_it->second, "ac_range", 0.0,
-			    static_cast<double>(2 * bind_data->OutputSampleCt()), "read_pfile");
+			    ac_it->second, "ac_range", 0.0, static_cast<double>(2 * bind_data->OutputSampleCt()), "read_pfile");
 		}
 
 		// Build shared SampleSubset for PgrGetCounts if needed
 		if (bind_data->count_filter.HasFilter() && bind_data->has_sample_subset) {
-			bind_data->count_filter_subset = make_uniq<SampleSubset>(
-			    BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
+			bind_data->count_filter_subset =
+			    make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
 		}
 	}
 
@@ -713,8 +711,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			if (bind_data->include_dosages) {
 				throw InvalidInputException("read_pfile: genotype_range is incompatible with dosages := true");
 			}
-			bind_data->genotype_filter.range = ParseRangeFilter(
-			    gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile");
+			bind_data->genotype_filter.range =
+			    ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile");
 			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
 		}
 	}
@@ -811,16 +809,18 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			// Set up sample subsetting for PgrGetCounts
 			plink2::PgrSampleSubsetIndex cf_pssi;
 			if (bind_data->has_sample_subset && bind_data->count_filter_subset) {
-				plink2::PgrSetSampleSubsetIndex(bind_data->count_filter_subset->CumulativePopcounts(),
-				                                &cf_pgr, &cf_pssi);
+				plink2::PgrSetSampleSubsetIndex(bind_data->count_filter_subset->CumulativePopcounts(), &cf_pgr,
+				                                &cf_pssi);
 			} else {
 				plink2::PgrClearSampleSubsetIndex(&cf_pgr, &cf_pssi);
 			}
 
 			const uintptr_t *cf_si = (bind_data->has_sample_subset && bind_data->count_filter_subset)
-			                             ? bind_data->count_filter_subset->SampleInclude() : nullptr;
+			                             ? bind_data->count_filter_subset->SampleInclude()
+			                             : nullptr;
 			const uintptr_t *cf_iv = (bind_data->has_sample_subset && bind_data->count_filter_subset)
-			                             ? bind_data->count_filter_subset->InterleavedVec() : nullptr;
+			                             ? bind_data->count_filter_subset->InterleavedVec()
+			                             : nullptr;
 			uint32_t cf_sc = bind_data->has_sample_subset ? bind_data->subset_sample_ct : bind_data->raw_sample_ct;
 
 			// Iterate effective variants and filter by count
@@ -829,8 +829,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			filtered_indices.reserve(pre_filter_ct);
 
 			for (uint32_t ev = 0; ev < pre_filter_ct; ev++) {
-				uint32_t vidx = bind_data->has_effective_variant_list
-				                    ? bind_data->effective_variant_indices[ev] : ev;
+				uint32_t vidx = bind_data->has_effective_variant_list ? bind_data->effective_variant_indices[ev] : ev;
 
 				STD_ARRAY_DECL(uint32_t, 4, genocounts);
 				plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, cf_pssi, cf_sc, vidx, &cf_pgr, genocounts);
@@ -1080,12 +1079,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
 				                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct, preread_phased_pairs.data());
 				// Apply genotype_range per-element filtering (phased: check diploid sum)
-				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() && !genotype_range_all_pass[ev]) {
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
+				    !genotype_range_all_pass[ev]) {
 					for (uint32_t s = 0; s < output_sample_ct; s++) {
 						int8_t a1 = preread_phased_pairs[s * 2];
 						int8_t a2 = preread_phased_pairs[s * 2 + 1];
-						if (a1 != -9 &&
-						    !bind_data->genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+						if (a1 != -9 && !bind_data->genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
 							preread_phased_pairs[s * 2] = -9;
 							preread_phased_pairs[s * 2 + 1] = -9;
 						}
@@ -1104,11 +1103,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				}
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
 				// Apply genotype_range per-element filtering
-				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() && !genotype_range_all_pass[ev]) {
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
+				    !genotype_range_all_pass[ev]) {
 					for (uint32_t s = 0; s < output_sample_ct; s++) {
 						int8_t geno = tmp_bytes[s];
-						if (geno != -9 &&
-						    !bind_data->genotype_filter.range.Passes(static_cast<double>(geno))) {
+						if (geno != -9 && !bind_data->genotype_filter.range.Passes(static_cast<double>(geno))) {
 							tmp_bytes[s] = -9;
 						}
 					}
@@ -1231,9 +1230,8 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 		}
 	}
 
-	state->need_pgen_reader = state->need_genotypes
-	                       || bind_data.count_filter.HasFilter()
-	                       || bind_data.genotype_filter.active;
+	state->need_pgen_reader =
+	    state->need_genotypes || bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active;
 
 	return std::move(state);
 }
@@ -1403,12 +1401,14 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active) && lstate.initialized) {
 				STD_ARRAY_DECL(uint32_t, 4, genocounts);
 				const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
-				                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
+				                             ? bind_data.count_filter_subset->SampleInclude()
+				                             : nullptr;
 				const uintptr_t *cf_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
-				                             ? bind_data.count_filter_subset->InterleavedVec() : nullptr;
+				                             ? bind_data.count_filter_subset->InterleavedVec()
+				                             : nullptr;
 				uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
-				plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx,
-				                                              &lstate.pgr, genocounts);
+				plink2::PglErr cf_err =
+				    plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx, &lstate.pgr, genocounts);
 				if (cf_err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 				}
@@ -1791,16 +1791,18 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.geno_current_variant_pos);
 
 		// Count filter + genotype range pre-decompression check
-		if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active)
-		    && lstate.initialized && !lstate.geno_variant_loaded) {
+		if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active) && lstate.initialized &&
+		    !lstate.geno_variant_loaded) {
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
-			                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
+			                             ? bind_data.count_filter_subset->SampleInclude()
+			                             : nullptr;
 			const uintptr_t *cf_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
-			                             ? bind_data.count_filter_subset->InterleavedVec() : nullptr;
+			                             ? bind_data.count_filter_subset->InterleavedVec()
+			                             : nullptr;
 			uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
-			plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx,
-			                                              &lstate.pgr, genocounts);
+			plink2::PglErr cf_err =
+			    plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx, &lstate.pgr, genocounts);
 			if (cf_err != plink2::kPglRetSuccess) {
 				throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 			}

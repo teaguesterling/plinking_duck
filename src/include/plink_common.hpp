@@ -227,56 +227,55 @@ struct RangeFilter {
 	double min = -std::numeric_limits<double>::infinity();
 	double max = std::numeric_limits<double>::infinity();
 	bool active = false;
-	bool Passes(double value) const { return value >= min && value <= max; }
+	bool Passes(double value) const {
+		return value >= min && value <= max;
+	}
 };
 
 struct CountFilter {
 	RangeFilter af_filter;
 	RangeFilter ac_filter;
-	bool HasFilter() const { return af_filter.active || ac_filter.active; }
+	bool HasFilter() const {
+		return af_filter.active || ac_filter.active;
+	}
 };
 
 //! Parse a STRUCT value into a RangeFilter with optional min/max fields.
 //! valid_min/valid_max define the legal range for values (e.g. 0.0-1.0 for AF).
-RangeFilter ParseRangeFilter(const Value &val, const string &param_name,
-                              double valid_min, double valid_max,
-                              const string &func_name);
+RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double valid_min, double valid_max,
+                             const string &func_name);
 
 //! Check if a variant passes count-based filters given its genotype counts.
 //! genocounts: [hom_ref, het, hom_alt, missing] from PgrGetCounts.
-bool VariantPassesCountFilter(const CountFilter &filter,
-                               const STD_ARRAY_REF(uint32_t, 4) genocounts,
-                               uint32_t effective_sample_ct);
+bool VariantPassesCountFilter(const CountFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts,
+                              uint32_t effective_sample_ct);
 
 // ---------------------------------------------------------------------------
 // Genotype range filtering (genotype_range)
 // ---------------------------------------------------------------------------
 
 struct GenotypeRangeResult {
-	bool any_pass;  // at least one non-missing sample has value in [min, max]
-	bool all_pass;  // every non-missing sample has value in [min, max]
+	bool any_pass; // at least one non-missing sample has value in [min, max]
+	bool all_pass; // every non-missing sample has value in [min, max]
 };
 
 struct GenotypeRangeFilter {
-	RangeFilter range;  // reuses Phase 1 RangeFilter
+	RangeFilter range; // reuses Phase 1 RangeFilter
 	bool active = false;
 };
 
-GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter,
-                                        const STD_ARRAY_REF(uint32_t, 4) genocounts);
+GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts);
 
 //! Combined pre-decompression filter check: count filter + genotype range.
 //! Returns: skip=true → skip variant entirely. skip=false → variant passes,
 //! all_pass indicates whether per-element range check can be skipped.
 struct PreDecompFilterResult {
-	bool skip;      //!< variant should be skipped entirely
-	bool all_pass;  //!< all non-missing genotypes pass range filter (skip per-element check)
+	bool skip;     //!< variant should be skipped entirely
+	bool all_pass; //!< all non-missing genotypes pass range filter (skip per-element check)
 };
 
-PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter,
-                                             const GenotypeRangeFilter &genotype_filter,
-                                             const STD_ARRAY_REF(uint32_t, 4) genocounts,
-                                             uint32_t sample_ct);
+PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter, const GenotypeRangeFilter &genotype_filter,
+                                            const STD_ARRAY_REF(uint32_t, 4) genocounts, uint32_t sample_ct);
 
 // ---------------------------------------------------------------------------
 // Phased genotype unpacking

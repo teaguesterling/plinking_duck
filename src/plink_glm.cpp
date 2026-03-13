@@ -311,15 +311,15 @@ struct LogisticBuffers {
 	vector<float> dcoef; // predictor_ctav
 
 	// Firth-specific buffers
-	vector<double> half_inverted_buf; // p * p
+	vector<double> half_inverted_buf;    // p * p
 	vector<MatrixInvertBuf1> inv_1d_buf; // 2 * p
-	vector<double> dbl_2d_buf;        // p * p
-	vector<float> ustar;    // predictor_ctav
-	vector<float> delta;    // predictor_ctav
-	vector<float> hdiag;    // max_sample_ctav
-	vector<float> ww;       // max_sample_ctav
-	vector<float> hh0;      // p * predictor_ctav
-	vector<float> tmpnxk_buf; // p * max_sample_ctav
+	vector<double> dbl_2d_buf;           // p * p
+	vector<float> ustar;                 // predictor_ctav
+	vector<float> delta;                 // predictor_ctav
+	vector<float> hdiag;                 // max_sample_ctav
+	vector<float> ww;                    // max_sample_ctav
+	vector<float> hh0;                   // p * predictor_ctav
+	vector<float> tmpnxk_buf;            // p * max_sample_ctav
 
 	// Hessian inversion buffers (reused for non-Firth and Firth paths)
 	// half_inverted_buf, inv_1d_buf, dbl_2d_buf are shared above
@@ -685,8 +685,8 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				// Check for NAN (which LoadPsamColumnAsDouble uses for NA/-9)
 				for (uint32_t i = 0; i < raw_values.size(); i++) {
 					if (std::isnan(raw_values[i])) {
-						throw InvalidInputException("plink_glm: covariate '%s' contains NULL at sample %u",
-						                            col_name, i);
+						throw InvalidInputException("plink_glm: covariate '%s' contains NULL at sample %u", col_name,
+						                            i);
 					}
 				}
 
@@ -1125,8 +1125,8 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 // ---------------------------------------------------------------------------
 
 static GlmResult ComputeLogisticRegression(const double *dosages, const double *phenotype,
-                                           const vector<vector<double>> &covariates, uint32_t sample_ct,
-                                           bool use_firth, LogisticBuffers &bufs) {
+                                           const vector<vector<double>> &covariates, uint32_t sample_ct, bool use_firth,
+                                           LogisticBuffers &bufs) {
 	GlmResult result;
 	result.is_logistic = true;
 
@@ -1189,8 +1189,8 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 
 	uint32_t is_unfinished = 0;
 	plink2::BoolErr logistic_failed = plink2::LogisticRegressionF(
-	    bufs.yy.data(), bufs.xx.data(), nullptr, n, p, bufs.coef.data(), &is_unfinished, bufs.ll.data(),
-	    bufs.pp.data(), bufs.vv.data(), bufs.hh.data(), bufs.grad.data(), bufs.dcoef.data());
+	    bufs.yy.data(), bufs.xx.data(), nullptr, n, p, bufs.coef.data(), &is_unfinished, bufs.ll.data(), bufs.pp.data(),
+	    bufs.vv.data(), bufs.hh.data(), bufs.grad.data(), bufs.dcoef.data());
 
 	// Treat "unfinished" (hit iteration limit) as failure for Firth fallback
 	bool needs_firth_fallback = logistic_failed || is_unfinished;

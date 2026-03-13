@@ -258,20 +258,18 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	{
 		auto af_it = input.named_parameters.find("af_range");
 		if (af_it != input.named_parameters.end()) {
-			bind_data->count_filter.af_filter = ParseRangeFilter(
-			    af_it->second, "af_range", 0.0, 1.0, "read_pgen");
+			bind_data->count_filter.af_filter = ParseRangeFilter(af_it->second, "af_range", 0.0, 1.0, "read_pgen");
 		}
 		uint32_t pgen_output_sc = bind_data->has_sample_subset ? bind_data->subset_sample_ct : bind_data->sample_ct;
 		auto ac_it = input.named_parameters.find("ac_range");
 		if (ac_it != input.named_parameters.end()) {
-			bind_data->count_filter.ac_filter = ParseRangeFilter(
-			    ac_it->second, "ac_range", 0.0,
-			    static_cast<double>(2 * pgen_output_sc), "read_pgen");
+			bind_data->count_filter.ac_filter =
+			    ParseRangeFilter(ac_it->second, "ac_range", 0.0, static_cast<double>(2 * pgen_output_sc), "read_pgen");
 		}
 
 		if (bind_data->count_filter.HasFilter() && bind_data->has_sample_subset) {
-			bind_data->count_filter_subset = make_uniq<SampleSubset>(
-			    BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
+			bind_data->count_filter_subset =
+			    make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
 		}
 	}
 
@@ -282,8 +280,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			if (bind_data->include_dosages) {
 				throw InvalidInputException("read_pgen: genotype_range is incompatible with dosages := true");
 			}
-			bind_data->genotype_filter.range = ParseRangeFilter(
-			    gr_it->second, "genotype_range", 0.0, 2.0, "read_pgen");
+			bind_data->genotype_filter.range = ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pgen");
 			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
 		}
 	}
@@ -370,9 +367,8 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 		}
 	}
 
-	state->need_pgen_reader = state->need_genotypes
-	                       || bind_data.count_filter.HasFilter()
-	                       || bind_data.genotype_filter.active;
+	state->need_pgen_reader =
+	    state->need_genotypes || bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active;
 
 	return std::move(state);
 }
@@ -534,12 +530,14 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 			if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active) && lstate.initialized) {
 				STD_ARRAY_DECL(uint32_t, 4, genocounts);
 				const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
-				                             ? bind_data.count_filter_subset->SampleInclude() : nullptr;
+				                             ? bind_data.count_filter_subset->SampleInclude()
+				                             : nullptr;
 				const uintptr_t *cf_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
-				                             ? bind_data.count_filter_subset->InterleavedVec() : nullptr;
+				                             ? bind_data.count_filter_subset->InterleavedVec()
+				                             : nullptr;
 				uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
-				plink2::PglErr cf_err = plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx,
-				                                              &lstate.pgr, genocounts);
+				plink2::PglErr cf_err =
+				    plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx, &lstate.pgr, genocounts);
 				if (cf_err != plink2::kPglRetSuccess) {
 					throw IOException("read_pgen: PgrGetCounts failed for variant %u", vidx);
 				}

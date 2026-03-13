@@ -539,9 +539,8 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 // Count-based filtering (af_range, ac_range)
 // ---------------------------------------------------------------------------
 
-RangeFilter ParseRangeFilter(const Value &val, const string &param_name,
-                              double valid_min, double valid_max,
-                              const string &func_name) {
+RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double valid_min, double valid_max,
+                             const string &func_name) {
 	RangeFilter result;
 
 	if (val.type().id() != LogicalTypeId::STRUCT) {
@@ -561,8 +560,8 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name,
 		auto &child_val = children[i];
 
 		if (field_name != "min" && field_name != "max") {
-			throw InvalidInputException("%s: %s has unknown field '%s' (expected 'min' and/or 'max')",
-			                            func_name, param_name, field_name);
+			throw InvalidInputException("%s: %s has unknown field '%s' (expected 'min' and/or 'max')", func_name,
+			                            param_name, field_name);
 		}
 
 		if (child_val.IsNull()) {
@@ -571,8 +570,8 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name,
 
 		double v = child_val.GetValue<double>();
 		if (v < valid_min || v > valid_max) {
-			throw InvalidInputException("%s: %s.%s value %g is out of range [%g, %g]",
-			                            func_name, param_name, field_name, v, valid_min, valid_max);
+			throw InvalidInputException("%s: %s.%s value %g is out of range [%g, %g]", func_name, param_name,
+			                            field_name, v, valid_min, valid_max);
 		}
 
 		if (field_name == "min") {
@@ -590,9 +589,8 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name,
 	return result;
 }
 
-bool VariantPassesCountFilter(const CountFilter &filter,
-                               const STD_ARRAY_REF(uint32_t, 4) genocounts,
-                               uint32_t effective_sample_ct) {
+bool VariantPassesCountFilter(const CountFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts,
+                              uint32_t effective_sample_ct) {
 	uint32_t non_missing = genocounts[0] + genocounts[1] + genocounts[2];
 	if (non_missing == 0) {
 		return false;
@@ -618,8 +616,7 @@ bool VariantPassesCountFilter(const CountFilter &filter,
 // Genotype range filtering (genotype_range)
 // ---------------------------------------------------------------------------
 
-GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter,
-                                        const STD_ARRAY_REF(uint32_t, 4) genocounts) {
+GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts) {
 	GenotypeRangeResult result;
 	result.any_pass = false;
 	result.all_pass = true;
@@ -639,10 +636,8 @@ GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter,
 	return result;
 }
 
-PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter,
-                                             const GenotypeRangeFilter &genotype_filter,
-                                             const STD_ARRAY_REF(uint32_t, 4) genocounts,
-                                             uint32_t sample_ct) {
+PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter, const GenotypeRangeFilter &genotype_filter,
+                                            const STD_ARRAY_REF(uint32_t, 4) genocounts, uint32_t sample_ct) {
 	PreDecompFilterResult result;
 	result.skip = false;
 	result.all_pass = true;
