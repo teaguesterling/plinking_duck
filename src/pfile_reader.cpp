@@ -352,6 +352,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 	uint32_t geno_current_variant_pos = 0; // index into effective_variant_indices
 	uint32_t geno_current_sample = 0;      // sample index within current variant
 	bool geno_variant_loaded = false;      // genotypes decoded for current variant
+	bool geno_range_all_pass = true;       // persists across chunk boundaries for genotype_range
 	bool geno_done = false;
 
 	~PfileLocalState() {
@@ -841,19 +842,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					throw IOException("read_pfile: PgrGetCounts failed for variant %u during count filter", vidx);
 				}
 
-				if (bind_data->count_filter.HasFilter() &&
-				    !VariantPassesCountFilter(bind_data->count_filter, genocounts, cf_sc)) {
+				auto pf = CheckPreDecompFilters(bind_data->count_filter, bind_data->genotype_filter, genocounts, cf_sc);
+				if (pf.skip) {
 					continue;
 				}
-
-				bool all_pass = true;
-				if (bind_data->genotype_filter.active) {
-					auto gr = CheckGenotypeRange(bind_data->genotype_filter.range, genocounts);
-					if (!gr.any_pass) {
-						continue;
-					}
-					all_pass = gr.all_pass;
-				}
+				bool all_pass = pf.all_pass;
 
 				filtered_indices.push_back(vidx);
 				genotype_range_all_pass.push_back(all_pass);
@@ -1420,17 +1413,11 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				if (cf_err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 				}
-				if (bind_data.count_filter.HasFilter() &&
-				    !VariantPassesCountFilter(bind_data.count_filter, genocounts, cf_sc)) {
+				auto pf = CheckPreDecompFilters(bind_data.count_filter, bind_data.genotype_filter, genocounts, cf_sc);
+				if (pf.skip) {
 					continue;
 				}
-				if (bind_data.genotype_filter.active) {
-					auto gr = CheckGenotypeRange(bind_data.genotype_filter.range, genocounts);
-					if (!gr.any_pass) {
-						continue;
-					}
-					geno_range_all_pass = gr.all_pass;
-				}
+				geno_range_all_pass = pf.all_pass;
 			}
 
 			// Read genotype data if needed
@@ -1805,7 +1792,6 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.geno_current_variant_pos);
 
 		// Count filter + genotype range pre-decompression check
-		bool geno_range_all_pass = true;
 		if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active)
 		    && lstate.initialized && !lstate.geno_variant_loaded) {
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
@@ -1819,21 +1805,13 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			if (cf_err != plink2::kPglRetSuccess) {
 				throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 			}
-			if (bind_data.count_filter.HasFilter() &&
-			    !VariantPassesCountFilter(bind_data.count_filter, genocounts, cf_sc)) {
+			auto pf = CheckPreDecompFilters(bind_data.count_filter, bind_data.genotype_filter, genocounts, cf_sc);
+			if (pf.skip) {
 				lstate.geno_current_variant_pos++;
 				lstate.geno_current_sample = 0;
 				continue;
 			}
-			if (bind_data.genotype_filter.active) {
-				auto gr = CheckGenotypeRange(bind_data.genotype_filter.range, genocounts);
-				if (!gr.any_pass) {
-					lstate.geno_current_variant_pos++;
-					lstate.geno_current_sample = 0;
-					continue;
-				}
-				geno_range_all_pass = gr.all_pass;
-			}
+			lstate.geno_range_all_pass = pf.all_pass;
 		}
 
 		// Load genotypes for current variant if not yet loaded
@@ -1889,7 +1867,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 						lstate.geno_current_sample++;
 						continue;
 					}
-					if (!geno_range_all_pass) {
+					if (!lstate.geno_range_all_pass) {
 						int8_t a2 = lstate.phased_pairs[lstate.geno_current_sample * 2 + 1];
 						if (!bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
 							lstate.geno_current_sample++;
@@ -1902,7 +1880,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 						lstate.geno_current_sample++;
 						continue;
 					}
-					if (!geno_range_all_pass &&
+					if (!lstate.geno_range_all_pass &&
 					    !bind_data.genotype_filter.range.Passes(static_cast<double>(geno))) {
 						lstate.geno_current_sample++;
 						continue;

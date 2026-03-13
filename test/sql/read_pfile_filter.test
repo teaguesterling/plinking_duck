@@ -1,5 +1,5 @@
 # name: test/sql/read_pfile_filter.test
-# description: Tests for af_range and ac_range count-based filter pushdown on read_pfile
+# description: Tests for af_range, ac_range, and genotype_range filter pushdown on read_pfile
 # group: [sql]
 
 require plinking_duck
@@ -264,6 +264,16 @@ rs1	NULL	1	2	NULL
 rs2	1	1	NULL	2
 rs3	2	NULL	1	NULL
 rs4	NULL	NULL	1	2
+
+# --- LIST mode with genotype_range ---
+
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotypes := 'list', genotype_range := {min: 1}) ORDER BY ID;
+----
+rs1	[NULL, 1, 2, NULL]
+rs2	[1, 1, NULL, 2]
+rs3	[2, NULL, 1, NULL]
+rs4	[NULL, NULL, 1, 2]
 
 # --- Phased mode with genotype_range (spec test case 9) ---
 # Diploid sum used for range check; pair NULLed as unit

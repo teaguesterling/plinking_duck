@@ -265,6 +265,19 @@ struct GenotypeRangeFilter {
 GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter,
                                         const STD_ARRAY_REF(uint32_t, 4) genocounts);
 
+//! Combined pre-decompression filter check: count filter + genotype range.
+//! Returns: skip=true → skip variant entirely. skip=false → variant passes,
+//! all_pass indicates whether per-element range check can be skipped.
+struct PreDecompFilterResult {
+	bool skip;      //!< variant should be skipped entirely
+	bool all_pass;  //!< all non-missing genotypes pass range filter (skip per-element check)
+};
+
+PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter,
+                                             const GenotypeRangeFilter &genotype_filter,
+                                             const STD_ARRAY_REF(uint32_t, 4) genocounts,
+                                             uint32_t sample_ct);
+
 // ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------

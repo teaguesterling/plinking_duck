@@ -543,17 +543,11 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				if (cf_err != plink2::kPglRetSuccess) {
 					throw IOException("read_pgen: PgrGetCounts failed for variant %u", vidx);
 				}
-				if (bind_data.count_filter.HasFilter() &&
-				    !VariantPassesCountFilter(bind_data.count_filter, genocounts, cf_sc)) {
+				auto pf = CheckPreDecompFilters(bind_data.count_filter, bind_data.genotype_filter, genocounts, cf_sc);
+				if (pf.skip) {
 					continue;
 				}
-				if (bind_data.genotype_filter.active) {
-					auto gr = CheckGenotypeRange(bind_data.genotype_filter.range, genocounts);
-					if (!gr.any_pass) {
-						continue;
-					}
-					geno_range_all_pass = gr.all_pass;
-				}
+				geno_range_all_pass = pf.all_pass;
 			}
 
 			// Read genotype data if needed (before filling columns, since

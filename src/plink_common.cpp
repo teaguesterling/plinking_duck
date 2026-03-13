@@ -639,6 +639,31 @@ GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter,
 	return result;
 }
 
+PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter,
+                                             const GenotypeRangeFilter &genotype_filter,
+                                             const STD_ARRAY_REF(uint32_t, 4) genocounts,
+                                             uint32_t sample_ct) {
+	PreDecompFilterResult result;
+	result.skip = false;
+	result.all_pass = true;
+
+	if (count_filter.HasFilter() && !VariantPassesCountFilter(count_filter, genocounts, sample_ct)) {
+		result.skip = true;
+		return result;
+	}
+
+	if (genotype_filter.active) {
+		auto gr = CheckGenotypeRange(genotype_filter.range, genocounts);
+		if (!gr.any_pass) {
+			result.skip = true;
+			return result;
+		}
+		result.all_pass = gr.all_pass;
+	}
+
+	return result;
+}
+
 // ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
