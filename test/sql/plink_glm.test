@@ -170,6 +170,16 @@ var1	0.020132	0.247427	0.942561
 # Phase 2: Logistic regression (auto-detection of binary phenotype)
 # ===========================================================================
 
+# Logistic with 1 covariate (validated against plink2 --glm hide-covar)
+query TRRRRT
+SELECT ID, ROUND(BETA, 6), ROUND(SE, 6), ROUND("OR", 6), ROUND(P, 6), FIRTH_YN
+FROM plink_glm('test/data/large_example',
+    phenotype := [0, 1, 0, 1, 1, 0, 1, 0],
+    covariates := {'age': [25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0]})
+WHERE ID = 'var1';
+----
+var1	-0.287203	1.11879	0.75036	0.797404	N
+
 # Binary 0/1 phenotype → auto-detects logistic
 # plink2's LogisticRegressionF converges for balanced phenotypes, so no Firth needed
 query TRRRT
