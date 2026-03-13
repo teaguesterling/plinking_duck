@@ -1,0 +1,170 @@
+# P2-007: plink_phenotype — Sample Data Loading Helper
+
+## Status: Design Only (Not Yet Implemented)
+
+## Problem
+
+`plink_glm` (and future functions needing per-sample input) requires phenotype
+and covariate data as `LIST(DOUBLE)` values in pgen sample order. Loading these
+from external files currently requires a multi-step `SET VARIABLE` workflow:
+
+```sql
+SET VARIABLE pheno = (
+    SELECT list(p.height ORDER BY s.rowid)
+    FROM read_psam('data/cohort.psam') s
+    JOIN 'phenotypes.parquet' p ON s.IID = p.IID
+);
+SELECT * FROM plink_glm('data/cohort', phenotype := getvariable('pheno'));
+```
+
+This works but is verbose and error-prone (sample ordering must be manually
+ensured). We want a simpler interface for common cases.
+
+## Proposed Solution: Three-Tier Type Dispatch
+
+Rather than a separate function, extend `plink_glm`'s parameter handling to
+accept multiple types for `phenotype` and `covariates`:
+
+### Tier 1: Direct Values (Current)
+
+```sql
+-- LIST(DOUBLE): values in pgen sample order
+phenotype := [1.5, 2.3, 3.7, 0.8]
+
+-- STRUCT of LIST(DOUBLE): named covariate vectors
+covariates := {'age': [25.0, 30.0, 35.0, 40.0], 'bmi': [22.1, 24.5, 23.0, 28.3]}
+```
+
+### Tier 2: Psam Column Names (Planned — Near-Term)
+
+```sql
+-- VARCHAR: column name from .psam file
+phenotype := 'height'
+
+-- LIST(VARCHAR): covariate column names from .psam file
+covariates := ['age', 'sex', 'pc1', 'pc2', 'pc3']
+```
+
+The function reads the psam internally and extracts the named columns. Sample
+ordering is guaranteed correct (psam rows = pgen sample order). The psam file
+must exist and contain the named columns.
+
+Type dispatch: `LIST(DOUBLE)` → Tier 1, `VARCHAR` → Tier 2, `LIST(VARCHAR)` →
+Tier 2 covariates.
+
+### Tier 3: External Source Reference (Future)
+
+```sql
+-- STRUCT: reference to an external table/view with configuration
+phenotype := {source: 'phenotypes', column: 'height', id: 'IID'}
+
+-- STRUCT for covariates with column selection
+covariates := {source: 'covariates', columns: ['age', 'bmi', 'pc1'], id: 'IID'}
+```
+
+The function resolves the source (table, view, or file path), joins against
+the psam by the `id` column, and extracts the specified columns in pgen sample
+order. This handles arbitrary external data without requiring the user to
+manage ordering.
+
+Type dispatch: `STRUCT` with `source` key → Tier 3.
+
+## Alternative: plink_phenotype Scalar Function
+
+Instead of (or in addition to) type dispatch inside `plink_glm`, a standalone
+scalar function could build the correctly-ordered list:
+
+```sql
+-- Returns LIST(DOUBLE) aligned to pgen sample order
+plink_phenotype('data/cohort', 'height')
+plink_phenotype('data/cohort', source := 'phenotypes.parquet', column := 'height')
+```
+
+### Advantages
+- Reusable across any function that needs per-sample data
+- Composable: `phenotype := plink_phenotype('data/cohort', 'height')`
+- Can be used with `SET VARIABLE` for caching
+
+### Challenges
+- As a scalar function called in table function args, it must be evaluable at
+  bind time (not runtime). This works for literal arguments but not column
+  references.
+- The function needs access to the psam path, which is derived from the pfile
+  prefix — coupling it to the pfile convention.
+
+### Possible Signatures
+
+```sql
+-- From psam column
+plink_phenotype(prefix, column_name)
+plink_phenotype('data/cohort', 'height')
+
+-- From external source, joined by IID
+plink_phenotype(prefix, source := 'table_or_path', column := 'col_name')
+plink_phenotype('data/cohort', source := 'phenotypes', column := 'height')
+
+-- Multiple columns → STRUCT of LIST(DOUBLE) (for covariates)
+plink_covariates(prefix, columns := ['age', 'bmi', 'pc1'])
+plink_covariates('data/cohort', source := 'covariates', columns := ['age', 'bmi'])
+```
+
+## Multi-Phenotype Support (Future)
+
+Run multiple phenotypes in a single scan over the genotype data:
+
+```sql
+-- STRUCT of LIST(DOUBLE): named phenotype vectors
+phenotype := {'height': [...], 'bmi': [...], 'diabetes': [...]}
+```
+
+### Output Format Options
+
+**Long format** (preferred): Adds a `PHENOTYPE` column, multiplies rows by
+the number of phenotypes. Each variant appears N times (once per phenotype).
+
+```
+| ID  | PHENOTYPE | BETA | SE | P |
+|-----|-----------|------|----|---|
+| rs1 | height    | 0.5  | .. | . |
+| rs1 | bmi       | 0.3  | .. | . |
+| rs1 | diabetes  | 1.2  | .. | . |
+```
+
+Advantages: standard SQL, composable, works with `COPY ... PARTITION_BY(PHENOTYPE)`.
+
+**Wide format**: STRUCT-valued stat columns. Compact but awkward to query.
+
+```
+| ID  | BETA                          | P                        |
+|-----|-------------------------------|--------------------------|
+| rs1 | {height: 0.5, bmi: 0.3, ...} | {height: .., bmi: .., ..}|
+```
+
+Long format is recommended. Implementation: loop over phenotypes inside the
+scan function, emitting one output row per variant × phenotype. Genotype
+loading is shared across phenotypes (loaded once per variant batch).
+
+## Implementation Order
+
+1. **Tier 2 (psam column names)**: Highest value, lowest complexity. Implement
+   VARCHAR dispatch in `plink_glm`'s bind function. Requires psam to exist.
+2. **plink_phenotype scalar function**: If the scalar-at-bind-time approach
+   works, implement as a standalone helper. Otherwise, keep the logic internal
+   to `plink_glm`.
+3. **Multi-phenotype**: Long format output with PHENOTYPE column.
+4. **Tier 3 (external source STRUCT)**: Full table/view resolution with
+   IID-based join.
+
+## Design Decisions Still Open
+
+- Should `plink_phenotype` be one function or two (`plink_phenotype` +
+  `plink_covariates`)? The return types differ (`LIST(DOUBLE)` vs
+  `STRUCT(name LIST(DOUBLE), ...)`).
+- For Tier 3, should `source` accept DuckDB table names, file paths, or both?
+  File paths are simpler but table names enable views and CTEs.
+- For multi-phenotype, should binary and continuous phenotypes be mixable in
+  one call? (Probably not — model detection becomes ambiguous.)
+- Sample filtering interaction: when `samples` parameter is used, do the
+  phenotype/covariate vectors need to match the subset or the full sample set?
+  Currently they must match the full set (NULLs for excluded samples). Psam
+  column mode would naturally handle this.

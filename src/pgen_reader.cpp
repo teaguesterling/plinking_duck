@@ -491,10 +491,10 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 
 				if (bind_data.include_dosages) {
 					uint32_t dosage_ct = 0;
-					plink2::PglErr err = plink2::PgrGetD(
-					    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-					    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-					    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+					plink2::PglErr err =
+					    plink2::PgrGetD(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+					                    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+					                    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("read_pgen: PgrGetD failed for variant %u", vidx);
 					}
