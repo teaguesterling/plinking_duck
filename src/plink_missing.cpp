@@ -326,8 +326,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 	}
 
 	// DuckDB-configured thread count
-	state->db_thread_count =
-	    static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	state->db_thread_count = static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 
 	// Sample mode: pre-allocate accumulation array
 	if (bind_data.sample_mode) {

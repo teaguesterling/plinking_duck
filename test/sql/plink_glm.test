@@ -1,6 +1,6 @@
 # name: test/sql/plink_glm.test
 # description: Test plink_glm regression (validated against plink2 --glm)
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 

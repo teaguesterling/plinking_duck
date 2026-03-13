@@ -1,6 +1,6 @@
 # name: test/sql/plink_glm_negative.test
 # description: Negative tests for plink_glm
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 

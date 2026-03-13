@@ -73,8 +73,8 @@ static vector<double> LoadPsamColumnAsDouble(ClientContext &context, const strin
 		}
 
 		if (col_idx >= fields.size()) {
-			throw IOException("plink_glm: psam file '%s' line %d has %d fields, expected at least %d",
-			                  psam_path, i + 1, fields.size(), col_idx + 1);
+			throw IOException("plink_glm: psam file '%s' line %d has %d fields, expected at least %d", psam_path, i + 1,
+			                  fields.size(), col_idx + 1);
 		}
 
 		auto &field = fields[col_idx];
@@ -119,9 +119,9 @@ static constexpr idx_t COL_FIRTH_YN = 15;
 // ---------------------------------------------------------------------------
 
 static double LogGamma(double x) {
-	static const double c[] = {0.99999999999980993,    676.5203681218851,       -1259.1392167224028,
-	                           771.32342877765313,     -176.61502916214059,      12.507343278686905,
-	                           -0.13857109526572012,   9.9843695780195716e-6,    1.5056327351493116e-7};
+	static const double c[] = {0.99999999999980993,  676.5203681218851,     -1259.1392167224028,
+	                           771.32342877765313,   -176.61502916214059,   12.507343278686905,
+	                           -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7};
 	if (x < 0.5) {
 		return std::log(M_PI / std::sin(M_PI * x)) - LogGamma(1.0 - x);
 	}
@@ -234,13 +234,13 @@ static double ZstatToPvalue(double z_stat) {
 
 // plink2's LinearRegressionInv is a header-inline that calls into plink2_matrix.
 // Under NOLAPACK, MatrixInvertBuf1 is a typedef in global scope (not in plink2::).
-using plink2::LinearRegressionInv;
-using plink2::MultiplySelfTranspose;
-using plink2::RoundUpPow2;
-using plink2::kFloatPerFVec;
 using plink2::InvertSymmdefFmatrixFirstHalf;
 using plink2::InvertSymmdefFmatrixSecondHalf;
+using plink2::kFloatPerFVec;
+using plink2::LinearRegressionInv;
+using plink2::MultiplySelfTranspose;
 using plink2::ReflectFmatrix0;
+using plink2::RoundUpPow2;
 
 // ---------------------------------------------------------------------------
 // Bind data
@@ -357,8 +357,8 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		} else if (fs.FileExists(prefix)) {
 			bind_data->pgen_path = prefix;
 		} else {
-			throw InvalidInputException("plink_glm: cannot find .pgen file for prefix '%s' (tried '%s')",
-			                            prefix, candidate);
+			throw InvalidInputException("plink_glm: cannot find .pgen file for prefix '%s' (tried '%s')", prefix,
+			                            candidate);
 		}
 	}
 
@@ -453,8 +453,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 			throw InvalidInputException("plink_glm: samples parameter requires .psam/.fam file");
 		}
 		auto sample_info = LoadSampleInfo(context, bind_data->psam_path);
-		auto indices =
-		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &sample_info, "plink_glm");
+		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &sample_info, "plink_glm");
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
 		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
@@ -463,8 +462,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	// --- Process region parameter ---
 	auto region_it = input.named_parameters.find("region");
 	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range =
-		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_glm");
+		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_glm");
 	}
 
 	// --- Process phenotype parameter ---
@@ -485,8 +483,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		auto raw_values = LoadPsamColumnAsDouble(context, bind_data->psam_path, pheno_col);
 		if (static_cast<uint32_t>(raw_values.size()) != bind_data->raw_sample_ct) {
 			throw InvalidInputException("plink_glm: psam has %llu samples but .pgen has %u",
-			                            static_cast<unsigned long long>(raw_values.size()),
-			                            bind_data->raw_sample_ct);
+			                            static_cast<unsigned long long>(raw_values.size()), bind_data->raw_sample_ct);
 		}
 
 		bind_data->phenotype.resize(bind_data->effective_sample_ct);
@@ -554,8 +551,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	}
 
 	if (non_missing_ct < 3) {
-		throw InvalidInputException("plink_glm: need at least 3 non-missing phenotype values, got %u",
-		                            non_missing_ct);
+		throw InvalidInputException("plink_glm: need at least 3 non-missing phenotype values, got %u", non_missing_ct);
 	}
 
 	if (min_val == max_val) {
@@ -588,8 +584,8 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				// Check for NAN (which LoadPsamColumnAsDouble uses for NA/-9)
 				for (uint32_t i = 0; i < raw_values.size(); i++) {
 					if (std::isnan(raw_values[i])) {
-						throw InvalidInputException(
-						    "plink_glm: covariate '%s' contains NA/missing at sample %u", col_name, i);
+						throw InvalidInputException("plink_glm: covariate '%s' contains NA/missing at sample %u",
+						                            col_name, i);
 					}
 				}
 
@@ -621,15 +617,15 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				auto &val = struct_vals[ci];
 
 				if (val.type().id() != LogicalTypeId::LIST) {
-					throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s",
-					                            name, val.type().ToString());
+					throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s", name,
+					                            val.type().ToString());
 				}
 
 				auto &list_children = ListValue::GetChildren(val);
 				if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
-					throw InvalidInputException(
-					    "plink_glm: covariate '%s' length (%llu) must match sample count (%u)", name,
-					    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
+					throw InvalidInputException("plink_glm: covariate '%s' length (%llu) must match sample count (%u)",
+					                            name, static_cast<unsigned long long>(list_children.size()),
+					                            bind_data->raw_sample_ct);
 				}
 
 				// Extract values for effective samples (NULLs not allowed in covariates)
@@ -640,8 +636,8 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 					for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
 						if (plink2::IsSet(si, raw_idx)) {
 							if (list_children[raw_idx].IsNull()) {
-								throw InvalidInputException(
-								    "plink_glm: covariate '%s' contains NULL at index %u", name, raw_idx);
+								throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name,
+								                            raw_idx);
 							}
 							covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
 							out_idx++;
@@ -650,8 +646,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				} else {
 					for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
 						if (list_children[i].IsNull()) {
-							throw InvalidInputException(
-							    "plink_glm: covariate '%s' contains NULL at index %u", name, i);
+							throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name, i);
 						}
 						covar_vals[i] = list_children[i].GetValue<double>();
 					}
@@ -701,19 +696,16 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 			}
 		}
 	} else {
-		throw InvalidInputException("plink_glm: model must be 'auto', 'linear', or 'logistic', got '%s'",
-		                            model_str);
+		throw InvalidInputException("plink_glm: model must be 'auto', 'linear', or 'logistic', got '%s'", model_str);
 	}
 
 	// --- Output columns ---
-	names = {"CHROM", "POS", "ID", "REF", "ALT", "A1", "A1_FREQ", "TEST", "OBS_CT",
-	         "BETA",  "SE",  "T_STAT", "P", "ERRCODE", "OR", "FIRTH_YN"};
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::INTEGER,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
-	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,
-	                LogicalType::VARCHAR};
+	names = {"CHROM",  "POS",  "ID", "REF",    "ALT", "A1",      "A1_FREQ", "TEST",
+	         "OBS_CT", "BETA", "SE", "T_STAT", "P",   "ERRCODE", "OR",      "FIRTH_YN"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::VARCHAR,
+	                LogicalType::INTEGER, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::VARCHAR};
 
 	return std::move(bind_data);
 }
@@ -722,8 +714,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 // Init global
 // ---------------------------------------------------------------------------
 
-static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PlinkGlmBindData>();
 	auto state = make_uniq<PlinkGlmGlobalState>();
 
@@ -757,9 +748,8 @@ static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &co
 // Init local (per-thread PgenReader)
 // ---------------------------------------------------------------------------
 
-static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &context,
-                                                              TableFunctionInitInput &input,
-                                                              GlobalTableFunctionState *global_state) {
+static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                             GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PlinkGlmBindData>();
 	auto &gstate = global_state->Cast<PlinkGlmGlobalState>();
 	auto state = make_uniq<PlinkGlmLocalState>();
@@ -776,9 +766,9 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 	plink2::PgenHeaderCtrl header_ctrl;
 	uintptr_t pgfi_alloc_cacheline_ct = 0;
 
-	plink2::PglErr err = plink2::PgfiInitPhase1(bind_data.pgen_path.c_str(), nullptr, bind_data.raw_variant_ct,
-	                                            bind_data.raw_sample_ct, &header_ctrl, &state->pgfi,
-	                                            &pgfi_alloc_cacheline_ct, errstr_buf);
+	plink2::PglErr err =
+	    plink2::PgfiInitPhase1(bind_data.pgen_path.c_str(), nullptr, bind_data.raw_variant_ct, bind_data.raw_sample_ct,
+	                           &header_ctrl, &state->pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -793,9 +783,8 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 	uint32_t max_vrec_width = 0;
 	uintptr_t pgr_alloc_cacheline_ct = 0;
 
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state->pgfi.raw_variant_ct, &max_vrec_width,
-	                             &state->pgfi, state->pgfi_alloc_buf.As<unsigned char>(),
-	                             &pgr_alloc_cacheline_ct, errstr_buf);
+	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state->pgfi.raw_variant_ct, &max_vrec_width, &state->pgfi,
+	                             state->pgfi_alloc_buf.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -820,8 +809,7 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 
 	// Set up sample subsetting
 	if (bind_data.has_sample_subset && bind_data.sample_subset) {
-		plink2::PgrSetSampleSubsetIndex(bind_data.sample_subset->CumulativePopcounts(), &state->pgr,
-		                                &state->pssi);
+		plink2::PgrSetSampleSubsetIndex(bind_data.sample_subset->CumulativePopcounts(), &state->pgr, &state->pssi);
 	} else {
 		plink2::PgrClearSampleSubsetIndex(&state->pgr, &state->pssi);
 	}
@@ -871,8 +859,7 @@ struct GlmResult {
 // ---------------------------------------------------------------------------
 
 static GlmResult ComputeLinearRegression(const double *dosages, const double *phenotype,
-                                         const vector<vector<double>> &covariates,
-                                         uint32_t sample_ct) {
+                                         const vector<vector<double>> &covariates, uint32_t sample_ct) {
 	GlmResult result;
 
 	int n_covars = static_cast<int>(covariates.size());
@@ -959,8 +946,8 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 		if (dosages[i] == -9.0 || std::isnan(phenotype[i])) {
 			continue;
 		}
-		predictors_pmaj[0 * n + nm_idx] = 1.0;           // intercept
-		predictors_pmaj[1 * n + nm_idx] = dosages[i];     // genotype
+		predictors_pmaj[0 * n + nm_idx] = 1.0;        // intercept
+		predictors_pmaj[1 * n + nm_idx] = dosages[i]; // genotype
 		for (int c = 0; c < n_covars; c++) {
 			predictors_pmaj[(2 + c) * n + nm_idx] = covariates[c][i];
 		}
@@ -992,9 +979,8 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 	vector<double> dbl_2d_buf(up * std::max(up, 7u));
 
 	// Call plink2's LinearRegressionInv
-	if (LinearRegressionInv(pheno_d.data(), predictors_pmaj.data(), up, n, 1,
-	                        xtx_inv.data(), fitted_coefs.data(), xt_y.data(),
-	                        mi_buf.data(), dbl_2d_buf.data())) {
+	if (LinearRegressionInv(pheno_d.data(), predictors_pmaj.data(), up, n, 1, xtx_inv.data(), fitted_coefs.data(),
+	                        xt_y.data(), mi_buf.data(), dbl_2d_buf.data())) {
 		result.errcode = "SINGULAR_MATRIX";
 		return result;
 	}
@@ -1031,8 +1017,8 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 // ---------------------------------------------------------------------------
 
 static GlmResult ComputeLogisticRegression(const double *dosages, const double *phenotype,
-                                           const vector<vector<double>> &covariates,
-                                           uint32_t sample_ct, bool use_firth) {
+                                           const vector<vector<double>> &covariates, uint32_t sample_ct,
+                                           bool use_firth) {
 	GlmResult result;
 	result.is_logistic = true;
 
@@ -1085,7 +1071,7 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 
 	for (uint32_t idx = 0; idx < n; idx++) {
 		uint32_t i = nm_indices[idx];
-		xx[0 * sample_ctav + idx] = 1.0f;                          // intercept
+		xx[0 * sample_ctav + idx] = 1.0f;                           // intercept
 		xx[1 * sample_ctav + idx] = static_cast<float>(dosages[i]); // genotype
 		for (int c = 0; c < n_covars; c++) {
 			xx[(2 + c) * sample_ctav + idx] = static_cast<float>(covariates[c][i]);
@@ -1103,9 +1089,9 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 	vector<float> dcoef(predictor_ctav, 0.0f);
 
 	uint32_t is_unfinished = 0;
-	plink2::BoolErr logistic_failed = plink2::LogisticRegressionF(
-	    yy.data(), xx.data(), nullptr, n, p, coef.data(), &is_unfinished,
-	    ll.data(), pp.data(), vv.data(), hh.data(), grad.data(), dcoef.data());
+	plink2::BoolErr logistic_failed =
+	    plink2::LogisticRegressionF(yy.data(), xx.data(), nullptr, n, p, coef.data(), &is_unfinished, ll.data(),
+	                                pp.data(), vv.data(), hh.data(), grad.data(), dcoef.data());
 
 	// Treat "unfinished" (hit iteration limit) as failure for Firth fallback
 	bool needs_firth_fallback = logistic_failed || is_unfinished;
@@ -1129,10 +1115,9 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 		is_unfinished = 0;
 
 		plink2::BoolErr firth_failed = plink2::FirthRegressionF(
-		    yy.data(), xx.data(), nullptr, n, p, coef.data(), &is_unfinished,
-		    hh.data(), half_inverted_buf.data(), inv_1d_buf.data(),
-		    dbl_2d_buf.data(), pp.data(), vv.data(), ustar.data(), delta.data(),
-		    hdiag.data(), ww.data(), hh0.data(), tmpnxk_buf.data());
+		    yy.data(), xx.data(), nullptr, n, p, coef.data(), &is_unfinished, hh.data(), half_inverted_buf.data(),
+		    inv_1d_buf.data(), dbl_2d_buf.data(), pp.data(), vv.data(), ustar.data(), delta.data(), hdiag.data(),
+		    ww.data(), hh0.data(), tmpnxk_buf.data());
 
 		if (firth_failed) {
 			result.errcode = "NO_CONVERGENCE";
@@ -1150,26 +1135,24 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 		vector<double> half_inv(p * p, 0.0);
 		vector<MatrixInvertBuf1> inv_1d(2 * p);
 		vector<double> dbl_2d(p * p, 0.0);
-		if (InvertSymmdefFmatrixFirstHalf(p, predictor_ctav, hh.data(),
-		                                  half_inv.data(), inv_1d.data(), dbl_2d.data())) {
+		if (InvertSymmdefFmatrixFirstHalf(p, predictor_ctav, hh.data(), half_inv.data(), inv_1d.data(),
+		                                  dbl_2d.data())) {
 			result.errcode = "SINGULAR_MATRIX";
 			return result;
 		}
-		InvertSymmdefFmatrixSecondHalf(p, predictor_ctav, half_inv.data(),
-		                               hh.data(), inv_1d.data(), dbl_2d.data());
+		InvertSymmdefFmatrixSecondHalf(p, predictor_ctav, half_inv.data(), hh.data(), inv_1d.data(), dbl_2d.data());
 	} else {
 		// Logistic succeeded with Firth enabled but didn't need it
 		// Still need to invert hh for SE
 		vector<double> half_inv(p * p, 0.0);
 		vector<MatrixInvertBuf1> inv_1d(2 * p);
 		vector<double> dbl_2d(p * p, 0.0);
-		if (InvertSymmdefFmatrixFirstHalf(p, predictor_ctav, hh.data(),
-		                                  half_inv.data(), inv_1d.data(), dbl_2d.data())) {
+		if (InvertSymmdefFmatrixFirstHalf(p, predictor_ctav, hh.data(), half_inv.data(), inv_1d.data(),
+		                                  dbl_2d.data())) {
 			result.errcode = "SINGULAR_MATRIX";
 			return result;
 		}
-		InvertSymmdefFmatrixSecondHalf(p, predictor_ctav, half_inv.data(),
-		                               hh.data(), inv_1d.data(), dbl_2d.data());
+		InvertSymmdefFmatrixSecondHalf(p, predictor_ctav, half_inv.data(), hh.data(), inv_1d.data(), dbl_2d.data());
 	}
 
 	result.firth_applied = firth_applied;
@@ -1228,26 +1211,21 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 			if (gstate.need_regression && lstate.initialized) {
 				uint32_t dosage_ct = 0;
 				plink2::PglErr err = plink2::PgrGetD(
-				    sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
-				    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-				    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+				    sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr, lstate.genovec_buf.As<uintptr_t>(),
+				    lstate.dosage_present_buf.As<uintptr_t>(), lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("plink_glm: PgrGetD failed for variant %u", vidx);
 				}
 
 				plink2::Dosage16ToDoublesMinus9(
 				    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-				    lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct,
-				    lstate.dosage_doubles.data());
+				    lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct, lstate.dosage_doubles.data());
 
 				if (bind_data.is_logistic) {
-					lr = ComputeLogisticRegression(lstate.dosage_doubles.data(),
-					                               bind_data.phenotype.data(),
-					                               bind_data.covariate_values, sample_ct,
-					                               bind_data.use_firth);
+					lr = ComputeLogisticRegression(lstate.dosage_doubles.data(), bind_data.phenotype.data(),
+					                               bind_data.covariate_values, sample_ct, bind_data.use_firth);
 				} else {
-					lr = ComputeLinearRegression(lstate.dosage_doubles.data(),
-					                             bind_data.phenotype.data(),
+					lr = ComputeLinearRegression(lstate.dosage_doubles.data(), bind_data.phenotype.data(),
 					                             bind_data.covariate_values, sample_ct);
 				}
 			}
@@ -1264,13 +1242,11 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				switch (file_col) {
 				case COL_CHROM: {
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
-					    StringVector::AddString(vec, val);
+					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] =
-					    bind_data.variants.GetPos(vidx);
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
@@ -1278,15 +1254,13 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case COL_REF: {
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
-					    StringVector::AddString(vec, val);
+					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
@@ -1294,8 +1268,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1305,8 +1278,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1319,13 +1291,11 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					break;
 				}
 				case COL_TEST: {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
-					    StringVector::AddString(vec, "ADD");
+					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, "ADD");
 					break;
 				}
 				case COL_OBS_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] =
-					    static_cast<int32_t>(lr.obs_ct);
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(lr.obs_ct);
 					break;
 				}
 				case COL_BETA: {
@@ -1362,8 +1332,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 				case COL_ERRCODE: {
 					if (lr.errcode != nullptr) {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, lr.errcode);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, lr.errcode);
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					}
@@ -1403,8 +1372,8 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 // ---------------------------------------------------------------------------
 
 void RegisterPlinkGlm(ExtensionLoader &loader) {
-	TableFunction plink_glm("plink_glm", {LogicalType::VARCHAR}, PlinkGlmScan, PlinkGlmBind,
-	                         PlinkGlmInitGlobal, PlinkGlmInitLocal);
+	TableFunction plink_glm("plink_glm", {LogicalType::VARCHAR}, PlinkGlmScan, PlinkGlmBind, PlinkGlmInitGlobal,
+	                        PlinkGlmInitLocal);
 
 	plink_glm.projection_pushdown = true;
 

@@ -762,8 +762,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			bind_data->sample_orient_total_cols = names.size();
 		} else {
 			LogicalType sample_elem_type = bind_data->include_phased    ? LogicalType::ARRAY(LogicalType::TINYINT, 2)
-		                               : bind_data->include_dosages ? LogicalType::DOUBLE
-		                                                            : LogicalType::TINYINT;
+			                               : bind_data->include_dosages ? LogicalType::DOUBLE
+			                                                            : LogicalType::TINYINT;
 			LogicalType geno_type = bind_data->genotype_mode == GenotypeMode::ARRAY
 			                            ? LogicalType::ARRAY(sample_elem_type, effective_variant_ct)
 			                            : LogicalType::LIST(sample_elem_type);
@@ -786,13 +786,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			max_elements = max_elements_val.GetValue<int64_t>();
 		}
 		if (matrix_size > static_cast<uint64_t>(max_elements)) {
-			throw InvalidInputException(
-			    "read_pfile: orient := 'sample' would require %llu genotype values "
-			    "(%u variants x %u samples, limit: %lld). "
-			    "Use variants := [...] or samples := [...] to reduce, "
-			    "or SET plinking_max_matrix_elements = <higher value>.",
-			    static_cast<unsigned long long>(matrix_size), effective_variant_ct, output_sample_ct,
-			    static_cast<long long>(max_elements));
+			throw InvalidInputException("read_pfile: orient := 'sample' would require %llu genotype values "
+			                            "(%u variants x %u samples, limit: %lld). "
+			                            "Use variants := [...] or samples := [...] to reduce, "
+			                            "or SET plinking_max_matrix_elements = <higher value>.",
+			                            static_cast<unsigned long long>(matrix_size), effective_variant_ct,
+			                            output_sample_ct, static_cast<long long>(max_elements));
 		}
 
 		// Init temporary PgenReader for pre-reading
@@ -899,9 +898,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 			if (bind_data->include_dosages) {
 				uint32_t dosage_ct = 0;
-				err = plink2::PgrGetD(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-				                      genovec_buf2.As<uintptr_t>(), preread_dosage_present.As<uintptr_t>(),
-				                      preread_dosage_main.As<uint16_t>(), &dosage_ct);
+				err = plink2::PgrGetD(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr, genovec_buf2.As<uintptr_t>(),
+				                      preread_dosage_present.As<uintptr_t>(), preread_dosage_main.As<uint16_t>(),
+				                      &dosage_ct);
 				if (err != plink2::kPglRetSuccess) {
 					plink2::PglErr ce = plink2::kPglRetSuccess;
 					plink2::CleanupPgr(&tmp_pgr, &ce);
@@ -1230,10 +1229,10 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 
 				if (bind_data.include_dosages) {
 					uint32_t dosage_ct = 0;
-					plink2::PglErr err = plink2::PgrGetD(
-					    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-					    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-					    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+					plink2::PglErr err =
+					    plink2::PgrGetD(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+					                    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+					                    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("read_pfile: PgrGetD failed for variant %u", vidx);
 					}
@@ -1586,17 +1585,16 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 			if (bind_data.include_dosages) {
 				uint32_t dosage_ct = 0;
-				plink2::PglErr err = plink2::PgrGetD(
-				    sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-				    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+				plink2::PglErr err =
+				    plink2::PgrGetD(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+				                    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetD failed for variant %u", vidx);
 				}
-				plink2::Dosage16ToDoublesMinus9(lstate.genovec_buf.As<uintptr_t>(),
-				                                lstate.dosage_present_buf.As<uintptr_t>(),
-				                                lstate.dosage_main_buf.As<uint16_t>(), output_sample_ct, dosage_ct,
-				                                lstate.dosage_doubles.data());
+				plink2::Dosage16ToDoublesMinus9(
+				    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+				    lstate.dosage_main_buf.As<uint16_t>(), output_sample_ct, dosage_ct, lstate.dosage_doubles.data());
 			} else if (bind_data.include_phased) {
 				plink2::PglErr err =
 				    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,

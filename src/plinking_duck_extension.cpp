@@ -36,10 +36,10 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(db);
 
 	config.AddExtensionOption("plinking_max_matrix_elements",
-	    "Maximum genotype matrix elements for orient := 'sample' pre-read "
-	    "(variants x samples). Default 16 billion (~16 GB of int8).",
-	    LogicalType::BIGINT, Value::BIGINT(16LL * 1024 * 1024 * 1024),
-	    SetPlinkingMaxMatrixElements);
+	                          "Maximum genotype matrix elements for orient := 'sample' pre-read "
+	                          "(variants x samples). Default 16 billion (~16 GB of int8).",
+	                          LogicalType::BIGINT, Value::BIGINT(16LL * 1024 * 1024 * 1024),
+	                          SetPlinkingMaxMatrixElements);
 
 	// Register table functions
 	RegisterPvarReader(loader);

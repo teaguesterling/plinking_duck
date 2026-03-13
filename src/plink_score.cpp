@@ -427,8 +427,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkScoreInitGlobal(ClientContext &
 
 	state->total_samples = bind_data.effective_sample_ct;
 	state->column_ids = input.column_ids;
-	state->db_thread_count =
-	    static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	state->db_thread_count = static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	state->scored_variant_count = static_cast<uint32_t>(bind_data.scored_variants.size());
 
 	// Initialize accumulators
@@ -564,18 +563,17 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 					auto &sv = bind_data.scored_variants[si];
 					uint32_t dosage_ct = 0;
 
-					plink2::PglErr err = plink2::PgrGetD(
-					    sample_include, lstate.pssi, sample_ct, sv.variant_idx, &lstate.pgr,
-					    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-					    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+					plink2::PglErr err =
+					    plink2::PgrGetD(sample_include, lstate.pssi, sample_ct, sv.variant_idx, &lstate.pgr,
+					                    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+					                    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("plink_score: PgrGetD failed for variant %u", sv.variant_idx);
 					}
 
-					plink2::Dosage16ToDoublesMinus9(lstate.genovec_buf.As<uintptr_t>(),
-					                                lstate.dosage_present_buf.As<uintptr_t>(),
-					                                lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct,
-					                                lstate.dosage_doubles.data());
+					plink2::Dosage16ToDoublesMinus9(
+					    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+					    lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct, lstate.dosage_doubles.data());
 
 					// Per-variant statistics
 					double sum_alt = 0.0;
