@@ -47,6 +47,9 @@ struct PgenBindData : public TableFunctionData {
 	CountFilter count_filter;
 	unique_ptr<SampleSubset> count_filter_subset;
 
+	// Genotype range filtering (genotype_range)
+	GenotypeRangeFilter genotype_filter;
+
 	// Columns mode layout (genotypes := 'columns')
 	vector<string> genotype_column_names;     // IIDs for column names
 	idx_t columns_mode_first_geno_col = 0;    // first genotype column index in schema
@@ -272,6 +275,19 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		}
 	}
 
+	// --- Parse genotype_range filter ---
+	{
+		auto gr_it = input.named_parameters.find("genotype_range");
+		if (gr_it != input.named_parameters.end()) {
+			if (bind_data->include_dosages) {
+				throw InvalidInputException("read_pgen: genotype_range is incompatible with dosages := true");
+			}
+			bind_data->genotype_filter.range = ParseRangeFilter(
+			    gr_it->second, "genotype_range", 0.0, 2.0, "read_pgen");
+			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
+		}
+	}
+
 	// --- Resolve genotype output mode ---
 	uint32_t output_sample_ct = bind_data->has_sample_subset ? bind_data->subset_sample_ct : bind_data->sample_ct;
 
@@ -354,7 +370,9 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 		}
 	}
 
-	state->need_pgen_reader = state->need_genotypes || bind_data.count_filter.HasFilter();
+	state->need_pgen_reader = state->need_genotypes
+	                       || bind_data.count_filter.HasFilter()
+	                       || bind_data.genotype_filter.active;
 
 	return std::move(state);
 }
@@ -840,6 +858,7 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 	read_pgen.named_parameters["orient"] = LogicalType::VARCHAR;
 	read_pgen.named_parameters["af_range"] = LogicalType::ANY;
 	read_pgen.named_parameters["ac_range"] = LogicalType::ANY;
+	read_pgen.named_parameters["genotype_range"] = LogicalType::ANY;
 
 	loader.RegisterFunction(read_pgen);
 }
