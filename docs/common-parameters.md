@@ -18,7 +18,7 @@ SELECT * FROM plink_freq('data.pgen');
 SELECT * FROM plink_freq('data.pgen', pvar := '/other/path/variants.pvar');
 ```
 
-**Used by:** `read_pgen`, `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`
+**Used by:** `read_pgen`, `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`, `plink_glm`
 
 ## `psam`
 
@@ -40,7 +40,7 @@ The `.psam` file is **optional** for most functions -- they can operate in index
 SELECT * FROM read_pgen('data.pgen', psam := '/other/path/samples.fam');
 ```
 
-**Used by:** `read_pgen`, `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`
+**Used by:** `read_pgen`, `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`, `plink_glm`
 
 ## `samples`
 
@@ -65,7 +65,7 @@ The list must not be empty and must not contain duplicates.
 
 When no `.psam` file is available, only `LIST(INTEGER)` is accepted.
 
-**Used by:** `read_pgen`, `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`
+**Used by:** `read_pgen`, `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`, `plink_glm`
 
 ## `region`
 
@@ -84,7 +84,7 @@ The function assumes variants are sorted by (CHROM, POS) as required by the PLIN
 
 Both `start` and `end` must be specified (chromosome-only filtering is not supported in this parameter; use a `WHERE` clause instead).
 
-**Used by:** `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`
+**Used by:** `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`, `plink_glm`
 
 !!! note
     `read_pgen` and `read_pvar` do not have a `region` parameter. Use a SQL `WHERE` clause to filter their output by position.

@@ -45,6 +45,10 @@ struct PsamHeaderInfo {
 	vector<LogicalType> column_types; //!< DuckDB types for each column
 };
 
+//! Parse the header (or detect .fam format) from already-read file lines.
+//! Avoids re-reading the file when the caller already has the lines.
+PsamHeaderInfo ParsePsamHeaderFromLines(const vector<string> &lines, const string &path);
+
 //! Parse the header (or detect .fam format) from the given file path.
 //! Uses DuckDB's VFS for file access (supports S3, HTTP, etc).
 PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path);

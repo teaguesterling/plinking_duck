@@ -1,11 +1,95 @@
 #include "plink_glm.hpp"
 #include "plink_common.hpp"
+#include "psam_reader.hpp"
+#include "plink2_glm_logistic_math.hpp"
 
 #include <atomic>
 #include <cmath>
 #include <cstring>
 
 namespace duckdb {
+
+// ---------------------------------------------------------------------------
+// Psam column extraction helper
+// ---------------------------------------------------------------------------
+
+//! Extract a named column from pre-read .psam/.fam lines as a vector of doubles.
+//! Returns one value per sample in file order. "NA" and missing values
+//! become NAN. Throws on column not found or non-numeric values.
+static vector<double> LoadPsamColumnAsDouble(const vector<string> &lines, const PsamHeaderInfo &header,
+                                             const string &psam_path, const string &column_name) {
+
+	// Find the column index
+	idx_t col_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < header.column_names.size(); i++) {
+		if (header.column_names[i] == column_name) {
+			col_idx = i;
+			break;
+		}
+	}
+	if (col_idx == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("plink_glm: psam file '%s' has no column '%s'", psam_path, column_name);
+	}
+
+	// Data lines start at index 1 for .psam (skip header), 0 for .fam
+	idx_t data_start = (header.format != PsamFormat::FAM) ? 1 : 0;
+
+	vector<double> values;
+	for (idx_t i = data_start; i < lines.size(); i++) {
+		auto &line = lines[i];
+		if (line.empty()) {
+			continue;
+		}
+
+		// Split by tab (psam) or whitespace (fam)
+		vector<string> fields;
+		if (header.format == PsamFormat::FAM) {
+			// Space-delimited
+			idx_t pos = 0;
+			while (pos < line.size()) {
+				while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+					pos++;
+				}
+				if (pos >= line.size()) {
+					break;
+				}
+				idx_t start = pos;
+				while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') {
+					pos++;
+				}
+				fields.push_back(line.substr(start, pos - start));
+			}
+		} else {
+			// Tab-delimited
+			idx_t start = 0;
+			for (idx_t j = 0; j <= line.size(); j++) {
+				if (j == line.size() || line[j] == '\t') {
+					fields.push_back(line.substr(start, j - start));
+					start = j + 1;
+				}
+			}
+		}
+
+		if (col_idx >= fields.size()) {
+			throw IOException("plink_glm: psam file '%s' line %d has %d fields, expected at least %d", psam_path, i + 1,
+			                  fields.size(), col_idx + 1);
+		}
+
+		auto &field = fields[col_idx];
+		if (field == "NA" || field == "na" || field == "-9") {
+			values.push_back(NAN);
+		} else {
+			try {
+				values.push_back(std::stod(field));
+			} catch (const std::exception &) {
+				throw InvalidInputException("plink_glm: psam column '%s' has non-numeric value '%s' at line %d",
+				                            column_name, field, i + 1);
+			}
+		}
+	}
+
+	return values;
+}
 
 // ---------------------------------------------------------------------------
 // Column indices
@@ -33,9 +117,9 @@ static constexpr idx_t COL_FIRTH_YN = 15;
 // ---------------------------------------------------------------------------
 
 static double LogGamma(double x) {
-	static const double c[] = {0.99999999999980993,    676.5203681218851,       -1259.1392167224028,
-	                           771.32342877765313,     -176.61502916214059,      12.507343278686905,
-	                           -0.13857109526572012,   9.9843695780195716e-6,    1.5056327351493116e-7};
+	static const double c[] = {0.99999999999980993,  676.5203681218851,     -1259.1392167224028,
+	                           771.32342877765313,   -176.61502916214059,   12.507343278686905,
+	                           -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7};
 	if (x < 0.5) {
 		return std::log(M_PI / std::sin(M_PI * x)) - LogGamma(1.0 - x);
 	}
@@ -146,91 +230,15 @@ static double ZstatToPvalue(double z_stat) {
 	return 2.0 * (1.0 - NormalCdf(std::abs(z_stat)));
 }
 
-// ---------------------------------------------------------------------------
-// Small matrix utilities (row-major, for p×p where p ≤ ~50)
-// ---------------------------------------------------------------------------
-
-//! Cholesky decomposition: A = LL' (in-place, lower triangle).
-//! Returns false if not positive definite.
-static bool CholeskyDecomp(double *A, int p) {
-	for (int j = 0; j < p; j++) {
-		double sum = 0.0;
-		for (int k = 0; k < j; k++) {
-			sum += A[j * p + k] * A[j * p + k];
-		}
-		double diag = A[j * p + j] - sum;
-		if (diag <= 1e-20) {
-			return false;
-		}
-		A[j * p + j] = std::sqrt(diag);
-
-		for (int i = j + 1; i < p; i++) {
-			sum = 0.0;
-			for (int k = 0; k < j; k++) {
-				sum += A[i * p + k] * A[j * p + k];
-			}
-			A[i * p + j] = (A[i * p + j] - sum) / A[j * p + j];
-		}
-	}
-	return true;
-}
-
-//! Forward substitution: Lx = b (L is lower triangular).
-static void ForwardSolve(const double *L, const double *b, double *x, int p) {
-	for (int i = 0; i < p; i++) {
-		double sum = 0.0;
-		for (int j = 0; j < i; j++) {
-			sum += L[i * p + j] * x[j];
-		}
-		x[i] = (b[i] - sum) / L[i * p + i];
-	}
-}
-
-//! Backward substitution: L'x = b (L is lower triangular).
-static void BackwardSolve(const double *L, const double *b, double *x, int p) {
-	for (int i = p - 1; i >= 0; i--) {
-		double sum = 0.0;
-		for (int j = i + 1; j < p; j++) {
-			sum += L[j * p + i] * x[j];
-		}
-		x[i] = (b[i] - sum) / L[i * p + i];
-	}
-}
-
-//! Solve LL'x = b in-place. b is overwritten with x.
-static void CholeskySolve(const double *L, double *b, int p) {
-	vector<double> z(p);
-	ForwardSolve(L, b, z.data(), p);
-	BackwardSolve(L, z.data(), b, p);
-}
-
-//! Compute full inverse of Cholesky-factored matrix: (LL')^{-1}.
-//! L is the lower Cholesky factor, inv is output (p×p row-major).
-static void CholeskyInverse(const double *L, double *inv, int p) {
-	vector<double> e(p);
-	for (int j = 0; j < p; j++) {
-		std::fill(e.begin(), e.end(), 0.0);
-		e[j] = 1.0;
-		CholeskySolve(L, e.data(), p);
-		for (int i = 0; i < p; i++) {
-			inv[i * p + j] = e[i];
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Sigmoid and logistic regression utilities
-// ---------------------------------------------------------------------------
-
-static double Sigmoid(double x) {
-	if (x >= 0.0) {
-		double ez = std::exp(-x);
-		return 1.0 / (1.0 + ez);
-	} else {
-		double ez = std::exp(x);
-		return ez / (1.0 + ez);
-	}
-}
+// plink2's LinearRegressionInv is a header-inline that calls into plink2_matrix.
+// Under NOLAPACK, MatrixInvertBuf1 is a typedef in global scope (not in plink2::).
+using plink2::InvertSymmdefFmatrixFirstHalf;
+using plink2::InvertSymmdefFmatrixSecondHalf;
+using plink2::kFloatPerFVec;
+using plink2::LinearRegressionInv;
+using plink2::MultiplySelfTranspose;
+using plink2::ReflectFmatrix0;
+using plink2::RoundUpPow2;
 
 // ---------------------------------------------------------------------------
 // Bind data
@@ -264,6 +272,7 @@ struct PlinkGlmBindData : public TableFunctionData {
 	// Model
 	bool is_logistic = false;
 	bool use_firth = true;
+	uint32_t predictor_ct = 0; // intercept + genotype + covariates
 };
 
 // ---------------------------------------------------------------------------
@@ -287,6 +296,90 @@ struct PlinkGlmGlobalState : public GlobalTableFunctionState {
 // Local state (per-thread)
 // ---------------------------------------------------------------------------
 
+// Pre-allocated scratch buffers for logistic regression, reused across variants.
+// Allocated once per thread in InitLocal based on max sample count and predictor count.
+struct LogisticBuffers {
+	// Core IRLS buffers
+	vector<float> xx;    // p * max_sample_ctav (covariate-major design matrix)
+	vector<float> yy;    // max_sample_ctav (phenotype)
+	vector<float> coef;  // predictor_ctav
+	vector<float> ll;    // p * predictor_ctav (Cholesky output)
+	vector<float> pp;    // max_sample_ctav (predicted probabilities)
+	vector<float> vv;    // max_sample_ctav (variances)
+	vector<float> hh;    // p * predictor_ctav (Hessian / inverted var-cov)
+	vector<float> grad;  // predictor_ctav
+	vector<float> dcoef; // predictor_ctav
+
+	// Firth-specific buffers
+	vector<double> half_inverted_buf; // p * p
+	vector<MatrixInvertBuf1> inv_1d_buf; // 2 * p
+	vector<double> dbl_2d_buf;        // p * p
+	vector<float> ustar;    // predictor_ctav
+	vector<float> delta;    // predictor_ctav
+	vector<float> hdiag;    // max_sample_ctav
+	vector<float> ww;       // max_sample_ctav
+	vector<float> hh0;      // p * predictor_ctav
+	vector<float> tmpnxk_buf; // p * max_sample_ctav
+
+	// Hessian inversion buffers (reused for non-Firth and Firth paths)
+	// half_inverted_buf, inv_1d_buf, dbl_2d_buf are shared above
+
+	// Non-missing sample indices scratch
+	vector<uint32_t> nm_indices;
+
+	bool allocated = false;
+
+	void Allocate(uint32_t max_sample_ct, uint32_t predictor_ct, bool use_firth) {
+		uint32_t max_sample_ctav = RoundUpPow2(max_sample_ct, kFloatPerFVec);
+		uint32_t predictor_ctav = RoundUpPow2(predictor_ct, kFloatPerFVec);
+		uint32_t p = predictor_ct;
+
+		xx.resize(p * max_sample_ctav);
+		yy.resize(max_sample_ctav);
+		coef.resize(predictor_ctav);
+		ll.resize(p * predictor_ctav);
+		pp.resize(max_sample_ctav);
+		vv.resize(max_sample_ctav);
+		hh.resize(p * predictor_ctav);
+		grad.resize(predictor_ctav);
+		dcoef.resize(predictor_ctav);
+
+		// Hessian inversion buffers (needed for all logistic paths)
+		half_inverted_buf.resize(p * p);
+		inv_1d_buf.resize(2 * p);
+		dbl_2d_buf.resize(p * p);
+
+		if (use_firth) {
+			ustar.resize(predictor_ctav);
+			delta.resize(predictor_ctav);
+			hdiag.resize(max_sample_ctav);
+			ww.resize(max_sample_ctav);
+			hh0.resize(p * predictor_ctav);
+			tmpnxk_buf.resize(p * max_sample_ctav);
+		}
+
+		nm_indices.resize(max_sample_ct);
+
+		allocated = true;
+	}
+
+	//! Zero all buffers before reuse. Called once per variant.
+	void Reset(uint32_t n, uint32_t p, bool use_firth) {
+		uint32_t sample_ctav = RoundUpPow2(n, kFloatPerFVec);
+		uint32_t predictor_ctav = RoundUpPow2(p, kFloatPerFVec);
+
+		std::fill_n(xx.data(), p * sample_ctav, 0.0f);
+		std::fill_n(yy.data(), sample_ctav, 0.0f);
+		std::fill_n(coef.data(), predictor_ctav, 0.0f);
+		std::fill_n(ll.data(), p * predictor_ctav, 0.0f);
+		std::fill_n(pp.data(), sample_ctav, 0.0f);
+		std::fill_n(vv.data(), sample_ctav, 0.0f);
+		std::fill_n(hh.data(), p * predictor_ctav, 0.0f);
+		std::fill_n(grad.data(), predictor_ctav, 0.0f);
+		std::fill_n(dcoef.data(), predictor_ctav, 0.0f);
+	}
+};
+
 struct PlinkGlmLocalState : public LocalTableFunctionState {
 	plink2::PgenFileInfo pgfi;
 	AlignedBuffer pgfi_alloc_buf;
@@ -301,6 +394,9 @@ struct PlinkGlmLocalState : public LocalTableFunctionState {
 	AlignedBuffer dosage_present_buf;
 	AlignedBuffer dosage_main_buf;
 	vector<double> dosage_doubles;
+
+	// Pre-allocated logistic regression scratch buffers
+	LogisticBuffers logistic_bufs;
 
 	bool initialized = false;
 
@@ -320,7 +416,7 @@ struct PlinkGlmLocalState : public LocalTableFunctionState {
 static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PlinkGlmBindData>();
-	bind_data->pgen_path = input.inputs[0].GetValue<string>();
+	string prefix = input.inputs[0].GetValue<string>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
 
@@ -339,18 +435,50 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		}
 	}
 
+	// --- Resolve pgen path from prefix ---
+	{
+		string candidate = prefix + ".pgen";
+		if (fs.FileExists(candidate)) {
+			bind_data->pgen_path = candidate;
+		} else if (fs.FileExists(prefix)) {
+			bind_data->pgen_path = prefix;
+		} else {
+			throw InvalidInputException("plink_glm: cannot find .pgen file for prefix '%s' (tried '%s')", prefix,
+			                            candidate);
+		}
+	}
+
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
-		bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+		// Try prefix-based discovery first, then companion file discovery
+		for (auto &ext : {".pvar", ".bim"}) {
+			auto candidate = prefix + ext;
+			if (fs.FileExists(candidate)) {
+				bind_data->pvar_path = candidate;
+				break;
+			}
+		}
 		if (bind_data->pvar_path.empty()) {
-			throw InvalidInputException("plink_glm: cannot find .pvar or .bim companion for '%s' "
+			bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+		}
+		if (bind_data->pvar_path.empty()) {
+			throw InvalidInputException("plink_glm: cannot find .pvar or .bim file for '%s' "
 			                            "(use pvar := 'path' to specify explicitly)",
-			                            bind_data->pgen_path);
+			                            prefix);
 		}
 	}
 
 	if (bind_data->psam_path.empty()) {
-		bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+		for (auto &ext : {".psam", ".fam"}) {
+			auto candidate = prefix + ext;
+			if (fs.FileExists(candidate)) {
+				bind_data->psam_path = candidate;
+				break;
+			}
+		}
+		if (bind_data->psam_path.empty()) {
+			bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+		}
 	}
 
 	// --- Initialize pgenlib (Phase 1) to get counts ---
@@ -411,8 +539,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 			throw InvalidInputException("plink_glm: samples parameter requires .psam/.fam file");
 		}
 		auto sample_info = LoadSampleInfo(context, bind_data->psam_path);
-		auto indices =
-		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &sample_info, "plink_glm");
+		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &sample_info, "plink_glm");
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
 		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
@@ -421,8 +548,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	// --- Process region parameter ---
 	auto region_it = input.named_parameters.find("region");
 	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range =
-		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_glm");
+		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_glm");
 	}
 
 	// --- Process phenotype parameter ---
@@ -432,42 +558,82 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	}
 
 	auto &pheno_val = pheno_it->second;
-	if (pheno_val.type().id() != LogicalTypeId::LIST) {
-		throw InvalidInputException("plink_glm: phenotype must be a LIST(DOUBLE)");
-	}
 
-	auto &pheno_children = ListValue::GetChildren(pheno_val);
+	// Pre-read psam file once if any parameter uses column name dispatch
+	vector<string> psam_lines;
+	PsamHeaderInfo psam_header;
+	bool psam_loaded = false;
 
-	if (static_cast<uint32_t>(pheno_children.size()) != bind_data->raw_sample_ct) {
-		throw InvalidInputException("plink_glm: phenotype length (%llu) must match sample count (%u)",
-		                            static_cast<unsigned long long>(pheno_children.size()),
-		                            bind_data->raw_sample_ct);
-	}
+	auto EnsurePsamLoaded = [&]() {
+		if (!psam_loaded && !bind_data->psam_path.empty()) {
+			psam_lines = ReadFileLines(context, bind_data->psam_path);
+			psam_header = ParsePsamHeaderFromLines(psam_lines, bind_data->psam_path);
+			psam_loaded = true;
+		}
+	};
 
-	// Extract phenotype values for effective samples
-	bind_data->phenotype.resize(bind_data->effective_sample_ct);
+	// Type dispatch: VARCHAR → psam column name, LIST → direct values
+	if (pheno_val.type().id() == LogicalTypeId::VARCHAR) {
+		// --- Phenotype from psam column ---
+		if (bind_data->psam_path.empty()) {
+			throw InvalidInputException("plink_glm: phenotype as column name requires a .psam/.fam file");
+		}
+		EnsurePsamLoaded();
+		string pheno_col = pheno_val.GetValue<string>();
+		auto raw_values = LoadPsamColumnAsDouble(psam_lines, psam_header, bind_data->psam_path, pheno_col);
+		if (static_cast<uint32_t>(raw_values.size()) != bind_data->raw_sample_ct) {
+			throw InvalidInputException("plink_glm: psam has %llu samples but .pgen has %u",
+			                            static_cast<unsigned long long>(raw_values.size()), bind_data->raw_sample_ct);
+		}
 
-	if (bind_data->has_sample_subset) {
-		const uintptr_t *sample_include = bind_data->sample_subset->SampleInclude();
-		uint32_t out_idx = 0;
-		for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
-			if (plink2::IsSet(sample_include, raw_idx)) {
-				if (pheno_children[raw_idx].IsNull()) {
-					bind_data->phenotype[out_idx] = NAN;
-				} else {
-					bind_data->phenotype[out_idx] = pheno_children[raw_idx].GetValue<double>();
+		bind_data->phenotype.resize(bind_data->effective_sample_ct);
+		if (bind_data->has_sample_subset) {
+			const uintptr_t *sample_include = bind_data->sample_subset->SampleInclude();
+			uint32_t out_idx = 0;
+			for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+				if (plink2::IsSet(sample_include, raw_idx)) {
+					bind_data->phenotype[out_idx] = raw_values[raw_idx];
+					out_idx++;
 				}
-				out_idx++;
+			}
+		} else {
+			bind_data->phenotype = std::move(raw_values);
+		}
+	} else if (pheno_val.type().id() == LogicalTypeId::LIST) {
+		// --- Phenotype from direct LIST(DOUBLE) ---
+		auto &pheno_children = ListValue::GetChildren(pheno_val);
+
+		if (static_cast<uint32_t>(pheno_children.size()) != bind_data->raw_sample_ct) {
+			throw InvalidInputException("plink_glm: phenotype length (%llu) must match sample count (%u)",
+			                            static_cast<unsigned long long>(pheno_children.size()),
+			                            bind_data->raw_sample_ct);
+		}
+
+		bind_data->phenotype.resize(bind_data->effective_sample_ct);
+		if (bind_data->has_sample_subset) {
+			const uintptr_t *sample_include = bind_data->sample_subset->SampleInclude();
+			uint32_t out_idx = 0;
+			for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+				if (plink2::IsSet(sample_include, raw_idx)) {
+					if (pheno_children[raw_idx].IsNull()) {
+						bind_data->phenotype[out_idx] = NAN;
+					} else {
+						bind_data->phenotype[out_idx] = pheno_children[raw_idx].GetValue<double>();
+					}
+					out_idx++;
+				}
+			}
+		} else {
+			for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
+				if (pheno_children[i].IsNull()) {
+					bind_data->phenotype[i] = NAN;
+				} else {
+					bind_data->phenotype[i] = pheno_children[i].GetValue<double>();
+				}
 			}
 		}
 	} else {
-		for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
-			if (pheno_children[i].IsNull()) {
-				bind_data->phenotype[i] = NAN;
-			} else {
-				bind_data->phenotype[i] = pheno_children[i].GetValue<double>();
-			}
-		}
+		throw InvalidInputException("plink_glm: phenotype must be a LIST(DOUBLE) or a VARCHAR column name");
 	}
 
 	// Validate phenotype
@@ -485,8 +651,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	}
 
 	if (non_missing_ct < 3) {
-		throw InvalidInputException("plink_glm: need at least 3 non-missing phenotype values, got %u",
-		                            non_missing_ct);
+		throw InvalidInputException("plink_glm: need at least 3 non-missing phenotype values, got %u", non_missing_ct);
 	}
 
 	if (min_val == max_val) {
@@ -499,57 +664,102 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		auto &covar_val = covar_it->second;
 		auto &covar_type = covar_val.type();
 
-		if (covar_type.id() != LogicalTypeId::STRUCT) {
-			throw InvalidInputException("plink_glm: covariates must be a STRUCT of named LIST(DOUBLE) "
-			                            "columns, e.g. {'age': list(age), 'sex': list(sex)}");
-		}
-
-		auto &struct_children = StructType::GetChildTypes(covar_type);
-		auto &struct_vals = StructValue::GetChildren(covar_val);
-
-		for (idx_t ci = 0; ci < struct_children.size(); ci++) {
-			auto &name = struct_children[ci].first;
-			auto &val = struct_vals[ci];
-
-			if (val.type().id() != LogicalTypeId::LIST) {
-				throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s",
-				                            name, val.type().ToString());
+		if (covar_type.id() == LogicalTypeId::LIST &&
+		    ListType::GetChildType(covar_type).id() == LogicalTypeId::VARCHAR) {
+			// --- Covariates from psam column names: LIST(VARCHAR) ---
+			if (bind_data->psam_path.empty()) {
+				throw InvalidInputException("plink_glm: covariates as column names requires a .psam/.fam file");
 			}
+			EnsurePsamLoaded();
 
-			auto &list_children = ListValue::GetChildren(val);
-			if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
-				throw InvalidInputException(
-				    "plink_glm: covariate '%s' length (%llu) must match sample count (%u)", name,
-				    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
-			}
+			auto &list_children = ListValue::GetChildren(covar_val);
+			for (idx_t ci = 0; ci < list_children.size(); ci++) {
+				string col_name = list_children[ci].GetValue<string>();
+				auto raw_values = LoadPsamColumnAsDouble(psam_lines, psam_header, bind_data->psam_path, col_name);
+				if (static_cast<uint32_t>(raw_values.size()) != bind_data->raw_sample_ct) {
+					throw InvalidInputException("plink_glm: psam has %llu samples but .pgen has %u",
+					                            static_cast<unsigned long long>(raw_values.size()),
+					                            bind_data->raw_sample_ct);
+				}
 
-			// Extract values for effective samples (NULLs not allowed in covariates)
-			vector<double> covar_vals(bind_data->effective_sample_ct);
-			if (bind_data->has_sample_subset) {
-				const uintptr_t *si = bind_data->sample_subset->SampleInclude();
-				uint32_t out_idx = 0;
-				for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
-					if (plink2::IsSet(si, raw_idx)) {
-						if (list_children[raw_idx].IsNull()) {
-							throw InvalidInputException(
-							    "plink_glm: covariate '%s' contains NULL at index %u", name, raw_idx);
+				// Check for NAN (which LoadPsamColumnAsDouble uses for NA/-9)
+				for (uint32_t i = 0; i < raw_values.size(); i++) {
+					if (std::isnan(raw_values[i])) {
+						throw InvalidInputException("plink_glm: covariate '%s' contains NULL at sample %u",
+						                            col_name, i);
+					}
+				}
+
+				// Apply sample subset
+				vector<double> covar_vals(bind_data->effective_sample_ct);
+				if (bind_data->has_sample_subset) {
+					const uintptr_t *si = bind_data->sample_subset->SampleInclude();
+					uint32_t out_idx = 0;
+					for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+						if (plink2::IsSet(si, raw_idx)) {
+							covar_vals[out_idx] = raw_values[raw_idx];
+							out_idx++;
 						}
-						covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
-						out_idx++;
 					}
+				} else {
+					covar_vals = std::move(raw_values);
 				}
-			} else {
-				for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
-					if (list_children[i].IsNull()) {
-						throw InvalidInputException(
-						    "plink_glm: covariate '%s' contains NULL at index %u", name, i);
-					}
-					covar_vals[i] = list_children[i].GetValue<double>();
-				}
-			}
 
-			bind_data->covariate_names.push_back(name);
-			bind_data->covariate_values.push_back(std::move(covar_vals));
+				bind_data->covariate_names.push_back(col_name);
+				bind_data->covariate_values.push_back(std::move(covar_vals));
+			}
+		} else if (covar_type.id() == LogicalTypeId::STRUCT) {
+			// --- Covariates from STRUCT of LIST(DOUBLE) ---
+			auto &struct_children = StructType::GetChildTypes(covar_type);
+			auto &struct_vals = StructValue::GetChildren(covar_val);
+
+			for (idx_t ci = 0; ci < struct_children.size(); ci++) {
+				auto &name = struct_children[ci].first;
+				auto &val = struct_vals[ci];
+
+				if (val.type().id() != LogicalTypeId::LIST) {
+					throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s", name,
+					                            val.type().ToString());
+				}
+
+				auto &list_children = ListValue::GetChildren(val);
+				if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
+					throw InvalidInputException("plink_glm: covariate '%s' length (%llu) must match sample count (%u)",
+					                            name, static_cast<unsigned long long>(list_children.size()),
+					                            bind_data->raw_sample_ct);
+				}
+
+				// Extract values for effective samples (NULLs not allowed in covariates)
+				vector<double> covar_vals(bind_data->effective_sample_ct);
+				if (bind_data->has_sample_subset) {
+					const uintptr_t *si = bind_data->sample_subset->SampleInclude();
+					uint32_t out_idx = 0;
+					for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
+						if (plink2::IsSet(si, raw_idx)) {
+							if (list_children[raw_idx].IsNull()) {
+								throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name,
+								                            raw_idx);
+							}
+							covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
+							out_idx++;
+						}
+					}
+				} else {
+					for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
+						if (list_children[i].IsNull()) {
+							throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name, i);
+						}
+						covar_vals[i] = list_children[i].GetValue<double>();
+					}
+				}
+
+				bind_data->covariate_names.push_back(name);
+				bind_data->covariate_values.push_back(std::move(covar_vals));
+			}
+		} else {
+			throw InvalidInputException("plink_glm: covariates must be a STRUCT of named LIST(DOUBLE) "
+			                            "columns (e.g. {'age': list(age)}), or a LIST(VARCHAR) of "
+			                            "psam column names (e.g. ['age', 'sex'])");
 		}
 	}
 
@@ -587,19 +797,18 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 			}
 		}
 	} else {
-		throw InvalidInputException("plink_glm: model must be 'auto', 'linear', or 'logistic', got '%s'",
-		                            model_str);
+		throw InvalidInputException("plink_glm: model must be 'auto', 'linear', or 'logistic', got '%s'", model_str);
 	}
 
+	bind_data->predictor_ct = static_cast<uint32_t>(2 + bind_data->covariate_values.size());
+
 	// --- Output columns ---
-	names = {"CHROM", "POS", "ID", "REF", "ALT", "A1", "A1_FREQ", "TEST", "OBS_CT",
-	         "BETA",  "SE",  "T_STAT", "P", "ERRCODE", "OR", "FIRTH_YN"};
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::INTEGER,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
-	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,
-	                LogicalType::VARCHAR};
+	names = {"CHROM",  "POS",  "ID", "REF",    "ALT", "A1",      "A1_FREQ", "TEST",
+	         "OBS_CT", "BETA", "SE", "T_STAT", "P",   "ERRCODE", "OR",      "FIRTH_YN"};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::VARCHAR,
+	                LogicalType::INTEGER, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::VARCHAR};
 
 	return std::move(bind_data);
 }
@@ -608,8 +817,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 // Init global
 // ---------------------------------------------------------------------------
 
-static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PlinkGlmBindData>();
 	auto state = make_uniq<PlinkGlmGlobalState>();
 
@@ -643,9 +851,8 @@ static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &co
 // Init local (per-thread PgenReader)
 // ---------------------------------------------------------------------------
 
-static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &context,
-                                                              TableFunctionInitInput &input,
-                                                              GlobalTableFunctionState *global_state) {
+static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                             GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PlinkGlmBindData>();
 	auto &gstate = global_state->Cast<PlinkGlmGlobalState>();
 	auto state = make_uniq<PlinkGlmLocalState>();
@@ -662,9 +869,9 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 	plink2::PgenHeaderCtrl header_ctrl;
 	uintptr_t pgfi_alloc_cacheline_ct = 0;
 
-	plink2::PglErr err = plink2::PgfiInitPhase1(bind_data.pgen_path.c_str(), nullptr, bind_data.raw_variant_ct,
-	                                            bind_data.raw_sample_ct, &header_ctrl, &state->pgfi,
-	                                            &pgfi_alloc_cacheline_ct, errstr_buf);
+	plink2::PglErr err =
+	    plink2::PgfiInitPhase1(bind_data.pgen_path.c_str(), nullptr, bind_data.raw_variant_ct, bind_data.raw_sample_ct,
+	                           &header_ctrl, &state->pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -679,9 +886,8 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 	uint32_t max_vrec_width = 0;
 	uintptr_t pgr_alloc_cacheline_ct = 0;
 
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state->pgfi.raw_variant_ct, &max_vrec_width,
-	                             &state->pgfi, state->pgfi_alloc_buf.As<unsigned char>(),
-	                             &pgr_alloc_cacheline_ct, errstr_buf);
+	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state->pgfi.raw_variant_ct, &max_vrec_width, &state->pgfi,
+	                             state->pgfi_alloc_buf.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -706,8 +912,7 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 
 	// Set up sample subsetting
 	if (bind_data.has_sample_subset && bind_data.sample_subset) {
-		plink2::PgrSetSampleSubsetIndex(bind_data.sample_subset->CumulativePopcounts(), &state->pgr,
-		                                &state->pssi);
+		plink2::PgrSetSampleSubsetIndex(bind_data.sample_subset->CumulativePopcounts(), &state->pgr, &state->pssi);
 	} else {
 		plink2::PgrClearSampleSubsetIndex(&state->pgr, &state->pssi);
 	}
@@ -726,6 +931,11 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 	std::memset(state->dosage_main_buf.ptr, 0, raw_sample_ct * sizeof(uint16_t));
 
 	state->dosage_doubles.resize(bind_data.effective_sample_ct, 0.0);
+
+	// Pre-allocate logistic regression scratch buffers (once per thread)
+	if (bind_data.is_logistic) {
+		state->logistic_bufs.Allocate(bind_data.effective_sample_ct, bind_data.predictor_ct, bind_data.use_firth);
+	}
 
 	state->initialized = true;
 	return std::move(state);
@@ -757,8 +967,7 @@ struct GlmResult {
 // ---------------------------------------------------------------------------
 
 static GlmResult ComputeLinearRegression(const double *dosages, const double *phenotype,
-                                         const vector<vector<double>> &covariates,
-                                         uint32_t sample_ct) {
+                                         const vector<vector<double>> &covariates, uint32_t sample_ct) {
 	GlmResult result;
 
 	int n_covars = static_cast<int>(covariates.size());
@@ -829,62 +1038,65 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 		return result;
 	}
 
-	// Multivariate case: build X'X and X'y, solve via Cholesky
-	vector<double> xtx(p * p, 0.0);
-	vector<double> xty(p, 0.0);
-	double yty = 0.0;
+	// Multivariate case: use plink2's LinearRegressionInv
+	uint32_t up = static_cast<uint32_t>(p);
 
+	// Build predictor-major double matrix: predictors_pmaj[p × n]
+	// Row 0: intercept (all 1.0)
+	// Row 1: genotype dosages (non-missing only)
+	// Rows 2+: covariates (non-missing only)
+	vector<double> predictors_pmaj(up * n);
+	vector<double> pheno_d(n);
+	double pheno_ssq = 0.0;
+
+	uint32_t nm_idx = 0;
 	for (uint32_t i = 0; i < sample_ct; i++) {
-		double geno = dosages[i];
-		double y = phenotype[i];
-		if (geno == -9.0 || std::isnan(y)) {
+		if (dosages[i] == -9.0 || std::isnan(phenotype[i])) {
 			continue;
 		}
-
-		// Build predictor row: [1, geno, cov1, cov2, ...]
-		vector<double> xi(p);
-		xi[0] = 1.0;
-		xi[1] = geno;
+		predictors_pmaj[0 * n + nm_idx] = 1.0;        // intercept
+		predictors_pmaj[1 * n + nm_idx] = dosages[i]; // genotype
 		for (int c = 0; c < n_covars; c++) {
-			xi[2 + c] = covariates[c][i];
+			predictors_pmaj[(2 + c) * n + nm_idx] = covariates[c][i];
 		}
-
-		// Accumulate X'X (symmetric, but fill full for simplicity)
-		for (int r = 0; r < p; r++) {
-			for (int c_idx = 0; c_idx < p; c_idx++) {
-				xtx[r * p + c_idx] += xi[r] * xi[c_idx];
-			}
-			xty[r] += xi[r] * y;
-		}
-		yty += y * y;
+		pheno_d[nm_idx] = phenotype[i];
+		pheno_ssq += phenotype[i] * phenotype[i];
+		nm_idx++;
 	}
 
 	// Check for constant genotype
-	double geno_var = xtx[1 * p + 1] - xtx[0 * p + 1] * xtx[0 * p + 1] / xtx[0 * p + 0];
+	double geno_mean = sum_x / static_cast<double>(n);
+	double geno_var = 0.0;
+	for (uint32_t idx = 0; idx < n; idx++) {
+		double d = predictors_pmaj[1 * n + idx] - geno_mean;
+		geno_var += d * d;
+	}
 	if (geno_var < 1e-20) {
 		result.errcode = "CONST_ALLELE";
 		return result;
 	}
 
-	// Solve via Cholesky
-	vector<double> xtx_copy(xtx);
-	if (!CholeskyDecomp(xtx_copy.data(), p)) {
+	// Compute X'X (predictors_pmaj * transpose)
+	vector<double> xtx_inv(up * up);
+	MultiplySelfTranspose(predictors_pmaj.data(), up, n, xtx_inv.data());
+
+	// Allocate workspace
+	vector<double> fitted_coefs(up);
+	vector<double> xt_y(up);
+	vector<MatrixInvertBuf1> mi_buf(2 * up);
+	vector<double> dbl_2d_buf(up * std::max(up, 7u));
+
+	// Call plink2's LinearRegressionInv
+	if (LinearRegressionInv(pheno_d.data(), predictors_pmaj.data(), up, n, 1, xtx_inv.data(), fitted_coefs.data(),
+	                        xt_y.data(), mi_buf.data(), dbl_2d_buf.data())) {
 		result.errcode = "SINGULAR_MATRIX";
 		return result;
 	}
 
-	// Get beta = (X'X)^{-1} X'y
-	vector<double> beta(xty);
-	CholeskySolve(xtx_copy.data(), beta.data(), p);
-
-	// Compute (X'X)^{-1} for SE
-	vector<double> xtx_inv(p * p);
-	CholeskyInverse(xtx_copy.data(), xtx_inv.data(), p);
-
-	// RSS = y'y - beta' X'y
-	double rss = yty;
-	for (int j = 0; j < p; j++) {
-		rss -= beta[j] * xty[j];
+	// RSS = pheno_ssq - dot(xt_y, fitted_coefs)
+	double rss = pheno_ssq;
+	for (uint32_t j = 0; j < up; j++) {
+		rss -= xt_y[j] * fitted_coefs[j];
 	}
 	if (rss < 0.0) {
 		rss = 0.0;
@@ -894,8 +1106,9 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 	double mse = rss / df;
 
 	// Extract beta and SE for genotype coefficient (index 1)
-	result.beta = beta[1];
-	double se_sq = mse * xtx_inv[1 * p + 1];
+	// xtx_inv is now (X'X)^{-1}, row-major p×p
+	result.beta = fitted_coefs[1];
+	double se_sq = mse * xtx_inv[1 * up + 1];
 	if (se_sq < 1e-30) {
 		result.errcode = "ZERO_VARIANCE";
 		return result;
@@ -912,53 +1125,40 @@ static GlmResult ComputeLinearRegression(const double *dosages, const double *ph
 // ---------------------------------------------------------------------------
 
 static GlmResult ComputeLogisticRegression(const double *dosages, const double *phenotype,
-                                           const vector<vector<double>> &covariates,
-                                           uint32_t sample_ct, bool use_firth) {
+                                           const vector<vector<double>> &covariates, uint32_t sample_ct,
+                                           bool use_firth, LogisticBuffers &bufs) {
 	GlmResult result;
 	result.is_logistic = true;
 
 	int n_covars = static_cast<int>(covariates.size());
-	int p = 2 + n_covars; // intercept + genotype + covariates
+	uint32_t p = static_cast<uint32_t>(2 + n_covars); // intercept + genotype + covariates
 
-	// Collect non-missing samples
-	vector<uint32_t> nm_indices;
+	// Collect non-missing samples into pre-allocated buffer
+	uint32_t nm_count = 0;
 	double sum_x = 0.0;
 	for (uint32_t i = 0; i < sample_ct; i++) {
 		if (dosages[i] == -9.0 || std::isnan(phenotype[i])) {
 			continue;
 		}
-		nm_indices.push_back(i);
+		bufs.nm_indices[nm_count++] = i;
 		sum_x += dosages[i];
 	}
 
-	uint32_t n = static_cast<uint32_t>(nm_indices.size());
+	uint32_t n = nm_count;
 	result.obs_ct = n;
 
-	if (n < static_cast<uint32_t>(p + 1)) {
+	if (n < p + 1) {
 		result.errcode = "TOO_FEW_SAMPLES";
 		return result;
 	}
 
 	result.a1_freq = sum_x / (2.0 * static_cast<double>(n));
 
-	// Build design matrix X (n×p) and response y
-	vector<double> X(n * p);
-	vector<double> y(n);
-	for (uint32_t idx = 0; idx < n; idx++) {
-		uint32_t i = nm_indices[idx];
-		X[idx * p + 0] = 1.0;     // intercept
-		X[idx * p + 1] = dosages[i]; // genotype
-		for (int c = 0; c < n_covars; c++) {
-			X[idx * p + 2 + c] = covariates[c][i];
-		}
-		y[idx] = phenotype[i];
-	}
-
 	// Check for constant genotype
 	double geno_mean = sum_x / static_cast<double>(n);
 	double geno_var = 0.0;
 	for (uint32_t idx = 0; idx < n; idx++) {
-		double d = X[idx * p + 1] - geno_mean;
+		double d = dosages[bufs.nm_indices[idx]] - geno_mean;
 		geno_var += d * d;
 	}
 	if (geno_var < 1e-20) {
@@ -966,144 +1166,88 @@ static GlmResult ComputeLogisticRegression(const double *dosages, const double *
 		return result;
 	}
 
-	// IRLS iteration
-	static constexpr int MAX_ITER = 25;
-	static constexpr double TOL = 1e-7;
-	static constexpr double MAX_BETA = 20.0; // separation detection
+	// Vector-aligned sizes for plink2's SIMD code
+	uint32_t sample_ctav = RoundUpPow2(n, kFloatPerFVec);
+	uint32_t predictor_ctav = RoundUpPow2(p, kFloatPerFVec);
 
-	vector<double> beta(p, 0.0);
-	vector<double> mu(n);
-	vector<double> w(n);
-	vector<double> xwx(p * p);
-	vector<double> xwz(p);
-	vector<double> xwx_inv(p * p);
-	bool converged = false;
+	// Zero scratch buffers for this variant's sample count
+	bufs.Reset(n, p, use_firth);
 
-	for (int iter = 0; iter < MAX_ITER; iter++) {
-		// Compute linear predictor and predicted probabilities
-		for (uint32_t idx = 0; idx < n; idx++) {
-			double eta = 0.0;
-			for (int j = 0; j < p; j++) {
-				eta += X[idx * p + j] * beta[j];
-			}
-			mu[idx] = Sigmoid(eta);
-			// Clamp to avoid numerical issues
-			if (mu[idx] < 1e-10) {
-				mu[idx] = 1e-10;
-			}
-			if (mu[idx] > 1.0 - 1e-10) {
-				mu[idx] = 1.0 - 1e-10;
-			}
-			w[idx] = mu[idx] * (1.0 - mu[idx]);
+	// Build covariate-major float matrix xx[p × sample_ctav]:
+	// Row 0: intercept (1.0f), zero-padded to sample_ctav
+	// Row 1: genotype dosages (float), zero-padded
+	// Rows 2+: covariates (float), zero-padded
+	for (uint32_t idx = 0; idx < n; idx++) {
+		uint32_t i = bufs.nm_indices[idx];
+		bufs.xx[0 * sample_ctav + idx] = 1.0f;                           // intercept
+		bufs.xx[1 * sample_ctav + idx] = static_cast<float>(dosages[i]); // genotype
+		for (int c = 0; c < n_covars; c++) {
+			bufs.xx[(2 + c) * sample_ctav + idx] = static_cast<float>(covariates[c][i]);
 		}
-
-		// Build X'WX
-		std::fill(xwx.begin(), xwx.end(), 0.0);
-		for (uint32_t idx = 0; idx < n; idx++) {
-			for (int r = 0; r < p; r++) {
-				for (int c_idx = 0; c_idx < p; c_idx++) {
-					xwx[r * p + c_idx] += w[idx] * X[idx * p + r] * X[idx * p + c_idx];
-				}
-			}
-		}
-
-		// Cholesky decomposition of X'WX
-		vector<double> xwx_chol(xwx);
-		if (!CholeskyDecomp(xwx_chol.data(), p)) {
-			result.errcode = "SINGULAR_MATRIX";
-			return result;
-		}
-
-		// For Firth correction, compute hat matrix diagonal and modify score
-		vector<double> h_diag;
-		if (use_firth) {
-			CholeskyInverse(xwx_chol.data(), xwx_inv.data(), p);
-			h_diag.resize(n);
-			for (uint32_t idx = 0; idx < n; idx++) {
-				// h_ii = w_i * x_i' (X'WX)^{-1} x_i
-				double h = 0.0;
-				for (int r = 0; r < p; r++) {
-					for (int c_idx = 0; c_idx < p; c_idx++) {
-						h += X[idx * p + r] * xwx_inv[r * p + c_idx] * X[idx * p + c_idx];
-					}
-				}
-				h_diag[idx] = w[idx] * h;
-			}
-		}
-
-		// Build X'Wz (modified score for Firth)
-		std::fill(xwz.begin(), xwz.end(), 0.0);
-		for (uint32_t idx = 0; idx < n; idx++) {
-			double resid = y[idx] - mu[idx];
-			if (use_firth) {
-				resid += h_diag[idx] * (0.5 - mu[idx]);
-			}
-			for (int j = 0; j < p; j++) {
-				xwz[j] += X[idx * p + j] * resid;
-			}
-		}
-
-		// Newton step: delta = (X'WX)^{-1} X'Wz (as score)
-		vector<double> delta(xwz);
-		CholeskySolve(xwx_chol.data(), delta.data(), p);
-
-		// Update beta
-		double max_delta = 0.0;
-		for (int j = 0; j < p; j++) {
-			beta[j] += delta[j];
-			max_delta = std::max(max_delta, std::abs(delta[j]));
-		}
-
-		// Check convergence
-		if (max_delta < TOL) {
-			converged = true;
-			break;
-		}
-
-		// Check for separation
-		bool separated = false;
-		for (int j = 0; j < p; j++) {
-			if (std::abs(beta[j]) > MAX_BETA) {
-				separated = true;
-				break;
-			}
-		}
-		if (separated && !use_firth) {
-			result.errcode = "SEPARATION";
-			return result;
-		}
+		bufs.yy[idx] = static_cast<float>(phenotype[i]);
 	}
 
-	if (!converged) {
-		result.errcode = "NO_CONVERGENCE";
+	uint32_t is_unfinished = 0;
+	plink2::BoolErr logistic_failed = plink2::LogisticRegressionF(
+	    bufs.yy.data(), bufs.xx.data(), nullptr, n, p, bufs.coef.data(), &is_unfinished, bufs.ll.data(),
+	    bufs.pp.data(), bufs.vv.data(), bufs.hh.data(), bufs.grad.data(), bufs.dcoef.data());
+
+	// Treat "unfinished" (hit iteration limit) as failure for Firth fallback
+	bool needs_firth_fallback = logistic_failed || is_unfinished;
+	bool firth_applied = false;
+
+	if (needs_firth_fallback && use_firth) {
+		// Logistic failed — try Firth correction using pre-allocated buffers
+		std::fill_n(bufs.coef.data(), predictor_ctav, 0.0f);
+		std::fill_n(bufs.half_inverted_buf.data(), p * p, 0.0);
+		std::fill_n(bufs.dbl_2d_buf.data(), p * p, 0.0);
+		std::fill_n(bufs.ustar.data(), predictor_ctav, 0.0f);
+		std::fill_n(bufs.delta.data(), predictor_ctav, 0.0f);
+		std::fill_n(bufs.hdiag.data(), sample_ctav, 0.0f);
+		std::fill_n(bufs.ww.data(), sample_ctav, 0.0f);
+		std::fill_n(bufs.hh0.data(), p * predictor_ctav, 0.0f);
+		std::fill_n(bufs.tmpnxk_buf.data(), p * sample_ctav, 0.0f);
+		is_unfinished = 0;
+
+		plink2::BoolErr firth_failed = plink2::FirthRegressionF(
+		    bufs.yy.data(), bufs.xx.data(), nullptr, n, p, bufs.coef.data(), &is_unfinished, bufs.hh.data(),
+		    bufs.half_inverted_buf.data(), bufs.inv_1d_buf.data(), bufs.dbl_2d_buf.data(), bufs.pp.data(),
+		    bufs.vv.data(), bufs.ustar.data(), bufs.delta.data(), bufs.hdiag.data(), bufs.ww.data(), bufs.hh0.data(),
+		    bufs.tmpnxk_buf.data());
+
+		if (firth_failed) {
+			result.errcode = "NO_CONVERGENCE";
+			return result;
+		}
+		firth_applied = true;
+		// After Firth, hh contains the inverted variance-covariance matrix
+	} else if (needs_firth_fallback) {
+		// Logistic failed/unfinished, no Firth
+		result.errcode = logistic_failed ? "SEPARATION" : "NO_CONVERGENCE";
 		return result;
-	}
-
-	result.firth_applied = use_firth;
-
-	// Final computation of (X'WX)^{-1} for SE (if not already done by Firth)
-	if (!use_firth) {
-		// Use X'WX from last iteration (w computed before final beta update;
-		// negligible difference since convergence requires max_delta < 1e-7)
-		std::fill(xwx.begin(), xwx.end(), 0.0);
-		for (uint32_t idx = 0; idx < n; idx++) {
-			for (int r = 0; r < p; r++) {
-				for (int c_idx = 0; c_idx < p; c_idx++) {
-					xwx[r * p + c_idx] += w[idx] * X[idx * p + r] * X[idx * p + c_idx];
-				}
-			}
-		}
-		vector<double> xwx_chol(xwx);
-		if (!CholeskyDecomp(xwx_chol.data(), p)) {
+	} else {
+		// Logistic succeeded (with or without Firth enabled) — need to invert hh for SE.
+		// hh contains the Hessian from the last IRLS iteration.
+		// Note: we don't call ReflectFmatrix0 after inversion because we only read
+		// diagonal elements (hh[i * predictor_ctav + i]). Off-diagonal elements in
+		// the upper triangle are not filled — callers must not rely on them.
+		std::fill_n(bufs.half_inverted_buf.data(), p * p, 0.0);
+		std::fill_n(bufs.dbl_2d_buf.data(), p * p, 0.0);
+		if (InvertSymmdefFmatrixFirstHalf(p, predictor_ctav, bufs.hh.data(), bufs.half_inverted_buf.data(),
+		                                  bufs.inv_1d_buf.data(), bufs.dbl_2d_buf.data())) {
 			result.errcode = "SINGULAR_MATRIX";
 			return result;
 		}
-		CholeskyInverse(xwx_chol.data(), xwx_inv.data(), p);
+		InvertSymmdefFmatrixSecondHalf(p, predictor_ctav, bufs.half_inverted_buf.data(), bufs.hh.data(),
+		                               bufs.inv_1d_buf.data(), bufs.dbl_2d_buf.data());
 	}
+
+	result.firth_applied = firth_applied;
 
 	// Extract results for genotype coefficient (index 1)
-	result.beta = beta[1];
-	double se_sq = xwx_inv[1 * p + 1];
+	// hh is now inverted variance-covariance, covariate-major with stride predictor_ctav
+	result.beta = static_cast<double>(bufs.coef[1]);
+	double se_sq = static_cast<double>(bufs.hh[1 * predictor_ctav + 1]);
 	if (se_sq < 1e-30) {
 		result.errcode = "ZERO_VARIANCE";
 		return result;
@@ -1154,26 +1298,22 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 			if (gstate.need_regression && lstate.initialized) {
 				uint32_t dosage_ct = 0;
 				plink2::PglErr err = plink2::PgrGetD(
-				    sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
-				    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-				    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+				    sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr, lstate.genovec_buf.As<uintptr_t>(),
+				    lstate.dosage_present_buf.As<uintptr_t>(), lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("plink_glm: PgrGetD failed for variant %u", vidx);
 				}
 
 				plink2::Dosage16ToDoublesMinus9(
 				    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-				    lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct,
-				    lstate.dosage_doubles.data());
+				    lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct, lstate.dosage_doubles.data());
 
 				if (bind_data.is_logistic) {
-					lr = ComputeLogisticRegression(lstate.dosage_doubles.data(),
-					                               bind_data.phenotype.data(),
-					                               bind_data.covariate_values, sample_ct,
-					                               bind_data.use_firth);
+					lr = ComputeLogisticRegression(lstate.dosage_doubles.data(), bind_data.phenotype.data(),
+					                               bind_data.covariate_values, sample_ct, bind_data.use_firth,
+					                               lstate.logistic_bufs);
 				} else {
-					lr = ComputeLinearRegression(lstate.dosage_doubles.data(),
-					                             bind_data.phenotype.data(),
+					lr = ComputeLinearRegression(lstate.dosage_doubles.data(), bind_data.phenotype.data(),
 					                             bind_data.covariate_values, sample_ct);
 				}
 			}
@@ -1190,13 +1330,11 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				switch (file_col) {
 				case COL_CHROM: {
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
-					    StringVector::AddString(vec, val);
+					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] =
-					    bind_data.variants.GetPos(vidx);
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
@@ -1204,15 +1342,13 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case COL_REF: {
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
-					    StringVector::AddString(vec, val);
+					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
@@ -1220,8 +1356,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1231,8 +1366,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, val);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1245,13 +1379,11 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					break;
 				}
 				case COL_TEST: {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
-					    StringVector::AddString(vec, "ADD");
+					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, "ADD");
 					break;
 				}
 				case COL_OBS_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] =
-					    static_cast<int32_t>(lr.obs_ct);
+					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(lr.obs_ct);
 					break;
 				}
 				case COL_BETA: {
@@ -1288,8 +1420,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 				case COL_ERRCODE: {
 					if (lr.errcode != nullptr) {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
-						    StringVector::AddString(vec, lr.errcode);
+						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, lr.errcode);
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					}
@@ -1329,8 +1460,8 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 // ---------------------------------------------------------------------------
 
 void RegisterPlinkGlm(ExtensionLoader &loader) {
-	TableFunction plink_glm("plink_glm", {LogicalType::VARCHAR}, PlinkGlmScan, PlinkGlmBind,
-	                         PlinkGlmInitGlobal, PlinkGlmInitLocal);
+	TableFunction plink_glm("plink_glm", {LogicalType::VARCHAR}, PlinkGlmScan, PlinkGlmBind, PlinkGlmInitGlobal,
+	                        PlinkGlmInitLocal);
 
 	plink_glm.projection_pushdown = true;
 

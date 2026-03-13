@@ -1,0 +1,7 @@
+# Large generated stress test data (regenerate via generate_glm_stress_data.sh)
+glm_stress.pgen
+glm_stress.pvar
+glm_stress.psam
+glm_stress.log
+glm_stress_covariates.parquet
+glm_stress_phenotypes.parquet

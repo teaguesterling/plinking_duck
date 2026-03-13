@@ -402,10 +402,10 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 			if (gstate.need_frequencies && lstate.initialized) {
 				if (bind_data.include_dosage) {
-					plink2::PglErr err = plink2::PgrGetDCounts(
-					    sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,
-					    0, // is_minimac3_r2 = 0 (standard R²)
-					    &lstate.pgr, &imp_r2, genocounts, all_dosages);
+					plink2::PglErr err =
+					    plink2::PgrGetDCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,
+					                          0, // is_minimac3_r2 = 0 (standard R²)
+					                          &lstate.pgr, &imp_r2, genocounts, all_dosages);
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("plink_freq: PgrGetDCounts failed for variant %u", vidx);
 					}

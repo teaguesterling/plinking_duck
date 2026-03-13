@@ -121,6 +121,25 @@ Key decisions:
 - **I/O**: plink2_text + plink2_bgzf (already compiled, libdeflate > zlib)
 - **Scope**: Phase 1 = text VCF (.vcf/.vcf.gz), Phase 2 = BCF binary
 
+### P2-006 — plink_glm (GWAS Regression) ✓
+
+| Plan | Title | Depends On | Branch | Status |
+|------|-------|-----------|--------|--------|
+| P2-006 | plink_glm (association testing) | P2-001 | `feature/P2-006-plink-glm` | ✓ Implemented |
+
+Per-variant GWAS regression using plink2's actual regression engine
+(`LinearRegressionInv`, `LogisticRegressionF`, `FirthRegressionF`).
+Supports linear, logistic, and Firth correction with covariates.
+Accepts pfile-style prefix. See `P2-006-plink-glm` for full design.
+
+### Future — Planned Features
+
+| Feature | Description | Design Doc | Status |
+|---------|------------|------------|--------|
+| P2-007 plink_phenotype | Scalar helper for loading phenotype/covariate data | `P2-007-plink-phenotype` | Design only |
+| plink_glm psam column refs | `phenotype := 'height'` reads column from psam | (part of P2-007) | Planned |
+| plink_glm multi-phenotype | Run multiple phenotypes in one scan | — | Future |
+
 ### Future — Deferred Candidates
 
 **Advanced utility functions** (deferred by P1-006): Candidates requiring
@@ -128,7 +147,6 @@ external libraries, O(N²) computation, or complex input models.
 
 | Candidate | Reason Deferred | Estimated Complexity |
 |-----------|----------------|---------------------|
-| plink_glm (association) | Needs regression library | High |
 | plink_pca (PCA) | Needs LAPACK eigendecomposition | High |
 | plink_king_table (kinship) | O(N²) pairwise computation | High |
 | plink_het (heterozygosity) | Expressible via plink_freq + SQL | Low |

@@ -1,6 +1,6 @@
 # Function Reference
 
-PlinkingDuck provides 9 SQL table functions: 4 file readers and 5 analysis functions.
+PlinkingDuck provides 10 SQL table functions: 4 file readers and 6 analysis functions.
 
 ## File Readers
 
@@ -20,6 +20,7 @@ PlinkingDuck provides 9 SQL table functions: 4 file readers and 5 analysis funct
 | [`plink_missing(path)`](plink_missing.md) | `.pgen` | Per-variant or per-sample missingness rates |
 | [`plink_ld(path)`](plink_ld.md) | `.pgen` | Pairwise linkage disequilibrium (r², D') |
 | [`plink_score(path)`](plink_score.md) | `.pgen` | Polygenic risk scoring |
+| [`plink_glm(prefix)`](plink_glm.md) | pfile prefix | Per-variant GWAS regression (linear, logistic, Firth) |
 
 ## Common Features
 
