@@ -16,6 +16,8 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
   - `plink_missing.cpp` / `.hpp` — `plink_missing()`: per-variant and per-sample missingness via PgrGetMissingness
   - `plink_ld.cpp` / `.hpp` — `plink_ld()`: pairwise linkage disequilibrium (r², D, D') via PgrGet/PgrGetP
   - `plink_score.cpp` / `.hpp` — `plink_score()`: polygenic risk scoring via PgrGetD
+  - `plink_glm.cpp` / `.hpp` — `plink_glm()`: per-variant GWAS regression (linear, logistic, Firth) via plink2's regression engine
+  - `plink2_glm_logistic_math.cpp` / `.hpp` — extracted plink2 logistic/Firth regression math functions
 - `test/sql/` — DuckDB sqllogictest files (positive + negative per reader)
 - `test/data/` — test fixtures (small VCF-derived PLINK files)
 - `docs/planning/` — design docs and implementation plans
@@ -93,6 +95,14 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - `genotypes := 'columns'` outputs one scalar TINYINT column per sample (variant orient) or per variant (sample orient); column names from IIDs or variant IDs
 - `genotypes := 'columns'` has no column count limit (DuckDB has no hard column limit)
 - `genotypes := 'columns'` + `orient := 'genotype'` is an error (genotype mode already produces scalar output)
+- `af_range := {min: 0.01, max: 0.5}` filters variants by allele frequency; uses PgrGetCounts (no decompression) for cheap pre-filtering
+- `ac_range := {min: 2, max: 10}` filters variants by allele count; can combine with af_range
+- Count filters work in all orient modes and in both `read_pfile` and `read_pgen`; variant/genotype orient filter at scan time, sample orient filters at bind time (before schema)
+- AF denominator is `2 * non_missing_samples` (matches plink_freq), not `2 * total_samples`
+- `STD_ARRAY_DECL(uint32_t, 4, genocounts)` for PgrGetCounts (pgenlib uses std::array, not C arrays)
+- `genotype_range := {min: 1, max: 2}` filters individual genotype values; uses PgrGetCounts for pre-decompression optimization (skip variant if no values in range); per-element NULLing for partial matches
+- `genotype_range` incompatible with `dosages := true`; domain [0, 2]
+- `GenotypeRangeResult` from `CheckGenotypeRange`: `any_pass` = skip variant entirely when false; `all_pass` = skip per-element check when true (existing -9 handling suffices)
 
 ## Extension Config Options
 
