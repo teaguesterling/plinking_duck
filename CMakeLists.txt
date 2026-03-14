@@ -166,7 +166,7 @@ target_include_directories(plink2_glm_math PUBLIC ${PGENLIB_DIR} ${SIMDE_DIR})
 target_compile_definitions(plink2_glm_math PRIVATE NOLAPACK)
 # plink2_matrix.h uses fabs() in inline functions before <math.h> is included
 # by the .cc file. Force-include <cmath> so it's available in the header.
-target_compile_options(plink2_glm_math PRIVATE -include cmath)
+target_compile_options(plink2_glm_math PRIVATE "SHELL:-include cmath")
 set_target_properties(plink2_glm_math PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     POSITION_INDEPENDENT_CODE ON
@@ -174,7 +174,7 @@ set_target_properties(plink2_glm_math PROPERTIES
 )
 if(NOT HAVE_RAWMEMCHR)
     target_compile_options(plink2_glm_math PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h
+        "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h"
     )
 endif()
 
