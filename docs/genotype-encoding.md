@@ -42,6 +42,38 @@ FROM read_pfile('data', orient := 'genotype');
 -- rs1  SAMPLE4  NULL
 ```
 
+### Columns Context
+
+With `genotypes := 'columns'`, each sample (in variant orient) or each variant (in sample orient) gets its own scalar `TINYINT` column. Column names come from sample IIDs or variant IDs.
+
+```sql
+-- One column per sample
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3
+FROM read_pfile('data', genotypes := 'columns');
+-- rs1  0  1  2
+-- rs2  1  1  0
+```
+
+### Phased Haplotype Output
+
+With `phased := true`, genotype elements change from scalar `TINYINT` to `ARRAY(TINYINT, 2)` representing `[allele1, allele2]` haplotype pairs:
+
+| Value | Meaning | VCF Equivalent |
+|-------|---------|----------------|
+| `[0, 0]` | Homozygous reference | `0\|0` |
+| `[0, 1]` | Ref/Alt (or unphased het) | `0\|1` |
+| `[1, 0]` | Alt/Ref | `1\|0` |
+| `[1, 1]` | Homozygous alternate | `1\|1` |
+| `NULL` | Missing | `.\|.` |
+
+```sql
+SELECT ID, genotypes
+FROM read_pfile('data', phased := true);
+-- rs1  [[0, 0], [0, 1], [1, 1], NULL]
+```
+
+Phased output works across all orient modes and genotypes modes (array, list). Incompatible with `dosages := true`.
+
 ## Working with Genotypes
 
 ### Counting alternate alleles per sample

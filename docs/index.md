@@ -2,7 +2,7 @@
 
 A DuckDB extension for reading [PLINK 2](https://www.cog-genomics.org/plink/2.0/) genomics file formats and running common genetic analyses directly in SQL.
 
-PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific command-line tools. Read files, filter variants, compute allele frequencies, test Hardy-Weinberg equilibrium, measure missingness, calculate linkage disequilibrium, and run polygenic scoring — all from a SQL prompt.
+PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, letting you query genomics datasets with standard SQL instead of format-specific command-line tools. Read files, filter variants, compute allele frequencies, test Hardy-Weinberg equilibrium, measure missingness, calculate linkage disequilibrium, run polygenic scoring, and perform genome-wide association testing — all from a SQL prompt.
 
 !!! tip "Built on the shoulders of [DuckHTS](https://github.com/RGenomicsETL/duckhts)"
 
@@ -37,7 +37,7 @@ WHERE P_HWE < 1e-6;
 
 ## Functions
 
-PlinkingDuck provides **4 file readers** and **5 analysis functions**:
+PlinkingDuck provides **4 file readers** and **6 analysis functions**:
 
 ### File Readers
 
@@ -57,6 +57,7 @@ PlinkingDuck provides **4 file readers** and **5 analysis functions**:
 | [`plink_missing(path)`](functions/plink_missing.md) | Per-variant or per-sample missingness |
 | [`plink_ld(path)`](functions/plink_ld.md) | Pairwise linkage disequilibrium |
 | [`plink_score(path)`](functions/plink_score.md) | Polygenic risk scoring |
+| [`plink_glm(prefix)`](functions/plink_glm.md) | Per-variant GWAS regression (linear, logistic, Firth) |
 
 ## Features
 
@@ -65,5 +66,7 @@ PlinkingDuck provides **4 file readers** and **5 analysis functions**:
 - **Parallel scan** -- multi-threaded variant processing for large files
 - **Sample subsetting** -- filter to specific samples by IID or index
 - **Region filtering** -- restrict to genomic regions (`chr:start-end`)
+- **Filter pushdown** -- pre-filter variants by allele frequency, count, or genotype value
+- **GWAS regression** -- per-variant association testing with covariates and Firth correction
 - **Legacy format support** -- read PLINK 1 `.bim` and `.fam` files
 - **VFS integration** -- works with DuckDB's filesystem abstraction

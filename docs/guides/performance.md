@@ -37,13 +37,15 @@ Functions that process `.pgen` files use multi-threaded parallel scanning:
 | `read_pgen` | Yes | Per-thread pgenlib readers |
 | `read_pfile` (default) | Yes | Same as `read_pgen` |
 | `read_pfile` (genotype orient) | No | Row expansion is single-threaded |
+| `read_pfile` (sample orient) | No | Pre-reads all genotypes at bind time |
 | `plink_freq` | Yes | Per-thread readers, atomic batch claiming |
 | `plink_hardy` | Yes | Same pattern as `plink_freq` |
 | `plink_missing` (variant) | Yes | Parallel missingness extraction |
-| `plink_missing` (sample) | No | Must scan all variants for each sample |
+| `plink_missing` (sample) | No | Parallel per-sample accumulation |
 | `plink_ld` (windowed) | Yes | Per-thread anchor claiming |
 | `plink_ld` (pairwise) | No | Single pair computation |
-| `plink_score` | No | Sequential variant scoring |
+| `plink_score` | Yes | Parallel per-sample accumulation |
+| `plink_glm` | Yes | Per-thread regression |
 
 Each parallel function uses atomic batch claiming: threads claim batches of variants from a shared counter, ensuring even work distribution without lock contention.
 
@@ -62,6 +64,22 @@ SELECT * FROM plink_freq('biobank.pgen',
 Region filtering works by scanning the pre-loaded variant metadata (sorted by chromosome and position) to find the matching variant index range. The .pgen reader then starts at the first matching variant and stops after the last.
 
 This avoids reading genotype data for variants outside the region.
+
+## Filter Pushdown
+
+The `af_range`, `ac_range`, and `genotype_range` parameters let you filter variants or genotype values before full decompression:
+
+```sql
+-- Skip variants outside MAF range (uses PgrGetCounts, no decompression)
+SELECT * FROM read_pfile('biobank',
+    af_range := {min: 0.01, max: 0.5});
+
+-- Only keep heterozygous calls
+SELECT * FROM read_pgen('biobank.pgen',
+    genotype_range := {min: 1, max: 1});
+```
+
+`af_range` and `ac_range` use pgenlib's `PgrGetCounts` to count genotypes without decompressing, then skip variants that fail the filter. `genotype_range` also uses `PgrGetCounts` as a pre-check — if a variant has no genotypes in range, it is skipped entirely without decompression.
 
 ## Sample Subsetting
 

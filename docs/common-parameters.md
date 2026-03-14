@@ -88,3 +88,60 @@ Both `start` and `end` must be specified (chromosome-only filtering is not suppo
 
 !!! note
     `read_pgen` and `read_pvar` do not have a `region` parameter. Use a SQL `WHERE` clause to filter their output by position.
+
+## `af_range`
+
+| Type | Default |
+|------|---------|
+| `STRUCT(min DOUBLE, max DOUBLE)` | All variants |
+
+Filter variants by alternate allele frequency. Uses `PgrGetCounts` for fast pre-filtering without genotype decompression. The frequency denominator is `2 * non_missing_samples`.
+
+```sql
+-- Keep only common variants (MAF > 1%)
+SELECT * FROM read_pfile('data', af_range := {min: 0.01, max: 0.99});
+
+-- Rare variants only
+SELECT * FROM plink_freq('data.pgen', af_range := {min: 0.0, max: 0.01});
+```
+
+Can be combined with `ac_range`.
+
+**Used by:** `read_pgen`, `read_pfile`
+
+## `ac_range`
+
+| Type | Default |
+|------|---------|
+| `STRUCT(min INTEGER, max INTEGER)` | All variants |
+
+Filter variants by alternate allele count. Uses `PgrGetCounts` for fast pre-filtering.
+
+```sql
+-- Variants with at least 2 alt alleles
+SELECT * FROM read_pfile('data', ac_range := {min: 2, max: 1000000});
+```
+
+Can be combined with `af_range`.
+
+**Used by:** `read_pgen`, `read_pfile`
+
+## `genotype_range`
+
+| Type | Default |
+|------|---------|
+| `STRUCT(min TINYINT, max TINYINT)` | All genotype values |
+
+Filter individual genotype values. Genotypes outside the range are set to NULL. The domain is [0, 2]. Uses `PgrGetCounts` for pre-decompression optimization: variants where no values fall in range are skipped entirely.
+
+```sql
+-- Only heterozygous calls (genotype = 1)
+SELECT * FROM read_pgen('data.pgen', genotype_range := {min: 1, max: 1});
+
+-- Het and hom-alt calls only
+SELECT * FROM read_pfile('data', genotype_range := {min: 1, max: 2});
+```
+
+Incompatible with `dosages := true`.
+
+**Used by:** `read_pgen`, `read_pfile`
