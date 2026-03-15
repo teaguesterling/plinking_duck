@@ -133,10 +133,10 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 	// next_block_idx, then increments pass_generation to release waiters.
 	// Non-last threads return empty chunks and check pass_generation on
 	// re-entry — if it has advanced, they join the new pass.
-	uint32_t total_passes = 0;                       // n_pcs + 2
-	std::atomic<uint32_t> pass_generation {0};       // incremented after each pass completes
-	std::atomic<uint32_t> pass_active_threads {0};   // threads currently in a pass
-	std::atomic<uint32_t> next_block_idx {0};        // variant block claiming
+	uint32_t total_passes = 0;                     // n_pcs + 2
+	std::atomic<uint32_t> pass_generation {0};     // incremented after each pass completes
+	std::atomic<uint32_t> pass_active_threads {0}; // threads currently in a pass
+	std::atomic<uint32_t> next_block_idx {0};      // variant block claiming
 	std::atomic<bool> algorithm_done {false};
 
 	// Thread ID assignment
@@ -329,8 +329,7 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 	// --- Process region parameter ---
 	auto region_it = input.named_parameters.find("region");
 	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range =
-		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_pca");
+		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_pca");
 	}
 
 	// --- Compute per-variant allele frequencies and build effective variant list ---
@@ -435,11 +434,11 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 	}
 	if (static_cast<int64_t>(qq_elements) > max_elements) {
 		throw InvalidInputException(
-		    "plink_pca: QQ matrix would require %llu elements (%llu MB), exceeding plinking_max_matrix_elements (%lld). "
+		    "plink_pca: QQ matrix would require %llu elements (%llu MB), exceeding plinking_max_matrix_elements "
+		    "(%lld). "
 		    "Reduce n_pcs or variant count, or increase the limit with SET plinking_max_matrix_elements = <value>.",
 		    static_cast<unsigned long long>(qq_elements),
-		    static_cast<unsigned long long>(qq_elements * 8 / (1024 * 1024)),
-		    static_cast<long long>(max_elements));
+		    static_cast<unsigned long long>(qq_elements * 8 / (1024 * 1024)), static_cast<long long>(max_elements));
 	}
 
 	// --- Register output schema ---
@@ -477,8 +476,7 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 // Init global
 // ---------------------------------------------------------------------------
 
-static unique_ptr<GlobalTableFunctionState> PlinkPcaInitGlobal(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> PlinkPcaInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PlinkPcaBindData>();
 	auto state = make_uniq<PlinkPcaGlobalState>();
 
@@ -522,7 +520,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkPcaInitGlobal(ClientContext &co
 // ---------------------------------------------------------------------------
 
 static unique_ptr<LocalTableFunctionState> PlinkPcaInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
-                                                              GlobalTableFunctionState *global_state) {
+                                                             GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PlinkPcaBindData>();
 	auto &gstate = global_state->Cast<PlinkPcaGlobalState>();
 	auto state = make_uniq<PlinkPcaLocalState>();
@@ -607,8 +605,7 @@ static unique_ptr<LocalTableFunctionState> PlinkPcaInitLocal(ExecutionContext &c
 
 // Step A: qq_row = norm_geno (1 x N) × G1 (N x pc_ct_x2) → 1 x pc_ct_x2
 // Written into QQ at row eff_idx, columns [col_offset, col_offset + pc_ct_x2)
-static void AccumulateStepA(PlinkPcaGlobalState &gs, const double *norm_geno, uint32_t eff_idx,
-                             uint32_t col_offset) {
+static void AccumulateStepA(PlinkPcaGlobalState &gs, const double *norm_geno, uint32_t eff_idx, uint32_t col_offset) {
 	uint32_t N = gs.N;
 	uint32_t pc_ct_x2 = gs.pc_ct_x2;
 	double *qq_row = &gs.QQ[static_cast<size_t>(eff_idx) * gs.qq_col_ct + col_offset];
@@ -626,7 +623,7 @@ static void AccumulateStepA(PlinkPcaGlobalState &gs, const double *norm_geno, ui
 // Step B: g2_part += norm_genoᵀ (N x 1) × qq_row (1 x pc_ct_x2) → rank-1 update N x pc_ct_x2
 // Accumulated into thread_partials[tid] at appropriate column offset
 static void AccumulateStepB(PlinkPcaGlobalState &gs, uint32_t tid, const double *norm_geno, const double *qq_row,
-                             uint32_t col_offset) {
+                            uint32_t col_offset) {
 	uint32_t N = gs.N;
 	uint32_t pc_ct_x2 = gs.pc_ct_x2;
 	double *partial = gs.thread_partials[tid].data();
@@ -661,9 +658,9 @@ static void AccumulatePhase3(PlinkPcaGlobalState &gs, uint32_t tid, const double
 // Phase 2 SVD: QQ (M x qq_col_ct) → overwrite with left singular vectors
 static void RunKrylovSVD(PlinkPcaGlobalState &gs) {
 	Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> qq_map(gs.QQ.data(), gs.M,
-	                                                                                           gs.qq_col_ct);
+	                                                                                          gs.qq_col_ct);
 
-	Eigen::BDCSVD<Eigen::MatrixXd, Eigen::ComputeThinU> svd(qq_map);
+	Eigen::BDCSVD<Eigen::MatrixXd> svd(qq_map, Eigen::ComputeThinU);
 
 	// Overwrite QQ with left singular vectors (M x qq_col_ct)
 	// Eigen BDCSVD returns column-major U; we need to write back row-major
@@ -677,8 +674,8 @@ static void RunKrylovSVD(PlinkPcaGlobalState &gs) {
 
 // Phase 3 SVD: BB (N x qq_col_ct) → eigenvectors and eigenvalues
 static void RunFinalSVD(PlinkPcaGlobalState &gs, const vector<double> &bb) {
-	Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> bb_map(
-	    bb.data(), gs.N, gs.qq_col_ct);
+	Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> bb_map(bb.data(), gs.N,
+	                                                                                                gs.qq_col_ct);
 
 	Eigen::BDCSVD<Eigen::MatrixXd, Eigen::ComputeThinU> svd(bb_map);
 
@@ -823,8 +820,8 @@ static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState 
 		fields.push_back({"FID", has_fid ? Value(bind_data.sample_info.fids[orig_idx]) : Value()});
 		fields.push_back({"IID", Value(bind_data.sample_info.iids[orig_idx])});
 		for (uint32_t pc = 0; pc < gs.n_pcs; pc++) {
-			fields.push_back(
-			    {"PC" + std::to_string(pc + 1), Value::DOUBLE(gs.eigenvectors[static_cast<size_t>(sidx) * gs.n_pcs + pc])});
+			fields.push_back({"PC" + std::to_string(pc + 1),
+			                  Value::DOUBLE(gs.eigenvectors[static_cast<size_t>(sidx) * gs.n_pcs + pc])});
 		}
 		eigenvec_entries.push_back(Value::STRUCT(std::move(fields)));
 	}
@@ -858,7 +855,7 @@ static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState 
 // ---------------------------------------------------------------------------
 
 static void ScanVariantPass(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs, PlinkPcaLocalState &ls,
-                             const uintptr_t *sample_include, uint32_t pass) {
+                            const uintptr_t *sample_include, uint32_t pass) {
 	uint32_t sample_ct = bind_data.effective_sample_ct;
 	uint32_t M = gs.M;
 	bool is_phase3 = (pass == bind_data.n_pcs + 1);
@@ -1072,7 +1069,7 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 
 void RegisterPlinkPca(ExtensionLoader &loader) {
 	TableFunction plink_pca("plink_pca", {LogicalType::VARCHAR}, PlinkPcaScan, PlinkPcaBind, PlinkPcaInitGlobal,
-	                         PlinkPcaInitLocal);
+	                        PlinkPcaInitLocal);
 
 	plink_pca.projection_pushdown = true;
 
