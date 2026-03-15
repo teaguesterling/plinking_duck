@@ -278,6 +278,26 @@ PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter, con
                                             const STD_ARRAY_REF(uint32_t, 4) genocounts, uint32_t sample_ct);
 
 // ---------------------------------------------------------------------------
+// Genotype normalization for PCA (Price et al. 2006)
+// ---------------------------------------------------------------------------
+
+//! Per-variant normalization parameters for standardized genotype matrix.
+//! p = ALT allele frequency (matches plink_freq ALT_FREQ convention).
+struct VariantNorm {
+	double center;    //!< 2 * allele_freq
+	double inv_stdev; //!< 1.0 / sqrt(2 * af * (1 - af))
+	bool skip;        //!< true if monomorphic (af == 0 or af == 1)
+};
+
+//! Compute normalization parameters from ALT allele frequency.
+VariantNorm ComputeVariantNorm(double alt_freq);
+
+//! Normalize int8 genotypes (from GenoarrToBytesMinus9) into centered, standardized doubles.
+//! Missing values (-9) become 0.0 (mean imputation after centering).
+//! output must be pre-allocated to sample_ct doubles.
+void NormalizeGenotypes(const int8_t *genotypes, uint32_t sample_ct, const VariantNorm &norm, double *output);
+
+// ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
 

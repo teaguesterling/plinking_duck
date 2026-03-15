@@ -23,6 +23,7 @@ set(EXTENSION_SOURCES
     src/plink_score.cpp
     src/plink_glm.cpp
     src/plink2_glm_logistic_math.cpp
+    src/plink_pca.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -142,6 +143,7 @@ target_compile_definitions(pgenlib PRIVATE
 )
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Eigen3 CONFIG REQUIRED)
 target_link_libraries(pgenlib PRIVATE ZLIB::ZLIB Threads::Threads)
 set_target_properties(pgenlib PROPERTIES
     CXX_VISIBILITY_PRESET hidden
@@ -182,8 +184,8 @@ endif()
 # Deps are listed explicitly because pgenlib links them PRIVATE (won't propagate
 # in static builds) and DuckDB's macros require the plain target_link_libraries
 # signature (no PRIVATE/PUBLIC keyword).
-target_link_libraries(${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
+target_link_libraries(${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads Eigen3::Eigen)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads Eigen3::Eigen)
 target_include_directories(${EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_DIR})
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_DIR})
 target_compile_definitions(${EXTENSION_NAME} PRIVATE NOLAPACK)

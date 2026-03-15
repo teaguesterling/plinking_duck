@@ -1,0 +1,162 @@
+# name: test/sql/plink_pca.test
+# description: Positive tests for plink_pca table function
+# group: [sql]
+
+require plinking_duck
+
+# --- mode := 'samples' (default) ---
+
+# Row count matches sample count
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3);
+----
+250
+
+# Column types for samples mode
+query TTTTT
+SELECT typeof(FID), typeof(IID), typeof(PC1), typeof(PC2), typeof(PC3)
+FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3) LIMIT 1;
+----
+VARCHAR	VARCHAR	DOUBLE	DOUBLE	DOUBLE
+
+# IID values are present
+query T
+SELECT IID FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3) ORDER BY IID LIMIT 3;
+----
+per0
+per1
+per10
+
+# PC values are non-null
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3) WHERE PC1 IS NULL;
+----
+0
+
+# Default n_pcs is 10 (FID + IID + PC1..PC10 = 12 columns)
+query TTTTTTTTTTTT
+SELECT typeof(FID), typeof(IID), typeof(PC1), typeof(PC2), typeof(PC3), typeof(PC4),
+       typeof(PC5), typeof(PC6), typeof(PC7), typeof(PC8), typeof(PC9), typeof(PC10)
+FROM plink_pca('test/data/pca_example.pgen') LIMIT 1;
+----
+VARCHAR	VARCHAR	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE
+
+# --- mode := 'pcs' ---
+
+# Correct row count
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+----
+3
+
+# Column types for pcs mode
+query TTTT
+SELECT typeof(PC), typeof(EIGENVALUE), typeof(VARIANCE_PROPORTION), typeof(CUMULATIVE_VARIANCE)
+FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs') LIMIT 1;
+----
+INTEGER	DOUBLE	DOUBLE	DOUBLE
+
+# PC numbers are 1-indexed
+query I
+SELECT PC FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+----
+1
+2
+3
+
+# Eigenvalues are positive
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs')
+WHERE EIGENVALUE <= 0;
+----
+0
+
+# Variance proportions sum to 1.0
+query R
+SELECT ROUND(SUM(VARIANCE_PROPORTION), 6) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+----
+1.0
+
+# Cumulative variance is monotonically increasing and ends at 1.0
+query R
+SELECT MAX(CUMULATIVE_VARIANCE) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+----
+1.0
+
+# Eigenvalues are in descending order
+query I
+SELECT COUNT(*) FROM (
+    SELECT EIGENVALUE, LAG(EIGENVALUE) OVER (ORDER BY PC) AS prev
+    FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs')
+) WHERE prev IS NOT NULL AND EIGENVALUE > prev;
+----
+0
+
+# --- mode := 'both' ---
+
+# Returns exactly 1 row
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'both');
+----
+1
+
+# --- Deterministic results (fixed seed) ---
+
+# Same eigenvalues across runs
+query R
+SELECT ROUND(EIGENVALUE, 10) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+----
+5.3246437702
+4.8015826961
+4.6826320378
+
+# --- Filters ---
+
+# region filter
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, region := '1:1-5000');
+----
+250
+
+# samples filter reduces output rows
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 1,
+    samples := ['per0', 'per1', 'per2', 'per3', 'per4', 'per5', 'per6', 'per7', 'per8', 'per9']);
+----
+10
+
+# --- Multi-threaded consistency ---
+
+statement ok
+SET threads = 1;
+
+query R
+SELECT ROUND(EIGENVALUE, 10) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+----
+5.3246437702
+4.8015826961
+4.6826320378
+
+statement ok
+SET threads = 4;
+
+query R
+SELECT ROUND(EIGENVALUE, 10) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+----
+5.3246437702
+4.8015826961
+4.6826320378
+
+# --- Projection pushdown ---
+
+# Select only PC1 and IID
+query TT
+SELECT typeof(IID), typeof(PC1) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3) LIMIT 1;
+----
+VARCHAR	DOUBLE
+
+# Select only eigenvalues
+query R
+SELECT EIGENVALUE FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs') LIMIT 1;
+----
+5.324643770244834

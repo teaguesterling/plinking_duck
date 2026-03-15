@@ -660,6 +660,34 @@ PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter, con
 }
 
 // ---------------------------------------------------------------------------
+// Genotype normalization for PCA
+// ---------------------------------------------------------------------------
+
+VariantNorm ComputeVariantNorm(double alt_freq) {
+	VariantNorm norm;
+	if (alt_freq <= 0.0 || alt_freq >= 1.0) {
+		norm.center = 0.0;
+		norm.inv_stdev = 0.0;
+		norm.skip = true;
+		return norm;
+	}
+	norm.center = 2.0 * alt_freq;
+	norm.inv_stdev = 1.0 / std::sqrt(2.0 * alt_freq * (1.0 - alt_freq));
+	norm.skip = false;
+	return norm;
+}
+
+void NormalizeGenotypes(const int8_t *genotypes, uint32_t sample_ct, const VariantNorm &norm, double *output) {
+	for (uint32_t s = 0; s < sample_ct; s++) {
+		if (genotypes[s] == -9) {
+			output[s] = 0.0; // mean imputation (centered mean = 0)
+		} else {
+			output[s] = (static_cast<double>(genotypes[s]) - norm.center) * norm.inv_stdev;
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Phased genotype unpacking
 // ---------------------------------------------------------------------------
 
