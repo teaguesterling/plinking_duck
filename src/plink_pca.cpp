@@ -125,11 +125,18 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 	uint32_t thread_count = 0;
 	vector<vector<double>> thread_partials;
 
-	// Pass coordination
-	uint32_t total_passes = 0; // n_pcs + 2
-	std::atomic<uint32_t> current_pass {0};
-	std::atomic<uint32_t> next_block_idx {0};
-	std::atomic<uint32_t> pass_active_threads {0};
+	// Pass coordination — sense-reversing barrier
+	//
+	// All threads participate in every pass. After finishing variant blocks,
+	// each thread increments arrived_count. The last to arrive (arrived_count
+	// == expected_threads) does the merge/SVD, resets arrived_count and
+	// next_block_idx, then increments pass_generation to release waiters.
+	// Non-last threads return empty chunks and check pass_generation on
+	// re-entry — if it has advanced, they join the new pass.
+	uint32_t total_passes = 0;                       // n_pcs + 2
+	std::atomic<uint32_t> pass_generation {0};       // incremented after each pass completes
+	std::atomic<uint32_t> pass_active_threads {0};   // threads currently in a pass
+	std::atomic<uint32_t> next_block_idx {0};        // variant block claiming
 	std::atomic<bool> algorithm_done {false};
 
 	// Thread ID assignment
@@ -145,7 +152,6 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 
 	// Threading
 	uint32_t db_thread_count = 1;
-	std::mutex merge_mutex;
 
 	idx_t MaxThreads() const override {
 		if (M < PCA_VARIANT_BLOCK_SIZE) {
@@ -173,7 +179,7 @@ struct PlinkPcaLocalState : public LocalTableFunctionState {
 	vector<double> norm_geno;
 
 	uint32_t thread_id = 0;
-	uint32_t last_pass_seen = UINT32_MAX;
+	uint32_t last_generation_seen = UINT32_MAX;
 	bool phase1_done = false;
 	bool initialized = false;
 
@@ -851,189 +857,21 @@ static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState 
 // Scan function
 // ---------------------------------------------------------------------------
 
-static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<PlinkPcaBindData>();
-	auto &gs = data_p.global_state->Cast<PlinkPcaGlobalState>();
-	auto &ls = data_p.local_state->Cast<PlinkPcaLocalState>();
-
-	// --- Phase 2: Emit rows (algorithm complete) ---
-	if (gs.algorithm_done.load(std::memory_order_acquire)) {
-		switch (bind_data.mode) {
-		case PcaMode::SAMPLES:
-			EmitSamplesMode(bind_data, gs, output);
-			return;
-		case PcaMode::PCS:
-			EmitPcsMode(bind_data, gs, output);
-			return;
-		case PcaMode::BOTH:
-			EmitBothMode(bind_data, gs, output);
-			return;
-		}
-	}
-
-	// --- Phase 1: Participate in the algorithm ---
-	if (!ls.initialized || bind_data.effective_variants.empty() || ls.phase1_done) {
-		// Not participating — return empty and wait
-		output.SetCardinality(0);
-		return;
-	}
-
-	const uintptr_t *sample_include = nullptr;
-	if (bind_data.has_sample_subset && bind_data.sample_subset) {
-		sample_include = bind_data.sample_subset->SampleInclude();
-	}
+static void ScanVariantPass(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs, PlinkPcaLocalState &ls,
+                             const uintptr_t *sample_include, uint32_t pass) {
 	uint32_t sample_ct = bind_data.effective_sample_ct;
-	uint32_t N = gs.N;
 	uint32_t M = gs.M;
-
-	// Multi-pass algorithm: all threads participate in the first pass.
-	// The last thread to finish a pass does the merge/SVD work and then
-	// continues through all remaining passes solo (avoiding pass-barrier
-	// race conditions). Non-last threads mark phase1_done and wait for
-	// algorithm_done to be set before emitting rows.
-	//
-	// This means passes 2..k+2 are single-threaded, but the variant
-	// scanning within the first pass is fully parallelized. The inter-pass
-	// merge/SVD is inherently single-threaded anyway.
-
-	uint32_t pass = gs.current_pass.load(std::memory_order_acquire);
-
-	// If this thread already participated and the pass hasn't changed,
-	// wait for the last thread to finish all passes.
-	if (pass == ls.last_pass_seen && ls.last_pass_seen != UINT32_MAX) {
-		output.SetCardinality(0);
-		return;
-	}
-
-	gs.pass_active_threads.fetch_add(1, std::memory_order_acq_rel);
-
-	// Zero partial buffer for the new pass
-	if (ls.thread_id < gs.thread_count) {
-		std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
-	}
-	ls.last_pass_seen = pass;
-
 	bool is_phase3 = (pass == bind_data.n_pcs + 1);
 	uint32_t col_offset = is_phase3 ? 0 : pass * gs.pc_ct_x2;
 
-	// Claim variant blocks (parallel across threads for the first pass)
-	if (ls.thread_id < gs.thread_count) {
-		while (true) {
-			uint32_t block_start = gs.next_block_idx.fetch_add(PCA_VARIANT_BLOCK_SIZE);
-			if (block_start >= M) {
-				break;
-			}
-			uint32_t block_end = std::min(block_start + PCA_VARIANT_BLOCK_SIZE, M);
-
-			for (uint32_t eff_idx = block_start; eff_idx < block_end; eff_idx++) {
-				auto &ev = bind_data.effective_variants[eff_idx];
-
-				plink2::PglErr err = plink2::PgrGet(sample_include, ls.pssi, sample_ct, ev.pgen_idx, &ls.pgr,
-				                                    ls.genovec_buf.As<uintptr_t>());
-				if (err != plink2::kPglRetSuccess) {
-					throw IOException("plink_pca: PgrGet failed for variant %u", ev.pgen_idx);
-				}
-
-				plink2::GenoarrToBytesMinus9(ls.genovec_buf.As<uintptr_t>(), sample_ct, ls.geno_bytes.data());
-				NormalizeGenotypes(ls.geno_bytes.data(), sample_ct, ev.norm, ls.norm_geno.data());
-
-				if (is_phase3) {
-					AccumulatePhase3(gs, ls.thread_id, ls.norm_geno.data(), eff_idx);
-				} else {
-					AccumulateStepA(gs, ls.norm_geno.data(), eff_idx, col_offset);
-
-					if (pass < bind_data.n_pcs) {
-						const double *qq_row = &gs.QQ[static_cast<size_t>(eff_idx) * gs.qq_col_ct + col_offset];
-						AccumulateStepB(gs, ls.thread_id, ls.norm_geno.data(), qq_row, col_offset);
-					}
-				}
-			}
-		}
-	}
-
-	// Thread finished this pass
-	uint32_t remaining = gs.pass_active_threads.fetch_sub(1, std::memory_order_acq_rel);
-
-	if (remaining != 1) {
-		// Not the last thread — mark done and return. The last thread
-		// will handle all remaining passes and set algorithm_done.
-		ls.phase1_done = true;
-		output.SetCardinality(0);
-		return;
-	}
-
-	// --- Last thread: complete this pass and all remaining passes ---
-
-	// Loop through remaining passes (this thread is now solo)
 	while (true) {
-		pass = gs.current_pass.load(std::memory_order_acquire);
-		is_phase3 = (pass == bind_data.n_pcs + 1);
-		col_offset = is_phase3 ? 0 : pass * gs.pc_ct_x2;
-
-		if (is_phase3) {
-			// Merge all thread partials into BB
-			vector<double> bb(static_cast<size_t>(N) * gs.qq_col_ct, 0.0);
-			for (uint32_t t = 0; t < gs.thread_count; t++) {
-				auto &partial = gs.thread_partials[t];
-				for (size_t i = 0; i < bb.size(); i++) {
-					bb[i] += partial[i];
-				}
-			}
-
-			RunFinalSVD(gs, bb);
-
-			gs.algorithm_done.store(true, std::memory_order_release);
-			ls.phase1_done = true;
-
-			// Emit first batch of rows
-			switch (bind_data.mode) {
-			case PcaMode::SAMPLES:
-				EmitSamplesMode(bind_data, gs, output);
-				return;
-			case PcaMode::PCS:
-				EmitPcsMode(bind_data, gs, output);
-				return;
-			case PcaMode::BOTH:
-				EmitBothMode(bind_data, gs, output);
-				return;
-			}
+		uint32_t block_start = gs.next_block_idx.fetch_add(PCA_VARIANT_BLOCK_SIZE);
+		if (block_start >= M) {
+			break;
 		}
+		uint32_t block_end = std::min(block_start + PCA_VARIANT_BLOCK_SIZE, M);
 
-		// Non-Phase-3 pass: merge thread partials → G2, compute G1 = G2 / M
-		std::fill(gs.G1.begin(), gs.G1.end(), 0.0);
-		for (uint32_t t = 0; t < gs.thread_count; t++) {
-			auto &partial = gs.thread_partials[t];
-			for (uint32_t s = 0; s < N; s++) {
-				for (uint32_t c = 0; c < gs.pc_ct_x2; c++) {
-					gs.G1[static_cast<size_t>(s) * gs.pc_ct_x2 + c] +=
-					    partial[static_cast<size_t>(s) * gs.qq_col_ct + col_offset + c];
-				}
-			}
-		}
-
-		double inv_M = 1.0 / static_cast<double>(M);
-		for (auto &val : gs.G1) {
-			val *= inv_M;
-		}
-
-		if (pass == bind_data.n_pcs) {
-			RunKrylovSVD(gs);
-		}
-
-		// Advance to next pass — only this thread is active now
-		gs.next_block_idx.store(0, std::memory_order_release);
-		gs.current_pass.fetch_add(1, std::memory_order_release);
-
-		// Zero the last thread's own partial for the next pass
-		// (other threads' partials are already zeroed and won't change)
-		std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
-
-		// Process the next pass (solo — claim all variant blocks)
-		pass = gs.current_pass.load(std::memory_order_acquire);
-		is_phase3 = (pass == bind_data.n_pcs + 1);
-		col_offset = is_phase3 ? 0 : pass * gs.pc_ct_x2;
-
-		for (uint32_t eff_idx = 0; eff_idx < M; eff_idx++) {
+		for (uint32_t eff_idx = block_start; eff_idx < block_end; eff_idx++) {
 			auto &ev = bind_data.effective_variants[eff_idx];
 
 			plink2::PglErr err = plink2::PgrGet(sample_include, ls.pssi, sample_ct, ev.pgen_idx, &ls.pgr,
@@ -1056,8 +894,175 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 			}
 		}
+	}
+}
 
-		// Continue to next iteration of outer loop (merge this pass's results)
+static void MergePass(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs, uint32_t pass) {
+	uint32_t N = gs.N;
+	bool is_phase3 = (pass == bind_data.n_pcs + 1);
+	uint32_t col_offset = is_phase3 ? 0 : pass * gs.pc_ct_x2;
+
+	if (is_phase3) {
+		vector<double> bb(static_cast<size_t>(N) * gs.qq_col_ct, 0.0);
+		for (uint32_t t = 0; t < gs.thread_count; t++) {
+			auto &partial = gs.thread_partials[t];
+			for (size_t i = 0; i < bb.size(); i++) {
+				bb[i] += partial[i];
+			}
+		}
+		RunFinalSVD(gs, bb);
+		gs.algorithm_done.store(true, std::memory_order_release);
+		return;
+	}
+
+	// Merge thread partials → G2, compute G1 = G2 / M
+	std::fill(gs.G1.begin(), gs.G1.end(), 0.0);
+	for (uint32_t t = 0; t < gs.thread_count; t++) {
+		auto &partial = gs.thread_partials[t];
+		for (uint32_t s = 0; s < N; s++) {
+			for (uint32_t c = 0; c < gs.pc_ct_x2; c++) {
+				gs.G1[static_cast<size_t>(s) * gs.pc_ct_x2 + c] +=
+				    partial[static_cast<size_t>(s) * gs.qq_col_ct + col_offset + c];
+			}
+		}
+	}
+
+	double inv_M = 1.0 / static_cast<double>(gs.M);
+	for (auto &val : gs.G1) {
+		val *= inv_M;
+	}
+
+	if (pass == bind_data.n_pcs) {
+		RunKrylovSVD(gs);
+	}
+}
+
+static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<PlinkPcaBindData>();
+	auto &gs = data_p.global_state->Cast<PlinkPcaGlobalState>();
+	auto &ls = data_p.local_state->Cast<PlinkPcaLocalState>();
+
+	// --- Emit rows (algorithm complete) ---
+	if (gs.algorithm_done.load(std::memory_order_acquire)) {
+		switch (bind_data.mode) {
+		case PcaMode::SAMPLES:
+			EmitSamplesMode(bind_data, gs, output);
+			return;
+		case PcaMode::PCS:
+			EmitPcsMode(bind_data, gs, output);
+			return;
+		case PcaMode::BOTH:
+			EmitBothMode(bind_data, gs, output);
+			return;
+		}
+	}
+
+	// --- Not participating ---
+	if (!ls.initialized || bind_data.effective_variants.empty() || ls.thread_id >= gs.thread_count) {
+		output.SetCardinality(0);
+		return;
+	}
+
+	// --- Wait for pass transition ---
+	// If pass_generation hasn't advanced since our last participation,
+	// the last thread is still doing merge/SVD. Return empty and wait.
+	uint32_t gen = gs.pass_generation.load(std::memory_order_acquire);
+	if (gen == ls.last_generation_seen) {
+		output.SetCardinality(0);
+		return;
+	}
+	ls.last_generation_seen = gen;
+
+	// pass_generation starts at 0 and the first Scan entry sees
+	// last_generation_seen == UINT32_MAX != 0, so it proceeds.
+	// gen maps directly to the pass number.
+	uint32_t pass = gen;
+	if (pass >= gs.total_passes) {
+		output.SetCardinality(0);
+		return;
+	}
+
+	const uintptr_t *sample_include = nullptr;
+	if (bind_data.has_sample_subset && bind_data.sample_subset) {
+		sample_include = bind_data.sample_subset->SampleInclude();
+	}
+
+	// Register this thread as active in the current pass
+	gs.pass_active_threads.fetch_add(1, std::memory_order_acq_rel);
+
+	// Zero partial and scan variant blocks (parallel with other threads)
+	std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
+	ScanVariantPass(bind_data, gs, ls, sample_include, pass);
+
+	// --- Barrier ---
+	uint32_t remaining = gs.pass_active_threads.fetch_sub(1, std::memory_order_acq_rel);
+	if (remaining != 1) {
+		// Not the last thread — return empty. DuckDB will re-call us and
+		// we'll wait on pass_generation at the top until the last thread
+		// finishes the merge and advances the generation.
+		output.SetCardinality(0);
+		return;
+	}
+
+	// --- Last thread: merge this pass, then loop through remaining passes ---
+	// The last thread must not return 0 cardinality between passes because
+	// DuckDB would interpret "all threads returned 0" as "scan complete."
+	// Instead, the last thread processes the merge + next pass inline,
+	// only returning when it either emits rows (algorithm done) or yields
+	// to let other threads help with the next pass.
+	while (true) {
+		MergePass(bind_data, gs, pass);
+
+		if (gs.algorithm_done.load(std::memory_order_relaxed)) {
+			switch (bind_data.mode) {
+			case PcaMode::SAMPLES:
+				EmitSamplesMode(bind_data, gs, output);
+				return;
+			case PcaMode::PCS:
+				EmitPcsMode(bind_data, gs, output);
+				return;
+			case PcaMode::BOTH:
+				EmitBothMode(bind_data, gs, output);
+				return;
+			}
+		}
+
+		// Prepare next pass: reset block counter, advance generation to
+		// release waiting threads. Order matters: reset state BEFORE
+		// advancing generation so threads see clean state.
+		pass++;
+		gs.next_block_idx.store(0, std::memory_order_release);
+		gs.pass_generation.fetch_add(1, std::memory_order_release);
+
+		// Process the next pass inline — zero partial and scan
+		std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
+		ScanVariantPass(bind_data, gs, ls, sample_include, pass);
+
+		// Wait for other threads to finish this pass too.
+		// We don't increment pass_active_threads for ourselves (we're
+		// already inline), but other threads did via their Scan entry.
+		// Wait by checking if all other threads have decremented.
+		//
+		// However, other threads increment pass_active_threads when they
+		// re-enter Scan and see the new generation. We need to wait for
+		// them to both enter AND finish. Use a simple approach: increment
+		// for ourselves, then decrement and check.
+		gs.pass_active_threads.fetch_add(1, std::memory_order_acq_rel);
+		remaining = gs.pass_active_threads.fetch_sub(1, std::memory_order_acq_rel);
+
+		if (remaining != 1) {
+			// Other threads are still working on this pass. Return empty
+			// and let DuckDB re-call us. On re-entry, we'll see
+			// pass_generation == last_generation_seen and return empty
+			// until all threads finish. When the actual last thread
+			// decrements to 0, it will become the new "last thread" and
+			// do the merge.
+			ls.last_generation_seen = gs.pass_generation.load(std::memory_order_acquire);
+			output.SetCardinality(0);
+			return;
+		}
+
+		// We're still the last thread — loop back to merge
 	}
 }
 
