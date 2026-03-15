@@ -697,11 +697,6 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			    ac_it->second, "ac_range", 0.0, static_cast<double>(2 * bind_data->OutputSampleCt()), "read_pfile");
 		}
 
-		// Build shared SampleSubset for PgrGetCounts if needed
-		if (bind_data->count_filter.HasFilter() && bind_data->has_sample_subset) {
-			bind_data->count_filter_subset =
-			    make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
-		}
 	}
 
 	// --- Parse genotype_range filter ---
@@ -715,6 +710,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			    ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile");
 			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
 		}
+	}
+
+	// Build shared SampleSubset for PgrGetCounts if needed.
+	// Required when af_range/ac_range or genotype_range is active with sample subsetting,
+	// because PgrGetCounts needs sample_include + interleaved_vec for correct counting.
+	// Must come after both count_filter and genotype_filter are parsed.
+	if ((bind_data->count_filter.HasFilter() || bind_data->genotype_filter.active) &&
+	    bind_data->has_sample_subset && !bind_data->count_filter_subset) {
+		bind_data->count_filter_subset =
+		    make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices));
 	}
 
 	// --- Build output schema ---

@@ -337,3 +337,34 @@ statement error
 SELECT * FROM read_pfile('test/data/pfile_example', genotype_range := {min: 1}, dosages := true);
 ----
 genotype_range is incompatible with dosages
+
+# --- genotype_range combined with samples (regression test) ---
+
+# genotype_range + samples in genotype orient mode
+# 3 variants pass (rs4 has no carriers in subset), 2 samples = 6 rows
+# Non-carrier genotypes are NULLed but rows are kept
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example',
+    orient := 'genotype',
+    samples := ['SAMPLE1', 'SAMPLE2'],
+    genotype_range := {min: 1, max: 2});
+----
+6
+
+# genotype_range + samples in variant orient mode
+# 3 of 4 variants have at least one carrier among SAMPLE1/SAMPLE2
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example',
+    samples := ['SAMPLE1', 'SAMPLE2'],
+    genotype_range := {min: 1, max: 2});
+----
+3
+
+# genotype_range + samples in sample orient mode
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example',
+    orient := 'sample',
+    samples := ['SAMPLE1', 'SAMPLE2'],
+    genotype_range := {min: 1, max: 2});
+----
+2
