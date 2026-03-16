@@ -125,12 +125,12 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 	uint32_t thread_count = 0;
 	vector<vector<double>> thread_partials;
 
-	// Pass coordination — sense-reversing barrier
+	// Pass coordination — generation-based barrier
 	//
-	// All threads participate in every pass. After finishing variant blocks,
-	// each thread increments arrived_count. The last to arrive (arrived_count
-	// == expected_threads) does the merge/SVD, resets arrived_count and
-	// next_block_idx, then increments pass_generation to release waiters.
+	// All threads participate in every pass. Each thread increments
+	// pass_active_threads on entry and decrements on finish. The last
+	// thread to finish (decrement returns 1) does the merge/SVD, resets
+	// next_block_idx, and increments pass_generation to release waiters.
 	// Non-last threads return empty chunks and check pass_generation on
 	// re-entry — if it has advanced, they join the new pass.
 	uint32_t total_passes = 0;                     // n_pcs + 2
@@ -180,7 +180,6 @@ struct PlinkPcaLocalState : public LocalTableFunctionState {
 
 	uint32_t thread_id = 0;
 	uint32_t last_generation_seen = UINT32_MAX;
-	bool phase1_done = false;
 	bool initialized = false;
 
 	~PlinkPcaLocalState() {
@@ -428,11 +427,12 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 	// --- Memory guard ---
 	uint64_t qq_elements = static_cast<uint64_t>(bind_data->effective_variant_ct) * bind_data->qq_col_ct;
 	Value max_elements_val;
-	int64_t max_elements = 16LL * 1024 * 1024 * 1024; // default
+	uint64_t max_elements = 16ULL * 1024 * 1024 * 1024; // default
 	if (context.TryGetCurrentSetting("plinking_max_matrix_elements", max_elements_val)) {
-		max_elements = max_elements_val.GetValue<int64_t>();
+		auto val = max_elements_val.GetValue<int64_t>();
+		max_elements = val > 0 ? static_cast<uint64_t>(val) : 0;
 	}
-	if (static_cast<int64_t>(qq_elements) > max_elements) {
+	if (qq_elements > max_elements) {
 		throw InvalidInputException(
 		    "plink_pca: QQ matrix would require %llu elements (%llu MB), exceeding plinking_max_matrix_elements "
 		    "(%lld). "
@@ -1031,29 +1031,21 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		gs.next_block_idx.store(0, std::memory_order_release);
 		gs.pass_generation.fetch_add(1, std::memory_order_release);
 
-		// Process the next pass inline — zero partial and scan
+		// Process the next pass inline. Register as active (matching
+		// the normal Scan entry path) so the barrier works correctly
+		// regardless of whether other threads have joined yet.
+		gs.pass_active_threads.fetch_add(1, std::memory_order_acq_rel);
 		std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
 		ScanVariantPass(bind_data, gs, ls, sample_include, pass);
 
-		// Wait for other threads to finish this pass too.
-		// We don't increment pass_active_threads for ourselves (we're
-		// already inline), but other threads did via their Scan entry.
-		// Wait by checking if all other threads have decremented.
-		//
-		// However, other threads increment pass_active_threads when they
-		// re-enter Scan and see the new generation. We need to wait for
-		// them to both enter AND finish. Use a simple approach: increment
-		// for ourselves, then decrement and check.
-		gs.pass_active_threads.fetch_add(1, std::memory_order_acq_rel);
+		// Decrement and check if we're still last
 		remaining = gs.pass_active_threads.fetch_sub(1, std::memory_order_acq_rel);
 
 		if (remaining != 1) {
 			// Other threads are still working on this pass. Return empty
 			// and let DuckDB re-call us. On re-entry, we'll see
-			// pass_generation == last_generation_seen and return empty
-			// until all threads finish. When the actual last thread
-			// decrements to 0, it will become the new "last thread" and
-			// do the merge.
+			// pass_generation == last_generation_seen and wait until
+			// the actual last thread finishes and merges.
 			ls.last_generation_seen = gs.pass_generation.load(std::memory_order_acquire);
 			output.SetCardinality(0);
 			return;
