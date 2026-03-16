@@ -1,0 +1,61 @@
+# name: test/sql/plink_pca_negative.test
+# description: Negative tests for plink_pca table function
+# group: [sql]
+
+require plinking_duck
+
+# --- Invalid parameters ---
+
+# n_pcs = 0
+statement error
+SELECT * FROM plink_pca('test/data/pca_example.pgen', n_pcs := 0);
+----
+n_pcs must be >= 1
+
+# Negative n_pcs
+statement error
+SELECT * FROM plink_pca('test/data/pca_example.pgen', n_pcs := -1);
+----
+n_pcs must be >= 1
+
+# Invalid mode
+statement error
+SELECT * FROM plink_pca('test/data/pca_example.pgen', mode := 'invalid');
+----
+invalid mode
+
+# n_pcs >= sample count
+statement error
+SELECT * FROM plink_pca('test/data/pca_example.pgen', n_pcs := 250);
+----
+n_pcs
+
+# --- Too few samples ---
+
+# large_example has 8 samples — too few for 3 PCs (qq_col_ct = 24)
+statement error
+SELECT * FROM plink_pca('test/data/large_example.pgen', n_pcs := 3);
+----
+too few samples
+
+# --- Too few variants ---
+
+# pgen_example has 4 variants — too few for any n_pcs (qq_col_ct = 4 for n_pcs=1)
+statement error
+SELECT * FROM plink_pca('test/data/pgen_example.pgen', n_pcs := 1);
+----
+too few variants
+
+# --- File not found ---
+
+statement error
+SELECT * FROM plink_pca('test/data/nonexistent.pgen');
+----
+cannot find .pvar
+
+# --- Missing companion files ---
+
+statement error
+SELECT * FROM plink_pca('test/data/pgen_orphan.pgen');
+----
+cannot find .psam

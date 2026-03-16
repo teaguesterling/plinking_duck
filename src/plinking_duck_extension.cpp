@@ -11,6 +11,9 @@
 #include "plink_ld.hpp"
 #include "plink_score.hpp"
 #include "plink_glm.hpp"
+#ifdef PLINKING_HAVE_EIGEN3
+#include "plink_pca.hpp"
+#endif
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
@@ -52,6 +55,9 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPlinkLd(loader);
 	RegisterPlinkScore(loader);
 	RegisterPlinkGlm(loader);
+#ifdef PLINKING_HAVE_EIGEN3
+	RegisterPlinkPca(loader);
+#endif
 }
 
 std::string PlinkingDuckExtension::Name() {

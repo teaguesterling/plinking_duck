@@ -1,0 +1,593 @@
+# P6-001: plink_pca — Principal Component Analysis
+
+## Overview
+
+`plink_pca(path)` computes per-sample principal component scores via
+randomized SVD (Halko et al. 2011), matching plink2's `--pca approx`
+algorithm. Uses Eigen3 (header-only) for linear algebra — no LAPACK
+dependency.
+
+**Workflow frequency**: Extremely common. PCA is used in virtually every
+GWAS pipeline for population stratification correction. The output (PC
+scores) feeds directly into `plink_glm` as covariates.
+
+**Justification**: Cannot be expressed in SQL on existing function output.
+Requires streaming the full genotype matrix with normalization and matrix
+decomposition — a dedicated function with pgenlib fast-paths is the only
+viable approach at biobank scale.
+
+---
+
+## Function Signature
+
+```sql
+plink_pca(path VARCHAR,
+          -- Output control (uses 'mode' for consistency with plink_missing)
+          mode := 'samples',       -- 'samples' | 'pcs' | 'both'
+          n_pcs := 10,             -- number of principal components
+          -- Standard filters
+          samples := NULL,         -- LIST(VARCHAR) or LIST(INTEGER)
+          region := NULL,          -- VARCHAR 'chr:start-end'
+          variants := NULL,        -- LIST(VARCHAR) or LIST(INTEGER)
+          af_range := NULL,        -- STRUCT{min, max}
+          ac_range := NULL,        -- STRUCT{min, max}
+          -- Companion file overrides
+          pvar := NULL,            -- VARCHAR
+          psam := NULL             -- VARCHAR
+)
+```
+
+---
+
+## Output Schemas
+
+### `mode := 'samples'` (default)
+
+One row per sample. Matches plink2's `.eigenvec` output. Analogous to
+`plink_missing` `mode := 'variant'` / `mode := 'sample'`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| FID | VARCHAR | Family ID (from .psam, may be absent) |
+| IID | VARCHAR | Individual ID |
+| PC1 | DOUBLE | First principal component score |
+| PC2 | DOUBLE | Second principal component score |
+| ... | ... | ... |
+| PCk | DOUBLE | k-th principal component score |
+
+Column count depends on `n_pcs`. Supports projection pushdown — if only
+PC1 and PC2 are selected, eigendecomposition still computes all requested
+PCs (unavoidable) but only the projected columns are emitted.
+
+### `mode := 'pcs'`
+
+One row per principal component. Matches plink2's `.eigenval` output.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| PC | INTEGER | Principal component number (1-based) |
+| EIGENVALUE | DOUBLE | Eigenvalue (variance explained by this PC) |
+| VARIANCE_PROPORTION | DOUBLE | Proportion of total variance explained |
+| CUMULATIVE_VARIANCE | DOUBLE | Cumulative proportion of variance explained |
+
+### `mode := 'both'`
+
+Single-row table containing the full decomposition as nested structures.
+Lower implementation priority — can be deferred if the other two modes
+cover the primary use cases.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| EIGENVEC | STRUCT(FID VARCHAR, IID VARCHAR, PC1 DOUBLE, ...)[] | Array of per-sample PC scores |
+| EIGENVAL | DOUBLE[] | Array of eigenvalues |
+
+---
+
+## Algorithm
+
+Randomized SVD following plink2's implementation of Halko et al. (2011),
+adapted from EIGENSOFT 6. The algorithm avoids materializing the full
+M×N genotype matrix by streaming variants through pgenlib in multiple
+passes.
+
+### Constants (matching plink2)
+
+```
+k          = n_pcs                        -- requested PC count
+qq_col_ct  = (k + 1) * k * 2             -- Krylov matrix columns (oversampling)
+block_size = 240                          -- variant block size (kPcaVariantBlockSize)
+```
+
+For 10 PCs: `qq_col_ct = 220`.
+
+### Pre-scan Phase
+
+1. Open pgenlib, load variant metadata and sample info.
+2. Apply filters: `samples`, `region`, `variants`, `af_range`, `ac_range`.
+   Count filters use `PgrGetCounts` (no decompression). Variant list
+   filters use VariantMetadataIndex lookup.
+3. Compute per-variant allele frequencies for all effective variants
+   (reuse `PgrGetCounts` results from filter step).
+4. Record effective variant count M and effective sample count N.
+5. Validate:
+   - M > qq_col_ct (variant count must exceed Krylov columns; for
+     10 PCs this means M > 220. Matches plink2 line 5713: "Too few
+     variants to compute N PCs with --pca approx")
+   - N >= 2 (need at least 2 samples)
+   - N > qq_col_ct (sample count must exceed Krylov matrix width;
+     for 10 PCs this means N > 220. If N <= qq_col_ct, error with
+     a message suggesting fewer PCs or more samples)
+
+### Memory Allocation
+
+Let X be the M×N standardized genotype matrix (variant-major: M variants,
+N samples). We never materialize X — we stream it in blocks of 240
+variants via `yy_buf`.
+
+Key dimensions (matching plink2 variable names):
+- `pc_ct_x2` = 2k (double the PC count)
+- `qq_col_ct` = (k+1) × 2k (Krylov matrix columns)
+- `gg_size` = N × 2k (random projection / feedback matrix size)
+- `b_size` = N × qq_col_ct (final projection matrix size)
+
+| Buffer | Size | plink2 var | Purpose |
+|--------|------|-----------|---------|
+| G1 | N × 2k doubles | `g1` (gg_size) | Random projection / feedback matrix |
+| QQ | M × qq_col_ct doubles | `qq` | Krylov matrix (accumulated across all iterations) |
+| g2_bb_part | N × qq_col_ct doubles × T | per-thread `g2_bb_part_bufs` | Per-thread accumulation (reused for BB in Phase 3) |
+| yy_bufs[2] | 240×T × N doubles each | `yy_bufs` | Double-buffered variant genotype blocks |
+| y_transpose | 240 × N doubles × T | per-thread `y_transpose_bufs` | Per-thread transpose scratch |
+| ss | qq_col_ct doubles | `ss` | Singular values |
+| svd_workspace | ~ qq_col_ct² doubles | `svd_rect_wkspace` | LAPACK/Eigen3 SVD workspace |
+| genovec | NypCtToAlignedWordCt(N) words × T | — | Per-thread pgenlib decode buffer |
+
+Where T = number of compute threads.
+
+**Dominant allocation**: QQ at M × qq_col_ct doubles. This scales with
+**variant count**, not sample count. For 1M variants × 10 PCs
+(qq_col_ct=220): 1M × 220 × 8 = **1.76 GB**. The per-thread buffers
+(g2_bb_part at N × qq_col_ct each) scale with sample count and thread
+count.
+
+### Phase 1: Krylov Subspace Construction
+
+**k+1 passes** through all effective variants. The first k passes are
+power iterations (XᵀXA), the final pass projects X×G1 without the
+XᵀX feedback. Each pass simultaneously:
+1. Stores X×G1 into QQ (building the Krylov basis, variant-major)
+2. Accumulates XᵀX×G1 into G2 (for the next power iteration)
+
+The dual-purpose design is why QQ has M rows — each iteration contributes
+2k columns for each of M variants, totaling (k+1)×2k = qq_col_ct columns.
+
+```
+G1 = random Gaussian matrix    (N × 2k)
+QQ = allocated but not zeroed  (M × qq_col_ct)
+
+for iter = 0 to k:
+    // Zero per-thread accumulators (G2 for iters 0..k-1, unused for iter k)
+    for each thread: g2_part[thread] = 0    (N × qq_col_ct)
+
+    // qq_iter tracks current column offset in QQ for this iteration
+    qq_iter = QQ + iter × 2k columns
+
+    for each variant block (240 × T variants, double-buffered):
+        Load genotypes via PgrGet into yy_buf (block_size × N)
+        Normalize: center by 2*AF, scale by 1/sqrt(2*AF*(1-AF))
+        Missing → 0 (centered mean imputation)
+
+        // Each thread processes its 240-variant slice:
+        //   cur_qq = qq_iter offset for this thread's variants
+        //   Step A: cur_qq = yy_buf × G1   (block × N)(N × 2k) → block × 2k
+        //           Written into QQ at the variant's row offset
+        //           Note: stride is qq_col_ct (full row width of QQ)
+
+        if iter < k:
+            //   Step B: y_transpose = yy_bufᵀ
+            //   g2_part += y_transpose × cur_qq   (N × block)(block × 2k) → N × 2k
+            //     accumulated at the 2k-column offset matching this iter
+
+    if iter < k:
+        // Merge per-thread g2_parts → G1 for next iteration
+        G1 = sum(g2_part[0..T-1]) / variant_ct
+```
+
+Note: the `G1 = sum / variant_ct` normalization between power iterations
+matches plink2 exactly (line 5842-5843 of plink2_matrix_calc.cc). plink2
+does not use QR re-orthogonalization. The large oversampling factor
+`(k+1)×2k` compensates for orthogonality drift.
+
+**pgenlib usage**: `PgrGet()` with sample subsetting (existing
+`SampleSubset` infrastructure). k+1 full variant scans in Phase 1.
+
+### Phase 2: SVD of Krylov Matrix
+
+```
+[U_krylov, S_krylov, V_krylov] = BDCSVD(QQ)   // Eigen3
+// QQ is M × qq_col_ct — "tall-skinny" SVD (M >> qq_col_ct)
+// Cost: O(M × qq_col_ct²) — fast because qq_col_ct << M
+// plink2: SvdRectFused(pca_row_ct, qq_col_ct, ...)
+```
+
+After SVD, QQ is overwritten with the left singular vectors (M × qq_col_ct).
+
+### Phase 3: Final Eigenvector Recovery (XᵀB)
+
+One more pass through genotypes. Each thread computes Xᵀ × QQ for its
+variant slice, accumulating into per-thread BB buffers (N × qq_col_ct).
+
+```
+for each thread: bb_part[thread] = 0    (N × qq_col_ct)
+
+// qq_iter tracks position in QQ (now containing singular vectors)
+for each variant block (240 × T variants, double-buffered):
+    Load + normalize genotypes → yy_buf  (block_size × N)
+
+    // Each thread:
+    //   y_transpose = yy_bufᵀ   (N × block)
+    //   bb_part += y_transpose × qq_slice   (N × block)(block × qq_col_ct) → N × qq_col_ct
+
+// Merge per-thread bb_parts
+BB = sum(bb_part[0..T-1])    (N × qq_col_ct)
+
+[U_final, S_final, V_final] = BDCSVD(BB)   // Eigen3
+// BB is N × qq_col_ct
+// plink2: SvdRectFused(pca_sample_ct, qq_col_ct, ...)
+
+// Extract top k eigenvectors and eigenvalues
+for each sample s:
+    eigenvectors[s, 0:k] = BB[s, 0:k]   // first k columns of U_final
+eigenvalues[i] = S_final[i]² / M        // for i = 0..k-1
+```
+
+**Total pgenlib passes**: k + 2 (k+1 in Phase 1, 1 in Phase 3).
+For 10 PCs: 12 passes.
+
+### Normalization (Price et al. 2006)
+
+For each variant with allele frequency p (where p = ALT allele freq):
+
+```
+centered_value = raw_genotype - 2*p
+standardized_value = centered_value / sqrt(2*p*(1-p))
+```
+
+Missing genotypes are set to 0 after centering (equivalent to mean
+imputation). Variants with p = 0 or p = 1 (monomorphic) are skipped
+(zero variance, undefined normalization).
+
+### Eigenvalue Computation
+
+```
+eigenvalue[i] = singular_value[i]² / effective_variant_ct
+```
+
+Matches plink2. Variance proportion = eigenvalue[i] / sum(eigenvalues).
+
+---
+
+## Threading Model
+
+### Variant Loading (Parallel)
+
+Each variant block can be loaded independently by separate threads.
+Use DuckDB's per-thread local state pattern:
+
+- **GlobalState**: atomic variant block counter, shared accumulation
+  matrices (G1, G2, QQ, BB) protected by mutex for merge.
+- **LocalState**: per-thread pgenlib reader, per-thread partial
+  accumulation buffers, genovec decode buffer.
+
+Each thread:
+1. Claims a variant block via atomic fetch-add
+2. Loads genotypes via its own PgenReader
+3. Normalizes and accumulates into thread-local partial matrix
+4. Merges into global accumulator under mutex (or lock-free via
+   per-thread partials merged after pass completion)
+
+**Preferred**: Per-thread partial matrices merged after each pass
+completes (same pattern as `plink_score`). Avoids mutex contention
+during the hot loop.
+
+### SVD (Single-threaded Eigen3)
+
+Eigen3 BDCSVD runs single-threaded on the small Krylov/projection
+matrices. This is O(N × qq_col_ct²) and takes negligible time compared
+to the genotype streaming passes.
+
+If performance profiling shows SVD as a bottleneck (unlikely), Eigen3
+can be compiled with OpenBLAS backend via `-DEIGEN_USE_BLAS` without
+code changes.
+
+---
+
+## Dependency: Eigen3
+
+Header-only C++ linear algebra library. No linking, no Fortran, no
+runtime dependencies.
+
+### Integration
+
+**Recommended: vcpkg.** The DuckDB extension build system already has
+full vcpkg support (toolchain, manifest merging, platform triplets).
+Adding Eigen3 via vcpkg is a one-line manifest change and keeps the
+dependency managed alongside the build:
+
+```json
+{
+  "dependencies": ["eigen3"]
+}
+```
+
+Alternative: vendor Eigen3 headers in `third_party/eigen3/` (~4MB,
+MPL2-licensed). This avoids adding vcpkg as a new mechanism but adds
+vendored code to the repo. The project already vendors plink-ng as a
+submodule, so either approach has precedent.
+
+### Usage
+
+```cpp
+#include <Eigen/Dense>
+#include <Eigen/SVD>
+
+// BDCSVD for tall-skinny Krylov matrix (M variants × qq_col_ct columns)
+Eigen::Map<Eigen::MatrixXd> QQ(qq_data, M, qq_col_ct);
+Eigen::BDCSVD<Eigen::MatrixXd> svd(QQ, Eigen::ComputeThinU | Eigen::ComputeThinV);
+auto U = svd.matrixU();
+auto S = svd.singularValues();
+```
+
+### Future: OpenBLAS Backend
+
+If SVD becomes a bottleneck, add `-DEIGEN_USE_BLAS` and link OpenBLAS.
+Zero code changes — Eigen3 delegates to BLAS automatically. OpenBLAS
+available via vcpkg.
+
+---
+
+## Parameters
+
+### `n_pcs` (INTEGER, default 10)
+
+Number of principal components to compute. Must be >= 1 and < effective
+sample count. plink2 default is also 10.
+
+Affects oversampling: `qq_col_ct = (n_pcs + 1) * n_pcs * 2`. For large
+`n_pcs` (> 50), memory grows quadratically — warn if qq_col_ct × N
+exceeds a threshold.
+
+### `mode` (VARCHAR, default `'samples'`)
+
+Output mode. One of `'samples'` (eigenvec table), `'pcs'` (eigenval
+table), or `'both'` (nested struct with both). Uses `mode` for
+consistency with `plink_missing` (`mode := 'variant'` / `'sample'`).
+
+### `variants` (LIST(VARCHAR) or LIST(INTEGER), default NULL)
+
+Filter to specific variants. Primary use case: pass in an LD-pruned
+variant set computed externally. **Note**: this is the first P2-style
+utility function to accept `variants` as a named parameter (previously
+only `read_pfile` supported it). The implementation pattern established
+here can be backported to other utility functions if needed.
+
+```sql
+-- LD-prune then PCA
+CREATE TABLE pruned AS
+  SELECT DISTINCT v1_id AS id FROM plink_ld('data/example.pgen')
+  WHERE R2 < 0.2;
+
+SELECT * FROM plink_pca('data/example.pgen',
+    variants := (SELECT LIST(id) FROM pruned));
+```
+
+Type dispatch follows the standard convention: `LIST(VARCHAR)` matches
+by variant ID, `LIST(INTEGER)` matches by 0-based index.
+
+### Standard Filters
+
+`samples`, `region`, `af_range`, `ac_range`, `pvar`, `psam` — all
+follow existing conventions from `read_pfile` and P2 functions.
+`af_range` and `ac_range` use `PgrGetCounts` for pre-decompression
+filtering (existing `CountFilter` infrastructure).
+
+---
+
+## Implementation Structure
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `src/plink_pca.cpp` | Table function implementation |
+| `src/include/plink_pca.hpp` | Header with RegisterPlinkPca declaration |
+| `test/sql/plink_pca.test` | Positive tests (known-answer, plink2-validated) |
+| `test/sql/plink_pca_negative.test` | Negative tests (invalid params, edge cases) |
+
+### Bind Phase
+
+1. Resolve companion files (existing `DiscoverCompanionFile`)
+2. Open pgenlib (`PgfiInitPhase1/Phase2`)
+3. Load variant metadata (`VariantMetadataIndex`)
+4. Load sample info (`LoadSampleInfo`)
+5. Apply sample subsetting (`BuildSampleSubset`)
+6. Apply variant filters:
+   - `region` → `ParseRegion` (existing)
+   - `variants` → ID/index lookup against VariantMetadataIndex
+   - `af_range` / `ac_range` → `PgrGetCounts` + `VariantPassesCountFilter`
+7. Build effective variant list with per-variant allele frequencies
+8. Validate: enough variants and samples for requested PCs
+9. Compute oversampling parameters
+
+### Scan Phase (Multi-pass)
+
+The scan function must perform k+2 full passes through the genotype
+data before emitting any rows. This uses the same "phase 1 accumulation,
+phase 2 emission" pattern as `plink_score`:
+
+- **Phase 1** (first scan call): All threads participate in the Halko
+  algorithm. Atomic coordination ensures passes complete in order.
+  No rows emitted (return 0-size chunk).
+- **Phase 2** (subsequent scan calls): Emit eigenvector/eigenvalue rows
+  from the completed decomposition. Standard atomic sample-index
+  claiming.
+
+### GRM Isolation
+
+The GRM is not computed in this implementation (randomized SVD avoids
+it). However, the genotype normalization code (center by 2*AF, scale
+by 1/sqrt(2*AF*(1-AF))) should be extracted into a reusable helper in
+`plink_common.hpp` so that a future `plink_grm` or exact-PCA
+implementation can share it:
+
+```cpp
+// In plink_common.hpp
+
+// Allele frequency convention: p = ALT allele frequency, matching
+// plink_freq's ALT_FREQ and plink2's internal convention. Not MAF.
+struct VariantNormalization {
+    double center;     // 2 * allele_freq (ALT freq)
+    double inv_stdev;  // 1.0 / sqrt(2 * af * (1 - af))
+    bool skip;         // true if monomorphic (af == 0 or af == 1)
+};
+
+VariantNormalization ComputeVariantNormalization(double allele_freq);
+
+// Normalize a genotype vector: int8 genotypes → centered, standardized
+// doubles. Missing values (-9) are set to 0.0 (mean imputation).
+void NormalizeGenotypes(const int8_t *genotypes, uint32_t sample_ct,
+                        const VariantNormalization &norm,
+                        double *output);
+```
+
+---
+
+## Testing
+
+### Test Data
+
+Existing datasets have few samples (4-8), which limits meaningful PCA
+validation. A new test dataset is needed:
+
+- **`pca_example.*`**: ~30 samples × ~500 variants, with 2-3
+  population clusters that produce clearly separable PCs. Generate
+  with plink2 `--dummy` or from a public 1000 Genomes subset.
+  Sample count must exceed qq_col_ct for the requested PCs
+  (e.g., n_pcs=3 → qq_col_ct=24, so 30 samples works).
+
+Existing datasets can still be used for edge-case and negative tests:
+- `pgen_example.*` (4 variants × 4 samples): degenerate case, max 3 PCs
+- `large_example.*` (3000 variants × 8 samples): stress test for many
+  variants, few samples
+- `all_missing.*`: all-missing genotype handling
+
+### plink2 Validation
+
+Run plink2 `--pca approx` on `pca_example` and compare output within
+tolerance:
+- Eigenvalues: relative tolerance 1e-4
+- Eigenvectors: element-wise tolerance 1e-3 (sign ambiguity handled —
+  eigenvectors can be negated; compare absolute values or use
+  sign-corrected cosine similarity)
+
+Note: wider tolerances than other P2 functions because randomized SVD
+uses a random projection matrix — results vary with RNG seed. plink2
+validation confirms we're in the right ballpark, not bit-identical.
+
+```bash
+plink2 --pfile test/data/pca_example \
+       --pca approx 5 \
+       --out test/data/pca_example_pca
+```
+
+### Test Cases
+
+**Positive:**
+- Default parameters (10 PCs or max feasible)
+- Custom `n_pcs`
+- `mode := 'samples'`, `'pcs'`, `'both'`
+- With `af_range` filtering
+- With `ac_range` filtering
+- With `variants` filter (by ID and by index)
+- With `samples` filter
+- With `region` filter
+- Combined filters
+- Large dataset (`large_example.*`: 3000 variants × 8 samples)
+- Streaming dataset (`streaming_example.*`: 50K variants × 8 samples)
+
+**Negative:**
+- `n_pcs` > sample count
+- `n_pcs` = 0 or negative
+- Invalid `mode` value
+- No variants pass filters (all monomorphic or all filtered)
+- All genotypes missing for a variant (should be auto-skipped)
+- Single sample (can't compute PCs)
+- File not found
+
+**Edge Cases:**
+- `n_pcs` = 1 (minimum)
+- All samples identical genotypes (zero variance — degenerate)
+- Variants with very low AF near filter boundary
+- Large `n_pcs` relative to sample count (e.g., n_pcs = N-1)
+
+---
+
+## Scale Guidance
+
+The dominant allocation is QQ (M × qq_col_ct doubles), which scales
+with variant count. Per-thread g2/bb buffers (N × qq_col_ct each)
+scale with sample count × thread count.
+
+Memory formula (T = compute threads):
+```
+QQ:           M × qq_col_ct × 8 bytes
+G1:           N × 2k × 8 bytes
+g2_bb_parts:  N × qq_col_ct × 8 bytes × T
+yy_bufs:      240 × T × N × 8 bytes × 2  (double-buffered)
+y_transpose:  240 × N × 8 bytes × T
+Total ≈ M × qq_col_ct × 8  +  N × qq_col_ct × 8 × T  +  small terms
+```
+
+| N (samples) | M (variants) | n_pcs | qq_col_ct | QQ (dominant) | g2/bb (T=4) | Total ~T=4 | Passes |
+|-------------|-------------|-------|-----------|--------------|-------------|------------|--------|
+| 1K | 100K | 10 | 220 | 176 MB | 7 MB | ~190 MB | 12 |
+| 10K | 1M | 10 | 220 | 1.76 GB | 70 MB | ~2.1 GB | 12 |
+| 50K | 1M | 10 | 220 | 1.76 GB | 352 MB | ~3.2 GB | 12 |
+| 50K | 5M | 10 | 220 | 8.8 GB | 352 MB | ~9.9 GB | 12 |
+| 50K | 5M | 20 | 840 | 33.6 GB | 1.34 GB | ~39 GB | 22 |
+| 500K | 1M | 10 | 220 | 1.76 GB | 3.5 GB | ~16 GB | 12 |
+
+Key observations:
+- QQ dominates for high variant counts (which is the typical PCA case —
+  many LD-pruned variants)
+- g2/bb per-thread buffers dominate for very high sample counts with
+  few variants (unusual)
+- For large n_pcs (> 20), qq_col_ct grows quadratically — warn early
+
+Consider reusing the `plinking_max_matrix_elements` config option as a
+memory guard. The critical product is `M × qq_col_ct` (QQ allocation).
+
+---
+
+## Future Extensions
+
+- **Exact PCA** (`approx := 'exact'`): Build N×N GRM, Eigen3
+  `SelfAdjointEigenSolver`. Add when needed for small-N validation.
+- **`plink_grm`**: Extract GRM computation as a separate function.
+  Reuse normalization code from plink_pca.
+- **Variant weights/loadings**: Additional output mode for per-variant
+  PC loadings (plink2's `.eigenvec.var`).
+- **OpenBLAS acceleration**: `-DEIGEN_USE_BLAS` compile flag for
+  BLAS-accelerated SVD when profiling shows need.
+- **`approx` parameter**: Re-add when exact mode is implemented.
+  `'auto'` selects based on memory (GRM < 25% available) and sample
+  count (< 50K), with hard cutoff at 50K unless `'exact'` specified.
+
+---
+
+## Dependencies
+
+| Dependency | Type | Purpose |
+|-----------|------|---------|
+| Eigen3 | Header-only (vcpkg or vendored) | BDCSVD, matrix operations |
+| pgenlib | Existing submodule | Genotype access via PgrGet |
+| plink_common | Existing shared infra | SampleSubset, VariantMetadataIndex, CountFilter, etc. |

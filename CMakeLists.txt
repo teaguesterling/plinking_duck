@@ -25,6 +25,8 @@ set(EXTENSION_SOURCES
     src/plink2_glm_logistic_math.cpp
 )
 
+# plink_pca requires Eigen3 — added conditionally after find_package below
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
@@ -142,6 +144,19 @@ target_compile_definitions(pgenlib PRIVATE
 )
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Eigen3 CONFIG QUIET)
+if(NOT Eigen3_FOUND)
+    # Fallback: try system-installed Eigen3 (e.g., /usr/include/eigen3)
+    find_path(EIGEN3_INCLUDE_DIR NAMES Eigen/Dense PATHS /usr/include/eigen3 /usr/local/include/eigen3)
+    if(EIGEN3_INCLUDE_DIR)
+        add_library(Eigen3::Eigen INTERFACE IMPORTED)
+        set_target_properties(Eigen3::Eigen PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
+        set(Eigen3_FOUND TRUE)
+    endif()
+endif()
+if(NOT Eigen3_FOUND)
+    message(WARNING "Eigen3 not found — plink_pca will not be built. Install via vcpkg or libeigen3-dev.")
+endif()
 target_link_libraries(pgenlib PRIVATE ZLIB::ZLIB Threads::Threads)
 set_target_properties(pgenlib PROPERTIES
     CXX_VISIBILITY_PRESET hidden
@@ -188,6 +203,16 @@ target_include_directories(${EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_D
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_DIR})
 target_compile_definitions(${EXTENSION_NAME} PRIVATE NOLAPACK)
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE NOLAPACK)
+
+# --- plink_pca (requires Eigen3) ---
+if(Eigen3_FOUND)
+    target_sources(${EXTENSION_NAME} PRIVATE src/plink_pca.cpp)
+    target_sources(${LOADABLE_EXTENSION_NAME} PRIVATE src/plink_pca.cpp)
+    target_link_libraries(${EXTENSION_NAME} Eigen3::Eigen)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} Eigen3::Eigen)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE PLINKING_HAVE_EIGEN3)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE PLINKING_HAVE_EIGEN3)
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd
