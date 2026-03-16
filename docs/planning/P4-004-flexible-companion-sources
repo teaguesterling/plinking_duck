@@ -1,0 +1,412 @@
+# P4-004: Flexible Companion File Sources
+
+## Goal
+
+Allow `pvar` and `psam` companion file overrides — and the `read_pvar` /
+`read_psam` positional argument — to accept any format DuckDB can read
+(parquet, CSV, etc.) or an existing table/view name, instead of only
+native PLINK text formats. The native parsers remain the default and fast
+path.
+
+## Prerequisites
+
+- Understanding of `FindCompanionFile`, `LoadVariantMetadataIndex` in
+  `plink_common.cpp`
+- Understanding of `LoadSampleInfo` in `psam_reader.cpp`
+- Understanding of `LoadPfileSampleMetadata` in `pfile_reader.cpp`
+- Understanding of DuckDB's `context.Query()` and replacement scan
+  mechanism
+
+---
+
+## Motivation
+
+Users with variant or sample metadata in parquet files, CSV exports, or
+pre-filtered DuckDB tables currently must convert to `.pvar`/`.psam`
+format before using plinking_duck functions. This is friction for
+workflows that already have metadata in other formats, especially when
+sample phenotype/covariate data lives in parquet or in a DuckDB table
+from a prior analysis step.
+
+---
+
+## Design
+
+### Resolution Order
+
+When a `pvar` or `psam` source is provided (either as a positional
+argument to `read_pvar`/`read_psam`, or as a named parameter override
+in `read_pgen`/`read_pfile`/P2 utility functions):
+
+1. **Native PLINK format**: path ends in `.pvar`, `.bim`, `.psam`, or
+   `.fam` → use existing native parsers (no change, fast path)
+2. **Any other value** → execute `context.Query("SELECT * FROM '<source>'")`
+   at bind time, which triggers DuckDB's replacement scan pipeline for
+   file paths (`.parquet` → `read_parquet`, `.csv` → `read_csv`, etc.)
+   and resolves table/view names through catalog lookup
+
+Both file paths and table/view names are handled by the same code path.
+DuckDB's `FROM '<string>'` syntax triggers replacement scans for
+recognized file extensions, and falls through to catalog lookup for
+table/view names. This is the same mechanism DuckDB uses internally
+(e.g., in `query_function.cpp`).
+
+**Source escaping**: single quotes in the source string are escaped by
+doubling (`'` → `''`). This is the only SQL construction involved — the
+query is always `SELECT * FROM '<escaped_source>'`, never anything
+user-controlled beyond the source path.
+
+### Auto-Discovery Unchanged
+
+`FindCompanionFile` continues to search for `.pvar`/`.bim`/`.psam`/`.fam`
+only. Non-native companion sources must be specified explicitly via the
+`pvar :=` / `psam :=` named parameters. This keeps the default behavior
+predictable and avoids surprising file resolution.
+
+### Column Mapping
+
+The result from `context.Query()` is mapped to the required schema using
+a two-tier strategy:
+
+**For variant metadata (pvar equivalent):**
+
+1. **By name** (case-insensitive): look for `CHROM` (or `#CHROM`), `POS`,
+   `ID`, `REF`, `ALT`
+2. **By position**: if named columns not found, use positional mapping
+   matching `.bim` fixed-column order: col0=CHROM, col1=ID, col2=CM,
+   col3=POS, col4=ALT, col5=REF
+3. **Error**: if fewer than required columns and names don't match
+
+**For sample metadata (psam equivalent):**
+
+1. **By name** (case-insensitive): look for `IID` (required), plus
+   optional `FID`, `SEX`, `PAT`, `MAT`
+2. **By position**: if `IID` not found by name, use positional mapping
+   matching `.fam` fixed-column order: col0=FID, col1=IID, col2=PAT,
+   col3=MAT, col4=SEX, col5=PHENO
+3. **Error**: if `IID` cannot be resolved by either name or position
+
+Additional columns beyond the required set are preserved for genotype and
+sample orient modes (which output all sample metadata columns).
+
+### Execution Mechanism
+
+At bind time, for non-native sources:
+
+```cpp
+// Escape single quotes in source path
+auto escaped = StringUtil::Replace(source, "'", "''");
+auto query = "SELECT * FROM '" + escaped + "'";
+auto result = context.Query(query, false);  // false = not internal
+if (result->HasError()) {
+    throw InvalidInputException("Cannot read companion source '%s': %s",
+                                source, result->GetError());
+}
+// Fetch all chunks, map columns, build row-oriented metadata
+```
+
+This uses `context.Query()` which runs within the current transaction
+context. This means table/view names created earlier in the same session
+(even in an explicit transaction) are visible — unlike a separate
+`Connection` which would have its own transaction.
+
+### Data Representation
+
+`VariantMetadataIndex` is a text-buffer-with-byte-offsets structure
+(`file_content` + `line_offsets`) designed for lazy field parsing from raw
+file bytes. It cannot be populated from a `QueryResult` directly.
+
+For non-native sources, the `LoadVariantMetadataFromSource` function
+materializes the query result into a text buffer in `.pvar` format
+(tab-separated, with the standard `#CHROM POS ID REF ALT` header line).
+This synthetic buffer is then passed to the existing
+`LoadVariantMetadataIndex` constructor, producing an identical
+`VariantMetadataIndex` object. The same approach is used for sample
+metadata — synthesize a `.psam`-format text buffer and pass it to the
+existing `LoadSampleInfo` parser.
+
+This avoids creating a parallel data representation while keeping the
+conversion code simple and localized. The conversion cost is O(rows ×
+columns) string concatenation, which is acceptable for metadata files
+that are fully materialized at bind time anyway.
+
+### Type Coercion
+
+Source columns may have different types than the native parsers produce.
+Since the synthetic buffer path converts everything to strings (matching
+how text parsers work), type coercion happens naturally — DuckDB's query
+result values are converted to strings via `ToString()`, and the existing
+parsers handle string-to-typed conversion.
+
+The one exception is that non-string source columns (e.g., integer CHROM
+in parquet) are converted via `Value::ToString()` before writing to the
+synthetic buffer. This is lossless for all expected types.
+
+---
+
+## Implementation Structure
+
+### New Helper Functions
+
+Add to `plink_common.hpp/cpp`:
+
+```cpp
+//! Check if a path refers to a native PLINK format file
+bool IsNativePlinkFormat(const string &path);
+
+//! Load variant metadata from any DuckDB-readable source.
+//! Executes context.Query(), maps columns by name (case-insensitive)
+//! falling back to positional, synthesizes a pvar-format text buffer,
+//! and returns a standard VariantMetadataIndex.
+VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context,
+                                                    const string &source);
+
+//! Load sample info from any DuckDB-readable source.
+//! Same approach: query, map columns, synthesize psam-format buffer,
+//! return standard SampleInfo.
+SampleInfo LoadSampleInfoFromSource(ClientContext &context,
+                                     const string &source);
+```
+
+Add to `pfile_reader.cpp`:
+
+```cpp
+//! Load full sample metadata from a non-native source for
+//! genotype/sample orient modes. Returns PfileSampleMetadata with all
+//! columns preserved.
+PfileSampleMetadata LoadPfileSampleMetadataFromSource(
+    ClientContext &context, const string &source, SampleInfo &sample_info_out);
+```
+
+### Dispatch Logic
+
+Replace direct parser calls with format-aware dispatch:
+
+```cpp
+// Before (in bind functions):
+bind_data->variants = LoadVariantMetadataIndex(context, pvar_path);
+
+// After:
+if (IsNativePlinkFormat(pvar_path)) {
+    bind_data->variants = LoadVariantMetadataIndex(context, pvar_path);
+} else {
+    bind_data->variants = LoadVariantMetadataFromSource(context, pvar_path);
+}
+```
+
+This pattern applies at every companion file loading site. Since
+`LoadVariantMetadataIndex` and `LoadSampleInfo` are the shared entry
+points called by all functions (read_pgen, read_pfile, and all P2
+utility functions), adding the dispatch at these call sites covers the
+entire codebase.
+
+An alternative is to add the dispatch inside `LoadVariantMetadataIndex`
+and `LoadSampleInfo` themselves (detect format, delegate). This is
+cleaner but changes the existing function signatures to require
+`ClientContext` where they currently only take a path. The preferred
+approach depends on how many call sites exist — if most already have
+context available, internalize the dispatch.
+
+### Bind Restructuring for `read_pvar` / `read_psam`
+
+Currently `PvarBind` and `PsamBind` pass the first positional argument
+directly to `ReadFileLines(context, path)`, which calls
+`FileSystem::OpenFile`. If the source is a table name or non-native file,
+this fails before any format detection can run.
+
+The fix: add format detection before the file read:
+
+```cpp
+// In PvarBind:
+auto source = input.inputs[0].GetValue<string>();
+if (IsNativePlinkFormat(source)) {
+    // Existing path: ReadFileLines → parse header → build schema
+    auto lines = ReadFileLines(context, source);
+    // ... existing bind logic
+} else {
+    // New path: query source, map columns, emit result
+    auto result = QueryExternalSource(context, source);
+    // ... build schema from result columns
+}
+```
+
+For `read_pvar` and `read_psam`, the non-native path is different from
+the companion file loading path: instead of building a
+`VariantMetadataIndex`, these functions need to emit the data as a table
+scan. The implementation should materialize the query result and emit
+rows from it during scan, using the same column mapping logic.
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/plink_common.cpp` | Add `IsNativePlinkFormat`, `LoadVariantMetadataFromSource`, `LoadSampleInfoFromSource`, column mapping helpers |
+| `src/include/plink_common.hpp` | Declare new functions |
+| `src/pvar_reader.cpp` | Add format dispatch in `PvarBind` — if source is non-native, query and emit rows |
+| `src/psam_reader.cpp` | Add format dispatch in `PsamBind` — if source is non-native, query and emit rows |
+| `src/pfile_reader.cpp` | Add format dispatch for pvar/psam loading; add `LoadPfileSampleMetadataFromSource` for genotype/sample orient |
+| `src/pgen_reader.cpp` | Add format dispatch for pvar/psam loading in `PgenBind` |
+| `src/plinking_duck_extension.cpp` | No change (no new functions registered) |
+
+### What Changes
+
+- **`read_pvar` and `read_psam`**: Accept any DuckDB-readable source as
+  their positional path argument. If the path is not a native PLINK format,
+  resolve via `context.Query()` and emit rows from the result. This means
+  `read_pvar('variants.parquet')` and `read_psam('my_samples_table')` work
+  directly.
+- Companion file loading paths in `read_pgen` and `read_pfile` bind
+  functions gain format detection and dispatch for `pvar :=` / `psam :=`
+  named parameters.
+- P2 utility functions (`plink_freq`, `plink_hardy`, `plink_missing`,
+  `plink_ld`, `plink_score`, `plink_glm`, `plink_pca`) gain the same
+  dispatch automatically if the dispatch is internalized in the shared
+  loading functions. If dispatch is at call sites, each function needs
+  an explicit change (all call `LoadVariantMetadataIndex` and
+  `LoadSampleInfo` with `ClientContext` available).
+
+### What Doesn't Change
+
+- Native parser code (`pvar_reader.cpp`, `psam_reader.cpp`) — existing
+  parsing logic is untouched; non-native sources synthesize text buffers
+  that feed into the same parsers
+- Scan phase — metadata is fully resolved at bind time regardless of source
+- `.pgen` file handling (always pgenlib)
+- Auto-discovery logic (`FindCompanionFile` still searches for native
+  formats only)
+- Output schemas
+
+---
+
+## Testing
+
+### Positive Tests
+
+**read_pvar and read_psam with alternative formats:**
+```sql
+-- read_pvar from parquet
+COPY (SELECT * FROM read_pvar('test/data/pgen_example.pvar'))
+  TO 'test/data/pgen_example_variants.parquet';
+SELECT * FROM read_pvar('test/data/pgen_example_variants.parquet');
+
+-- read_psam from parquet
+COPY (SELECT * FROM read_psam('test/data/pgen_example.psam'))
+  TO 'test/data/pgen_example_samples.parquet';
+SELECT * FROM read_psam('test/data/pgen_example_samples.parquet');
+
+-- read_pvar from a table
+CREATE TABLE my_variants AS SELECT * FROM read_pvar('test/data/pgen_example.pvar');
+SELECT * FROM read_pvar('my_variants');
+
+-- read_psam from a view
+CREATE VIEW my_samples AS SELECT * FROM read_psam('test/data/pgen_example.psam');
+SELECT * FROM read_psam('my_samples');
+```
+
+**Parquet companion files with read_pgen:**
+```sql
+-- Use parquet companions with read_pgen
+SELECT * FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'test/data/pgen_example_variants.parquet',
+    psam := 'test/data/pgen_example_samples.parquet');
+```
+
+**Table/view companions:**
+```sql
+CREATE TABLE my_variants AS SELECT * FROM read_pvar('test/data/pgen_example.pvar');
+CREATE VIEW my_samples AS SELECT * FROM read_psam('test/data/pgen_example.psam');
+
+SELECT * FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'my_variants',
+    psam := 'my_samples');
+```
+
+**Positional column mapping (no header names):**
+```sql
+-- CSV with positional columns (no CHROM/POS/ID/REF/ALT header)
+SELECT * FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'test/data/variants_no_header.csv');
+```
+
+**Column name case insensitivity:**
+```sql
+-- Parquet with lowercase column names (chrom, pos, id, ref, alt)
+SELECT * FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'test/data/variants_lowercase.parquet');
+```
+
+**Mixed: native pvar + parquet psam:**
+```sql
+SELECT * FROM read_pfile('test/data/pgen_example',
+    psam := 'test/data/samples.parquet');
+```
+
+**With all orient modes and filters:**
+```sql
+-- Parquet companions with orient := 'genotype'
+SELECT * FROM read_pfile('test/data/pgen_example',
+    pvar := 'test/data/pgen_example_variants.parquet',
+    psam := 'test/data/pgen_example_samples.parquet',
+    orient := 'genotype');
+```
+
+### Negative Tests
+
+- Non-existent file path → error from DuckDB resolution
+- Non-existent table name → error from catalog lookup
+- Parquet file with too few columns and no matching names → column mapping
+  error with helpful message listing expected columns
+- Parquet file missing required `IID` column → clear error message
+- Type mismatch that can't be coerced (e.g., POS column contains
+  non-numeric strings) → error during synthetic buffer parsing
+- Source with single-quote in path → properly escaped, no SQL injection
+
+### Validation
+
+Output from parquet/table companions must be identical to output from
+native parsers for the same underlying data. Use EXCEPT queries to verify:
+
+```sql
+-- Verify read_pvar parquet matches native
+SELECT COUNT(*) FROM (
+  SELECT * FROM read_pvar('test/data/pgen_example.pvar')
+  EXCEPT
+  SELECT * FROM read_pvar('test/data/pgen_example_variants.parquet')
+);
+-- Must be 0
+```
+
+---
+
+## Scale Guidance
+
+Companion metadata is fully materialized at bind time regardless of source
+format. The `context.Query()` path adds:
+
+- One query execution within the current transaction (lightweight)
+- One full scan of the companion source (same as native parsers — both
+  read the entire file)
+- Synthetic buffer construction: O(rows × columns) string concatenation
+- Column mapping overhead (negligible — O(column_count) per row)
+
+For large `.pvar` files (170M variants, ~10GB), reading via parquet would
+actually be faster than the native text parser since parquet supports
+column pruning and compression. The synthetic buffer adds a conversion
+step, but this is bounded by the same memory that the native text parser
+would use (both produce the same `VariantMetadataIndex` in-memory
+structure).
+
+---
+
+## Future Extensions
+
+- **Filtered companions**: Users could pass a pre-filtered view
+  (`CREATE VIEW rare_variants AS SELECT * FROM my_variants WHERE af < 0.01`)
+  as a companion source. This works today via the table/view path — the
+  view is resolved and only matching rows are loaded.
+- **Remote sources**: Since `context.Query("SELECT * FROM '<url>'")` triggers
+  replacement scans, S3 and HTTP paths would work if the appropriate DuckDB
+  extensions are loaded (e.g., `httpfs`).
+- **Direct query results**: A future enhancement could accept a subquery
+  string as a companion source, enabling inline transformations without
+  creating intermediate views.
