@@ -1,0 +1,190 @@
+# P3-002: Genotype Orient Parallel Scan
+
+## Goal
+
+Parallelize `read_pfile` with `orient := 'genotype'`, which is currently
+single-threaded. Each variant expands to N rows (one per sample), so for
+large datasets this mode is a bottleneck. The fix applies the same
+atomic variant-batch claiming pattern used by every other parallel
+function in the codebase.
+
+## Prerequisites
+
+- P4-001 complete (orient/genotypes parameter redesign, merged)
+- Familiarity with `PfileTidyScan` in `pfile_reader.cpp`
+
+---
+
+## Current State
+
+`PfileTidyScan` walks variants sequentially via `geno_current_variant_pos`
+in `PfileLocalState`. The global state forces `MaxThreads() = 1` for
+genotype mode because the state machine (current variant + current sample
+within variant) was designed for single-threaded traversal.
+
+The comment at line 310:
+```cpp
+// Genotype mode must be single-threaded: the state machine tracks
+// current_variant and current_sample, which are not thread-safe.
+```
+
+This is a design constraint, not a fundamental one. The state machine
+tracks position within a sequential walk. Switching to per-thread batch
+ownership eliminates the shared-state concern entirely.
+
+---
+
+## Design
+
+### Threading Model
+
+Atomic variant-batch claiming, identical to `plink_freq` / `plink_hardy` /
+`plink_glm`:
+
+- **GlobalState**: reuses the existing `std::atomic<uint32_t> next_idx`
+  (already used by variant and sample orient modes) for batch claiming.
+  No new atomic fields needed.
+- **LocalState**: per-thread PgenReader (already exists) plus batch-local
+  tracking: `batch_start`, `batch_end`, `current_variant_within_batch`,
+  `current_sample_within_variant`, `batch_variant_loaded` flag. The
+  existing `geno_done` flag is replaced by the batch boundary check
+  (batch_start >= total_effective_variants after fetch_add).
+- **Batch size**: 64 variants. Smaller than the existing
+  `PFILE_BATCH_SIZE = 128` because each variant fans out to N sample rows
+  — smaller batches improve load balancing when count/genotype filters
+  skip variants unevenly. Define as `PFILE_GENOTYPE_BATCH_SIZE = 64`.
+- **MaxThreads**: `effective_variant_count / 64 + 1`, capped at 16
+  (matching the existing cap used by variant and sample orient modes)
+
+### Scan Flow Per Thread
+
+```
+1. If no current batch or current batch exhausted:
+     batch_start = next_variant_batch.fetch_add(BATCH_SIZE)
+     batch_end = min(batch_start + BATCH_SIZE, total_effective_variants)
+     current_variant_within_batch = batch_start
+     current_sample_within_variant = 0
+     variant_loaded = false
+
+2. If batch_start >= total_effective_variants:
+     output.SetCardinality(0); return  // done
+
+3. For current variant in batch:
+   a. Resolve variant index via ResolveVariantIdx
+   b. If not yet loaded: apply count filter / genotype_range pre-decompression
+      check via PgrGetCounts. If variant fails → advance to next variant in
+      batch, reset sample counter, go to 3a
+   c. Load genotypes via PgrGet/PgrGetP/PgrGetD (if not already loaded)
+   d. Emit sample rows until STANDARD_VECTOR_SIZE or variant exhausted
+   e. If variant exhausted → advance to next variant in batch, go to 3a
+   f. If chunk full → return (resume at same variant+sample on next call)
+```
+
+### Row Ordering
+
+Output rows are interleaved across threads — thread 0 might emit variants
+0-63, thread 1 emits variants 64-127, etc., but the chunks arrive in
+arbitrary order. DuckDB table functions do not guarantee row order. Users
+who need ordered output use `ORDER BY`.
+
+Within a single thread's output, rows are ordered by (variant, sample)
+since each thread walks its batch sequentially.
+
+---
+
+## Changes
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `src/pfile_reader.cpp` | Refactor `PfileTidyScan` to use batch claiming; update `MaxThreads` for genotype mode; add batch tracking to `PfileLocalState` |
+
+### What Changes
+
+- **`PfileGlobalState::MaxThreads`**: Remove the `return 1` for
+  `OrientMode::GENOTYPE`. Use `effective_variant_count / 64 + 1`, capped
+  at 16 (matching the existing cap for other orient modes).
+- **`PfileLocalState`**: Add batch tracking fields: `batch_start`,
+  `batch_end`, `current_variant_in_batch`, `current_sample_in_variant`,
+  `batch_variant_loaded`. Remove `geno_done` — thread completion is
+  detected when `fetch_add` returns a value >= `total_effective_variants`.
+  The `geno_range_all_pass` field remains on LocalState and is safe
+  under parallelism: it resets each time a new variant is loaded within
+  a thread's batch, same as single-threaded behavior.
+- **`PfileTidyScan`**: Replace sequential variant walk with batch-claiming
+  loop using the existing `gstate.next_idx` atomic. The inner
+  sample-emission logic (genotype loading, filter checks, phased/dosage
+  paths, sample metadata column output) stays the same.
+
+### What Doesn't Change
+
+- Bind phase, output schema, named parameters
+- All other orient modes (variant, sample)
+- Filter logic (count filters, genotype_range)
+- `InitLocal` PgenReader initialization
+- `LoadPfileSampleMetadata` and sample column output
+
+---
+
+## Testing
+
+### Correctness
+
+Use `streaming_example.*` (50K variants × 8 samples = 400K genotype rows)
+to verify parallel output matches single-threaded output:
+
+```sql
+-- Baseline: force single thread
+SET threads = 1;
+CREATE TABLE baseline AS
+  SELECT * FROM read_pfile('test/data/streaming_example',
+                           orient := 'genotype')
+  ORDER BY "#CHROM", POS, IID;
+
+-- Parallel
+SET threads = 4;
+CREATE TABLE parallel AS
+  SELECT * FROM read_pfile('test/data/streaming_example',
+                           orient := 'genotype')
+  ORDER BY "#CHROM", POS, IID;
+
+-- Compare
+SELECT COUNT(*) FROM baseline;
+SELECT COUNT(*) FROM parallel;
+-- Row counts must match
+
+SELECT COUNT(*) FROM (
+  SELECT * FROM baseline EXCEPT SELECT * FROM parallel
+);
+-- Must be 0
+```
+
+### With Filters
+
+Verify correctness with count filters and genotype_range that cause
+variant skipping:
+
+```sql
+SELECT COUNT(*) FROM read_pfile('test/data/streaming_example',
+    orient := 'genotype', af_range := {min: 0.1, max: 0.9});
+```
+
+### Edge Cases
+
+- Single variant (batch size > variant count → single thread, one batch)
+- All variants filtered out (zero output)
+- `samples` subset combined with parallel genotype orient
+- `region` filter narrowing to a few variants
+
+---
+
+## Scale Guidance
+
+For 50K variants × 500K samples at 4 threads:
+- 50K / 64 = 781 batches, ~195 per thread
+- Each variant → 500K sample rows → ~244 chunks of STANDARD_VECTOR_SIZE
+- Total: ~12.2M chunks, well within DuckDB's streaming model
+
+The bottleneck shifts from single-thread variant iteration to pgenlib I/O
+and genotype decompression, which is the correct bottleneck.
