@@ -307,10 +307,10 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	OrientMode orient_mode = OrientMode::VARIANT;
 
 	idx_t MaxThreads() const override {
-		// Genotype mode must be single-threaded: the state machine tracks
-		// current_variant and current_sample, which are not thread-safe.
 		if (orient_mode == OrientMode::GENOTYPE) {
-			return 1;
+			// Each variant fans out to N sample rows — use smaller batch size (64)
+			// for better load balancing when filters skip variants unevenly
+			return std::min<idx_t>(total_count / 64 + 1, 16);
 		}
 		// Variant and sample modes support parallel scan
 		return std::min<idx_t>(total_count / 1000 + 1, 16);
@@ -348,12 +348,14 @@ struct PfileLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
-	// Tidy mode cursor state
-	uint32_t geno_current_variant_pos = 0; // index into effective_variant_indices
-	uint32_t geno_current_sample = 0;      // sample index within current variant
-	bool geno_variant_loaded = false;      // genotypes decoded for current variant
-	bool geno_range_all_pass = true;       // persists across chunk boundaries for genotype_range
-	bool geno_done = false;
+	// Genotype-orient batch claiming state
+	uint32_t batch_start = 0;                  // first effective variant index in current batch
+	uint32_t batch_end = 0;                    // one-past-end effective variant index in current batch
+	uint32_t current_variant_in_batch = 0;     // current effective variant index within batch
+	uint32_t current_sample_in_variant = 0;    // sample index within current variant
+	bool batch_variant_loaded = false;         // genotypes decoded for current variant in batch
+	bool geno_range_all_pass = true;           // per-variant flag for genotype_range optimization
+	bool batch_exhausted = true;               // true initially to trigger first batch claim
 
 	~PfileLocalState() {
 		if (initialized) {
@@ -1375,6 +1377,7 @@ static inline uint32_t ResolveVariantIdx(const PfileBindData &bind_data, uint32_
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t PFILE_BATCH_SIZE = 128;
+static constexpr uint32_t PFILE_GENOTYPE_BATCH_SIZE = 64;
 
 static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<PfileBindData>();
@@ -1775,11 +1778,6 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 	auto &gstate = data_p.global_state->Cast<PfileGlobalState>();
 	auto &lstate = data_p.local_state->Cast<PfileLocalState>();
 
-	if (lstate.geno_done) {
-		output.SetCardinality(0);
-		return;
-	}
-
 	auto &column_ids = gstate.column_ids;
 	uint32_t total_effective_variants = gstate.total_count;
 	uint32_t output_sample_ct = bind_data.OutputSampleCt();
@@ -1787,16 +1785,30 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 	idx_t rows_emitted = 0;
 
 	while (rows_emitted < STANDARD_VECTOR_SIZE) {
-		if (lstate.geno_current_variant_pos >= total_effective_variants) {
-			lstate.geno_done = true;
-			break;
+		// Claim a new batch if current batch is exhausted
+		if (lstate.batch_exhausted) {
+			lstate.batch_start = gstate.next_idx.fetch_add(PFILE_GENOTYPE_BATCH_SIZE);
+			if (lstate.batch_start >= total_effective_variants) {
+				break; // no more work
+			}
+			lstate.batch_end = std::min(lstate.batch_start + PFILE_GENOTYPE_BATCH_SIZE, total_effective_variants);
+			lstate.current_variant_in_batch = lstate.batch_start;
+			lstate.current_sample_in_variant = 0;
+			lstate.batch_variant_loaded = false;
+			lstate.batch_exhausted = false;
 		}
 
-		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.geno_current_variant_pos);
+		// Check if we've exhausted the current batch
+		if (lstate.current_variant_in_batch >= lstate.batch_end) {
+			lstate.batch_exhausted = true;
+			continue;
+		}
+
+		uint32_t vidx = ResolveVariantIdx(bind_data, lstate.current_variant_in_batch);
 
 		// Count filter + genotype range pre-decompression check
 		if ((bind_data.count_filter.HasFilter() || bind_data.genotype_filter.active) && lstate.initialized &&
-		    !lstate.geno_variant_loaded) {
+		    !lstate.batch_variant_loaded) {
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			const uintptr_t *cf_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
 			                             ? bind_data.count_filter_subset->SampleInclude()
@@ -1812,15 +1824,15 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			}
 			auto pf = CheckPreDecompFilters(bind_data.count_filter, bind_data.genotype_filter, genocounts, cf_sc);
 			if (pf.skip) {
-				lstate.geno_current_variant_pos++;
-				lstate.geno_current_sample = 0;
+				lstate.current_variant_in_batch++;
+				lstate.current_sample_in_variant = 0;
 				continue;
 			}
 			lstate.geno_range_all_pass = pf.all_pass;
 		}
 
 		// Load genotypes for current variant if not yet loaded
-		if (!lstate.geno_variant_loaded && gstate.need_genotypes && lstate.initialized) {
+		if (!lstate.batch_variant_loaded && gstate.need_genotypes && lstate.initialized) {
 			const uintptr_t *sample_include =
 			    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
@@ -1858,35 +1870,35 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
 				                             lstate.genotype_bytes.data());
 			}
-			lstate.geno_variant_loaded = true;
+			lstate.batch_variant_loaded = true;
 		}
 
 		// Emit rows for samples within current variant
-		while (lstate.geno_current_sample < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
+		while (lstate.current_sample_in_variant < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
 			// When genotype_range is active, skip rows for missing/out-of-range genotypes
-			if (bind_data.genotype_filter.active && gstate.need_genotypes && lstate.geno_variant_loaded) {
+			if (bind_data.genotype_filter.active && gstate.need_genotypes && lstate.batch_variant_loaded) {
 				if (bind_data.include_phased) {
-					int8_t a1 = lstate.phased_pairs[lstate.geno_current_sample * 2];
+					int8_t a1 = lstate.phased_pairs[lstate.current_sample_in_variant * 2];
 					if (a1 == -9) {
-						lstate.geno_current_sample++;
+						lstate.current_sample_in_variant++;
 						continue;
 					}
 					if (!lstate.geno_range_all_pass) {
-						int8_t a2 = lstate.phased_pairs[lstate.geno_current_sample * 2 + 1];
+						int8_t a2 = lstate.phased_pairs[lstate.current_sample_in_variant * 2 + 1];
 						if (!bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
-							lstate.geno_current_sample++;
+							lstate.current_sample_in_variant++;
 							continue;
 						}
 					}
 				} else if (!bind_data.include_dosages) {
-					int8_t geno = lstate.genotype_bytes[lstate.geno_current_sample];
+					int8_t geno = lstate.genotype_bytes[lstate.current_sample_in_variant];
 					if (geno == -9) {
-						lstate.geno_current_sample++;
+						lstate.current_sample_in_variant++;
 						continue;
 					}
 					if (!lstate.geno_range_all_pass &&
 					    !bind_data.genotype_filter.range.Passes(static_cast<double>(geno))) {
-						lstate.geno_current_sample++;
+						lstate.current_sample_in_variant++;
 						continue;
 					}
 				}
@@ -1897,8 +1909,8 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			// ascending-bit-order output, so genotype_bytes[i] corresponds
 			// to sample_indices[i].
 			uint32_t sample_file_idx = bind_data.has_sample_subset
-			                               ? bind_data.sample_indices[lstate.geno_current_sample]
-			                               : lstate.geno_current_sample;
+			                               ? bind_data.sample_indices[lstate.current_sample_in_variant]
+			                               : lstate.current_sample_in_variant;
 
 			// Fill projected columns
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
@@ -1947,24 +1959,25 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					}
 				} else if (file_col == bind_data.geno_genotype_col) {
 					// Genotype column
-					if (gstate.need_genotypes && lstate.geno_variant_loaded) {
+					if (gstate.need_genotypes && lstate.batch_variant_loaded) {
 						if (bind_data.include_phased) {
 							// ARRAY(TINYINT, 2) per row
 							auto &allele_vec = ArrayVector::GetEntry(vec);
 							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
 							idx_t allele_base = rows_emitted * 2;
-							int8_t a1 = lstate.phased_pairs[lstate.geno_current_sample * 2];
+							int8_t a1 = lstate.phased_pairs[lstate.current_sample_in_variant * 2];
 							if (a1 == -9) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 								allele_data[allele_base] = 0;
 								allele_data[allele_base + 1] = 0;
 							} else {
 								allele_data[allele_base] = a1;
-								allele_data[allele_base + 1] = lstate.phased_pairs[lstate.geno_current_sample * 2 + 1];
+								allele_data[allele_base + 1] =
+								    lstate.phased_pairs[lstate.current_sample_in_variant * 2 + 1];
 							}
 						} else if (bind_data.include_dosages) {
 							// Scalar DOUBLE
-							double dosage = lstate.dosage_doubles[lstate.geno_current_sample];
+							double dosage = lstate.dosage_doubles[lstate.current_sample_in_variant];
 							if (dosage == -9.0) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
@@ -1972,7 +1985,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 							}
 						} else {
 							// Scalar TINYINT
-							int8_t geno = lstate.genotype_bytes[lstate.geno_current_sample];
+							int8_t geno = lstate.genotype_bytes[lstate.current_sample_in_variant];
 							if (geno == -9) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
@@ -2002,14 +2015,14 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			}
 
 			rows_emitted++;
-			lstate.geno_current_sample++;
+			lstate.current_sample_in_variant++;
 		}
 
 		// Advance to next variant if all samples emitted
-		if (lstate.geno_current_sample >= output_sample_ct) {
-			lstate.geno_current_variant_pos++;
-			lstate.geno_current_sample = 0;
-			lstate.geno_variant_loaded = false;
+		if (lstate.current_sample_in_variant >= output_sample_ct) {
+			lstate.current_variant_in_batch++;
+			lstate.current_sample_in_variant = 0;
+			lstate.batch_variant_loaded = false;
 		}
 	}
 
