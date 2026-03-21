@@ -677,7 +677,7 @@ static void RunFinalSVD(PlinkPcaGlobalState &gs, const vector<double> &bb) {
 	Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> bb_map(bb.data(), gs.N,
 	                                                                                                gs.qq_col_ct);
 
-	Eigen::BDCSVD<Eigen::MatrixXd, Eigen::ComputeThinU> svd(bb_map);
+	Eigen::BDCSVD<Eigen::MatrixXd> svd(bb_map, Eigen::ComputeThinU);
 
 	auto &U = svd.matrixU();
 	auto &S = svd.singularValues();
