@@ -349,13 +349,13 @@ struct PfileLocalState : public LocalTableFunctionState {
 	bool initialized = false;
 
 	// Genotype-orient batch claiming state
-	uint32_t batch_start = 0;                  // first effective variant index in current batch
-	uint32_t batch_end = 0;                    // one-past-end effective variant index in current batch
-	uint32_t current_variant_in_batch = 0;     // current effective variant index within batch
-	uint32_t current_sample_in_variant = 0;    // sample index within current variant
-	bool batch_variant_loaded = false;         // genotypes decoded for current variant in batch
-	bool geno_range_all_pass = true;           // per-variant flag for genotype_range optimization
-	bool batch_exhausted = true;               // true initially to trigger first batch claim
+	uint32_t batch_start = 0;               // first effective variant index in current batch
+	uint32_t batch_end = 0;                 // one-past-end effective variant index in current batch
+	uint32_t current_variant_in_batch = 0;  // current effective variant index within batch
+	uint32_t current_sample_in_variant = 0; // sample index within current variant
+	bool batch_variant_loaded = false;      // genotypes decoded for current variant in batch
+	bool geno_range_all_pass = true;        // per-variant flag for genotype_range optimization
+	bool batch_exhausted = true;            // true initially to trigger first batch claim
 
 	~PfileLocalState() {
 		if (initialized) {
