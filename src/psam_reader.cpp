@@ -114,21 +114,50 @@ PsamHeaderInfo ParsePsamHeaderFromLines(const vector<string> &lines, const strin
 }
 
 PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path) {
-	auto lines = ReadFileLines(context, path);
-	auto info = ParsePsamHeaderFromLines(lines, path);
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto file_size = handle->GetFileSize();
 
-	// Compute data_start_offset by scanning the raw file for the end of the header line
-	if (info.format != PsamFormat::FAM) {
-		auto &fs = FileSystem::GetFileSystem(context);
-		auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
-		// Read forward past the first line (the # header line)
-		char buf[1];
-		while (handle->Read(buf, 1) == 1) {
-			if (buf[0] == '\n') {
+	if (file_size == 0) {
+		throw IOException("read_psam: file '%s' is empty", path);
+	}
+
+	// Read the first line to determine format and column schema.
+	// Use a buffered read — header lines are short (typically < 1KB).
+	string first_line;
+	static constexpr size_t HEADER_BUF_SIZE = 4096;
+	char buf[HEADER_BUF_SIZE];
+	size_t total_read = 0;
+	bool found_newline = false;
+
+	while (!found_newline && total_read < file_size) {
+		size_t to_read = std::min<size_t>(HEADER_BUF_SIZE, file_size - total_read);
+		auto bytes = handle->Read(buf, to_read);
+		if (bytes == 0) {
+			break;
+		}
+		for (size_t i = 0; i < bytes; i++) {
+			if (buf[i] == '\n') {
+				found_newline = true;
+				total_read += i + 1;
 				break;
 			}
+			if (buf[i] != '\r') {
+				first_line += buf[i];
+			}
 		}
-		info.data_start_offset = handle->SeekPosition();
+		if (!found_newline) {
+			total_read += bytes;
+		}
+	}
+
+	// Parse header from the first line
+	vector<string> lines = {first_line};
+	auto info = ParsePsamHeaderFromLines(lines, path);
+
+	// For .psam: data starts after the header line
+	if (info.format != PsamFormat::FAM) {
+		info.data_start_offset = total_read;
 	}
 	// For .fam: data_start_offset stays 0 (no header)
 

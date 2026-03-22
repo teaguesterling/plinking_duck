@@ -320,6 +320,10 @@ static constexpr uint64_t TEXT_FILE_CHUNK_SIZE = 4 * 1024 * 1024;
 
 //! Global state for parallel text file scanning.
 //! Manages byte-range chunk distribution across threads via atomic claiming.
+//!
+//! NOTE: Output row order is non-deterministic when MaxThreads() > 1.
+//! Each thread claims and emits chunks independently, so rows arrive in
+//! arbitrary order. Callers requiring ordered output must use ORDER BY.
 struct TextFileGlobalState : public GlobalTableFunctionState {
 	string file_path;
 	uint64_t file_size = 0;

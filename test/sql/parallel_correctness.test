@@ -53,7 +53,10 @@ statement ok
 DROP TABLE pvar_parallel;
 
 # ===================================================================
-# read_pvar: .bim format parallel correctness
+# read_pvar: .bim format (degenerate case — file < chunk size, single thread)
+# Validates that the parallel infrastructure handles small files correctly.
+# The actual multi-threaded .bim path is exercised by the .pvar tests since
+# the byte-range protocol is format-agnostic.
 # ===================================================================
 
 statement ok
@@ -150,7 +153,8 @@ statement ok
 DROP TABLE psam_parallel;
 
 # ===================================================================
-# read_psam: .fam format parallel correctness
+# read_psam: .fam format (degenerate case — file < chunk size, single thread)
+# Same rationale as .bim test above.
 # ===================================================================
 
 statement ok
