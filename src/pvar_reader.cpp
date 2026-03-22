@@ -2,6 +2,7 @@
 #include "plink_common.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -68,7 +69,6 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 	auto handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_READ);
 
 	PvarHeaderInfo info;
-	info.skip_lines = 0;
 	info.is_bim = false;
 	info.data_start_offset = 0;
 	string line;
@@ -77,12 +77,12 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 	while (ReadLineFromHandle(*handle, line)) {
 		// Skip empty lines
 		if (line.empty()) {
-			info.skip_lines++;
+	
 			continue;
 		}
 		// Skip ## comment/meta lines (e.g. ##fileformat=PVARv1.0)
 		if (line.size() >= 2 && line[0] == '#' && line[1] == '#') {
-			info.skip_lines++;
+	
 			continue;
 		}
 		found_header_or_data = true;
@@ -97,8 +97,6 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 	if (line.size() >= 6 && line.substr(0, 6) == "#CHROM") {
 		// .pvar format: parse column names from the header line
 		info.is_bim = false;
-		info.skip_lines++; // count the header line itself
-
 		// Strip the leading '#' so "#CHROM" becomes "CHROM", then split on tabs
 		string header_content = line.substr(1);
 		auto fields = SplitTabLine(header_content);
@@ -118,7 +116,6 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 		// The reader normalizes .bim output to match .pvar column ordering
 		// so that downstream queries work identically on both formats.
 		info.is_bim = true;
-		info.skip_lines = 0; // no header to skip; data starts at line 1
 		info.data_start_offset = 0;
 		info.column_names = {"CHROM", "POS", "ID", "REF", "ALT", "CM"};
 		info.column_types = {
@@ -186,6 +183,7 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 	state->data_start_offset = bind_data.header_info.data_start_offset;
 	state->next_chunk_offset.store(state->data_start_offset);
 	state->column_ids = input.column_ids;
+	state->db_thread_count = TaskScheduler::GetScheduler(context).NumberOfThreads();
 
 	return std::move(state);
 }

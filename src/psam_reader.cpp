@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -311,6 +312,7 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 
 	// Store projected column IDs and pre-compute parent column flags
 	state->column_ids = input.column_ids;
+	state->db_thread_count = TaskScheduler::GetScheduler(context).NumberOfThreads();
 	for (idx_t out_col = 0; out_col < state->column_ids.size(); out_col++) {
 		auto file_col = state->column_ids[out_col];
 		bool is_parent = false;

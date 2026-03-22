@@ -14,8 +14,6 @@ struct PvarHeaderInfo {
 	vector<LogicalType> column_types;
 	//! True if the file is legacy .bim format (no header line)
 	bool is_bim;
-	//! Number of lines to skip before data begins (comments + header)
-	idx_t skip_lines;
 	//! Byte offset in the file where data lines begin (after comments + header)
 	uint64_t data_start_offset = 0;
 };

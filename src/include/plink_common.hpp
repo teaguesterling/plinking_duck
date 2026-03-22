@@ -331,12 +331,15 @@ struct TextFileGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> next_chunk_offset {0};
 	vector<column_t> column_ids;
 
+	//! DuckDB-configured thread count (set during InitGlobal)
+	idx_t db_thread_count = 1;
+
 	idx_t MaxThreads() const override {
 		uint64_t data_size = file_size > data_start_offset ? file_size - data_start_offset : 0;
 		if (data_size < TEXT_FILE_CHUNK_SIZE) {
 			return 1;
 		}
-		return std::min<idx_t>(data_size / TEXT_FILE_CHUNK_SIZE + 1, 16);
+		return std::min<idx_t>(data_size / TEXT_FILE_CHUNK_SIZE + 1, db_thread_count);
 	}
 };
 
