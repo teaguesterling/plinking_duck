@@ -1,9 +1,11 @@
 #include "psam_reader.hpp"
+#include "plink_common.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <stdexcept>
 #include <string>
 
@@ -37,46 +39,8 @@ static bool IsParentMissing(const string &val) {
 // WHERE PHENO1 != '-9' if needed.
 
 // ---------------------------------------------------------------------------
-// Line splitting utilities
+// Line splitting utilities (use shared implementations from plink_common)
 // ---------------------------------------------------------------------------
-
-//! Split a line on tab characters. Used for .psam files (strictly tab-delimited).
-static vector<string> SplitTabLine(const string &line) {
-	vector<string> fields;
-	size_t start = 0;
-	size_t pos = line.find('\t');
-	while (pos != string::npos) {
-		fields.push_back(line.substr(start, pos - start));
-		start = pos + 1;
-		pos = line.find('\t', start);
-	}
-	fields.push_back(line.substr(start));
-	return fields;
-}
-
-//! Split a line on any whitespace (spaces or tabs). Used for .fam files
-//! which are whitespace-delimited per the PLINK 1 spec. Consecutive
-//! whitespace characters are treated as a single delimiter.
-static vector<string> SplitWhitespaceLine(const string &line) {
-	vector<string> fields;
-	size_t i = 0;
-	while (i < line.size()) {
-		// Skip whitespace
-		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
-			i++;
-		}
-		if (i >= line.size()) {
-			break;
-		}
-		// Collect field
-		size_t start = i;
-		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
-			i++;
-		}
-		fields.push_back(line.substr(start, i - start));
-	}
-	return fields;
-}
 
 //! Split a line using the appropriate delimiter for the given format.
 static vector<string> SplitLine(const string &line, PsamFormat format) {
@@ -84,54 +48,6 @@ static vector<string> SplitLine(const string &line, PsamFormat format) {
 		return SplitWhitespaceLine(line);
 	}
 	return SplitTabLine(line);
-}
-
-// ---------------------------------------------------------------------------
-// File reading via DuckDB VFS
-// ---------------------------------------------------------------------------
-
-//! Read an entire file via DuckDB's virtual file system and split into lines.
-//! Strips \r from line endings. Returns an empty vector for empty files.
-//! Uses VFS so that S3, HTTP, and custom filesystems work transparently.
-static vector<string> ReadFileLines(ClientContext &context, const string &path) {
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
-	auto file_size = handle->GetFileSize();
-
-	if (file_size == 0) {
-		return {};
-	}
-
-	// Read entire file into a string buffer — .psam/.fam files are small
-	// metadata files (typically KB to low MB), so this is safe and simple
-	string content(file_size, '\0');
-	handle->Read(const_cast<char *>(content.data()), file_size);
-
-	// Split into lines, stripping \r and skipping trailing empty line
-	vector<string> lines;
-	size_t start = 0;
-	for (size_t i = 0; i < content.size(); i++) {
-		if (content[i] == '\n') {
-			size_t end = i;
-			if (end > start && content[end - 1] == '\r') {
-				end--;
-			}
-			lines.push_back(content.substr(start, end - start));
-			start = i + 1;
-		}
-	}
-	// Handle last line without trailing newline
-	if (start < content.size()) {
-		size_t end = content.size();
-		if (end > start && content[end - 1] == '\r') {
-			end--;
-		}
-		if (end > start) {
-			lines.push_back(content.substr(start, end - start));
-		}
-	}
-
-	return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +115,24 @@ PsamHeaderInfo ParsePsamHeaderFromLines(const vector<string> &lines, const strin
 
 PsamHeaderInfo ParsePsamHeader(ClientContext &context, const string &path) {
 	auto lines = ReadFileLines(context, path);
-	return ParsePsamHeaderFromLines(lines, path);
+	auto info = ParsePsamHeaderFromLines(lines, path);
+
+	// Compute data_start_offset by scanning the raw file for the end of the header line
+	if (info.format != PsamFormat::FAM) {
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+		// Read forward past the first line (the # header line)
+		char buf[1];
+		while (handle->Read(buf, 1) == 1) {
+			if (buf[0] == '\n') {
+				break;
+			}
+		}
+		info.data_start_offset = handle->SeekPosition();
+	}
+	// For .fam: data_start_offset stays 0 (no header)
+
+	return info;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,38 +214,21 @@ struct PsamBindData : public TableFunctionData {
 
 	//! Index of SEX column in the file (-1 if absent)
 	idx_t sex_col_idx = DConstants::INVALID_INDEX;
+
+	//! Byte offset where data lines begin (after header)
+	uint64_t data_start_offset = 0;
 };
 
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
-struct PsamGlobalState : public GlobalTableFunctionState {
-	//! All data lines from the file (pre-read during init for simplicity;
-	//! .psam files are at most ~500MB at extreme biobank scale and typically
-	//! much smaller — this is a metadata file, not genotype data)
-	vector<vector<string>> rows;
-	//! Next row to hand out to a scan call
-	idx_t next_row_idx = 0;
-	//! Mutex for thread-safe row claiming
-	mutex lock;
-	//! Projected column IDs (file column index for each output column)
-	vector<column_t> column_ids;
+struct PsamGlobalState : public TextFileGlobalState {
 	//! For each output column, whether it's a PAT/MAT column
 	vector<bool> is_parent_col;
-
-	idx_t MaxThreads() const override {
-		return 1; // .psam files are small; single-threaded scan is fine
-	}
 };
 
-// ---------------------------------------------------------------------------
-// Local state
-// ---------------------------------------------------------------------------
-
-struct PsamLocalState : public LocalTableFunctionState {
-	// No per-thread state needed for single-threaded scan
-};
+struct PsamLocalState : public TextFileLocalState {};
 
 // ---------------------------------------------------------------------------
 // Bind function
@@ -327,6 +243,7 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 	result->format = header.format;
 	result->column_names = header.column_names;
 	result->column_types = header.column_types;
+	result->data_start_offset = header.data_start_offset;
 
 	// Identify PAT/MAT columns for special missing-value handling
 	for (idx_t i = 0; i < header.column_names.size(); i++) {
@@ -355,6 +272,14 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 	auto &bind_data = input.bind_data->Cast<PsamBindData>();
 	auto state = make_uniq<PsamGlobalState>();
 
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ);
+
+	state->file_path = bind_data.file_path;
+	state->file_size = handle->GetFileSize();
+	state->data_start_offset = bind_data.data_start_offset;
+	state->next_chunk_offset.store(state->data_start_offset);
+
 	// Store projected column IDs and pre-compute parent column flags
 	state->column_ids = input.column_ids;
 	for (idx_t out_col = 0; out_col < state->column_ids.size(); out_col++) {
@@ -369,35 +294,15 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 		state->is_parent_col.push_back(is_parent);
 	}
 
-	auto lines = ReadFileLines(context, bind_data.file_path);
-	auto header = ParsePsamHeaderFromLines(lines, bind_data.file_path);
-	idx_t expected_cols = bind_data.column_names.size();
-
-	// Data lines start at index 1 for .psam (skip header), 0 for .fam
-	idx_t data_start = (bind_data.format != PsamFormat::FAM) ? 1 : 0;
-
-	for (idx_t i = data_start; i < lines.size(); i++) {
-		auto &line = lines[i];
-		if (line.empty()) {
-			continue;
-		}
-
-		auto fields = SplitLine(line, header.format);
-
-		if (fields.size() != expected_cols) {
-			throw IOException("read_psam: file '%s' line %d has %d fields, expected %d", bind_data.file_path, i + 1,
-			                  fields.size(), expected_cols);
-		}
-
-		state->rows.push_back(std::move(fields));
-	}
-
 	return std::move(state);
 }
 
 static unique_ptr<LocalTableFunctionState> PsamInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state) {
-	return make_uniq<PsamLocalState>();
+	auto &gstate = global_state->Cast<PsamGlobalState>();
+	auto state = make_uniq<PsamLocalState>();
+	state->Init(context.client, gstate.file_path);
+	return std::move(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,33 +311,42 @@ static unique_ptr<LocalTableFunctionState> PsamInitLocal(ExecutionContext &conte
 
 static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<PsamBindData>();
-	auto &global_state = input.global_state->Cast<PsamGlobalState>();
+	auto &gstate = input.global_state->Cast<PsamGlobalState>();
+	auto &lstate = input.local_state->Cast<PsamLocalState>();
 
-	// Claim a batch of rows
-	idx_t start_idx;
-	idx_t batch_size;
-	{
-		lock_guard<mutex> guard(global_state.lock);
-		start_idx = global_state.next_row_idx;
-		batch_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, global_state.rows.size() - start_idx);
-		global_state.next_row_idx += batch_size;
-	}
+	auto &column_ids = gstate.column_ids;
+	auto &is_parent_col = gstate.is_parent_col;
+	idx_t expected_cols = bind_data.column_names.size();
+	idx_t row_count = 0;
+	string line;
 
-	if (batch_size == 0) {
-		output.SetCardinality(0);
-		return;
-	}
+	while (row_count < STANDARD_VECTOR_SIZE) {
+		// Claim a new chunk if current one is exhausted
+		if (lstate.chunk_exhausted) {
+			if (!lstate.ClaimChunk(gstate)) {
+				break;
+			}
+		}
 
-	auto &column_ids = global_state.column_ids;
-	auto &is_parent_col = global_state.is_parent_col;
+		if (!lstate.ReadChunkLine(line, gstate.file_size)) {
+			continue;
+		}
 
-	for (idx_t row = 0; row < batch_size; row++) {
-		auto &fields = global_state.rows[start_idx + row];
+		if (line.empty()) {
+			continue;
+		}
+
+		auto fields = SplitLine(line, bind_data.format);
+
+		if (fields.size() != expected_cols) {
+			throw IOException("read_psam: line has %llu fields, expected %llu in '%s'",
+			                  static_cast<unsigned long long>(fields.size()),
+			                  static_cast<unsigned long long>(expected_cols), bind_data.file_path);
+		}
 
 		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 			auto file_col = column_ids[out_col];
 
-			// Handle ROW_ID pseudo-column
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
 				continue;
 			}
@@ -441,43 +355,41 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 			const string &val = fields[file_col];
 
 			if (file_col == bind_data.sex_col_idx) {
-				// SEX column: integer with special missing handling
-				// 1=male, 2=female; 0/NA/.  → NULL
 				if (IsMissingValue(val)) {
-					FlatVector::SetNull(vec, row, true);
+					FlatVector::SetNull(vec, row_count, true);
 				} else {
 					try {
 						int32_t sex_val = std::stoi(val);
 						if (sex_val == 0) {
-							FlatVector::SetNull(vec, row, true);
+							FlatVector::SetNull(vec, row_count, true);
 						} else {
-							FlatVector::GetData<int32_t>(vec)[row] = sex_val;
+							FlatVector::GetData<int32_t>(vec)[row_count] = sex_val;
 						}
 					} catch (const std::invalid_argument &) {
-						FlatVector::SetNull(vec, row, true);
+						FlatVector::SetNull(vec, row_count, true);
 					} catch (const std::out_of_range &) {
-						FlatVector::SetNull(vec, row, true);
+						FlatVector::SetNull(vec, row_count, true);
 					}
 				}
 			} else if (is_parent_col[out_col]) {
-				// PAT/MAT columns: "0" means unknown parent → NULL
 				if (IsParentMissing(val)) {
-					FlatVector::SetNull(vec, row, true);
+					FlatVector::SetNull(vec, row_count, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row] = StringVector::AddString(vec, val);
+					FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, val);
 				}
 			} else {
-				// VARCHAR columns: general missing-value handling
 				if (IsMissingValue(val)) {
-					FlatVector::SetNull(vec, row, true);
+					FlatVector::SetNull(vec, row_count, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row] = StringVector::AddString(vec, val);
+					FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, val);
 				}
 			}
 		}
+
+		row_count++;
 	}
 
-	output.SetCardinality(batch_size);
+	output.SetCardinality(row_count);
 }
 
 // ---------------------------------------------------------------------------

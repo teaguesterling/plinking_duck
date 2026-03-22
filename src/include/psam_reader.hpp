@@ -43,6 +43,7 @@ struct PsamHeaderInfo {
 	PsamFormat format;
 	vector<string> column_names;      //!< Column names in file order
 	vector<LogicalType> column_types; //!< DuckDB types for each column
+	uint64_t data_start_offset = 0;   //!< Byte offset where data lines begin
 };
 
 //! Parse the header (or detect .fam format) from already-read file lines.
