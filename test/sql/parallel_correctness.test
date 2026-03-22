@@ -1,0 +1,357 @@
+# name: test/sql/parallel_correctness.test
+# description: Parallel scan correctness for read_pvar, read_psam, and genotype orient mode
+# group: [sql]
+
+require plinking_duck
+
+# ===================================================================
+# read_pvar: parallel correctness on wes_chr10 (30K variants)
+# ===================================================================
+
+# Single-threaded baseline
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE pvar_baseline AS
+    SELECT * FROM read_pvar('test/data/wes_chr10.pvar') ORDER BY CHROM, POS, ID;
+
+# Multi-threaded
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE pvar_parallel AS
+    SELECT * FROM read_pvar('test/data/wes_chr10.pvar') ORDER BY CHROM, POS, ID;
+
+# Row counts must match
+query I
+SELECT COUNT(*) FROM pvar_baseline;
+----
+30000
+
+query I
+SELECT COUNT(*) FROM pvar_parallel;
+----
+30000
+
+# Content must be identical (EXCEPT returns empty set)
+query I
+SELECT COUNT(*) FROM (SELECT * FROM pvar_baseline EXCEPT SELECT * FROM pvar_parallel);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM pvar_parallel EXCEPT SELECT * FROM pvar_baseline);
+----
+0
+
+statement ok
+DROP TABLE pvar_baseline;
+
+statement ok
+DROP TABLE pvar_parallel;
+
+# ===================================================================
+# read_pvar: .bim format parallel correctness
+# ===================================================================
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE bim_baseline AS
+    SELECT * FROM read_pvar('test/data/pgen_example.bim') ORDER BY POS;
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE bim_parallel AS
+    SELECT * FROM read_pvar('test/data/pgen_example.bim') ORDER BY POS;
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM bim_baseline EXCEPT SELECT * FROM bim_parallel);
+----
+0
+
+statement ok
+DROP TABLE bim_baseline;
+
+statement ok
+DROP TABLE bim_parallel;
+
+# ===================================================================
+# read_pvar: streaming_example (50K variants, larger file)
+# ===================================================================
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE pvar_stream_1t AS
+    SELECT * FROM read_pvar('test/data/streaming_example.pvar') ORDER BY CHROM, POS;
+
+statement ok
+SET threads = 8;
+
+statement ok
+CREATE TABLE pvar_stream_8t AS
+    SELECT * FROM read_pvar('test/data/streaming_example.pvar') ORDER BY CHROM, POS;
+
+query I
+SELECT COUNT(*) FROM pvar_stream_1t;
+----
+50000
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM pvar_stream_1t EXCEPT SELECT * FROM pvar_stream_8t);
+----
+0
+
+statement ok
+DROP TABLE pvar_stream_1t;
+
+statement ok
+DROP TABLE pvar_stream_8t;
+
+# ===================================================================
+# read_psam: parallel correctness on wes_chr10 (10K samples)
+# ===================================================================
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE psam_baseline AS
+    SELECT * FROM read_psam('test/data/wes_chr10.psam') ORDER BY IID;
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE psam_parallel AS
+    SELECT * FROM read_psam('test/data/wes_chr10.psam') ORDER BY IID;
+
+query I
+SELECT COUNT(*) FROM psam_baseline;
+----
+10000
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM psam_baseline EXCEPT SELECT * FROM psam_parallel);
+----
+0
+
+statement ok
+DROP TABLE psam_baseline;
+
+statement ok
+DROP TABLE psam_parallel;
+
+# ===================================================================
+# read_psam: .fam format parallel correctness
+# ===================================================================
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE fam_baseline AS
+    SELECT * FROM read_psam('test/data/example.fam') ORDER BY IID;
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE fam_parallel AS
+    SELECT * FROM read_psam('test/data/example.fam') ORDER BY IID;
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM fam_baseline EXCEPT SELECT * FROM fam_parallel);
+----
+0
+
+statement ok
+DROP TABLE fam_baseline;
+
+statement ok
+DROP TABLE fam_parallel;
+
+# ===================================================================
+# read_pvar: no duplicate IDs at multi-thread scale
+# ===================================================================
+
+statement ok
+SET threads = 8;
+
+query I
+SELECT COUNT(*) FROM read_pvar('test/data/wes_chr10.pvar');
+----
+30000
+
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pvar('test/data/wes_chr10.pvar');
+----
+30000
+
+# ===================================================================
+# read_psam: no duplicate IIDs at multi-thread scale
+# ===================================================================
+
+query I
+SELECT COUNT(*) FROM read_psam('test/data/wes_chr10.psam');
+----
+10000
+
+query I
+SELECT COUNT(DISTINCT IID) FROM read_psam('test/data/wes_chr10.psam');
+----
+10000
+
+# ===================================================================
+# Genotype orient: parallel correctness on streaming_example (400K rows)
+# ===================================================================
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE geno_baseline AS
+    SELECT CHROM, POS, ID, IID, genotype
+    FROM read_pfile('test/data/streaming_example', orient := 'genotype')
+    ORDER BY CHROM, POS, IID;
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE geno_parallel AS
+    SELECT CHROM, POS, ID, IID, genotype
+    FROM read_pfile('test/data/streaming_example', orient := 'genotype')
+    ORDER BY CHROM, POS, IID;
+
+query I
+SELECT COUNT(*) FROM geno_baseline;
+----
+400000
+
+query I
+SELECT COUNT(*) FROM geno_parallel;
+----
+400000
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM geno_baseline EXCEPT SELECT * FROM geno_parallel);
+----
+0
+
+statement ok
+DROP TABLE geno_baseline;
+
+statement ok
+DROP TABLE geno_parallel;
+
+# ===================================================================
+# Genotype orient: parallel with wes_chr10 (300M rows, count only)
+# ===================================================================
+
+# 30K variants x 10K samples = 300M rows
+# Test at multiple thread counts to exercise different batch distributions
+
+statement ok
+SET threads = 1;
+
+query II
+SELECT COUNT(*), SUM(genotype) FROM read_pfile('test/data/wes_chr10', orient := 'genotype');
+----
+300000000	14328698
+
+statement ok
+SET threads = 4;
+
+query II
+SELECT COUNT(*), SUM(genotype) FROM read_pfile('test/data/wes_chr10', orient := 'genotype');
+----
+300000000	14328698
+
+statement ok
+SET threads = 8;
+
+query II
+SELECT COUNT(*), SUM(genotype) FROM read_pfile('test/data/wes_chr10', orient := 'genotype');
+----
+300000000	14328698
+
+# ===================================================================
+# Genotype orient: parallel with filters
+# ===================================================================
+
+statement ok
+SET threads = 4;
+
+# AF filter should produce same results regardless of thread count
+statement ok
+CREATE TABLE geno_filter_4t AS
+    SELECT CHROM, POS, IID, genotype
+    FROM read_pfile('test/data/streaming_example', orient := 'genotype',
+                    af_range := {min: 0.1, max: 0.9})
+    ORDER BY CHROM, POS, IID;
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE geno_filter_1t AS
+    SELECT CHROM, POS, IID, genotype
+    FROM read_pfile('test/data/streaming_example', orient := 'genotype',
+                    af_range := {min: 0.1, max: 0.9})
+    ORDER BY CHROM, POS, IID;
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM geno_filter_4t EXCEPT SELECT * FROM geno_filter_1t);
+----
+0
+
+statement ok
+DROP TABLE geno_filter_4t;
+
+statement ok
+DROP TABLE geno_filter_1t;
+
+# ===================================================================
+# Genotype orient: parallel with sample subset
+# ===================================================================
+
+statement ok
+SET threads = 4;
+
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/streaming_example', orient := 'genotype',
+                samples := ['SAMPLE1', 'SAMPLE3']);
+----
+100000
+
+# ===================================================================
+# Genotype orient: small dataset (batch_size > variant count)
+# ===================================================================
+
+# pgen_example has 4 variants — smaller than PFILE_GENOTYPE_BATCH_SIZE (64)
+# Should work correctly as a single batch
+
+statement ok
+SET threads = 4;
+
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/pgen_example', orient := 'genotype');
+----
+16
+
+# ===================================================================
+# Reset threads to default
+# ===================================================================
+
+statement ok
+RESET threads;
