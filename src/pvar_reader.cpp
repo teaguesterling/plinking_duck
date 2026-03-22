@@ -1,7 +1,9 @@
 #include "pvar_reader.hpp"
+#include "plink_common.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
@@ -33,52 +35,6 @@ static bool ReadLineFromHandle(FileHandle &handle, string &line) {
 			line += buffer[0];
 		}
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Line splitting utilities
-// ---------------------------------------------------------------------------
-
-//! Split a line on tab characters. Used for .pvar files (strictly
-//! tab-delimited; fields like INFO can contain spaces).
-//! Matches psam_reader's SplitTabLine — will be extracted to a shared
-//! utility header in P2-001 (plink_common.hpp).
-static vector<string> SplitTabLine(const string &line) {
-	vector<string> fields;
-	size_t start = 0;
-	size_t pos = line.find('\t');
-	while (pos != string::npos) {
-		fields.push_back(line.substr(start, pos - start));
-		start = pos + 1;
-		pos = line.find('\t', start);
-	}
-	fields.push_back(line.substr(start));
-	return fields;
-}
-
-//! Split a line on any whitespace (spaces or tabs). Used for .bim files
-//! which are whitespace-delimited per the PLINK 1 spec. Consecutive
-//! whitespace characters are treated as a single delimiter.
-//! Matches psam_reader's SplitWhitespaceLine.
-static vector<string> SplitWhitespaceLine(const string &line) {
-	vector<string> fields;
-	size_t i = 0;
-	while (i < line.size()) {
-		// Skip whitespace
-		while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
-			i++;
-		}
-		if (i >= line.size()) {
-			break;
-		}
-		// Collect field
-		size_t start = i;
-		while (i < line.size() && line[i] != ' ' && line[i] != '\t') {
-			i++;
-		}
-		fields.push_back(line.substr(start, i - start));
-	}
-	return fields;
 }
 
 //! Split a line using the appropriate delimiter for the file format.
@@ -114,6 +70,7 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 	PvarHeaderInfo info;
 	info.skip_lines = 0;
 	info.is_bim = false;
+	info.data_start_offset = 0;
 	string line;
 	bool found_header_or_data = false;
 
@@ -149,6 +106,9 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 			info.column_names.push_back(col_name);
 			info.column_types.push_back(PvarColumnType(col_name));
 		}
+
+		// Record byte offset where data starts (current file position after header)
+		info.data_start_offset = handle->SeekPosition();
 	} else {
 		// No #CHROM header: legacy .bim format with 6 fixed columns.
 		//
@@ -159,6 +119,7 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 		// so that downstream queries work identically on both formats.
 		info.is_bim = true;
 		info.skip_lines = 0; // no header to skip; data starts at line 1
+		info.data_start_offset = 0;
 		info.column_names = {"CHROM", "POS", "ID", "REF", "ALT", "CM"};
 		info.column_types = {
 		    LogicalType::VARCHAR, // CHROM
@@ -182,17 +143,9 @@ struct PvarBindData : public TableFunctionData {
 	PvarHeaderInfo header_info;
 };
 
-struct PvarGlobalState : public GlobalTableFunctionState {
-	unique_ptr<FileHandle> handle;
-	bool finished = false;
-	vector<column_t> column_ids;
+struct PvarGlobalState : public TextFileGlobalState {};
 
-	idx_t MaxThreads() const override {
-		return 1; // Sequential text file reading
-	}
-};
-
-struct PvarLocalState : public LocalTableFunctionState {};
+struct PvarLocalState : public TextFileLocalState {};
 
 // ---------------------------------------------------------------------------
 // .bim column order normalization
@@ -226,15 +179,12 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 	auto state = make_uniq<PvarGlobalState>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	state->handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ);
+	auto handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ);
 
-	// Skip comment and header lines to reach the first data line
-	string skip;
-	for (idx_t i = 0; i < bind_data.header_info.skip_lines; i++) {
-		ReadLineFromHandle(*state->handle, skip);
-	}
-
-	// Store projected column indices for the scan function
+	state->file_path = bind_data.file_path;
+	state->file_size = handle->GetFileSize();
+	state->data_start_offset = bind_data.header_info.data_start_offset;
+	state->next_chunk_offset.store(state->data_start_offset);
 	state->column_ids = input.column_ids;
 
 	return std::move(state);
@@ -242,7 +192,10 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 
 static unique_ptr<LocalTableFunctionState> PvarInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state) {
-	return make_uniq<PvarLocalState>();
+	auto &gstate = global_state->Cast<PvarGlobalState>();
+	auto state = make_uniq<PvarLocalState>();
+	state->Init(context.client, gstate.file_path);
+	return std::move(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -307,19 +260,26 @@ static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const 
 
 static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<PvarBindData>();
-	auto &state = data_p.global_state->Cast<PvarGlobalState>();
-
-	if (state.finished) {
-		output.SetCardinality(0);
-		return;
-	}
+	auto &gstate = data_p.global_state->Cast<PvarGlobalState>();
+	auto &lstate = data_p.local_state->Cast<PvarLocalState>();
 
 	auto &header = bind_data.header_info;
-	auto &column_ids = state.column_ids;
+	auto &column_ids = gstate.column_ids;
 	idx_t row_count = 0;
 	string line;
 
-	while (row_count < STANDARD_VECTOR_SIZE && ReadLineFromHandle(*state.handle, line)) {
+	while (row_count < STANDARD_VECTOR_SIZE) {
+		// Claim a new chunk if current one is exhausted
+		if (lstate.chunk_exhausted) {
+			if (!lstate.ClaimChunk(gstate)) {
+				break; // no more work
+			}
+		}
+
+		if (!lstate.ReadChunkLine(line, gstate.file_size)) {
+			continue; // chunk exhausted, will claim next on loop
+		}
+
 		if (line.empty()) {
 			continue;
 		}
@@ -350,10 +310,6 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		}
 
 		row_count++;
-	}
-
-	if (row_count == 0) {
-		state.finished = true;
 	}
 
 	output.SetCardinality(row_count);

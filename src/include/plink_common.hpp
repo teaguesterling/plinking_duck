@@ -310,4 +310,135 @@ void NormalizeGenotypes(const int8_t *genotypes, uint32_t sample_ct, const Varia
 void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent, const uintptr_t *phaseinfo,
                            uint32_t sample_ct, int8_t *output_pairs);
 
+// ---------------------------------------------------------------------------
+// Parallel text file scanning (shared by pvar/psam/bim/fam readers)
+// ---------------------------------------------------------------------------
+
+//! Chunk size for parallel text file reading (~4MB per chunk).
+//! Chosen to balance parallelism granularity against per-chunk overhead.
+static constexpr uint64_t TEXT_FILE_CHUNK_SIZE = 4 * 1024 * 1024;
+
+//! Global state for parallel text file scanning.
+//! Manages byte-range chunk distribution across threads via atomic claiming.
+struct TextFileGlobalState : public GlobalTableFunctionState {
+	string file_path;
+	uint64_t file_size = 0;
+	uint64_t data_start_offset = 0;
+	std::atomic<uint64_t> next_chunk_offset {0};
+	vector<column_t> column_ids;
+
+	idx_t MaxThreads() const override {
+		uint64_t data_size = file_size > data_start_offset ? file_size - data_start_offset : 0;
+		if (data_size < TEXT_FILE_CHUNK_SIZE) {
+			return 1;
+		}
+		return std::min<idx_t>(data_size / TEXT_FILE_CHUNK_SIZE + 1, 16);
+	}
+};
+
+//! Per-thread state for parallel text file scanning.
+//! Each thread owns a file handle, reads chunks of the file, and extracts
+//! complete lines using the byte-range boundary protocol:
+//!   - If not the first chunk, skip to the next newline (previous thread owns partial line)
+//!   - Read past chunk end to finish the current line
+struct TextFileLocalState : public LocalTableFunctionState {
+	unique_ptr<FileHandle> handle;
+
+	//! Read buffer
+	static constexpr size_t READ_BUF_SIZE = 64 * 1024;
+	char read_buf[READ_BUF_SIZE];
+	size_t buf_pos = 0;   //!< Current position within read_buf
+	size_t buf_len = 0;   //!< Valid bytes in read_buf
+
+	//! Current chunk boundaries (byte offsets in file)
+	uint64_t chunk_start = 0;
+	uint64_t chunk_end = 0;
+	uint64_t file_pos = 0;   //!< Current byte offset in file (next byte to consume from buffer)
+	bool chunk_exhausted = true;
+
+	//! Initialize file handle for this thread
+	void Init(ClientContext &context, const string &file_path) {
+		auto &fs = FileSystem::GetFileSystem(context);
+		handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_READ);
+	}
+
+	//! Claim the next chunk from the global state. Returns false if no more work.
+	bool ClaimChunk(TextFileGlobalState &gstate) {
+		uint64_t start = gstate.next_chunk_offset.fetch_add(TEXT_FILE_CHUNK_SIZE);
+		if (start >= gstate.file_size) {
+			return false;
+		}
+		chunk_start = std::max(start, gstate.data_start_offset);
+		chunk_end = std::min(start + TEXT_FILE_CHUNK_SIZE, gstate.file_size);
+
+		// Seek to chunk start and reset buffer
+		handle->Seek(chunk_start);
+		file_pos = chunk_start;
+		buf_pos = 0;
+		buf_len = 0;
+		chunk_exhausted = false;
+
+		// If not the first data chunk, skip to the next newline
+		// (the previous thread will finish the partial line at this boundary)
+		if (chunk_start > gstate.data_start_offset) {
+			string discard;
+			ReadLine(discard, gstate.file_size);
+		}
+		return true;
+	}
+
+	//! Read one line from the buffered file handle, returning false at EOF.
+	//! Handles \r\n and \n line endings (strips \r).
+	//! file_size_limit prevents reading past end of file.
+	bool ReadLine(string &line, uint64_t file_size_limit) {
+		line.clear();
+		while (true) {
+			// Refill buffer if needed
+			if (buf_pos >= buf_len) {
+				if (file_pos >= file_size_limit) {
+					return !line.empty();
+				}
+				size_t to_read = std::min<size_t>(READ_BUF_SIZE, file_size_limit - file_pos);
+				buf_len = handle->Read(read_buf, to_read);
+				buf_pos = 0;
+				if (buf_len == 0) {
+					return !line.empty();
+				}
+			}
+
+			char c = read_buf[buf_pos++];
+			file_pos++;
+			if (c == '\n') {
+				// Strip trailing \r
+				if (!line.empty() && line.back() == '\r') {
+					line.pop_back();
+				}
+				return true;
+			}
+			line += c;
+		}
+	}
+
+	//! Read lines for this thread's current chunk, respecting boundaries.
+	//! Returns false when the chunk (and any overflow line) is exhausted.
+	//! When file_pos >= chunk_end, finishes the current line then stops.
+	bool ReadChunkLine(string &line, uint64_t file_size) {
+		if (chunk_exhausted) {
+			return false;
+		}
+		// If we're past our chunk end, we're done (the previous call
+		// already finished the line that straddled the boundary)
+		if (file_pos >= chunk_end) {
+			chunk_exhausted = true;
+			return false;
+		}
+		// Read the line — allow reading past chunk_end to finish it
+		bool got_line = ReadLine(line, file_size);
+		if (!got_line) {
+			chunk_exhausted = true;
+		}
+		return got_line;
+	}
+};
+
 } // namespace duckdb
