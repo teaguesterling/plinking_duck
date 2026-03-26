@@ -68,9 +68,10 @@ struct PgenGlobalState : public GlobalTableFunctionState {
 	bool need_genotypes = false;
 	bool need_pgen_reader = false;
 	vector<column_t> column_ids;
+	uint32_t max_threads_config = 0;
 
 	idx_t MaxThreads() const override {
-		return std::min<idx_t>(total_variants / 1000 + 1, 16);
+		return ApplyMaxThreadsCap(total_variants / 1000 + 1, max_threads_config);
 	}
 };
 
@@ -348,6 +349,7 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 
 	state->total_variants = bind_data.raw_variant_ct;
 	state->column_ids = input.column_ids;
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 
 	// Check if genotypes column(s) are in the projection
 	state->need_genotypes = false;

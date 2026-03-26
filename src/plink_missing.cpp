@@ -91,13 +91,15 @@ struct PlinkMissingGlobalState : public GlobalTableFunctionState {
 
 	// DuckDB-configured thread count
 	uint32_t db_thread_count = 1;
+	uint32_t max_threads_config = 0;
 
 	// In sample mode, MaxThreads > 1 enables parallel Phase 1 (variant scanning
 	// into per-thread accumulators). The formula matches variant mode's batch
 	// granularity but drives Phase 1 parallelism rather than row emission.
 	idx_t MaxThreads() const override {
 		uint32_t range = end_variant_idx - start_variant_idx;
-		return std::min<idx_t>(range / 500 + 1, db_thread_count);
+		idx_t computed = std::min<idx_t>(range / 500 + 1, db_thread_count);
+		return ApplyMaxThreadsCap(computed, max_threads_config);
 	}
 };
 
@@ -327,6 +329,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 
 	// DuckDB-configured thread count
 	state->db_thread_count = static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 
 	// Sample mode: pre-allocate accumulation array
 	if (bind_data.sample_mode) {

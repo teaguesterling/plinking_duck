@@ -33,6 +33,13 @@ static void SetPlinkingMaxMatrixElements(ClientContext &, SetScope, Value &param
 	}
 }
 
+static void SetPlinkingMaxThreads(ClientContext &, SetScope, Value &parameter) {
+	auto val = parameter.GetValue<int64_t>();
+	if (val < 0) {
+		throw InvalidInputException("plinking_max_threads must be non-negative (0 = default, >0 = cap)");
+	}
+}
+
 void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	// Register config options
 	auto &db = loader.GetDatabaseInstance();
@@ -43,6 +50,11 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	                          "(variants x samples). Default 16 billion (~16 GB of int8).",
 	                          LogicalType::BIGINT, Value::BIGINT(16LL * 1024 * 1024 * 1024),
 	                          SetPlinkingMaxMatrixElements);
+
+	config.AddExtensionOption("plinking_max_threads",
+	                          "Maximum threads for parallel scan operations. "
+	                          "0 = default (hardcoded cap of 16), >0 = cap at this value.",
+	                          LogicalType::BIGINT, Value::BIGINT(0), SetPlinkingMaxThreads);
 
 	// Register table functions
 	RegisterPvarReader(loader);

@@ -61,6 +61,7 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - `all_missing.*`: 2 variants × 2 samples, all genotypes missing
 - `large_example.*`: 3000 variants × 8 samples, 3 chroms × 1000 each (multi-batch/parallel tests)
 - `streaming_example.*`: 50000 variants × 8 samples, 3 chroms (20K/15K/15K), biallelic A/G (streaming/threading tests)
+- `wes_chr10.*`: 30000 variants × 10000 samples, chr10 WES-scale dataset (~11MB .pgen, parallel correctness tests)
 - `example.*`: pvar/psam/bim/fam test data for P1-001/P1-002 — do not overwrite
 - `generate_test_data.sh`: regenerates pgen fixtures (needs plink2)
 - `plink2`: Binary is in `/mnt/aux-data/teague/Dev/spack/opt/spack/linux-zen3/plink2-2.0.0-a.6.9-e2l3wx22vy6tkmdwzhaexlml4rs3okx3`
@@ -107,6 +108,7 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 ## Extension Config Options
 
 - `plinking_max_matrix_elements` (BIGINT, default 16G): max genotype matrix elements for `orient := 'sample'` pre-read. Controls memory guard for variants × samples product. Set via `SET plinking_max_matrix_elements = <value>`.
+- `plinking_max_threads` (BIGINT, default 0): max threads for parallel scan operations. 0 = default (hardcoded cap of 16), >0 = cap at this value. Set via `SET plinking_max_threads = <value>`. Applied in all parallel table functions (`read_pfile`, `read_pgen`, `plink_freq`, `plink_hardy`, `plink_glm`, `plink_missing`, `plink_ld`, `plink_score`, `plink_pca`).
 - Config options registered via `DBConfig::GetConfig(db).AddExtensionOption()` in `Load()`, read at bind time via `context.TryGetCurrentSetting()`
 
 <!-- blq:agent-instructions -->

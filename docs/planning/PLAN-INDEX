@@ -132,6 +132,39 @@ Per-variant GWAS regression using plink2's actual regression engine
 Supports linear, logistic, and Firth correction with covariates.
 Accepts pfile-style prefix. See `P2-006-plink-glm` for full design.
 
+### P6 — PCA ✓
+
+| Plan | Title | Depends On | Branch | Status |
+|------|-------|-----------|--------|--------|
+| P6-001 | plink_pca (principal components) | P2-001 | `feature/P6-001-plink-pca` | ✓ Merged (PR #31) |
+
+Randomized SVD with multi-threaded generation-based barrier. Requires Eigen3
+(conditionally compiled). See `P6-001-plink-pca` for full design.
+
+### P7 — v0.4.0 Features (Planned)
+
+| Plan | Title | Depends On | Status |
+|------|-------|-----------|--------|
+| P7-001 | plinking_max_threads config | None | Planned |
+| P7-002 | GLM p-value threshold | None | Planned |
+| P7-003 | genotypes='counts'/'summary' | None | Planned |
+| P7-004 | Unified variants parameter | None (implement last) | Planned |
+
+**P7-001**: Configurable thread cap via `SET plinking_max_threads = N`.
+Default 0 (no override). Applied in all MaxThreads() overrides.
+
+**P7-002**: `p_threshold := 5e-8` parameter on `plink_glm()`. Scan-time
+filtering by p-value significance to reduce output for genome-wide scans.
+
+**P7-003**: `genotypes := 'counts'` returns `STRUCT(hom_ref, het, hom_alt,
+missing)` using PgrGetCounts (no decompression). `genotypes := 'summary'`
+adds derived fields (af, carrier_count, n). Key use case: fast carrier
+identification for gene regions.
+
+**P7-004**: Unified `variants` parameter accepting indices, rsids, CPRA
+strings, CPRA structs, ranges, lists of any of those, and parquet file
+paths. Subsumes current `variants` LIST behavior and complements `region`.
+
 ### Future — Planned Features
 
 | Feature | Description | Design Doc | Status |
@@ -147,7 +180,6 @@ external libraries, O(N²) computation, or complex input models.
 
 | Candidate | Reason Deferred | Estimated Complexity |
 |-----------|----------------|---------------------|
-| plink_pca (PCA) | Needs LAPACK eigendecomposition | High |
 | plink_king_table (kinship) | O(N²) pairwise computation | High |
 | plink_het (heterozygosity) | Expressible via plink_freq + SQL | Low |
 | plink_fst (FST) | Specialized population genetics use | Medium |

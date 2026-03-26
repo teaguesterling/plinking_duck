@@ -310,4 +310,17 @@ void NormalizeGenotypes(const int8_t *genotypes, uint32_t sample_ct, const Varia
 void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasepresent, const uintptr_t *phaseinfo,
                            uint32_t sample_ct, int8_t *output_pairs);
 
+// ---------------------------------------------------------------------------
+// Max threads config helper
+// ---------------------------------------------------------------------------
+
+//! Read the plinking_max_threads config option from the client context.
+//! Returns 0 if unset/default (meaning "no override").
+uint32_t GetPlinkingMaxThreads(ClientContext &context);
+
+//! Apply the max threads cap to a computed thread count.
+//! If config_max_threads > 0, returns min(computed, config_max_threads).
+//! Otherwise returns min(computed, 16) (existing default behavior).
+idx_t ApplyMaxThreadsCap(idx_t computed, uint32_t config_max_threads);
+
 } // namespace duckdb

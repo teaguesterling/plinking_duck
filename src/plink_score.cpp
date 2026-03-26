@@ -93,6 +93,7 @@ struct PlinkScoreGlobalState : public GlobalTableFunctionState {
 
 	// DuckDB-configured thread count
 	uint32_t db_thread_count = 1;
+	uint32_t max_threads_config = 0;
 
 	// MaxThreads > 1 enables parallel Phase 1 (scoring into per-thread
 	// accumulators). Single-threaded for small workloads (< 100 scored variants).
@@ -100,7 +101,8 @@ struct PlinkScoreGlobalState : public GlobalTableFunctionState {
 		if (scored_variant_count < 100) {
 			return 1;
 		}
-		return std::min<idx_t>(scored_variant_count / 16 + 1, db_thread_count);
+		idx_t computed = std::min<idx_t>(scored_variant_count / 16 + 1, db_thread_count);
+		return ApplyMaxThreadsCap(computed, max_threads_config);
 	}
 };
 
@@ -428,6 +430,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkScoreInitGlobal(ClientContext &
 	state->total_samples = bind_data.effective_sample_ct;
 	state->column_ids = input.column_ids;
 	state->db_thread_count = static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 	state->scored_variant_count = static_cast<uint32_t>(bind_data.scored_variants.size());
 
 	// Initialize accumulators

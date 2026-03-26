@@ -273,6 +273,9 @@ struct PlinkGlmBindData : public TableFunctionData {
 	bool is_logistic = false;
 	bool use_firth = true;
 	uint32_t predictor_ct = 0; // intercept + genotype + covariates
+
+	// P-value threshold filter (NaN = no filter)
+	double p_threshold = std::numeric_limits<double>::quiet_NaN();
 };
 
 // ---------------------------------------------------------------------------
@@ -285,10 +288,11 @@ struct PlinkGlmGlobalState : public GlobalTableFunctionState {
 	uint32_t end_variant_idx = 0;
 	vector<column_t> column_ids;
 	bool need_regression = false;
+	uint32_t max_threads_config = 0;
 
 	idx_t MaxThreads() const override {
 		uint32_t range = end_variant_idx - start_variant_idx;
-		return std::min<idx_t>(range / 500 + 1, 16);
+		return ApplyMaxThreadsCap(range / 500 + 1, max_threads_config);
 	}
 };
 
@@ -432,6 +436,12 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 			model_str = kv.second.GetValue<string>();
 		} else if (kv.first == "firth") {
 			bind_data->use_firth = kv.second.GetValue<bool>();
+		} else if (kv.first == "p_threshold") {
+			double pt = kv.second.GetValue<double>();
+			if (pt <= 0.0 || pt > 1.0) {
+				throw InvalidInputException("plink_glm: p_threshold must be in (0, 1], got %g", pt);
+			}
+			bind_data->p_threshold = pt;
 		}
 	}
 
@@ -831,9 +841,10 @@ static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &co
 
 	state->next_variant_idx.store(state->start_variant_idx);
 	state->column_ids = input.column_ids;
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 
-	// Check if any regression columns are projected
-	state->need_regression = false;
+	// Check if any regression columns are projected, or if p_threshold requires it
+	state->need_regression = !std::isnan(bind_data.p_threshold);
 	for (auto col_id : input.column_ids) {
 		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
 			continue;
@@ -1318,6 +1329,14 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 			}
 
+			// Apply p-value threshold filter: skip variants with errors, NaN p-values,
+			// or p-values exceeding the threshold
+			if (!std::isnan(bind_data.p_threshold)) {
+				if (lr.errcode != nullptr || std::isnan(lr.p_value) || lr.p_value > bind_data.p_threshold) {
+					continue; // skip this variant, don't emit row
+				}
+			}
+
 			// Fill projected columns
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 				auto file_col = column_ids[out_col];
@@ -1473,6 +1492,7 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 	plink_glm.named_parameters["region"] = LogicalType::VARCHAR;
 	plink_glm.named_parameters["model"] = LogicalType::VARCHAR;
 	plink_glm.named_parameters["firth"] = LogicalType::BOOLEAN;
+	plink_glm.named_parameters["p_threshold"] = LogicalType::DOUBLE;
 
 	loader.RegisterFunction(plink_glm);
 }

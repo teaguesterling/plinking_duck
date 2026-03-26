@@ -1,0 +1,168 @@
+# name: test/sql/plinking_max_threads.test
+# description: Tests for plinking_max_threads config option
+# group: [sql]
+
+require plinking_duck
+
+# ===================================================================
+# Single-threaded mode (max_threads = 1)
+# ===================================================================
+
+statement ok
+SET plinking_max_threads = 1;
+
+# read_pfile variant mode: correct row count
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/large_example');
+----
+3000
+
+# read_pfile genotype mode: correct row count (3000 variants x 8 samples)
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/large_example', orient := 'genotype');
+----
+24000
+
+# read_pgen: correct row count
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/large_example.pgen');
+----
+3000
+
+# plink_freq: correct row count and valid frequencies
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/large_example.pgen')
+WHERE ALT_FREQ >= 0.0 AND ALT_FREQ <= 1.0;
+----
+3000
+
+# plink_hardy: correct row count
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/large_example.pgen');
+----
+3000
+
+# plink_missing variant mode: correct row count
+query I
+SELECT COUNT(*) FROM plink_missing('test/data/large_example.pgen');
+----
+3000
+
+# plink_missing sample mode: correct row count
+query I
+SELECT COUNT(*) FROM plink_missing('test/data/large_example.pgen', mode := 'sample');
+----
+8
+
+# No duplicate variant IDs (threading correctness)
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pfile('test/data/large_example');
+----
+3000
+
+# ===================================================================
+# Two-thread mode (max_threads = 2)
+# ===================================================================
+
+statement ok
+SET plinking_max_threads = 2;
+
+# read_pfile: correct row count
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/large_example');
+----
+3000
+
+# No duplicate IDs
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pfile('test/data/large_example');
+----
+3000
+
+# plink_freq: correct row count
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/large_example.pgen');
+----
+3000
+
+# plink_hardy: correct row count
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/large_example.pgen');
+----
+3000
+
+# plink_missing: correct row count
+query I
+SELECT COUNT(*) FROM plink_missing('test/data/large_example.pgen');
+----
+3000
+
+# ===================================================================
+# Default behavior (max_threads = 0)
+# ===================================================================
+
+statement ok
+SET plinking_max_threads = 0;
+
+# Should behave same as uncapped (hardcoded max 16)
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/large_example');
+----
+3000
+
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pfile('test/data/large_example');
+----
+3000
+
+# ===================================================================
+# RESET restores default
+# ===================================================================
+
+statement ok
+RESET plinking_max_threads;
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/large_example');
+----
+3000
+
+query I
+SELECT COUNT(DISTINCT ID) FROM read_pfile('test/data/large_example');
+----
+3000
+
+# ===================================================================
+# Validation: negative value should error
+# ===================================================================
+
+statement error
+SET plinking_max_threads = -1;
+----
+plinking_max_threads must be non-negative
+
+# ===================================================================
+# Cross-function consistency under thread cap
+# ===================================================================
+
+statement ok
+SET plinking_max_threads = 1;
+
+# Variant-mode and sample-mode missingness totals must agree
+query I
+SELECT (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/large_example.pgen'))
+     = (SELECT SUM(MISSING_CT) FROM plink_missing('test/data/large_example.pgen',
+                                                    mode := 'sample'));
+----
+true
+
+# plink_freq and plink_hardy report same variant count
+query I
+SELECT (SELECT COUNT(*) FROM plink_freq('test/data/large_example.pgen'))
+     = (SELECT COUNT(*) FROM plink_hardy('test/data/large_example.pgen'));
+----
+true
+
+# Restore default for subsequent tests
+statement ok
+RESET plinking_max_threads;

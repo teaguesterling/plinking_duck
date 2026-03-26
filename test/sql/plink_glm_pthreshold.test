@@ -1,0 +1,155 @@
+# name: test/sql/plink_glm_pthreshold.test
+# description: Test plink_glm p_threshold parameter
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# p_threshold := 1.0 returns all rows (same as no filter)
+# ===========================================================================
+
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    p_threshold := 1.0);
+----
+4
+
+# Verify same count as without threshold
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8]);
+----
+4
+
+# ===========================================================================
+# Threshold filters to a subset
+# ===========================================================================
+
+# From the main test, we know:
+# rs1 P ≈ 0.0994, rs2 P ≈ 0.0488, rs3 P ≈ 0.8514, rs4 P ≈ 0.7413
+# So p_threshold := 0.1 should return rs1 and rs2
+
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    p_threshold := 0.1);
+----
+2
+
+query T
+SELECT ID
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    p_threshold := 0.1)
+ORDER BY ID;
+----
+rs1
+rs2
+
+# Very strict threshold: only rs2 (P ≈ 0.0488)
+query T
+SELECT ID
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    p_threshold := 0.05)
+ORDER BY ID;
+----
+rs2
+
+# ===========================================================================
+# Threshold with larger dataset — count with threshold <= count without
+# ===========================================================================
+
+# p_threshold := 1.0 returns all non-error variants (>= stricter threshold count)
+# Stricter threshold returns fewer or equal rows compared to threshold 1.0
+query I
+SELECT (
+    SELECT COUNT(*) FROM plink_glm('test/data/large_example',
+        phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
+        p_threshold := 0.5)
+) <= (
+    SELECT COUNT(*) FROM plink_glm('test/data/large_example',
+        phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
+        p_threshold := 1.0)
+);
+----
+1
+
+# Threshold count is always <= total count (including error rows)
+query I
+SELECT (
+    SELECT COUNT(*) FROM plink_glm('test/data/large_example',
+        phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
+        p_threshold := 1.0)
+) <= (
+    SELECT COUNT(*) FROM plink_glm('test/data/large_example',
+        phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7])
+);
+----
+1
+
+# Moderate threshold returns some rows (not all filtered out)
+query I
+SELECT COUNT(*) > 0
+FROM plink_glm('test/data/large_example',
+    phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7],
+    p_threshold := 0.5);
+----
+1
+
+# ===========================================================================
+# Threshold with error variants — errors are excluded
+# ===========================================================================
+
+# With NULLs causing TOO_FEW_SAMPLES errors, those variants should be filtered out
+query I
+SELECT COUNT(*)
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, NULL, 3.7, 0.8],
+    p_threshold := 1.0);
+----
+3
+
+# rs1 gets TOO_FEW_SAMPLES with this phenotype, so threshold filters it out
+query T
+SELECT ID
+FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, NULL, 3.7, 0.8],
+    p_threshold := 1.0)
+ORDER BY ID;
+----
+rs2
+rs3
+rs4
+
+# ===========================================================================
+# Negative tests — validation errors
+# ===========================================================================
+
+# p_threshold := 0.0 is invalid (must be > 0)
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    p_threshold := 0.0);
+----
+p_threshold must be in (0, 1]
+
+# p_threshold > 1 is invalid
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    p_threshold := 1.5);
+----
+p_threshold must be in (0, 1]
+
+# Negative p_threshold is invalid
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example',
+    phenotype := [1.5, 2.3, 3.7, 0.8],
+    p_threshold := -0.1);
+----
+p_threshold must be in (0, 1]

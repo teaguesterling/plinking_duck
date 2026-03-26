@@ -1,0 +1,97 @@
+# P7-001: plinking_max_threads config option
+
+Configurable thread cap for all parallel scan operations.
+
+## Status
+
+- [ ] Register config option in Load()
+- [ ] Add helper function in plink_common
+- [ ] Apply cap in all MaxThreads() overrides
+- [ ] Tests
+
+## Prerequisites
+
+None — fully independent.
+
+## Branch
+
+`feature/P7-001-max-threads-config`
+
+---
+
+## Background
+
+All parallel table functions currently hardcode a max thread cap of 16. Users
+running on machines with fewer cores waste no resources, but users wanting to
+limit parallelism (e.g., shared servers, debugging) have no control.
+
+## Design
+
+### Config Option
+
+Register `plinking_max_threads` as a BIGINT config option with default 0
+(meaning "no override — use the existing hardcoded cap of 16").
+
+```sql
+SET plinking_max_threads = 4;   -- cap at 4 threads
+SET plinking_max_threads = 1;   -- single-threaded
+SET plinking_max_threads = 0;   -- default (use hardcoded cap)
+RESET plinking_max_threads;     -- restore default
+```
+
+### Implementation
+
+1. **`plinking_duck_extension.cpp`**: Register via `config.AddExtensionOption()`
+   in `Load()`, same pattern as `plinking_max_matrix_elements`.
+
+2. **`plink_common.hpp/cpp`**: Add helper:
+   ```cpp
+   uint32_t GetPlinkingMaxThreads(ClientContext &context);
+   ```
+   Returns 0 if unset/default, otherwise the configured value.
+
+3. **`plink_common.hpp/cpp`**: Add centralized cap function:
+   ```cpp
+   idx_t ApplyMaxThreadsCap(idx_t computed, uint32_t config_max_threads);
+   ```
+   Logic: if `config_max_threads > 0`, return `min(computed, config_max_threads)`.
+   Otherwise return `min(computed, 16)` (existing behavior).
+
+4. **All GlobalState::MaxThreads() overrides**: Read config in InitGlobal,
+   store in global state, call `ApplyMaxThreadsCap` in `MaxThreads()`.
+
+### Affected Files
+
+- `src/plinking_duck_extension.cpp` — config registration
+- `src/plink_common.hpp` / `src/plink_common.cpp` — helper functions
+- `src/pfile_reader.cpp` — MaxThreads in PfileGlobalState
+- `src/pgen_reader.cpp` — MaxThreads in PgenGlobalState
+- `src/plink_freq.cpp` — MaxThreads
+- `src/plink_hardy.cpp` — MaxThreads
+- `src/plink_glm.cpp` — MaxThreads
+- `src/plink_missing.cpp` — MaxThreads
+- `src/plink_ld.cpp` — MaxThreads
+- `src/plink_score.cpp` — MaxThreads
+- `src/plink_pca.cpp` — MaxThreads
+
+### Validation
+
+- Value < 0: error
+- Value = 0: no override (default)
+- Value > 0: applied as cap
+
+## Test Cases
+
+`test/sql/plinking_max_threads.test`:
+- `SET plinking_max_threads = 1;` then query `large_example` — verify correct results (single-threaded)
+- `SET plinking_max_threads = 2;` then query `large_example` — verify correct results (2 threads)
+- `SET plinking_max_threads = 0;` — verify default behavior unchanged
+- `RESET plinking_max_threads;` — verify default restored
+- Negative value should error
+
+## Acceptance Criteria
+
+- [ ] Config option registered and documented in CLAUDE.md
+- [ ] All parallel functions respect the cap
+- [ ] Default behavior (0) unchanged from current hardcoded 16
+- [ ] Tests pass

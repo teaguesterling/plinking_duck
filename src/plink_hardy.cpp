@@ -163,10 +163,11 @@ struct PlinkHardyGlobalState : public GlobalTableFunctionState {
 	uint32_t end_variant_idx = 0;
 	vector<column_t> column_ids;
 	bool need_genotype_counts = false;
+	uint32_t max_threads_config = 0;
 
 	idx_t MaxThreads() const override {
 		uint32_t range = end_variant_idx - start_variant_idx;
-		return std::min<idx_t>(range / 500 + 1, 16);
+		return ApplyMaxThreadsCap(range / 500 + 1, max_threads_config);
 	}
 };
 
@@ -344,6 +345,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkHardyInitGlobal(ClientContext &
 
 	state->next_variant_idx.store(state->start_variant_idx);
 	state->column_ids = input.column_ids;
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 
 	// Check if any genotype-dependent columns are projected
 	state->need_genotype_counts = false;

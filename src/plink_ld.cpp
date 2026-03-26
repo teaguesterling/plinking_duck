@@ -170,13 +170,14 @@ struct PlinkLdGlobalState : public GlobalTableFunctionState {
 
 	// Windowed mode
 	std::atomic<uint32_t> next_anchor_idx {0};
+	uint32_t max_threads_config = 0;
 
 	idx_t MaxThreads() const override {
 		if (mode == LdMode::PAIRWISE) {
 			return 1;
 		}
 		uint32_t range = end_variant_idx - start_variant_idx;
-		return std::min<idx_t>(range / 50 + 1, 16);
+		return ApplyMaxThreadsCap(range / 50 + 1, max_threads_config);
 	}
 };
 
@@ -402,6 +403,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkLdInitGlobal(ClientContext &con
 	auto state = make_uniq<PlinkLdGlobalState>();
 
 	state->mode = bind_data.mode;
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 
 	if (bind_data.variant_range.has_filter) {
 		state->start_variant_idx = bind_data.variant_range.start_idx;

@@ -152,12 +152,14 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 
 	// Threading
 	uint32_t db_thread_count = 1;
+	uint32_t max_threads_config = 0;
 
 	idx_t MaxThreads() const override {
 		if (M < PCA_VARIANT_BLOCK_SIZE) {
 			return 1;
 		}
-		return std::min<idx_t>(M / PCA_VARIANT_BLOCK_SIZE + 1, db_thread_count);
+		idx_t computed = std::min<idx_t>(M / PCA_VARIANT_BLOCK_SIZE + 1, db_thread_count);
+		return ApplyMaxThreadsCap(computed, max_threads_config);
 	}
 };
 
@@ -489,6 +491,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkPcaInitGlobal(ClientContext &co
 
 	state->column_ids = input.column_ids;
 	state->db_thread_count = static_cast<uint32_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 	state->thread_count = static_cast<uint32_t>(state->MaxThreads());
 
 	// Initialize G1 with Gaussian random noise (fixed seed)

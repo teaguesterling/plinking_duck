@@ -728,4 +728,26 @@ void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasep
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Max threads config helper
+// ---------------------------------------------------------------------------
+
+uint32_t GetPlinkingMaxThreads(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("plinking_max_threads", val)) {
+		auto v = val.GetValue<int64_t>();
+		if (v > 0) {
+			return static_cast<uint32_t>(v);
+		}
+	}
+	return 0;
+}
+
+idx_t ApplyMaxThreadsCap(idx_t computed, uint32_t config_max_threads) {
+	if (config_max_threads > 0) {
+		return MinValue<idx_t>(computed, static_cast<idx_t>(config_max_threads));
+	}
+	return MinValue<idx_t>(computed, 16);
+}
+
 } // namespace duckdb

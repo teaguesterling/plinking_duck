@@ -1,0 +1,250 @@
+# P7-004: Unified variants parameter
+
+Flexible variant selection supporting indices, rsids, CPRA strings, structs,
+ranges, and external sources (parquet/subquery).
+
+## Status
+
+- [ ] Phase 1: Type dispatch and identifier resolution
+- [ ] Phase 2: Range support (index and identifier)
+- [ ] Phase 3: External sources (parquet file path, subquery)
+- [ ] Tests
+
+## Prerequisites
+
+None — but should be implemented after P7-001, P7-002, P7-003 to minimize
+merge conflicts.
+
+## Branch
+
+`feature/P7-004-unified-variants-parameter`
+
+---
+
+## Background
+
+### Current State
+
+`read_pfile` accepts:
+- `variants := [1, 2, 3]` — LIST(INTEGER), 0-based indices
+- `variants := ['rs1', 'rs2']` — LIST(VARCHAR), rsids
+- `region := 'chr1:100-200'` — VARCHAR, genomic region
+
+`read_pgen` has no `variants` or `region` parameter.
+
+### Goal
+
+Unify into a single `variants` parameter accepting many formats, making the
+common genomics workflows natural in SQL:
+
+```sql
+-- Single variant by index
+read_pfile('cohort', variants := 123)
+
+-- Single variant by rsid
+read_pfile('cohort', variants := 'rs123')
+
+-- Single variant by CPRA
+read_pfile('cohort', variants := 'X:123:A:T')
+
+-- CPRA struct (type-safe)
+read_pfile('cohort', variants := {chrom: 'X', pos: 123, ref: 'A', alt: 'T'})
+
+-- List of indices
+read_pfile('cohort', variants := [123, 456])
+
+-- List of rsids
+read_pfile('cohort', variants := ['rs123', 'rs456'])
+
+-- List of CPRA strings
+read_pfile('cohort', variants := ['X:123:A:T', '5:456:G:C'])
+
+-- List of CPRA structs
+read_pfile('cohort', variants := [{chrom: 'X', pos: 123}, ...])
+
+-- Index range
+read_pfile('cohort', variants := {start: 0, stop: 100})
+
+-- Identifier range (any identifier type for start/stop)
+read_pfile('cohort', variants := {start: 'rs123', stop: '5:456:G:C'})
+
+-- From parquet file (Phase 3)
+read_pfile('cohort', variants := 'gene_variants.parquet')
+
+-- From subquery via list (Phase 3)
+read_pfile('cohort', variants := (SELECT id FROM my_gene_list))
+```
+
+## Design
+
+### Phase 1: Type Dispatch and Identifier Resolution
+
+#### Core Types
+
+```cpp
+struct VariantIdentifier {
+    enum class Type { INDEX, RSID, CPRA };
+    Type type;
+    uint32_t index;         // for INDEX
+    string id;              // for RSID
+    string chrom;           // for CPRA
+    int64_t pos;            // for CPRA (1-based)
+    string ref;             // for CPRA (optional)
+    string alt;             // for CPRA (optional)
+};
+
+struct VariantSelection {
+    enum class Mode { NONE, INDICES, IDENTIFIERS, INDEX_RANGE, IDENTIFIER_RANGE };
+    Mode mode = Mode::NONE;
+    vector<uint32_t> indices;
+    vector<VariantIdentifier> identifiers;
+    uint32_t range_start = 0, range_end = 0;
+    VariantIdentifier range_start_id, range_end_id;
+};
+```
+
+#### Type Dispatch (bind time)
+
+| Value Type | Detection | Interpretation |
+|-----------|-----------|---------------|
+| INTEGER/BIGINT | `type().id() == INTEGER` | Single variant index |
+| VARCHAR | `type().id() == VARCHAR` | Parse: rsid if starts with 'rs', CPRA if contains ':', else try rsid |
+| STRUCT with chrom+pos | Child names contain "chrom" | Single CPRA struct |
+| STRUCT with start+stop | Child names contain "start" | Range |
+| LIST(INTEGER) | List child is INTEGER | List of indices |
+| LIST(VARCHAR) | List child is VARCHAR | List of identifiers |
+| LIST(STRUCT) | List child is STRUCT | List of CPRA structs |
+
+#### CPRA String Parsing
+
+Format: `CHROM:POS:REF:ALT` or `CHROM:POS` (position-only).
+
+```cpp
+VariantIdentifier ParseCPRAString(const string &s);
+// "X:123:A:T" → {CPRA, chrom="X", pos=123, ref="A", alt="T"}
+// "X:123"     → {CPRA, chrom="X", pos=123, ref="", alt=""}
+// "rs123"     → {RSID, id="rs123"}
+```
+
+Position-only CPRA matches all variants at that position.
+
+#### Identifier Resolution
+
+```cpp
+uint32_t ResolveVariantIdentifier(
+    const VariantIdentifier &id,
+    const VariantMetadataIndex &variants);
+```
+
+- INDEX: validate in range, return directly
+- RSID: lookup in `unordered_map<string, uint32_t>` built from variant IDs
+- CPRA: build position index `map<(chrom, pos), vector<uint32_t>>`, then
+  filter by ref/alt if specified
+
+Resolution errors (not found) throw with helpful message including the
+identifier that failed.
+
+### Phase 2: Range Support
+
+#### Index Range
+
+`{start: 0, stop: 100}` → variant indices [0, 100] inclusive.
+
+Validation: start <= stop, both in [0, raw_variant_ct).
+
+#### Identifier Range
+
+`{start: 'rs123', stop: '5:456:G:C'}` →
+1. Resolve start identifier to index S
+2. Resolve stop identifier to index E
+3. Return indices [S, E] inclusive (file order)
+
+Range uses file order (variant index order), not genomic coordinate order.
+This matches plink2's behavior and avoids needing a sorted position index.
+
+#### STRUCT Disambiguation
+
+Distinguish range from CPRA struct by field names:
+- `start`/`stop` present → range
+- `chrom`/`pos` present → CPRA struct
+- Both or neither → error with clear message
+
+### Phase 3: External Sources
+
+#### Parquet File
+
+```sql
+variants := 'my_variants.parquet'
+```
+
+Detection: VARCHAR ending in `.parquet`. At bind time:
+1. Open parquet file via DuckDB's built-in parquet reader
+2. Read first column (expected: variant identifiers — rsids or CPRA strings)
+3. Convert to VariantIdentifier list
+4. Resolve normally
+
+#### Subquery
+
+```sql
+variants := (SELECT id FROM my_gene_list)
+```
+
+DuckDB evaluates subqueries to a LIST before passing to table function
+parameters. So this naturally becomes `LIST(VARCHAR)` and works via Phase 1
+dispatch with no special handling.
+
+### Backward Compatibility
+
+- `variants := [1, 2, 3]` (LIST(INTEGER)) continues to work identically
+- `variants := ['rs1', 'rs2']` (LIST(VARCHAR)) continues to work identically
+- `region` parameter kept as-is (not deprecated in v0.4.0)
+- When both `region` and `variants` specified, they are intersected
+
+### Propagation
+
+Phase 1 adds `variants` to `read_pfile` and `read_pgen`. Utility functions
+(`plink_freq`, `plink_hardy`, etc.) continue to use `region` for now;
+propagation to utility functions can be a follow-up.
+
+## Affected Files
+
+- `src/include/plink_common.hpp` — VariantIdentifier, VariantSelection types,
+  ParseVariantsParameter, ResolveVariantSelection declarations
+- `src/plink_common.cpp` — implementations
+- `src/pfile_reader.cpp` — replace variants parameter handling in bind
+- `src/pgen_reader.cpp` — add variants parameter support
+
+## Test Cases
+
+`test/sql/read_pfile_variants_unified.test`:
+- Single integer: `variants := 0`
+- Single rsid: `variants := 'rs1'`
+- Single CPRA: `variants := '1:100:A:T'` (needs test data with known positions)
+- CPRA struct: `variants := {chrom: '1', pos: 100, ref: 'A', alt: 'T'}`
+- Position-only CPRA: `variants := '1:100'` (matches all at position)
+- Index range: `variants := {start: 0, stop: 2}`
+- Identifier range: `variants := {start: 'rs1', stop: 'rs3'}`
+- List of indices: `variants := [0, 2]`
+- List of rsids: `variants := ['rs1', 'rs3']`
+- List of CPRA strings
+- Combined with `region` (intersection)
+- Combined with `af_range`
+- Combined with `samples`
+
+`test/sql/read_pfile_variants_unified_negative.test`:
+- Invalid CPRA format (wrong number of colons)
+- rsid not found
+- Index out of range
+- Range start > stop
+- Empty list
+- Ambiguous struct (has both start and chrom fields)
+
+## Acceptance Criteria
+
+- [ ] All variant identifier formats supported
+- [ ] Index and identifier ranges work
+- [ ] Parquet file input works (Phase 3)
+- [ ] Backward compatible with existing LIST(INTEGER) and LIST(VARCHAR)
+- [ ] Error messages helpful for resolution failures
+- [ ] Tests pass
+- [ ] CLAUDE.md updated

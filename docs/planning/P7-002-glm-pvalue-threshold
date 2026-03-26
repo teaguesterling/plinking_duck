@@ -1,0 +1,92 @@
+# P7-002: GLM p-value threshold parameter
+
+Named parameter for filtering plink_glm output by p-value significance.
+
+## Status
+
+- [ ] Add p_threshold parameter to plink_glm bind
+- [ ] Filter in scan function
+- [ ] Tests
+
+## Prerequisites
+
+None — isolated to plink_glm.cpp.
+
+## Branch
+
+`feature/P7-002-glm-pvalue-threshold`
+
+---
+
+## Background
+
+Genome-wide association scans produce millions of rows, most non-significant.
+Users typically filter with `WHERE p_value < 5e-8` after the fact, but the
+full result set must still be materialized. A scan-time p-value threshold
+reduces output without changing the computation (the regression must still
+run to determine the p-value).
+
+## Design
+
+### Parameter
+
+```sql
+-- Only return genome-wide significant hits
+SELECT * FROM plink_glm('cohort', phenotype := 'height', p_threshold := 5e-8);
+
+-- Suggestive threshold
+SELECT * FROM plink_glm('cohort', phenotype := 'height', p_threshold := 1e-5);
+```
+
+Named parameter: `p_threshold` (DOUBLE). Default: no filtering (all rows emitted).
+
+### Implementation
+
+1. **Bind data**: Add `double p_threshold = NAN;` to `PlinkGlmBindData`.
+
+2. **Parameter parsing**: In bind function:
+   ```cpp
+   bind_data->p_threshold = val.GetValue<double>();
+   if (bind_data->p_threshold <= 0.0 || bind_data->p_threshold > 1.0) {
+       throw InvalidInputException("plink_glm: p_threshold must be in (0, 1]");
+   }
+   ```
+
+3. **Registration**: `plink_glm.named_parameters["p_threshold"] = LogicalType::DOUBLE;`
+
+4. **Scan function**: After computing regression result, before emitting row:
+   ```cpp
+   if (!std::isnan(bind_data.p_threshold)) {
+       if (lr.errcode != nullptr || std::isnan(lr.p_value) || lr.p_value > bind_data.p_threshold) {
+           continue; // skip this variant
+       }
+   }
+   ```
+
+### Performance Note
+
+The regression runs for every variant regardless — the savings come from
+reduced output materialization, not reduced computation. This is the expected
+behavior since the p-value is unknown until after regression.
+
+### Affected Files
+
+- `src/plink_glm.cpp` — bind data, parameter parsing, scan filtering
+- `src/include/plink_glm.hpp` — bind data struct (if fields declared there)
+
+## Test Cases
+
+`test/sql/plink_glm_pthreshold.test`:
+- `p_threshold := 1.0` — returns all rows (same as no filter)
+- `p_threshold := 0.001` — returns only significant variants (verify subset)
+- Verify variants with errcode are excluded
+- `p_threshold := 0.0` — error (must be > 0)
+- `p_threshold := 1.5` — error (must be <= 1)
+- `p_threshold := -0.1` — error
+
+## Acceptance Criteria
+
+- [ ] Parameter registered and documented in CLAUDE.md
+- [ ] Scan-time filtering works correctly
+- [ ] Error variants (convergence failures) excluded when threshold active
+- [ ] Tests pass

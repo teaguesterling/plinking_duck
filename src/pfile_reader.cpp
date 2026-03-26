@@ -305,15 +305,16 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	bool need_pgen_reader = false; // genotypes OR count filter
 	vector<column_t> column_ids;
 	OrientMode orient_mode = OrientMode::VARIANT;
+	uint32_t max_threads_config = 0;
 
 	idx_t MaxThreads() const override {
 		if (orient_mode == OrientMode::GENOTYPE) {
 			// Each variant fans out to N sample rows — use smaller batch size (64)
 			// for better load balancing when filters skip variants unevenly
-			return std::min<idx_t>(total_count / 64 + 1, 16);
+			return ApplyMaxThreadsCap(total_count / 64 + 1, max_threads_config);
 		}
 		// Variant and sample modes support parallel scan
-		return std::min<idx_t>(total_count / 1000 + 1, 16);
+		return ApplyMaxThreadsCap(total_count / 1000 + 1, max_threads_config);
 	}
 };
 
@@ -1185,6 +1186,7 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 
 	state->column_ids = input.column_ids;
 	state->orient_mode = bind_data.orient_mode;
+	state->max_threads_config = GetPlinkingMaxThreads(context);
 
 	if (bind_data.orient_mode == OrientMode::GENOTYPE) {
 		state->total_count = bind_data.EffectiveVariantCt();
