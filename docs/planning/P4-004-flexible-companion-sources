@@ -40,28 +40,45 @@ in `read_pgen`/`read_pfile`/P2 utility functions):
 
 1. **Native PLINK format**: path ends in `.pvar`, `.bim`, `.psam`, or
    `.fam` → use existing native parsers (no change, fast path)
-2. **Any other value** → execute `context.Query("SELECT * FROM '<source>'")`
-   at bind time, which triggers DuckDB's replacement scan pipeline for
-   file paths (`.parquet` → `read_parquet`, `.csv` → `read_csv`, etc.)
-   and resolves table/view names through catalog lookup
+2. **Parquet file** (`.parquet` extension) → invoke DuckDB's `read_parquet`
+   table function directly via C++ API (no SQL, no subquery)
+3. **Any other value** → use a separate `Connection` to execute
+   `SELECT * FROM '<source>'`, which triggers DuckDB's replacement scan
+   pipeline for file paths (`.csv` → `read_csv`, etc.) and resolves
+   table/view names through catalog lookup
 
-Both file paths and table/view names are handled by the same code path.
-DuckDB's `FROM '<string>'` syntax triggers replacement scans for
-recognized file extensions, and falls through to catalog lookup for
-table/view names. This is the same mechanism DuckDB uses internally
-(e.g., in `query_function.cpp`).
+**Source escaping** (Option B only): single quotes in the source string
+are escaped by doubling (`'` → `''`). The query is always
+`SELECT * FROM '<escaped_source>'`, never anything user-controlled beyond
+the source path.
 
-**Source escaping**: single quotes in the source string are escaped by
-doubling (`'` → `''`). This is the only SQL construction involved — the
-query is always `SELECT * FROM '<escaped_source>'`, never anything
-user-controlled beyond the source path.
+### Auto-Discovery with Parquet Priority (Phase 0)
 
-### Auto-Discovery Unchanged
+When `plinking_use_parquet_companions` config option is true (default: true),
+`FindCompanionFile` searches for parquet companions **before** text formats:
 
-`FindCompanionFile` continues to search for `.pvar`/`.bim`/`.psam`/`.fam`
-only. Non-native companion sources must be specified explicitly via the
-`pvar :=` / `psam :=` named parameters. This keeps the default behavior
-predictable and avoids surprising file resolution.
+**Variant companion search order**:
+1. `.pvar.parquet` (parquet, preferred)
+2. `.pvar` (native text)
+3. `.bim` (PLINK 1 text)
+
+**Sample companion search order**:
+1. `.psam.parquet` (parquet, preferred)
+2. `.psam` (native text)
+3. `.fam` (PLINK 1 text)
+
+When a `.pvar.parquet` or `.psam.parquet` file is found, it is loaded via
+`context.Query("SELECT * FROM read_parquet('<path>')")` and mapped into
+the same `VariantMetadataIndex`/`SampleInfo` structures using the column
+mapping logic described below.
+
+Setting `SET plinking_use_parquet_companions = false` disables parquet
+auto-discovery, reverting to the original search order (`.pvar`/`.bim`,
+`.psam`/`.fam` only). This is useful when stale parquet files exist
+alongside current text files.
+
+Non-native companions other than parquet (CSV, tables, views) must still
+be specified explicitly via `pvar :=` / `psam :=` named parameters.
 
 ### Column Mapping
 
@@ -91,24 +108,50 @@ sample orient modes (which output all sample metadata columns).
 
 ### Execution Mechanism
 
-At bind time, for non-native sources:
+**Important**: Loading companion data happens during bind. Running a
+subquery via `context.Query()` during bind causes reentrancy issues with
+DuckDB's execution model (nested query within a bind phase). Two
+alternatives, in order of preference:
+
+**Option A: Direct parquet reader invocation (preferred for Phase 0)**
+
+For parquet files specifically, call DuckDB's parquet table function
+directly via its C++ API rather than going through SQL:
 
 ```cpp
-// Escape single quotes in source path
-auto escaped = StringUtil::Replace(source, "'", "''");
-auto query = "SELECT * FROM '" + escaped + "'";
-auto result = context.Query(query, false);  // false = not internal
-if (result->HasError()) {
-    throw InvalidInputException("Cannot read companion source '%s': %s",
-                                source, result->GetError());
-}
-// Fetch all chunks, map columns, build row-oriented metadata
+// Look up the read_parquet function from the catalog
+auto &catalog = Catalog::GetSystemCatalog(context);
+auto func = catalog.GetEntry<TableFunctionCatalogEntry>(
+    context, DEFAULT_SCHEMA, "read_parquet");
+
+// Build inputs and call bind + scan directly
+vector<Value> inputs = {Value(parquet_path)};
+// ... invoke table function bind, then fetch chunks
 ```
 
-This uses `context.Query()` which runs within the current transaction
-context. This means table/view names created earlier in the same session
-(even in an explicit transaction) are visible — unlike a separate
-`Connection` which would have its own transaction.
+This avoids any SQL parsing or nested execution. The parquet reader is
+always available (bundled with DuckDB) and its table function API is
+stable.
+
+**Option B: Separate connection (for arbitrary sources)**
+
+For non-parquet sources (CSV, tables, views) where we need SQL
+resolution, create a separate `Connection` from the `DatabaseInstance`:
+
+```cpp
+auto &db = DatabaseInstance::GetDatabase(context);
+Connection conn(db);
+auto result = conn.Query("SELECT * FROM '" + escaped + "'");
+```
+
+A separate connection has its own transaction, so table/view names from
+the caller's session may not be visible (uncommitted creates). This is
+acceptable for file-based sources but limits table/view companion support
+to committed objects. Document this limitation.
+
+**Phase 0 (parquet auto-discovery) uses Option A exclusively** — we only
+need to read parquet files, so the direct function invocation is clean
+and avoids both reentrancy and transaction visibility issues.
 
 ### Data Representation
 
@@ -272,8 +315,7 @@ rows from it during scan, using the same column mapping logic.
   that feed into the same parsers
 - Scan phase — metadata is fully resolved at bind time regardless of source
 - `.pgen` file handling (always pgenlib)
-- Auto-discovery logic (`FindCompanionFile` still searches for native
-  formats only)
+- Auto-discovery logic extended with parquet priority (Phase 0)
 - Output schemas
 
 ---

@@ -1,14 +1,14 @@
-# P7-003: genotypes='counts' and genotypes='summary' modes
+# P7-003: Genotype output mode extensions — struct, counts, stats
 
-Fast aggregate genotype output using PgrGetCounts (no decompression).
+New genotype output modes for structured access, fast counting, and summary
+statistics.
 
 ## Status
 
-- [ ] Extend GenotypeMode enum
-- [ ] Implement variant orient counts output
-- [ ] Implement sample orient counts output
-- [ ] Implement summary mode (derived fields)
-- [ ] Tests
+- [ ] Phase 1: `genotypes='struct'` — structured per-allele output
+- [ ] Phase 2: `genotypes='counts'` — fast genotype counting via PgrGetCounts
+- [ ] Phase 3: `genotypes='stats'` — summary statistics (AF, missingness, etc.)
+- [ ] Tests for all modes
 
 ## Prerequisites
 
@@ -16,7 +16,7 @@ None — extends existing GenotypeMode infrastructure.
 
 ## Branch
 
-`feature/P7-003-genotype-counts-mode`
+`feature/P7-003-genotype-output-modes`
 
 ---
 
@@ -24,62 +24,117 @@ None — extends existing GenotypeMode infrastructure.
 
 ### Motivation
 
-The primary use case is fast carrier identification: given a gene region and
-a subset of subjects (e.g., those with a trait), quickly determine which
-subjects carry variants without decompressing individual genotypes.
+Three use cases drive these modes:
 
-```sql
--- Fast carrier summary per variant
-SELECT ID, genotypes
-FROM read_pfile('cohort',
-    variants := {start: 'gene_start', stop: 'gene_end'},
-    samples := [...trait_subjects...],
-    genotypes := 'counts');
--- Returns: rs123  {hom_ref: 45, het: 12, hom_alt: 3, missing: 0}
+1. **Structured access** (`struct`): Applications that need named access to
+   per-sample genotypes benefit from a STRUCT column where each field is a
+   sample name, rather than a positional array. DuckDB STRUCTs store each
+   field as a separate column vector, enabling natural vectorized parallelism.
 
--- Per-sample carrier summary across a gene region
-SELECT IID, genotypes
-FROM read_pfile('cohort',
-    orient := 'sample',
-    variants := {start: 'gene_start', stop: 'gene_end'},
-    samples := [...trait_subjects...],
-    genotypes := 'summary',
-    genotype_range := {min: 1});
--- Returns: SAMPLE1  {hom_ref: 0, het: 8, hom_alt: 2, missing: 0, n: 10, af: 0.6, carrier_count: 10}
+2. **Fast counting** (`counts`): Given a gene region and sample subset, quickly
+   count genotype classes without decompressing individual genotypes. Uses
+   PgrGetCounts (same fast path as af_range/ac_range and plink_freq).
+
+3. **Summary statistics** (`stats`): Per-row summary over the genotype
+   dimension — AF, missingness rate, carrier count, etc. Summarizes over
+   whatever the orient axis provides (variants in variant orient, samples in
+   sample orient).
+
+---
+
+## Phase 1: `genotypes='struct'`
+
+### Output Type
+
+A single `genotypes` column of type `STRUCT(sample1 TINYINT, sample2 TINYINT, ...)`
+in variant orient, or `STRUCT(rs1 TINYINT, rs2 TINYINT, ...)` in sample orient.
+
+This is conceptually equivalent to `genotypes='columns'` but bundled into a
+single logical column. The advantages:
+
+- **Named access**: `genotypes.SAMPLE1` instead of `genotypes[1]`
+- **Single column**: `SELECT genotypes FROM ...` gets everything, no need to
+  enumerate columns
+- **Vectorized internals**: DuckDB STRUCTs are stored as parallel column
+  vectors, so each sample's genotypes form a contiguous vector — good for
+  SIMD and cache locality
+
+### Schema
+
+**Variant orient** (default): `genotypes STRUCT(IID1 TINYINT, IID2 TINYINT, ...)`
+- One field per output sample (after subsetting)
+- Field names from sample IIDs
+
+**Sample orient**: `genotypes STRUCT(var1 TINYINT, var2 TINYINT, ...)`
+- One field per effective variant (after filtering)
+- Field names from variant IDs (or chrom:pos if no ID)
+
+**Genotype orient**: Error — genotype orient already produces scalar output.
+
+### Scan Implementation
+
+The scan path is nearly identical to `COLUMNS` mode. The key difference is
+that instead of writing to separate top-level output columns, we write to
+child vectors of a single STRUCT column. DuckDB's `StructVector::GetEntries()`
+returns child vectors that are laid out identically to separate columns.
+
+```cpp
+// STRUCT scan (variant orient):
+auto &struct_entries = StructVector::GetEntries(genotypes_vec);
+for (uint32_t s = 0; s < sample_ct; s++) {
+    auto *data = FlatVector::GetData<int8_t>(*struct_entries[s]);
+    int8_t geno = genotype_bytes[s];
+    if (geno == -9) {
+        FlatVector::SetNull(*struct_entries[s], row_idx, true);
+    } else {
+        data[row_idx] = geno;
+    }
+}
 ```
+
+### Compatibility
+
+| Parameter | Compatible | Notes |
+|-----------|-----------|-------|
+| `phased := true` | ✓ | Fields become `ARRAY(TINYINT, 2)` |
+| `dosages := true` | ✓ | Fields become `DOUBLE` |
+| `genotype_range` | ✓ | Per-element NULLing same as columns |
+| `af_range`/`ac_range` | ✓ | Variant-level filter |
+| `samples` | ✓ | Reduces struct fields |
+| `orient := 'genotype'` | ✗ error | Same as columns mode |
+
+### Unique Name Handling
+
+Same requirement as `columns` mode: sample IIDs (variant orient) or variant
+IDs (sample orient) must be unique. Duplicate names trigger an error with
+guidance to use `samples := [...]` or `variants := [...]` to select unique
+identifiers.
+
+---
+
+## Phase 2: `genotypes='counts'`
+
+### Output Type
+
+`genotypes STRUCT(hom_ref UINTEGER, het UINTEGER, hom_alt UINTEGER, missing UINTEGER)`
+
+One struct per row, counting genotype classes across the opposite dimension:
+- **Variant orient**: counts across samples for each variant
+- **Sample orient**: counts across variants for each sample
 
 ### Performance
 
-In variant orient, `counts` mode uses `PgrGetCounts()` instead of `PgrGet()`.
-This is the same fast path used by `af_range`/`ac_range` filtering and
-`plink_freq` — no genotype decompression needed. For large cohorts this is
-significantly faster than reading all genotypes and counting in SQL.
+In variant orient, uses `PgrGetCounts()` — no genotype decompression needed.
+This is the same fast path as `plink_freq`. For 100K+ sample cohorts this is
+orders of magnitude faster than reading all genotypes.
 
-## Design
-
-### New GenotypeMode Values
-
-```cpp
-enum class GenotypeMode : uint8_t {
-    ARRAY, LIST, COLUMNS, COUNTS, SUMMARY
-};
-```
-
-### Output Types
-
-**COUNTS** — `STRUCT(hom_ref UINTEGER, het UINTEGER, hom_alt UINTEGER, missing UINTEGER)`
-
-**SUMMARY** — `STRUCT(hom_ref UINTEGER, het UINTEGER, hom_alt UINTEGER, missing UINTEGER, n UINTEGER, af DOUBLE, carrier_count UINTEGER)`
-
-Where:
-- `n = hom_ref + het + hom_alt` (non-missing count)
-- `af = (het + 2 * hom_alt) / (2 * n)` (alt allele frequency)
-- `carrier_count = het + hom_alt` (samples with ≥1 ALT allele)
+In sample orient, counts are accumulated from the pre-read genotype matrix
+(already materialized at bind time).
 
 ### Orient Compatibility
 
-| Orient | counts/summary | Notes |
-|--------|---------------|-------|
+| Orient | counts | Notes |
+|--------|--------|-------|
 | variant | ✓ | PgrGetCounts per variant — fast |
 | sample | ✓ | Accumulate from pre-read matrix |
 | genotype | ✗ error | Counts are aggregates, not per-genotype |
@@ -94,63 +149,140 @@ Where:
 | `af_range`/`ac_range` | ✓ | Variant-level filter, orthogonal |
 | `samples` | ✓ | PgrGetCounts supports sample subsetting |
 
-### Implementation
+### Scan Implementation (variant orient)
 
-#### Variant Orient (fast path)
+```cpp
+// Claim batch of variants (existing pattern)
+// For each variant:
+STD_ARRAY_DECL(uint32_t, 4, genocounts);
+PgrGetCounts(sample_include, interleaved_vec, pssi, sample_ct, vidx, &pgr, genocounts);
 
-Use `PgrGetCounts()` with sample_include/interleaved_vec for subset support.
-No `PgrGet()` call needed. Build STRUCT from `genocounts[0..3]`.
-
-The scan function checks `GenotypeMode::COUNTS` or `SUMMARY` and:
-1. Claims batch of variant indices (existing pattern)
-2. For each variant, calls PgrGetCounts
-3. Fills STRUCT column directly from genocounts
-
-#### Sample Orient
-
-The genotype matrix is already pre-read at bind time. Accumulate counts
-per-sample by iterating the matrix column-wise:
-
-```
-for each sample s:
-    counts = {0, 0, 0, 0}
-    for each variant v:
-        geno = genotype_matrix[v][s]
-        if geno == -9: counts.missing++
-        else: counts[geno]++
+// Fill STRUCT children
+auto &entries = StructVector::GetEntries(genotypes_vec);
+FlatVector::GetData<uint32_t>(*entries[0])[row] = genocounts[0]; // hom_ref
+FlatVector::GetData<uint32_t>(*entries[1])[row] = genocounts[1]; // het
+FlatVector::GetData<uint32_t>(*entries[2])[row] = genocounts[2]; // hom_alt
+FlatVector::GetData<uint32_t>(*entries[3])[row] = genocounts[3]; // missing
 ```
 
-#### Genotype Orient
+### Scan Implementation (sample orient)
 
-Error: `genotypes := 'counts' is not compatible with orient := 'genotype'`
+```cpp
+// Accumulate from pre-read matrix
+uint32_t counts[4] = {0, 0, 0, 0};
+for (idx_t v = 0; v < effective_variant_ct; v++) {
+    int8_t geno = genotype_matrix[v][sample_pos];
+    if (geno == -9) counts[3]++;
+    else counts[geno]++;
+}
+```
 
-### Affected Files
+---
 
-- `src/include/plink_common.hpp` — GenotypeMode enum extension, ResolveGenotypeMode
-- `src/plink_common.cpp` — ResolveGenotypeMode for "counts", "summary"
-- `src/pfile_reader.cpp` — bind (schema), scan (variant + sample orient)
-- `src/pgen_reader.cpp` — bind + scan for read_pgen
+## Phase 3: `genotypes='stats'`
+
+### Output Type
+
+```
+genotypes STRUCT(
+    hom_ref   UINTEGER,
+    het       UINTEGER,
+    hom_alt   UINTEGER,
+    missing   UINTEGER,
+    n         UINTEGER,      -- non-missing count
+    af        DOUBLE,        -- alt allele frequency
+    maf       DOUBLE,        -- minor allele frequency (min(af, 1-af))
+    missing_rate DOUBLE,     -- missing / (n + missing)
+    carrier_count UINTEGER,  -- het + hom_alt
+    het_rate  DOUBLE         -- het / n (observed heterozygosity)
+)
+```
+
+### Semantics by Orient
+
+**Variant orient**: Each row is one variant. Stats summarize genotypes across
+samples for that variant. `af` = alt allele frequency in the sample set.
+`missing_rate` = fraction of samples missing for that variant.
+
+**Sample orient**: Each row is one sample. Stats summarize genotypes across
+variants for that sample. `af` = mean alt allele frequency across variants
+for this sample. `missing_rate` = fraction of variants missing for this sample.
+`carrier_count` = number of variants where this sample carries ≥1 ALT allele.
+
+**Genotype orient**: Error.
+
+### Derivation
+
+All derived fields come from the base counts:
+```
+n = hom_ref + het + hom_alt
+af = (het + 2 * hom_alt) / (2.0 * n)     [NaN if n == 0]
+maf = min(af, 1.0 - af)                   [NaN if n == 0]
+missing_rate = missing / (n + missing)     [NaN if n + missing == 0]
+carrier_count = het + hom_alt
+het_rate = het / n                         [NaN if n == 0]
+```
+
+### Performance
+
+Same as `counts` — uses `PgrGetCounts()` in variant orient (no decompression).
+The derived fields are computed from the counts with trivial arithmetic.
+
+### Parameter Compatibility
+
+Same as `counts` — incompatible with phased, dosages. Compatible with
+genotype_range, af_range/ac_range, samples.
+
+---
+
+## Implementation Order
+
+1. **`struct`** first — closest to existing `columns` mode, mostly schema
+   and scan refactoring
+2. **`counts`** next — introduces PgrGetCounts scan path for genotypes column
+3. **`stats`** last — extends counts with derived fields
+
+## Affected Files
+
+- `src/include/plink_common.hpp` — GenotypeMode enum (add STRUCT, COUNTS, STATS)
+- `src/plink_common.cpp` — ResolveGenotypeMode for new strings
+- `src/pfile_reader.cpp` — bind (schema), scan (all orient modes)
+- `src/pgen_reader.cpp` — bind + scan for read_pgen (variant orient only)
 
 ## Test Cases
 
+`test/sql/read_pfile_genotypes_struct.test`:
+- Basic struct output, verify field names and values
+- Named access: `genotypes.SAMPLE1`
+- Struct with sample subsetting
+- Struct + orient := 'sample' (field names are variant IDs)
+- Struct + phased := true (fields become ARRAY(TINYINT, 2))
+- Struct + dosages := true (fields become DOUBLE)
+
 `test/sql/read_pfile_genotypes_counts.test`:
-- Basic COUNTS with pgen_example (4v × 4s), verify struct values
-- SUMMARY mode, verify derived fields match plink_freq output
-- COUNTS with sample subsetting
-- COUNTS with af_range
-- COUNTS + orient := 'sample' (per-sample aggregation)
-- COUNTS + genotype_range (filtered counts)
+- Basic counts with pgen_example (4v × 4s), verify struct values
+- Counts with sample subsetting
+- Counts with af_range
+- Counts + orient := 'sample' (per-sample aggregation)
+- Counts + genotype_range (filtered counts)
+
+`test/sql/read_pfile_genotypes_stats.test`:
+- Stats mode, verify all derived fields
+- Cross-check af against plink_freq output
+- Cross-check missing_rate against plink_missing output
+- Stats + orient := 'sample'
 
 `test/sql/read_pfile_genotypes_counts_negative.test`:
-- COUNTS + orient := 'genotype' — error
-- COUNTS + phased := true — error
-- COUNTS + dosages := true — error
+- counts/stats + orient := 'genotype' — error
+- counts/stats + phased := true — error
+- counts/stats + dosages := true — error
+- struct + orient := 'genotype' — error
 
 ## Acceptance Criteria
 
-- [ ] GenotypeMode::COUNTS and SUMMARY implemented
-- [ ] Variant orient uses PgrGetCounts (no decompression)
-- [ ] Sample orient accumulates from pre-read matrix
+- [ ] GenotypeMode::STRUCT implemented (all orient modes except genotype)
+- [ ] GenotypeMode::COUNTS implemented (PgrGetCounts fast path)
+- [ ] GenotypeMode::STATS implemented (derived statistics)
 - [ ] Incompatible parameter combinations rejected with clear errors
 - [ ] Tests pass
 - [ ] CLAUDE.md updated

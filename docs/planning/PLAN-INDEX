@@ -145,10 +145,11 @@ Randomized SVD with multi-threaded generation-based barrier. Requires Eigen3
 
 | Plan | Title | Depends On | Status |
 |------|-------|-----------|--------|
-| P7-001 | plinking_max_threads config | None | Planned |
-| P7-002 | GLM p-value threshold | None | Planned |
-| P7-003 | genotypes='counts'/'summary' | None | Planned |
+| P7-001 | plinking_max_threads config | None | ✓ Done |
+| P7-002 | GLM p-value threshold | None | ✓ Done |
+| P7-003 | genotypes='struct'/'counts'/'stats' | None | Planned |
 | P7-004 | Unified variants parameter | None (implement last) | Planned |
+| P4-004 | Parquet companion auto-discovery | None | Planned |
 
 **P7-001**: Configurable thread cap via `SET plinking_max_threads = N`.
 Default 0 (no override). Applied in all MaxThreads() overrides.
@@ -156,14 +157,21 @@ Default 0 (no override). Applied in all MaxThreads() overrides.
 **P7-002**: `p_threshold := 5e-8` parameter on `plink_glm()`. Scan-time
 filtering by p-value significance to reduce output for genome-wide scans.
 
-**P7-003**: `genotypes := 'counts'` returns `STRUCT(hom_ref, het, hom_alt,
-missing)` using PgrGetCounts (no decompression). `genotypes := 'summary'`
-adds derived fields (af, carrier_count, n). Key use case: fast carrier
-identification for gene regions.
+**P7-003**: Three new genotype output modes. `genotypes := 'struct'` returns
+a STRUCT with named fields per sample/variant (vectorized internals).
+`genotypes := 'counts'` returns `STRUCT(hom_ref, het, hom_alt, missing)`
+using PgrGetCounts (no decompression). `genotypes := 'stats'` adds derived
+fields (af, maf, missing_rate, carrier_count, het_rate). Key use case: fast
+carrier identification for gene regions.
 
 **P7-004**: Unified `variants` parameter accepting indices, rsids, CPRA
 strings, CPRA structs, ranges, lists of any of those, and parquet file
 paths. Subsumes current `variants` LIST behavior and complements `region`.
+
+**P4-004 Phase 0**: Auto-discover `.pvar.parquet` and `.psam.parquet` as
+higher-priority companion files. Loaded via DuckDB's internal parquet reader.
+Gated by `plinking_use_parquet_companions` config (default true). Full
+P4-004 (arbitrary sources, tables/views) deferred to later.
 
 ### Future — Planned Features
 
