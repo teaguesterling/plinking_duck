@@ -164,7 +164,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
-		bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+		bind_data->pvar_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".pvar", ".bim"});
 		if (bind_data->pvar_path.empty()) {
 			throw InvalidInputException("read_pgen: cannot find .pvar or .bim companion for '%s' "
 			                            "(use pvar := 'path' to specify explicitly)",
@@ -173,7 +173,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	}
 
 	if (bind_data->psam_path.empty()) {
-		bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+		bind_data->psam_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".psam", ".fam"});
 		// .psam is optional for read_pgen — if not found, we operate in index-only mode
 	}
 
@@ -220,7 +220,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "read_pgen");
+	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "read_pgen");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("read_pgen: variant count mismatch: .pgen has %u variants, "
@@ -231,7 +231,7 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 
 	// --- Load sample info (optional) ---
 	if (!bind_data->psam_path.empty()) {
-		bind_data->sample_info = LoadSampleInfo(context, bind_data->psam_path);
+		bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
 		bind_data->has_sample_info = true;
 		bind_data->sample_ct = static_cast<uint32_t>(bind_data->sample_info.sample_ct);
 

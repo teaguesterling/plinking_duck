@@ -1,0 +1,127 @@
+# name: test/sql/parquet_companions.test
+# description: Tests for parquet companion loading (P4-004 Phase 0)
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ===================================================================
+# Setup: create parquet companions in /tmp (avoids polluting test/data)
+# ===================================================================
+
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pgen_example.pvar')) TO '/tmp/plinking_duck_test.pvar.parquet';
+
+statement ok
+COPY (SELECT * FROM read_psam('test/data/pgen_example.psam')) TO '/tmp/plinking_duck_test.psam.parquet';
+
+# ===================================================================
+# Explicit parquet pvar override with read_pgen
+# ===================================================================
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.parquet');
+----
+4
+
+query TTITT
+SELECT ID, CHROM, POS, REF, ALT FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.parquet')
+ORDER BY ID;
+----
+rs1	1	10000	A	G
+rs2	1	20000	C	T
+rs3	1	30000	G	A
+rs4	2	15000	T	C
+
+# ===================================================================
+# Both parquet pvar + psam overrides
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.parquet',
+    psam := '/tmp/plinking_duck_test.psam.parquet')
+ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# ===================================================================
+# Parquet companions with sample subsetting
+# ===================================================================
+
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.parquet',
+    psam := '/tmp/plinking_duck_test.psam.parquet',
+    samples := ['SAMPLE1', 'SAMPLE3'])
+ORDER BY ID;
+----
+rs1	[0, 2]
+rs2	[1, 0]
+rs3	[2, 1]
+rs4	[0, 1]
+
+# ===================================================================
+# Utility functions with parquet pvar override
+# ===================================================================
+
+# plink_freq
+query TR
+SELECT ID, ALT_FREQ FROM plink_freq('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.parquet')
+ORDER BY ID;
+----
+rs1	0.5
+rs2	0.5
+rs3	0.5
+rs4	0.375
+
+# plink_hardy
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.parquet');
+----
+4
+
+# plink_missing
+query I
+SELECT COUNT(*) FROM plink_missing('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.parquet');
+----
+4
+
+# ===================================================================
+# Parquet produces identical results to native text companions
+# ===================================================================
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT ID, CHROM, POS, REF, ALT, genotypes
+    FROM read_pgen('test/data/pgen_example.pgen',
+        pvar := '/tmp/plinking_duck_test.pvar.parquet',
+        psam := '/tmp/plinking_duck_test.psam.parquet')
+    EXCEPT
+    SELECT ID, CHROM, POS, REF, ALT, genotypes
+    FROM read_pgen('test/data/pgen_example.pgen')
+);
+----
+0
+
+# ===================================================================
+# Config option exists and defaults to true
+# ===================================================================
+
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+statement ok
+RESET plinking_use_parquet_companions;

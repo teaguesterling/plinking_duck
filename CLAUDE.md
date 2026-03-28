@@ -109,6 +109,7 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 
 - `plinking_max_matrix_elements` (BIGINT, default 16G): max genotype matrix elements for `orient := 'sample'` pre-read. Controls memory guard for variants × samples product. Set via `SET plinking_max_matrix_elements = <value>`.
 - `plinking_max_threads` (BIGINT, default 0): max threads for parallel scan operations. 0 = default (hardcoded cap of 16), >0 = cap at this value. Set via `SET plinking_max_threads = <value>`. Applied in all parallel table functions (`read_pfile`, `read_pgen`, `plink_freq`, `plink_hardy`, `plink_glm`, `plink_missing`, `plink_ld`, `plink_score`, `plink_pca`).
+- `plinking_use_parquet_companions` (BOOLEAN, default true): auto-discover `.pvar.parquet` and `.psam.parquet` companion files. When true, parquet companions are preferred over text formats in the companion file search order. Set via `SET plinking_use_parquet_companions = false` to disable. Parquet companions are loaded via a separate Connection invoking DuckDB's built-in parquet reader.
 - Config options registered via `DBConfig::GetConfig(db).AddExtensionOption()` in `Load()`, read at bind time via `context.TryGetCurrentSetting()`
 
 <!-- blq:agent-instructions -->

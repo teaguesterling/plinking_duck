@@ -431,7 +431,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 	if (bind_data->pvar_path.empty()) {
 		if (!prefix.empty()) {
-			bind_data->pvar_path = FindCompanionFile(fs, prefix + ".pgen", {".pvar", ".bim"});
+			bind_data->pvar_path = FindCompanionFileWithParquet(context, fs, prefix + ".pgen", {".pvar", ".bim"});
 			if (bind_data->pvar_path.empty()) {
 				// Also try prefix-based discovery
 				for (auto &ext : {".pvar", ".bim"}) {
@@ -444,7 +444,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 		}
 		if (bind_data->pvar_path.empty()) {
-			bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+			bind_data->pvar_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".pvar", ".bim"});
 		}
 		if (bind_data->pvar_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .pvar or .bim file for '%s' "
@@ -464,7 +464,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 		}
 		if (bind_data->psam_path.empty()) {
-			bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+			bind_data->psam_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".psam", ".fam"});
 		}
 		if (bind_data->psam_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .psam or .fam file for '%s' "
@@ -513,7 +513,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "read_pfile");
+	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "read_pfile");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("read_pfile: variant count mismatch: .pgen has %u variants, "
@@ -528,7 +528,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		bind_data->sample_metadata = LoadPfileSampleMetadata(context, bind_data->psam_path, bind_data->sample_info);
 	} else {
-		bind_data->sample_info = LoadSampleInfo(context, bind_data->psam_path);
+		bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
 	}
 
 	if (bind_data->sample_info.sample_ct != bind_data->raw_sample_ct) {

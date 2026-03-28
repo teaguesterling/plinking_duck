@@ -56,6 +56,11 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	                          "0 = default (hardcoded cap of 16), >0 = cap at this value.",
 	                          LogicalType::BIGINT, Value::BIGINT(0), SetPlinkingMaxThreads);
 
+	config.AddExtensionOption("plinking_use_parquet_companions",
+	                          "Auto-discover .pvar.parquet and .psam.parquet companion files. "
+	                          "When true, parquet companions are preferred over text formats.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Register table functions
 	RegisterPvarReader(loader);
 	RegisterPsamReader(loader);

@@ -2,6 +2,8 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 
 namespace duckdb {
 
@@ -383,6 +385,200 @@ string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<s
 		}
 	}
 	return "";
+}
+
+bool IsParquetFile(const string &path) {
+	return StringUtil::EndsWith(StringUtil::Lower(path), ".parquet");
+}
+
+bool GetUseParquetCompanions(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("plinking_use_parquet_companions", val)) {
+		return val.GetValue<bool>();
+	}
+	return true; // default
+}
+
+string FindCompanionFileWithParquet(ClientContext &context, FileSystem &fs, const string &pgen_path,
+                                    const vector<string> &extensions) {
+	// If parquet companions enabled, check for .parquet versions first
+	if (GetUseParquetCompanions(context)) {
+		for (auto &ext : extensions) {
+			auto parquet_candidate = ReplaceExtension(pgen_path, ext + ".parquet");
+			if (fs.FileExists(parquet_candidate)) {
+				return parquet_candidate;
+			}
+		}
+	}
+	// Fall back to native text formats
+	return FindCompanionFile(fs, pgen_path, extensions);
+}
+
+// ---------------------------------------------------------------------------
+// Parquet companion loading
+// ---------------------------------------------------------------------------
+
+VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, const string &path,
+                                                    const string &func_name) {
+	// Use a separate connection to read the parquet file (avoids bind reentrancy)
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto result = conn.TableFunction("parquet_scan", {Value(path)})->Execute();
+	if (result->HasError()) {
+		throw IOException("%s: failed to read parquet companion '%s': %s", func_name, path, result->GetError());
+	}
+
+	// Map columns by name (case-insensitive)
+	auto &col_names = result->names;
+	idx_t chrom_col = DConstants::INVALID_INDEX;
+	idx_t pos_col = DConstants::INVALID_INDEX;
+	idx_t id_col = DConstants::INVALID_INDEX;
+	idx_t ref_col = DConstants::INVALID_INDEX;
+	idx_t alt_col = DConstants::INVALID_INDEX;
+
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		auto lower = StringUtil::Lower(col_names[i]);
+		if (lower == "chrom" || lower == "#chrom") {
+			chrom_col = i;
+		} else if (lower == "pos") {
+			pos_col = i;
+		} else if (lower == "id") {
+			id_col = i;
+		} else if (lower == "ref") {
+			ref_col = i;
+		} else if (lower == "alt") {
+			alt_col = i;
+		}
+	}
+
+	if (chrom_col == DConstants::INVALID_INDEX || pos_col == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("%s: parquet companion '%s' missing required columns "
+		                            "(need CHROM and POS, found: %s)",
+		                            func_name, path, StringUtil::Join(col_names, ", "));
+	}
+
+	// Synthesize a .pvar-format text buffer from the parquet data
+	string buf;
+	buf += "#CHROM\tPOS\tID\tREF\tALT\n";
+
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			buf += chunk->GetValue(chrom_col, row).ToString();
+			buf += '\t';
+			buf += chunk->GetValue(pos_col, row).ToString();
+			buf += '\t';
+			buf += (id_col != DConstants::INVALID_INDEX) ? chunk->GetValue(id_col, row).ToString() : ".";
+			buf += '\t';
+			buf += (ref_col != DConstants::INVALID_INDEX) ? chunk->GetValue(ref_col, row).ToString() : ".";
+			buf += '\t';
+			buf += (alt_col != DConstants::INVALID_INDEX) ? chunk->GetValue(alt_col, row).ToString() : ".";
+			buf += '\n';
+		}
+	}
+
+	// Parse the synthetic buffer using the existing text parser
+	VariantMetadataIndex idx;
+	idx.file_content = std::move(buf);
+	idx.is_bim = false;
+	idx.chrom_idx = 0;
+	idx.pos_idx = 1;
+	idx.id_idx = 2;
+	idx.ref_idx = 3;
+	idx.alt_idx = 4;
+
+	// Build line offsets — skip the header line (first line ending with \n)
+	size_t pos = 0;
+	// Skip header line
+	while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
+		pos++;
+	}
+	if (pos < idx.file_content.size()) {
+		pos++; // skip newline
+	}
+
+	// Index data lines
+	while (pos < idx.file_content.size()) {
+		if (idx.file_content[pos] == '\n') {
+			pos++;
+			continue;
+		}
+		idx.line_offsets.push_back(static_cast<uint64_t>(pos));
+		while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
+			pos++;
+		}
+		if (pos < idx.file_content.size()) {
+			pos++;
+		}
+	}
+
+	idx.variant_ct = idx.line_offsets.size();
+	return idx;
+}
+
+SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto result = conn.TableFunction("parquet_scan", {Value(path)})->Execute();
+	if (result->HasError()) {
+		throw IOException("Failed to read parquet companion '%s': %s", path, result->GetError());
+	}
+
+	// Map columns by name (case-insensitive)
+	auto &col_names = result->names;
+	idx_t iid_col = DConstants::INVALID_INDEX;
+	idx_t fid_col = DConstants::INVALID_INDEX;
+
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		auto lower = StringUtil::Lower(col_names[i]);
+		if (lower == "iid") {
+			iid_col = i;
+		} else if (lower == "fid") {
+			fid_col = i;
+		}
+	}
+
+	if (iid_col == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("Parquet companion '%s' missing required IID column (found: %s)", path,
+		                            StringUtil::Join(col_names, ", "));
+	}
+
+	SampleInfo info;
+	bool has_fid = (fid_col != DConstants::INVALID_INDEX);
+
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto iid = chunk->GetValue(iid_col, row).ToString();
+
+			if (info.iid_to_idx.count(iid)) {
+				throw IOException("Parquet companion '%s' has duplicate IID '%s'", path, iid);
+			}
+
+			info.iids.push_back(iid);
+			if (has_fid) {
+				info.fids.push_back(chunk->GetValue(fid_col, row).ToString());
+			}
+			info.iid_to_idx[iid] = info.iids.size() - 1;
+		}
+	}
+
+	info.sample_ct = info.iids.size();
+	return info;
+}
+
+VariantMetadataIndex LoadVariantMetadata(ClientContext &context, const string &path, const string &func_name) {
+	if (IsParquetFile(path)) {
+		return LoadVariantMetadataFromParquet(context, path, func_name);
+	}
+	return LoadVariantMetadataIndex(context, path, func_name);
+}
+
+SampleInfo LoadSampleMetadata(ClientContext &context, const string &path) {
+	if (IsParquetFile(path)) {
+		return LoadSampleInfoFromParquet(context, path);
+	}
+	return LoadSampleInfo(context, path);
 }
 
 // ---------------------------------------------------------------------------

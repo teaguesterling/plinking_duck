@@ -165,6 +165,32 @@ string ReplaceExtension(const string &path, const string &new_ext);
 //! Returns the first existing path from candidates, or empty string.
 string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions);
 
+//! Check if a file path refers to a parquet file.
+bool IsParquetFile(const string &path);
+
+//! Read the plinking_use_parquet_companions config option.
+bool GetUseParquetCompanions(ClientContext &context);
+
+//! Find companion file with parquet priority when config is enabled.
+//! For variant files: checks .pvar.parquet before .pvar/.bim
+//! For sample files: checks .psam.parquet before .psam/.fam
+string FindCompanionFileWithParquet(ClientContext &context, FileSystem &fs, const string &pgen_path,
+                                    const vector<string> &extensions);
+
+//! Load variant metadata from a parquet file via DuckDB's parquet reader.
+//! Uses a separate Connection to avoid bind-phase reentrancy.
+VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, const string &path,
+                                                    const string &func_name);
+
+//! Load sample info from a parquet file via DuckDB's parquet reader.
+SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path);
+
+//! Load variant metadata, auto-dispatching between parquet and native text.
+VariantMetadataIndex LoadVariantMetadata(ClientContext &context, const string &path, const string &func_name);
+
+//! Load sample info, auto-dispatching between parquet and native text.
+SampleInfo LoadSampleMetadata(ClientContext &context, const string &path);
+
 // ---------------------------------------------------------------------------
 // Sample subsetting (for PgrGetCounts / PgrGet)
 // ---------------------------------------------------------------------------

@@ -168,7 +168,7 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
-		bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+		bind_data->pvar_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".pvar", ".bim"});
 		if (bind_data->pvar_path.empty()) {
 			throw InvalidInputException("plink_missing: cannot find .pvar or .bim companion for '%s' "
 			                            "(use pvar := 'path' to specify explicitly)",
@@ -177,7 +177,7 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 	}
 
 	if (bind_data->psam_path.empty()) {
-		bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+		bind_data->psam_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".psam", ".fam"});
 	}
 
 	// Sample mode requires .psam for IID output
@@ -226,7 +226,7 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "plink_missing");
+	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_missing");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("plink_missing: variant count mismatch: .pgen has %u variants, "
@@ -237,7 +237,7 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 
 	// --- Load sample info (optional for variant mode, required for sample mode) ---
 	if (!bind_data->psam_path.empty()) {
-		bind_data->sample_info = LoadSampleInfo(context, bind_data->psam_path);
+		bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
 		bind_data->has_sample_info = true;
 
 		if (static_cast<uint32_t>(bind_data->sample_info.sample_ct) != bind_data->raw_sample_ct) {

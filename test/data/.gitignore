@@ -1,3 +1,7 @@
+# Generated parquet companion files (created by parquet_companions.test)
+*.pvar.parquet
+*.psam.parquet
+
 # Large generated stress test data (regenerate via generate_glm_stress_data.sh)
 glm_stress.pgen
 glm_stress.pvar

@@ -469,7 +469,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 			}
 		}
 		if (bind_data->pvar_path.empty()) {
-			bind_data->pvar_path = FindCompanionFile(fs, bind_data->pgen_path, {".pvar", ".bim"});
+			bind_data->pvar_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".pvar", ".bim"});
 		}
 		if (bind_data->pvar_path.empty()) {
 			throw InvalidInputException("plink_glm: cannot find .pvar or .bim file for '%s' "
@@ -487,7 +487,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 			}
 		}
 		if (bind_data->psam_path.empty()) {
-			bind_data->psam_path = FindCompanionFile(fs, bind_data->pgen_path, {".psam", ".fam"});
+			bind_data->psam_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".psam", ".fam"});
 		}
 	}
 
@@ -531,7 +531,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadataIndex(context, bind_data->pvar_path, "plink_glm");
+	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_glm");
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("plink_glm: variant count mismatch: .pgen has %u variants, "
@@ -548,7 +548,7 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		if (bind_data->psam_path.empty()) {
 			throw InvalidInputException("plink_glm: samples parameter requires .psam/.fam file");
 		}
-		auto sample_info = LoadSampleInfo(context, bind_data->psam_path);
+		auto sample_info = LoadSampleMetadata(context, bind_data->psam_path);
 		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &sample_info, "plink_glm");
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
