@@ -1,6 +1,6 @@
 # name: test/sql/read_pfile_variants.test
 # description: Test unified variants parameter for read_pfile
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 

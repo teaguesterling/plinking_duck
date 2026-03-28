@@ -1,6 +1,6 @@
 # name: test/sql/read_pfile_genotypes_counts_negative.test
 # description: Negative tests for STRUCT/COUNTS/STATS genotype modes
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 

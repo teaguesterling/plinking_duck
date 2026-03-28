@@ -110,7 +110,7 @@ static bool PfileIsMissingValue(const string &val) {
 //! Load full sample metadata from a non-native source for genotype/sample orient modes.
 //! Queries the source via Connection, populates both PfileSampleMetadata and SampleInfo.
 static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &context, const string &source,
-                                                              SampleInfo &sample_info_out) {
+                                                             SampleInfo &sample_info_out) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 	auto escaped = StringUtil::Replace(source, "'", "''");
@@ -676,8 +676,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// --- Process variants parameter ---
 	auto variants_it = input.named_parameters.find("variants");
 	if (variants_it != input.named_parameters.end()) {
-		bind_data->variant_indices = ResolveVariantsParameter(variants_it->second, bind_data->variants,
-		                                                       bind_data->raw_variant_ct, "read_pfile");
+		bind_data->variant_indices =
+		    ResolveVariantsParameter(variants_it->second, bind_data->variants, bind_data->raw_variant_ct, "read_pfile");
 		bind_data->has_variant_filter = true;
 	}
 
@@ -772,10 +772,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				    "(genotype mode already produces scalar output)");
 			}
 			if (gval == "counts" || gval == "stats") {
-				throw InvalidInputException(
-				    "read_pfile: genotypes := '%s' is not compatible with orient := 'genotype' "
-				    "(aggregate modes require orient := 'variant' or 'sample')",
-				    gval);
+				throw InvalidInputException("read_pfile: genotypes := '%s' is not compatible with orient := 'genotype' "
+				                            "(aggregate modes require orient := 'variant' or 'sample')",
+				                            gval);
 			}
 		}
 
@@ -1290,9 +1289,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 
 			names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
-			return_types = {LogicalType::VARCHAR,  LogicalType::INTEGER, LogicalType::VARCHAR,
-			                LogicalType::VARCHAR,  LogicalType::VARCHAR,
-			                LogicalType::STRUCT(std::move(struct_children))};
+			return_types = {LogicalType::VARCHAR, LogicalType::INTEGER,
+			                LogicalType::VARCHAR, LogicalType::VARCHAR,
+			                LogicalType::VARCHAR, LogicalType::STRUCT(std::move(struct_children))};
 		} else if (bind_data->genotype_mode == GenotypeMode::COUNTS) {
 			names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
 			return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
@@ -1747,14 +1746,12 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							break;
 						}
 						STD_ARRAY_DECL(uint32_t, 4, genocounts);
-						const uintptr_t *agg_si =
-						    (bind_data.has_sample_subset && bind_data.count_filter_subset)
-						        ? bind_data.count_filter_subset->SampleInclude()
-						        : nullptr;
-						const uintptr_t *agg_iv =
-						    (bind_data.has_sample_subset && bind_data.count_filter_subset)
-						        ? bind_data.count_filter_subset->InterleavedVec()
-						        : nullptr;
+						const uintptr_t *agg_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+						                              ? bind_data.count_filter_subset->SampleInclude()
+						                              : nullptr;
+						const uintptr_t *agg_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+						                              ? bind_data.count_filter_subset->InterleavedVec()
+						                              : nullptr;
 						uint32_t agg_sc =
 						    bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
 
@@ -1782,8 +1779,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
 							} else {
-								double af =
-								    (static_cast<double>(genocounts[1]) + 2.0 * genocounts[2]) / (2.0 * n);
+								double af = (static_cast<double>(genocounts[1]) + 2.0 * genocounts[2]) / (2.0 * n);
 								FlatVector::GetData<double>(*entries[5])[rows_emitted] = af;
 								FlatVector::GetData<double>(*entries[6])[rows_emitted] = std::min(af, 1.0 - af);
 								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
@@ -1796,8 +1792,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								FlatVector::GetData<double>(*entries[7])[rows_emitted] =
 								    static_cast<double>(genocounts[3]) / static_cast<double>(total);
 							}
-							FlatVector::GetData<uint32_t>(*entries[8])[rows_emitted] =
-							    genocounts[1] + genocounts[2];
+							FlatVector::GetData<uint32_t>(*entries[8])[rows_emitted] = genocounts[1] + genocounts[2];
 						}
 						break;
 					}

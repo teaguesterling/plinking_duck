@@ -369,8 +369,7 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 		auto escaped = StringUtil::Replace(result->file_path, "'", "''");
 		auto query_result = conn.Query("SELECT * FROM '" + escaped + "'");
 		if (query_result->HasError()) {
-			throw IOException("read_psam: failed to read source '%s': %s", result->file_path,
-			                  query_result->GetError());
+			throw IOException("read_psam: failed to read source '%s': %s", result->file_path, query_result->GetError());
 		}
 
 		// Use the result schema as the output schema
@@ -439,8 +438,8 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 			auto fields = SplitLine(line, header.format);
 
 			if (fields.size() != expected_cols) {
-				throw IOException("read_psam: file '%s' line %d has %d fields, expected %d", bind_data.file_path,
-				                  i + 1, fields.size(), expected_cols);
+				throw IOException("read_psam: file '%s' line %d has %d fields, expected %d", bind_data.file_path, i + 1,
+				                  fields.size(), expected_cols);
 			}
 
 			state->rows.push_back(std::move(fields));

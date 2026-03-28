@@ -385,9 +385,8 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		}
 
 		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
-		return_types = {LogicalType::VARCHAR,  LogicalType::INTEGER, LogicalType::VARCHAR,
-		                LogicalType::VARCHAR,  LogicalType::VARCHAR,
-		                LogicalType::STRUCT(std::move(struct_children))};
+		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::STRUCT(std::move(struct_children))};
 	} else if (bind_data->genotype_mode == GenotypeMode::COUNTS) {
 		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
 		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
@@ -420,9 +419,9 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 	auto &bind_data = input.bind_data->Cast<PgenBindData>();
 	auto state = make_uniq<PgenGlobalState>();
 
-	state->total_variants =
-	    bind_data.has_effective_variant_list ? static_cast<uint32_t>(bind_data.effective_variant_indices.size())
-	                                         : bind_data.raw_variant_ct;
+	state->total_variants = bind_data.has_effective_variant_list
+	                            ? static_cast<uint32_t>(bind_data.effective_variant_indices.size())
+	                            : bind_data.raw_variant_ct;
 	state->column_ids = input.column_ids;
 	state->max_threads_config = GetPlinkingMaxThreads(context);
 
@@ -795,14 +794,12 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							break;
 						}
 						STD_ARRAY_DECL(uint32_t, 4, genocounts);
-						const uintptr_t *agg_si =
-						    (bind_data.has_sample_subset && bind_data.count_filter_subset)
-						        ? bind_data.count_filter_subset->SampleInclude()
-						        : nullptr;
-						const uintptr_t *agg_iv =
-						    (bind_data.has_sample_subset && bind_data.count_filter_subset)
-						        ? bind_data.count_filter_subset->InterleavedVec()
-						        : nullptr;
+						const uintptr_t *agg_si = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+						                              ? bind_data.count_filter_subset->SampleInclude()
+						                              : nullptr;
+						const uintptr_t *agg_iv = (bind_data.has_sample_subset && bind_data.count_filter_subset)
+						                              ? bind_data.count_filter_subset->InterleavedVec()
+						                              : nullptr;
 						uint32_t agg_sc =
 						    bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.sample_ct;
 
@@ -830,8 +827,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
 							} else {
-								double af =
-								    (static_cast<double>(genocounts[1]) + 2.0 * genocounts[2]) / (2.0 * n);
+								double af = (static_cast<double>(genocounts[1]) + 2.0 * genocounts[2]) / (2.0 * n);
 								FlatVector::GetData<double>(*entries[5])[rows_emitted] = af;
 								FlatVector::GetData<double>(*entries[6])[rows_emitted] = std::min(af, 1.0 - af);
 								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
@@ -844,8 +840,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								FlatVector::GetData<double>(*entries[7])[rows_emitted] =
 								    static_cast<double>(genocounts[3]) / static_cast<double>(total);
 							}
-							FlatVector::GetData<uint32_t>(*entries[8])[rows_emitted] =
-							    genocounts[1] + genocounts[2];
+							FlatVector::GetData<uint32_t>(*entries[8])[rows_emitted] = genocounts[1] + genocounts[2];
 						}
 						break;
 					}

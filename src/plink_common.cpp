@@ -627,7 +627,7 @@ static unique_ptr<MaterializedQueryResult> QuerySource(ClientContext &context, c
 }
 
 VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const string &source,
-                                                    const string &func_name) {
+                                                   const string &func_name) {
 	auto result = QuerySource(context, source, func_name);
 
 	// Map columns by name (case-insensitive) — same logic as parquet loader
@@ -1267,9 +1267,8 @@ static uint32_t ResolveCpraStruct(const Value &val, const VariantMetadataIndex &
 
 //! Resolve a range struct ({start, stop} with INTEGER or VARCHAR values) to variant indices.
 static vector<uint32_t> ResolveRangeStruct(const Value &val, const VariantMetadataIndex &variants,
-                                            uint32_t raw_variant_ct,
-                                            const unordered_map<string, uint32_t> &id_to_idx,
-                                            const string &func_name) {
+                                           uint32_t raw_variant_ct, const unordered_map<string, uint32_t> &id_to_idx,
+                                           const string &func_name) {
 	auto &child_types = StructType::GetChildTypes(val.type());
 	auto &children = StructValue::GetChildren(val);
 
@@ -1319,7 +1318,7 @@ static vector<uint32_t> ResolveRangeStruct(const Value &val, const VariantMetada
 }
 
 vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadataIndex &variants,
-                                           uint32_t raw_variant_ct, const string &func_name) {
+                                          uint32_t raw_variant_ct, const string &func_name) {
 	vector<uint32_t> indices;
 	auto &type = val.type();
 
@@ -1356,10 +1355,9 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 		}
 
 		if (has_start && has_chrom) {
-			throw InvalidInputException(
-			    "%s: ambiguous variants struct — has both 'start' and 'chrom' fields. "
-			    "Use {start:, stop:} for a range or {chrom:, pos:} for a CPRA lookup.",
-			    func_name);
+			throw InvalidInputException("%s: ambiguous variants struct — has both 'start' and 'chrom' fields. "
+			                            "Use {start:, stop:} for a range or {chrom:, pos:} for a CPRA lookup.",
+			                            func_name);
 		} else if (has_start) {
 			ensure_id_index();
 			indices = ResolveRangeStruct(val, variants, raw_variant_ct, id_to_idx, func_name);
@@ -1367,7 +1365,8 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 			indices.push_back(ResolveCpraStruct(val, variants, func_name));
 		} else {
 			throw InvalidInputException(
-			    "%s: variants struct must have either 'start'/'stop' (range) or 'chrom'/'pos' (CPRA) fields", func_name);
+			    "%s: variants struct must have either 'start'/'stop' (range) or 'chrom'/'pos' (CPRA) fields",
+			    func_name);
 		}
 
 	} else if (type.id() == LogicalTypeId::LIST) {
@@ -1395,15 +1394,13 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 				indices.push_back(ResolveCpraStruct(child, variants, func_name));
 			}
 		} else {
-			throw InvalidInputException(
-			    "%s: variants list elements must be INTEGER, VARCHAR, or STRUCT (got %s)", func_name,
-			    child_type.ToString());
+			throw InvalidInputException("%s: variants list elements must be INTEGER, VARCHAR, or STRUCT (got %s)",
+			                            func_name, child_type.ToString());
 		}
 
 	} else {
-		throw InvalidInputException(
-		    "%s: variants parameter must be an integer, string, struct, or list (got %s)", func_name,
-		    type.ToString());
+		throw InvalidInputException("%s: variants parameter must be an integer, string, struct, or list (got %s)",
+		                            func_name, type.ToString());
 	}
 
 	// Validate no duplicates

@@ -207,7 +207,8 @@ SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path)
 //! Executes SELECT * FROM '<source>' via a separate Connection, maps columns by name
 //! (case-insensitive), synthesizes a pvar-format text buffer, and returns a standard
 //! VariantMetadataIndex.
-VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const string &source, const string &func_name);
+VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const string &source,
+                                                   const string &func_name);
 
 //! Load sample info from any DuckDB-readable source (CSV, table, view, etc.).
 //! Same approach: query via separate Connection, map columns, synthesize psam-format buffer,
@@ -373,7 +374,7 @@ void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasep
 //! Handles all supported input types: single integer, single string (rsid or CPRA),
 //! CPRA struct, range struct, and lists of any of those.
 vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadataIndex &variants,
-                                           uint32_t raw_variant_ct, const string &func_name);
+                                          uint32_t raw_variant_ct, const string &func_name);
 
 // ---------------------------------------------------------------------------
 // Max threads config helper

@@ -1,6 +1,6 @@
 # name: test/sql/read_pfile_genotypes_stats.test
 # description: Test genotypes := 'stats' mode for read_pfile and read_pgen
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 

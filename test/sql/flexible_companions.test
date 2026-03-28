@@ -1,6 +1,6 @@
 # name: test/sql/flexible_companions.test
 # description: Test flexible companion sources (P4-004) — CSV, tables, views as pvar/psam sources
-# group: [plinking_duck]
+# group: [sql]
 
 require plinking_duck
 
