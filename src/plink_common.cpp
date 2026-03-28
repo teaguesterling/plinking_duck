@@ -26,10 +26,42 @@ GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, con
 		return GenotypeMode::LIST;
 	} else if (mode == "columns") {
 		return GenotypeMode::COLUMNS;
+	} else if (mode == "struct") {
+		return GenotypeMode::STRUCT;
+	} else if (mode == "counts") {
+		return GenotypeMode::COUNTS;
+	} else if (mode == "stats") {
+		return GenotypeMode::STATS;
 	} else {
-		throw InvalidInputException("%s: invalid genotypes value '%s' (expected 'auto', 'array', 'list', or 'columns')",
-		                            func_name, mode_str);
+		throw InvalidInputException(
+		    "%s: invalid genotypes value '%s' (expected 'auto', 'array', 'list', 'columns', 'struct', 'counts', or "
+		    "'stats')",
+		    func_name, mode_str);
 	}
+}
+
+LogicalType MakeGenotypeCountsType() {
+	child_list_t<LogicalType> children;
+	children.push_back({"hom_ref", LogicalType::UINTEGER});
+	children.push_back({"het", LogicalType::UINTEGER});
+	children.push_back({"hom_alt", LogicalType::UINTEGER});
+	children.push_back({"missing", LogicalType::UINTEGER});
+	return LogicalType::STRUCT(std::move(children));
+}
+
+LogicalType MakeGenotypeStatsType() {
+	child_list_t<LogicalType> children;
+	children.push_back({"hom_ref", LogicalType::UINTEGER});
+	children.push_back({"het", LogicalType::UINTEGER});
+	children.push_back({"hom_alt", LogicalType::UINTEGER});
+	children.push_back({"missing", LogicalType::UINTEGER});
+	children.push_back({"n", LogicalType::UINTEGER});
+	children.push_back({"af", LogicalType::DOUBLE});
+	children.push_back({"maf", LogicalType::DOUBLE});
+	children.push_back({"missing_rate", LogicalType::DOUBLE});
+	children.push_back({"carrier_count", LogicalType::UINTEGER});
+	children.push_back({"het_rate", LogicalType::DOUBLE});
+	return LogicalType::STRUCT(std::move(children));
 }
 
 // ---------------------------------------------------------------------------

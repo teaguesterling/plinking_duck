@@ -1,0 +1,86 @@
+# name: test/sql/read_pfile_genotypes_struct.test
+# description: Test genotypes := 'struct' mode for read_pfile and read_pgen
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- Variant orient: STRUCT mode ---
+
+# Basic STRUCT output
+query ITTTT
+SELECT ID,
+       genotypes.SAMPLE1 AS s1,
+       genotypes.SAMPLE2 AS s2,
+       genotypes.SAMPLE3 AS s3,
+       genotypes.SAMPLE4 AS s4
+FROM read_pfile('test/data/pgen_example', genotypes := 'struct')
+ORDER BY ID;
+----
+rs1	0	1	2	NULL
+rs2	1	1	0	2
+rs3	2	NULL	1	0
+rs4	0	0	1	2
+
+# Verify column type is STRUCT
+query T
+SELECT typeof(genotypes)
+FROM read_pfile('test/data/pgen_example', genotypes := 'struct')
+LIMIT 1;
+----
+STRUCT(SAMPLE1 TINYINT, SAMPLE2 TINYINT, SAMPLE3 TINYINT, SAMPLE4 TINYINT)
+
+# STRUCT with sample subsetting
+query ITT
+SELECT ID,
+       genotypes.SAMPLE1 AS s1,
+       genotypes.SAMPLE3 AS s3
+FROM read_pfile('test/data/pgen_example', genotypes := 'struct', samples := ['SAMPLE1', 'SAMPLE3'])
+ORDER BY ID;
+----
+rs1	0	2
+rs2	1	0
+rs3	2	1
+rs4	0	1
+
+# --- read_pgen STRUCT mode ---
+
+query ITTTT
+SELECT ID,
+       genotypes.SAMPLE1 AS s1,
+       genotypes.SAMPLE2 AS s2,
+       genotypes.SAMPLE3 AS s3,
+       genotypes.SAMPLE4 AS s4
+FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'struct')
+ORDER BY ID;
+----
+rs1	0	1	2	NULL
+rs2	1	1	0	2
+rs3	2	NULL	1	0
+rs4	0	0	1	2
+
+# --- Sample orient: STRUCT mode ---
+
+query TT
+SELECT IID,
+       genotypes.rs1 AS rs1
+FROM read_pfile('test/data/pgen_example', orient := 'sample', genotypes := 'struct')
+ORDER BY IID;
+----
+SAMPLE1	0
+SAMPLE2	1
+SAMPLE3	2
+SAMPLE4	NULL
+
+query TTTTT
+SELECT IID,
+       genotypes.rs1 AS rs1,
+       genotypes.rs2 AS rs2,
+       genotypes.rs3 AS rs3,
+       genotypes.rs4 AS rs4
+FROM read_pfile('test/data/pgen_example', orient := 'sample', genotypes := 'struct')
+ORDER BY IID;
+----
+SAMPLE1	0	1	2	0
+SAMPLE2	1	1	NULL	0
+SAMPLE3	2	0	1	1
+SAMPLE4	NULL	2	0	2

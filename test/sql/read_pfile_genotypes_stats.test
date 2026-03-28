@@ -1,0 +1,67 @@
+# name: test/sql/read_pfile_genotypes_stats.test
+# description: Test genotypes := 'stats' mode for read_pfile and read_pgen
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- Variant orient: STATS mode ---
+
+# Basic STATS output - check counts + derived fields
+# rs1: hom_ref=1, het=1, hom_alt=1, missing=1 -> n=3, af=(1+2)/6=0.5, maf=0.5
+# rs2: hom_ref=1, het=2, hom_alt=1, missing=0 -> n=4, af=(2+2)/8=0.5, maf=0.5
+# rs3: hom_ref=1, het=1, hom_alt=1, missing=1 -> n=3, af=(1+2)/6=0.5, maf=0.5
+# rs4: hom_ref=2, het=1, hom_alt=1, missing=0 -> n=4, af=(1+2)/8=0.375, maf=0.375
+
+query IIIIIRRRII
+SELECT genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing,
+       genotypes.n,
+       ROUND(genotypes.af, 6) AS af,
+       ROUND(genotypes.maf, 6) AS maf,
+       ROUND(genotypes.missing_rate, 6) AS missing_rate,
+       genotypes.carrier_count,
+       ROUND(genotypes.het_rate, 6) AS het_rate
+FROM read_pfile('test/data/pgen_example', genotypes := 'stats')
+ORDER BY ID;
+----
+1	1	1	1	3	0.5	0.5	0.25	2	0.333333
+1	2	1	0	4	0.5	0.5	0.0	3	0.5
+1	1	1	1	3	0.5	0.5	0.25	2	0.333333
+2	1	1	0	4	0.375	0.375	0.0	2	0.25
+
+# Verify column type
+query T
+SELECT typeof(genotypes)
+FROM read_pfile('test/data/pgen_example', genotypes := 'stats')
+LIMIT 1;
+----
+STRUCT(hom_ref UINTEGER, het UINTEGER, hom_alt UINTEGER, missing UINTEGER, n UINTEGER, af DOUBLE, maf DOUBLE, missing_rate DOUBLE, carrier_count UINTEGER, het_rate DOUBLE)
+
+# --- read_pgen STATS mode ---
+
+query IIIII
+SELECT genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing,
+       genotypes.n
+FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'stats')
+ORDER BY ID;
+----
+1	1	1	1	3
+1	2	1	0	4
+1	1	1	1	3
+2	1	1	0	4
+
+# Cross-check af against plink_freq
+query IR
+SELECT ID, ROUND(genotypes.af, 6) AS stats_af
+FROM read_pfile('test/data/pgen_example', genotypes := 'stats')
+ORDER BY ID;
+----
+rs1	0.5
+rs2	0.5
+rs3	0.5
+rs4	0.375

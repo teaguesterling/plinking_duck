@@ -1,0 +1,85 @@
+# name: test/sql/read_pfile_genotypes_counts.test
+# description: Test genotypes := 'counts' mode for read_pfile and read_pgen
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- Variant orient: COUNTS mode ---
+
+# Basic COUNTS output
+query IIIII
+SELECT ID,
+       genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing
+FROM read_pfile('test/data/pgen_example', genotypes := 'counts')
+ORDER BY ID;
+----
+rs1	1	1	1	1
+rs2	1	2	1	0
+rs3	1	1	1	1
+rs4	2	1	1	0
+
+# Verify column type
+query T
+SELECT typeof(genotypes)
+FROM read_pfile('test/data/pgen_example', genotypes := 'counts')
+LIMIT 1;
+----
+STRUCT(hom_ref UINTEGER, het UINTEGER, hom_alt UINTEGER, missing UINTEGER)
+
+# COUNTS with sample subsetting (2 of 4 samples)
+query IIIII
+SELECT ID,
+       genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing
+FROM read_pfile('test/data/pgen_example', genotypes := 'counts', samples := ['SAMPLE1', 'SAMPLE3'])
+ORDER BY ID;
+----
+rs1	1	0	1	0
+rs2	1	1	0	0
+rs3	0	1	1	0
+rs4	1	1	0	0
+
+# --- read_pgen COUNTS mode ---
+
+query IIIII
+SELECT ID,
+       genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing
+FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'counts')
+ORDER BY ID;
+----
+rs1	1	1	1	1
+rs2	1	2	1	0
+rs3	1	1	1	1
+rs4	2	1	1	0
+
+# --- Sample orient: COUNTS mode ---
+# In sample orient, counts are accumulated across variants for each sample
+
+query TIIII
+SELECT IID,
+       genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing
+FROM read_pfile('test/data/pgen_example', orient := 'sample', genotypes := 'counts')
+ORDER BY IID;
+----
+SAMPLE1	2	1	1	0
+SAMPLE2	1	2	0	1
+SAMPLE3	1	2	1	0
+SAMPLE4	1	0	2	1
+
+# Cross-check: sum of all variant hom_ref should match
+query I
+SELECT SUM(genotypes.hom_ref)
+FROM read_pfile('test/data/pgen_example', genotypes := 'counts');
+----
+5

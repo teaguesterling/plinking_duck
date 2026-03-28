@@ -19,14 +19,28 @@ namespace duckdb {
 
 //! Genotype column output mode for read_pgen / read_pfile default mode.
 enum class GenotypeMode : uint8_t {
-	ARRAY,  //!< ARRAY(TINYINT, N) — requires N <= MAX_ARRAY_SIZE
-	LIST,   //!< LIST(TINYINT) — any sample count
-	COLUMNS //!< One scalar TINYINT column per sample (variant orient) or per variant (sample orient)
+	ARRAY,   //!< ARRAY(TINYINT, N) — requires N <= MAX_ARRAY_SIZE
+	LIST,    //!< LIST(TINYINT) — any sample count
+	COLUMNS, //!< One scalar TINYINT column per sample (variant orient) or per variant (sample orient)
+	STRUCT,  //!< STRUCT with named fields per sample/variant — like COLUMNS but single logical column
+	COUNTS,  //!< STRUCT(hom_ref, het, hom_alt, missing) — fast genotype counting via PgrGetCounts
+	STATS    //!< STRUCT with counts + derived stats (af, maf, missing_rate, carrier_count, het_rate)
 };
 
 //! Resolve a genotypes parameter string to a GenotypeMode.
 //! Case-insensitive. "auto" → ARRAY if sample_ct ≤ MAX_ARRAY_SIZE, else LIST.
 GenotypeMode ResolveGenotypeMode(const string &mode_str, uint32_t sample_ct, const string &func_name);
+
+//! Build the STRUCT type for genotypes='counts': {hom_ref, het, hom_alt, missing}
+LogicalType MakeGenotypeCountsType();
+
+//! Build the STRUCT type for genotypes='stats': counts + derived fields
+LogicalType MakeGenotypeStatsType();
+
+//! Check if a genotype mode is an aggregate mode (counts/stats)
+inline bool IsAggregateGenotypeMode(GenotypeMode mode) {
+	return mode == GenotypeMode::COUNTS || mode == GenotypeMode::STATS;
+}
 
 // ---------------------------------------------------------------------------
 // Orient mode

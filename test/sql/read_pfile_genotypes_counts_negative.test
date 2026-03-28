@@ -1,0 +1,68 @@
+# name: test/sql/read_pfile_genotypes_counts_negative.test
+# description: Negative tests for STRUCT/COUNTS/STATS genotype modes
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- COUNTS + genotype orient → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', orient := 'genotype', genotypes := 'counts');
+----
+aggregate modes require orient := 'variant' or 'sample'
+
+# --- STATS + genotype orient → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', orient := 'genotype', genotypes := 'stats');
+----
+aggregate modes require orient := 'variant' or 'sample'
+
+# --- STRUCT + genotype orient → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', orient := 'genotype', genotypes := 'struct');
+----
+genotypes := 'struct' is not compatible with orient := 'genotype'
+
+# --- COUNTS + phased → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'counts', phased := true);
+----
+incompatible with phased
+
+# --- COUNTS + dosages → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'counts', dosages := true);
+----
+incompatible with dosages
+
+# --- STATS + phased → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'stats', phased := true);
+----
+incompatible with phased
+
+# --- STATS + dosages → error ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'stats', dosages := true);
+----
+incompatible with dosages
+
+# --- read_pgen COUNTS + phased → error ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'counts', phased := true);
+----
+incompatible with phased
+
+# --- read_pgen STATS + dosages → error ---
+
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotypes := 'stats', dosages := true);
+----
+incompatible with dosages
