@@ -52,6 +52,12 @@ struct PgenBindData : public TableFunctionData {
 	// Genotype range filtering (genotype_range)
 	GenotypeRangeFilter genotype_filter;
 
+	// Variant filtering
+	bool has_variant_filter = false;
+	vector<uint32_t> variant_indices;
+	bool has_effective_variant_list = false;
+	vector<uint32_t> effective_variant_indices;
+
 	// Columns mode layout (genotypes := 'columns')
 	vector<string> genotype_column_names;     // IIDs for column names
 	idx_t columns_mode_first_geno_col = 0;    // first genotype column index in schema
@@ -156,6 +162,8 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			// Handled after pgenlib init (need raw_sample_ct)
 		} else if (kv.first == "genotypes") {
 			// Handled after sample count is known
+		} else if (kv.first == "variants") {
+			// Handled after variant metadata is loaded
 		}
 		// af_range, ac_range handled after pgenlib init
 	}
@@ -255,6 +263,16 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 
 		bind_data->has_sample_subset = true;
 		bind_data->subset_sample_ct = static_cast<uint32_t>(bind_data->sample_indices.size());
+	}
+
+	// --- Process variants parameter ---
+	auto variants_it = input.named_parameters.find("variants");
+	if (variants_it != input.named_parameters.end()) {
+		bind_data->variant_indices =
+		    ResolveVariantsParameter(variants_it->second, bind_data->variants, bind_data->raw_variant_ct, "read_pgen");
+		bind_data->has_variant_filter = true;
+		bind_data->has_effective_variant_list = true;
+		bind_data->effective_variant_indices = bind_data->variant_indices;
 	}
 
 	// --- Parse count filters (af_range, ac_range) ---
@@ -402,7 +420,9 @@ static unique_ptr<GlobalTableFunctionState> PgenInitGlobal(ClientContext &contex
 	auto &bind_data = input.bind_data->Cast<PgenBindData>();
 	auto state = make_uniq<PgenGlobalState>();
 
-	state->total_variants = bind_data.raw_variant_ct;
+	state->total_variants =
+	    bind_data.has_effective_variant_list ? static_cast<uint32_t>(bind_data.effective_variant_indices.size())
+	                                         : bind_data.raw_variant_ct;
 	state->column_ids = input.column_ids;
 	state->max_threads_config = GetPlinkingMaxThreads(context);
 
@@ -586,7 +606,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		}
 		uint32_t batch_end = std::min(batch_start + claim_size, total_variants);
 
-		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
+		for (uint32_t ev = batch_start; ev < batch_end; ev++) {
+			uint32_t vidx = bind_data.has_effective_variant_list ? bind_data.effective_variant_indices[ev] : ev;
 
 			// Count filter + genotype range pre-decompression check
 			bool geno_range_all_pass = true;
@@ -1040,6 +1061,7 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 	read_pgen.named_parameters["af_range"] = LogicalType::ANY;
 	read_pgen.named_parameters["ac_range"] = LogicalType::ANY;
 	read_pgen.named_parameters["genotype_range"] = LogicalType::ANY;
+	read_pgen.named_parameters["variants"] = LogicalType::ANY;
 
 	loader.RegisterFunction(read_pgen);
 }

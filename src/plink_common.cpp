@@ -957,6 +957,293 @@ void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasep
 }
 
 // ---------------------------------------------------------------------------
+// Unified variants parameter resolution
+// ---------------------------------------------------------------------------
+
+//! Validate a 0-based variant index is within range.
+static void ValidateVariantIndex(int64_t idx, uint32_t raw_variant_ct, const string &func_name) {
+	if (idx < 0 || static_cast<uint32_t>(idx) >= raw_variant_ct) {
+		throw InvalidInputException("%s: variant index %lld out of range (variant count: %u)", func_name,
+		                            static_cast<long long>(idx), raw_variant_ct);
+	}
+}
+
+//! Build a map from variant ID to 0-based index.
+static unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &variants) {
+	unordered_map<string, uint32_t> id_to_idx;
+	for (idx_t i = 0; i < variants.variant_ct; i++) {
+		auto id = variants.GetId(i);
+		if (!id.empty()) {
+			id_to_idx[id] = static_cast<uint32_t>(i);
+		}
+	}
+	return id_to_idx;
+}
+
+//! Resolve a single CPRA string (chrom:pos or chrom:pos:ref:alt) to a variant index.
+static uint32_t ResolveCpraString(const string &cpra, const VariantMetadataIndex &variants, const string &func_name) {
+	// Split on ':'
+	vector<string> parts;
+	size_t start = 0;
+	for (size_t i = 0; i <= cpra.size(); i++) {
+		if (i == cpra.size() || cpra[i] == ':') {
+			parts.push_back(cpra.substr(start, i - start));
+			start = i + 1;
+		}
+	}
+
+	if (parts.size() != 2 && parts.size() != 4) {
+		throw InvalidInputException("%s: invalid CPRA format '%s' (expected CHROM:POS or CHROM:POS:REF:ALT)", func_name,
+		                            cpra);
+	}
+
+	auto &chrom = parts[0];
+	char *end_ptr;
+	errno = 0;
+	long pos = std::strtol(parts[1].c_str(), &end_ptr, 10);
+	if (*end_ptr != '\0' || errno != 0) {
+		throw InvalidInputException("%s: invalid position in CPRA '%s'", func_name, cpra);
+	}
+
+	bool match_alleles = (parts.size() == 4);
+	string ref_match, alt_match;
+	if (match_alleles) {
+		ref_match = parts[2];
+		alt_match = parts[3];
+	}
+
+	for (idx_t i = 0; i < variants.variant_ct; i++) {
+		if (variants.GetChrom(i) == chrom && variants.GetPos(i) == static_cast<int32_t>(pos)) {
+			if (match_alleles) {
+				if (variants.GetRef(i) == ref_match && variants.GetAlt(i) == alt_match) {
+					return static_cast<uint32_t>(i);
+				}
+			} else {
+				return static_cast<uint32_t>(i);
+			}
+		}
+	}
+
+	throw InvalidInputException("%s: variant '%s' not found", func_name, cpra);
+}
+
+//! Resolve a single variant string (rsid or CPRA) to a variant index.
+static uint32_t ResolveVariantString(const string &id, const VariantMetadataIndex &variants,
+                                     const unordered_map<string, uint32_t> &id_to_idx, const string &func_name) {
+	// If it contains ':', treat as CPRA
+	if (id.find(':') != string::npos) {
+		return ResolveCpraString(id, variants, func_name);
+	}
+
+	// Otherwise, look up as rsid
+	auto it = id_to_idx.find(id);
+	if (it == id_to_idx.end()) {
+		throw InvalidInputException("%s: variant '%s' not found", func_name, id);
+	}
+	return it->second;
+}
+
+//! Resolve a CPRA struct ({chrom, pos} or {chrom, pos, ref, alt}) to a variant index.
+static uint32_t ResolveCpraStruct(const Value &val, const VariantMetadataIndex &variants, const string &func_name) {
+	auto &child_types = StructType::GetChildTypes(val.type());
+	auto &children = StructValue::GetChildren(val);
+
+	string chrom;
+	int32_t pos = 0;
+	string ref_val, alt_val;
+	bool has_ref = false, has_alt = false;
+
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		auto &name = child_types[i].first;
+		if (name == "chrom") {
+			chrom = children[i].GetValue<string>();
+		} else if (name == "pos") {
+			pos = children[i].GetValue<int32_t>();
+		} else if (name == "ref") {
+			ref_val = children[i].GetValue<string>();
+			has_ref = true;
+		} else if (name == "alt") {
+			alt_val = children[i].GetValue<string>();
+			has_alt = true;
+		}
+	}
+
+	bool match_alleles = has_ref && has_alt;
+
+	for (idx_t i = 0; i < variants.variant_ct; i++) {
+		if (variants.GetChrom(i) == chrom && variants.GetPos(i) == pos) {
+			if (match_alleles) {
+				if (variants.GetRef(i) == ref_val && variants.GetAlt(i) == alt_val) {
+					return static_cast<uint32_t>(i);
+				}
+			} else {
+				return static_cast<uint32_t>(i);
+			}
+		}
+	}
+
+	string desc = chrom + ":" + std::to_string(pos);
+	if (match_alleles) {
+		desc += ":" + ref_val + ":" + alt_val;
+	}
+	throw InvalidInputException("%s: variant '%s' not found", func_name, desc);
+}
+
+//! Resolve a range struct ({start, stop} with INTEGER or VARCHAR values) to variant indices.
+static vector<uint32_t> ResolveRangeStruct(const Value &val, const VariantMetadataIndex &variants,
+                                            uint32_t raw_variant_ct,
+                                            const unordered_map<string, uint32_t> &id_to_idx,
+                                            const string &func_name) {
+	auto &child_types = StructType::GetChildTypes(val.type());
+	auto &children = StructValue::GetChildren(val);
+
+	idx_t start_field = DConstants::INVALID_INDEX;
+	idx_t stop_field = DConstants::INVALID_INDEX;
+
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		if (child_types[i].first == "start") {
+			start_field = i;
+		} else if (child_types[i].first == "stop") {
+			stop_field = i;
+		}
+	}
+
+	if (start_field == DConstants::INVALID_INDEX || stop_field == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("%s: range struct must have 'start' and 'stop' fields", func_name);
+	}
+
+	auto &start_type = child_types[start_field].second;
+	uint32_t start_idx, stop_idx;
+
+	if (start_type.id() == LogicalTypeId::INTEGER || start_type.id() == LogicalTypeId::BIGINT) {
+		int64_t sv = children[start_field].GetValue<int64_t>();
+		int64_t ev = children[stop_field].GetValue<int64_t>();
+		ValidateVariantIndex(sv, raw_variant_ct, func_name);
+		ValidateVariantIndex(ev, raw_variant_ct, func_name);
+		start_idx = static_cast<uint32_t>(sv);
+		stop_idx = static_cast<uint32_t>(ev);
+	} else if (start_type.id() == LogicalTypeId::VARCHAR) {
+		auto start_str = children[start_field].GetValue<string>();
+		auto stop_str = children[stop_field].GetValue<string>();
+		start_idx = ResolveVariantString(start_str, variants, id_to_idx, func_name);
+		stop_idx = ResolveVariantString(stop_str, variants, id_to_idx, func_name);
+	} else {
+		throw InvalidInputException("%s: range struct start/stop must be INTEGER or VARCHAR", func_name);
+	}
+
+	if (start_idx > stop_idx) {
+		throw InvalidInputException("%s: variants range start (%u) is after stop (%u)", func_name, start_idx, stop_idx);
+	}
+
+	vector<uint32_t> indices;
+	for (uint32_t i = start_idx; i <= stop_idx; i++) {
+		indices.push_back(i);
+	}
+	return indices;
+}
+
+vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadataIndex &variants,
+                                           uint32_t raw_variant_ct, const string &func_name) {
+	vector<uint32_t> indices;
+	auto &type = val.type();
+
+	// Lazily build ID index only when needed
+	unordered_map<string, uint32_t> id_to_idx;
+	auto ensure_id_index = [&]() {
+		if (id_to_idx.empty()) {
+			id_to_idx = BuildVariantIdIndex(variants);
+		}
+	};
+
+	if (type.id() == LogicalTypeId::INTEGER || type.id() == LogicalTypeId::BIGINT) {
+		// Single integer index
+		int64_t idx = val.GetValue<int64_t>();
+		ValidateVariantIndex(idx, raw_variant_ct, func_name);
+		indices.push_back(static_cast<uint32_t>(idx));
+
+	} else if (type.id() == LogicalTypeId::VARCHAR) {
+		// Single rsid or CPRA string
+		ensure_id_index();
+		indices.push_back(ResolveVariantString(val.GetValue<string>(), variants, id_to_idx, func_name));
+
+	} else if (type.id() == LogicalTypeId::STRUCT) {
+		// Could be CPRA struct or range struct — disambiguate by field names
+		auto &child_types = StructType::GetChildTypes(type);
+		bool has_start = false, has_chrom = false;
+		for (auto &ct : child_types) {
+			if (ct.first == "start") {
+				has_start = true;
+			}
+			if (ct.first == "chrom") {
+				has_chrom = true;
+			}
+		}
+
+		if (has_start && has_chrom) {
+			throw InvalidInputException(
+			    "%s: ambiguous variants struct — has both 'start' and 'chrom' fields. "
+			    "Use {start:, stop:} for a range or {chrom:, pos:} for a CPRA lookup.",
+			    func_name);
+		} else if (has_start) {
+			ensure_id_index();
+			indices = ResolveRangeStruct(val, variants, raw_variant_ct, id_to_idx, func_name);
+		} else if (has_chrom) {
+			indices.push_back(ResolveCpraStruct(val, variants, func_name));
+		} else {
+			throw InvalidInputException(
+			    "%s: variants struct must have either 'start'/'stop' (range) or 'chrom'/'pos' (CPRA) fields", func_name);
+		}
+
+	} else if (type.id() == LogicalTypeId::LIST) {
+		auto &child_type = ListType::GetChildType(type);
+		auto &children = ListValue::GetChildren(val);
+
+		if (children.empty()) {
+			throw InvalidInputException("%s: variants list must not be empty", func_name);
+		}
+
+		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
+			for (auto &child : children) {
+				int64_t idx = child.GetValue<int64_t>();
+				ValidateVariantIndex(idx, raw_variant_ct, func_name);
+				indices.push_back(static_cast<uint32_t>(idx));
+			}
+		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
+			ensure_id_index();
+			for (auto &child : children) {
+				auto id = child.GetValue<string>();
+				indices.push_back(ResolveVariantString(id, variants, id_to_idx, func_name));
+			}
+		} else if (child_type.id() == LogicalTypeId::STRUCT) {
+			for (auto &child : children) {
+				indices.push_back(ResolveCpraStruct(child, variants, func_name));
+			}
+		} else {
+			throw InvalidInputException(
+			    "%s: variants list elements must be INTEGER, VARCHAR, or STRUCT (got %s)", func_name,
+			    child_type.ToString());
+		}
+
+	} else {
+		throw InvalidInputException(
+		    "%s: variants parameter must be an integer, string, struct, or list (got %s)", func_name,
+		    type.ToString());
+	}
+
+	// Validate no duplicates
+	{
+		std::unordered_set<uint32_t> seen;
+		for (auto idx : indices) {
+			if (!seen.insert(idx).second) {
+				throw InvalidInputException("%s: duplicate variant index %u in variants parameter", func_name, idx);
+			}
+		}
+	}
+
+	return indices;
+}
+
+// ---------------------------------------------------------------------------
 // Max threads config helper
 // ---------------------------------------------------------------------------
 

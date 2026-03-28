@@ -598,57 +598,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// --- Process variants parameter ---
 	auto variants_it = input.named_parameters.find("variants");
 	if (variants_it != input.named_parameters.end()) {
-		auto &variants_val = variants_it->second;
-		auto &child_type = ListType::GetChildType(variants_val.type());
-
-		auto &children_check = ListValue::GetChildren(variants_val);
-		if (children_check.empty()) {
-			throw InvalidInputException("read_pfile: variants list must not be empty");
-		}
-
-		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
-			auto &children = ListValue::GetChildren(variants_val);
-			for (auto &child : children) {
-				int64_t idx = child.GetValue<int64_t>();
-				if (idx < 0 || static_cast<uint32_t>(idx) >= bind_data->raw_variant_ct) {
-					throw InvalidInputException("read_pfile: variant index %lld out of range (variant count: %u)",
-					                            static_cast<long long>(idx), bind_data->raw_variant_ct);
-				}
-				bind_data->variant_indices.push_back(static_cast<uint32_t>(idx));
-			}
-		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
-			// Build ID→index map from VariantMetadataIndex
-			unordered_map<string, uint32_t> id_to_idx;
-			for (idx_t i = 0; i < bind_data->variants.variant_ct; i++) {
-				auto id = bind_data->variants.GetId(i);
-				if (!id.empty()) {
-					id_to_idx[id] = static_cast<uint32_t>(i);
-				}
-			}
-
-			auto &children = ListValue::GetChildren(variants_val);
-			for (auto &child : children) {
-				auto vid = child.GetValue<string>();
-				auto it = id_to_idx.find(vid);
-				if (it == id_to_idx.end()) {
-					throw InvalidInputException("read_pfile: variant '%s' not found in .pvar", vid);
-				}
-				bind_data->variant_indices.push_back(it->second);
-			}
-		} else {
-			throw InvalidInputException("read_pfile: variants parameter must be LIST(VARCHAR) or LIST(INTEGER)");
-		}
-
-		// Validate no duplicate variant indices (consistent with samples behavior)
-		{
-			std::unordered_set<uint32_t> seen;
-			for (auto idx : bind_data->variant_indices) {
-				if (!seen.insert(idx).second) {
-					throw InvalidInputException("read_pfile: duplicate variant index %u in variants list", idx);
-				}
-			}
-		}
-
+		bind_data->variant_indices = ResolveVariantsParameter(variants_it->second, bind_data->variants,
+		                                                       bind_data->raw_variant_ct, "read_pfile");
 		bind_data->has_variant_filter = true;
 	}
 

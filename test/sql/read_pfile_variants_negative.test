@@ -1,0 +1,65 @@
+# name: test/sql/read_pfile_variants_negative.test
+# description: Negative tests for unified variants parameter
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- rsid not found ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := 'rs999');
+----
+not found
+
+# --- Index out of range ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := 999);
+----
+out of range
+
+# --- Negative index ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := -1);
+----
+out of range
+
+# --- Invalid CPRA format (3 parts) ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := '1:10000:A');
+----
+invalid CPRA format
+
+# --- Ambiguous struct (has both start and chrom) ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := {start: 0, chrom: '1'});
+----
+ambiguous
+
+# --- Range start > stop ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := {start: 3, stop: 0});
+----
+after stop
+
+# --- Empty list ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := []);
+----
+empty
+
+# --- CPRA not found ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := '99:99999');
+----
+not found
+
+# --- CPRA with wrong alleles ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := '1:10000:C:T');
+----
+not found
+
+# --- Struct missing required fields ---
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', variants := {foo: 'bar'});
+----
+must have either

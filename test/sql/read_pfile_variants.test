@@ -1,0 +1,125 @@
+# name: test/sql/read_pfile_variants.test
+# description: Test unified variants parameter for read_pfile
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- Single integer ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := 0);
+----
+1
+
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := 0);
+----
+rs1
+
+# --- Single rsid ---
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := 'rs1');
+----
+rs1
+
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := 'rs4');
+----
+rs4
+
+# --- CPRA string (chrom:pos) ---
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := '1:10000');
+----
+rs1
+
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := '2:15000');
+----
+rs4
+
+# --- CPRA string with ref/alt ---
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := '1:10000:A:G');
+----
+rs1
+
+# --- List of integers (existing behavior) ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := [0, 2]);
+----
+2
+
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := [0, 2]) ORDER BY POS;
+----
+rs1
+rs3
+
+# --- List of rsids (existing behavior) ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := ['rs1', 'rs3']);
+----
+2
+
+# --- List of CPRA strings ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := ['1:10000', '2:15000']);
+----
+2
+
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := ['1:10000', '2:15000']) ORDER BY POS;
+----
+rs1
+rs4
+
+# --- CPRA struct ---
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := {chrom: '1', pos: 10000});
+----
+rs1
+
+# --- CPRA struct with alleles ---
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := {chrom: '1', pos: 10000, ref: 'A', alt: 'G'});
+----
+rs1
+
+# --- List of CPRA structs ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := [{chrom: '1', pos: 10000}, {chrom: '2', pos: 15000}]);
+----
+2
+
+# --- Index range ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := {start: 0, stop: 2});
+----
+3
+
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := {start: 0, stop: 2}) ORDER BY POS;
+----
+rs1
+rs2
+rs3
+
+# --- Index range single element ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := {start: 1, stop: 1});
+----
+1
+
+# --- Identifier range ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example', variants := {start: 'rs1', stop: 'rs3'});
+----
+3
+
+# --- Variants + region intersection ---
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', variants := [0, 1, 2, 3], region := '1') ORDER BY POS;
+----
+rs1
+rs2
+rs3

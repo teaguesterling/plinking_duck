@@ -351,6 +351,16 @@ void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasep
                            uint32_t sample_ct, int8_t *output_pairs);
 
 // ---------------------------------------------------------------------------
+// Unified variants parameter resolution
+// ---------------------------------------------------------------------------
+
+//! Resolve a variants parameter value into a sorted list of 0-based variant indices.
+//! Handles all supported input types: single integer, single string (rsid or CPRA),
+//! CPRA struct, range struct, and lists of any of those.
+vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadataIndex &variants,
+                                           uint32_t raw_variant_ct, const string &func_name);
+
+// ---------------------------------------------------------------------------
 // Max threads config helper
 // ---------------------------------------------------------------------------
 

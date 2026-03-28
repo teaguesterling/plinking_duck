@@ -1,0 +1,65 @@
+# name: test/sql/read_pgen_variants.test
+# description: Test variants parameter for read_pgen
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- Single integer ---
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', variants := 0);
+----
+rs1
+
+# --- Single rsid ---
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', variants := 'rs1');
+----
+rs1
+
+# --- List of integers ---
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', variants := [0, 2]);
+----
+2
+
+# --- List of rsids ---
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', variants := ['rs1', 'rs4']);
+----
+2
+
+# --- CPRA string ---
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', variants := '1:10000');
+----
+rs1
+
+# --- Index range ---
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', variants := {start: 0, stop: 1});
+----
+2
+
+# --- CPRA struct ---
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', variants := {chrom: '2', pos: 15000});
+----
+rs4
+
+# --- Verify genotypes are correct for filtered variant ---
+query T
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', variants := 3);
+----
+rs4
+
+# --- Error: index out of range ---
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', variants := 999);
+----
+out of range
+
+# --- Error: rsid not found ---
+statement error
+SELECT * FROM read_pgen('test/data/pgen_example.pgen', variants := 'rs999');
+----
+not found
