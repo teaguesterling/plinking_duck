@@ -5,6 +5,8 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
@@ -105,10 +107,86 @@ static bool PfileIsMissingValue(const string &val) {
 	return val.empty() || val == "." || val == "NA" || val == "na";
 }
 
+//! Load full sample metadata from a non-native source for genotype/sample orient modes.
+//! Queries the source via Connection, populates both PfileSampleMetadata and SampleInfo.
+static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &context, const string &source,
+                                                              SampleInfo &sample_info_out) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto escaped = StringUtil::Replace(source, "'", "''");
+	auto result = conn.Query("SELECT * FROM '" + escaped + "'");
+	if (result->HasError()) {
+		throw IOException("read_pfile: failed to read source '%s': %s", source, result->GetError());
+	}
+
+	PfileSampleMetadata meta;
+
+	// Build header from result schema
+	meta.header.format = PsamFormat::PSAM_IID;
+	meta.header.column_names = result->names;
+	meta.header.column_types = result->types;
+
+	// Find special column indices (case-insensitive)
+	idx_t iid_idx = DConstants::INVALID_INDEX;
+	idx_t fid_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < result->names.size(); i++) {
+		auto lower = StringUtil::Lower(result->names[i]);
+		if (lower == "sex") {
+			meta.sex_col_idx = i;
+		} else if (lower == "pat" || lower == "mat") {
+			meta.parent_col_indices.push_back(i);
+		}
+		if (lower == "iid") {
+			iid_idx = i;
+		} else if (lower == "fid") {
+			fid_idx = i;
+		}
+	}
+
+	if (iid_idx == DConstants::INVALID_INDEX) {
+		throw IOException("read_pfile: source '%s' has no IID column (found: %s)", source,
+		                  StringUtil::Join(result->names, ", "));
+	}
+
+	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
+
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			vector<string> fields;
+			for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+				auto val = chunk->GetValue(col, row);
+				fields.push_back(val.IsNull() ? "" : val.ToString());
+			}
+
+			// Extract sample info
+			const auto &iid = fields[iid_idx];
+			if (sample_info_out.iid_to_idx.count(iid)) {
+				throw IOException("read_pfile: source '%s' has duplicate IID '%s'", source, iid);
+			}
+			sample_info_out.iids.push_back(iid);
+			if (has_fid) {
+				sample_info_out.fids.push_back(fields[fid_idx]);
+			}
+			sample_info_out.iid_to_idx[iid] = sample_info_out.iids.size() - 1;
+
+			meta.rows.push_back(std::move(fields));
+		}
+	}
+
+	sample_info_out.sample_ct = sample_info_out.iids.size();
+	return meta;
+}
+
 //! Load full sample metadata including all columns for genotype orient mode output.
 //! Also populates sample_info to avoid a separate file read for LoadSampleInfo.
 static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const string &path,
                                                    SampleInfo &sample_info_out) {
+	// Non-native sources: dispatch to source loader
+	if (!IsNativePlinkFormat(path)) {
+		return LoadPfileSampleMetadataFromSource(context, path, sample_info_out);
+	}
+
 	auto lines = ReadFileLines(context, path);
 
 	PfileSampleMetadata meta;

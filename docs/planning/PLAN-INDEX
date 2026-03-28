@@ -147,9 +147,11 @@ Randomized SVD with multi-threaded generation-based barrier. Requires Eigen3
 |------|-------|-----------|--------|
 | P7-001 | plinking_max_threads config | None | ✓ Done |
 | P7-002 | GLM p-value threshold | None | ✓ Done |
-| P7-003 | genotypes='struct'/'counts'/'stats' | None | Planned |
-| P7-004 | Unified variants parameter | None (implement last) | Planned |
-| P4-004 | Parquet companion auto-discovery | None | Planned |
+| P7-003 | genotypes='struct'/'counts'/'stats' | None | ✓ Done |
+| P7-004 | Unified variants parameter | None | ✓ Done |
+| P4-004-0 | Parquet companion auto-discovery | None | ✓ Done |
+| P4-004 | Full flexible companion sources | P4-004-0 | Planned |
+| P2-007 | plink_phenotype + psam column refs | None | Planned |
 
 **P7-001**: Configurable thread cap via `SET plinking_max_threads = N`.
 Default 0 (no override). Applied in all MaxThreads() overrides.

@@ -423,6 +423,13 @@ bool IsParquetFile(const string &path) {
 	return StringUtil::EndsWith(StringUtil::Lower(path), ".parquet");
 }
 
+bool IsNativePlinkFormat(const string &path) {
+	auto lower = StringUtil::Lower(path);
+	return StringUtil::EndsWith(lower, ".pvar") || StringUtil::EndsWith(lower, ".bim") ||
+	       StringUtil::EndsWith(lower, ".psam") || StringUtil::EndsWith(lower, ".fam") ||
+	       StringUtil::EndsWith(lower, ".pvar.zst") || StringUtil::EndsWith(lower, ".psam.zst");
+}
+
 bool GetUseParquetCompanions(ClientContext &context) {
 	Value val;
 	if (context.TryGetCurrentSetting("plinking_use_parquet_companions", val)) {
@@ -599,18 +606,187 @@ SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path)
 	return info;
 }
 
+// ---------------------------------------------------------------------------
+// Generic source loading (CSV, tables, views, etc.)
+// ---------------------------------------------------------------------------
+
+//! Execute a query against a source string via a separate Connection.
+//! The source may be a file path (CSV, parquet, etc.) or a table/view name.
+//! DuckDB's replacement scan mechanism handles file extension dispatch.
+static unique_ptr<MaterializedQueryResult> QuerySource(ClientContext &context, const string &source,
+                                                       const string &func_name) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	// Escape single quotes for safety
+	auto escaped = StringUtil::Replace(source, "'", "''");
+	auto result = conn.Query("SELECT * FROM '" + escaped + "'");
+	if (result->HasError()) {
+		throw IOException("%s: failed to read source '%s': %s", func_name, source, result->GetError());
+	}
+	return result;
+}
+
+VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const string &source,
+                                                    const string &func_name) {
+	auto result = QuerySource(context, source, func_name);
+
+	// Map columns by name (case-insensitive) — same logic as parquet loader
+	auto &col_names = result->names;
+	idx_t chrom_col = DConstants::INVALID_INDEX;
+	idx_t pos_col = DConstants::INVALID_INDEX;
+	idx_t id_col = DConstants::INVALID_INDEX;
+	idx_t ref_col = DConstants::INVALID_INDEX;
+	idx_t alt_col = DConstants::INVALID_INDEX;
+
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		auto lower = StringUtil::Lower(col_names[i]);
+		if (lower == "chrom" || lower == "#chrom") {
+			chrom_col = i;
+		} else if (lower == "pos") {
+			pos_col = i;
+		} else if (lower == "id") {
+			id_col = i;
+		} else if (lower == "ref") {
+			ref_col = i;
+		} else if (lower == "alt") {
+			alt_col = i;
+		}
+	}
+
+	if (chrom_col == DConstants::INVALID_INDEX || pos_col == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("%s: source '%s' missing required columns "
+		                            "(need CHROM and POS, found: %s)",
+		                            func_name, source, StringUtil::Join(col_names, ", "));
+	}
+
+	// Synthesize a .pvar-format text buffer from the query result
+	string buf;
+	buf += "#CHROM\tPOS\tID\tREF\tALT\n";
+
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			buf += chunk->GetValue(chrom_col, row).ToString();
+			buf += '\t';
+			buf += chunk->GetValue(pos_col, row).ToString();
+			buf += '\t';
+			buf += (id_col != DConstants::INVALID_INDEX) ? chunk->GetValue(id_col, row).ToString() : ".";
+			buf += '\t';
+			buf += (ref_col != DConstants::INVALID_INDEX) ? chunk->GetValue(ref_col, row).ToString() : ".";
+			buf += '\t';
+			buf += (alt_col != DConstants::INVALID_INDEX) ? chunk->GetValue(alt_col, row).ToString() : ".";
+			buf += '\n';
+		}
+	}
+
+	// Parse the synthetic buffer using the existing text parser structure
+	VariantMetadataIndex idx;
+	idx.file_content = std::move(buf);
+	idx.is_bim = false;
+	idx.chrom_idx = 0;
+	idx.pos_idx = 1;
+	idx.id_idx = 2;
+	idx.ref_idx = 3;
+	idx.alt_idx = 4;
+
+	// Build line offsets — skip the header line (first line ending with \n)
+	size_t pos = 0;
+	while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
+		pos++;
+	}
+	if (pos < idx.file_content.size()) {
+		pos++; // skip newline
+	}
+
+	// Index data lines
+	while (pos < idx.file_content.size()) {
+		if (idx.file_content[pos] == '\n') {
+			pos++;
+			continue;
+		}
+		idx.line_offsets.push_back(static_cast<uint64_t>(pos));
+		while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
+			pos++;
+		}
+		if (pos < idx.file_content.size()) {
+			pos++;
+		}
+	}
+
+	idx.variant_ct = idx.line_offsets.size();
+	return idx;
+}
+
+SampleInfo LoadSampleInfoFromSource(ClientContext &context, const string &source) {
+	auto result = QuerySource(context, source, "LoadSampleInfoFromSource");
+
+	// Map columns by name (case-insensitive) — same logic as parquet loader
+	auto &col_names = result->names;
+	idx_t iid_col = DConstants::INVALID_INDEX;
+	idx_t fid_col = DConstants::INVALID_INDEX;
+
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		auto lower = StringUtil::Lower(col_names[i]);
+		if (lower == "iid") {
+			iid_col = i;
+		} else if (lower == "fid") {
+			fid_col = i;
+		}
+	}
+
+	if (iid_col == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("Source '%s' missing required IID column (found: %s)", source,
+		                            StringUtil::Join(col_names, ", "));
+	}
+
+	SampleInfo info;
+	bool has_fid = (fid_col != DConstants::INVALID_INDEX);
+
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto iid = chunk->GetValue(iid_col, row).ToString();
+
+			if (info.iid_to_idx.count(iid)) {
+				throw IOException("Source '%s' has duplicate IID '%s'", source, iid);
+			}
+
+			info.iids.push_back(iid);
+			if (has_fid) {
+				info.fids.push_back(chunk->GetValue(fid_col, row).ToString());
+			}
+			info.iid_to_idx[iid] = info.iids.size() - 1;
+		}
+	}
+
+	info.sample_ct = info.iids.size();
+	return info;
+}
+
+// ---------------------------------------------------------------------------
+// Unified dispatch functions
+// ---------------------------------------------------------------------------
+
 VariantMetadataIndex LoadVariantMetadata(ClientContext &context, const string &path, const string &func_name) {
 	if (IsParquetFile(path)) {
 		return LoadVariantMetadataFromParquet(context, path, func_name);
 	}
-	return LoadVariantMetadataIndex(context, path, func_name);
+	if (IsNativePlinkFormat(path)) {
+		return LoadVariantMetadataIndex(context, path, func_name);
+	}
+	// Arbitrary source (CSV, table, view, etc.)
+	return LoadVariantMetadataFromSource(context, path, func_name);
 }
 
 SampleInfo LoadSampleMetadata(ClientContext &context, const string &path) {
 	if (IsParquetFile(path)) {
 		return LoadSampleInfoFromParquet(context, path);
 	}
-	return LoadSampleInfo(context, path);
+	if (IsNativePlinkFormat(path)) {
+		return LoadSampleInfo(context, path);
+	}
+	// Arbitrary source (CSV, table, view, etc.)
+	return LoadSampleInfoFromSource(context, path);
 }
 
 // ---------------------------------------------------------------------------

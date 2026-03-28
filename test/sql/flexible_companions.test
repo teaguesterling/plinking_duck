@@ -1,0 +1,153 @@
+# name: test/sql/flexible_companions.test
+# description: Test flexible companion sources (P4-004) — CSV, tables, views as pvar/psam sources
+# group: [plinking_duck]
+
+require plinking_duck
+
+# --- Setup: create CSV companions ---
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pgen_example.pvar')) TO '/tmp/plinking_duck_test.pvar.csv' (HEADER);
+
+statement ok
+COPY (SELECT * FROM read_psam('test/data/pgen_example.psam')) TO '/tmp/plinking_duck_test.psam.csv' (HEADER);
+
+# --- read_pvar with non-native source (CSV) ---
+query I
+SELECT COUNT(*) FROM read_pvar('/tmp/plinking_duck_test.pvar.csv');
+----
+4
+
+# --- read_psam with non-native source (CSV) ---
+query I
+SELECT COUNT(*) FROM read_psam('/tmp/plinking_duck_test.psam.csv');
+----
+4
+
+# --- Table companions ---
+statement ok
+CREATE TABLE my_variants AS SELECT * FROM read_pvar('test/data/pgen_example.pvar');
+
+statement ok
+CREATE TABLE my_samples AS SELECT * FROM read_psam('test/data/pgen_example.psam');
+
+# --- read_pvar from table ---
+query I
+SELECT COUNT(*) FROM read_pvar('my_variants');
+----
+4
+
+# --- read_psam from table ---
+query I
+SELECT COUNT(*) FROM read_psam('my_samples');
+----
+4
+
+# --- read_pgen with CSV pvar ---
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.csv');
+----
+4
+
+# --- read_pgen with CSV pvar and psam ---
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.csv',
+    psam := '/tmp/plinking_duck_test.psam.csv');
+----
+4
+
+# --- Verify data matches native for read_pgen with CSV companions ---
+query I
+SELECT COUNT(*) FROM (
+    SELECT ID, CHROM, POS, REF, ALT, genotypes
+    FROM read_pgen('test/data/pgen_example.pgen',
+        pvar := '/tmp/plinking_duck_test.pvar.csv',
+        psam := '/tmp/plinking_duck_test.psam.csv')
+    EXCEPT
+    SELECT ID, CHROM, POS, REF, ALT, genotypes
+    FROM read_pgen('test/data/pgen_example.pgen')
+);
+----
+0
+
+# --- read_pgen with table companions ---
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'my_variants',
+    psam := 'my_samples');
+----
+4
+
+# --- Verify data matches for table companions ---
+query I
+SELECT COUNT(*) FROM (
+    SELECT ID, CHROM, POS, genotypes
+    FROM read_pgen('test/data/pgen_example.pgen',
+        pvar := 'my_variants', psam := 'my_samples')
+    EXCEPT
+    SELECT ID, CHROM, POS, genotypes
+    FROM read_pgen('test/data/pgen_example.pgen')
+);
+----
+0
+
+# --- Utility functions with CSV companions ---
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.csv');
+----
+4
+
+# --- plink_freq with table companion ---
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/pgen_example.pgen',
+    pvar := 'my_variants');
+----
+4
+
+# --- plink_hardy with CSV companion ---
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/pgen_example.pgen',
+    pvar := '/tmp/plinking_duck_test.pvar.csv');
+----
+4
+
+# --- Sample subsetting with table companion ---
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen',
+    pvar := 'my_variants', psam := 'my_samples',
+    samples := ['SAMPLE1', 'SAMPLE2']);
+----
+4
+
+# --- read_pfile with CSV companions ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example',
+    pvar := '/tmp/plinking_duck_test.pvar.csv',
+    psam := '/tmp/plinking_duck_test.psam.csv');
+----
+4
+
+# --- Verify read_pfile data matches ---
+query I
+SELECT COUNT(*) FROM (
+    SELECT ID, CHROM, POS, genotypes
+    FROM read_pfile('test/data/pgen_example',
+        pvar := '/tmp/plinking_duck_test.pvar.csv',
+        psam := '/tmp/plinking_duck_test.psam.csv')
+    EXCEPT
+    SELECT ID, CHROM, POS, genotypes
+    FROM read_pfile('test/data/pgen_example')
+);
+----
+0
+
+# --- read_pfile genotype orient with CSV companions ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pgen_example',
+    pvar := '/tmp/plinking_duck_test.pvar.csv',
+    psam := '/tmp/plinking_duck_test.psam.csv',
+    orient := 'genotype');
+----
+16

@@ -1,10 +1,19 @@
 #include "pvar_reader.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
+
+// Forward declaration from plink_common.hpp — avoid including the full header
+// to prevent name conflicts with local static SplitTabLine/SplitWhitespaceLine.
+namespace duckdb {
+bool IsNativePlinkFormat(const string &path);
+} // namespace duckdb
 
 namespace duckdb {
 
@@ -180,12 +189,23 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 struct PvarBindData : public TableFunctionData {
 	string file_path;
 	PvarHeaderInfo header_info;
+
+	//! True if the source is a non-native format (CSV, parquet, table, view, etc.)
+	//! In this case, data is materialized at bind time and emitted from materialized_rows.
+	bool is_external_source = false;
+
+	//! Materialized rows from a non-native source (one vector<Value> per row).
+	//! Only populated when is_external_source is true.
+	vector<vector<Value>> materialized_rows;
 };
 
 struct PvarGlobalState : public GlobalTableFunctionState {
 	unique_ptr<FileHandle> handle;
 	bool finished = false;
 	vector<column_t> column_ids;
+
+	//! Next row index for materialized (non-native) sources
+	idx_t next_row_idx = 0;
 
 	idx_t MaxThreads() const override {
 		return 1; // Sequential text file reading
@@ -213,10 +233,49 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PvarBindData>();
 	bind_data->file_path = input.inputs[0].GetValue<string>();
-	bind_data->header_info = ParsePvarHeader(context, bind_data->file_path);
 
-	names = bind_data->header_info.column_names;
-	return_types = bind_data->header_info.column_types;
+	// Check if this is a native PLINK format file
+	if (IsNativePlinkFormat(bind_data->file_path)) {
+		// Existing path: parse native text file
+		bind_data->header_info = ParsePvarHeader(context, bind_data->file_path);
+		names = bind_data->header_info.column_names;
+		return_types = bind_data->header_info.column_types;
+	} else {
+		// Non-native source: query via Connection and materialize
+		bind_data->is_external_source = true;
+
+		auto &db = DatabaseInstance::GetDatabase(context);
+		Connection conn(db);
+		auto escaped = StringUtil::Replace(bind_data->file_path, "'", "''");
+		auto result = conn.Query("SELECT * FROM '" + escaped + "'");
+		if (result->HasError()) {
+			throw IOException("read_pvar: failed to read source '%s': %s", bind_data->file_path, result->GetError());
+		}
+
+		// Use the result schema as the output schema
+		for (idx_t i = 0; i < result->names.size(); i++) {
+			names.push_back(result->names[i]);
+			return_types.push_back(result->types[i]);
+		}
+
+		// Also populate header_info for consistency
+		bind_data->header_info.column_names = names;
+		bind_data->header_info.column_types = return_types;
+		bind_data->header_info.is_bim = false;
+		bind_data->header_info.skip_lines = 0;
+
+		// Materialize all rows
+		unique_ptr<DataChunk> chunk;
+		while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> row_values;
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					row_values.push_back(chunk->GetValue(col, row));
+				}
+				bind_data->materialized_rows.push_back(std::move(row_values));
+			}
+		}
+	}
 
 	return std::move(bind_data);
 }
@@ -225,17 +284,20 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 	auto &bind_data = input.bind_data->Cast<PvarBindData>();
 	auto state = make_uniq<PvarGlobalState>();
 
-	auto &fs = FileSystem::GetFileSystem(context);
-	state->handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ);
-
-	// Skip comment and header lines to reach the first data line
-	string skip;
-	for (idx_t i = 0; i < bind_data.header_info.skip_lines; i++) {
-		ReadLineFromHandle(*state->handle, skip);
-	}
-
 	// Store projected column indices for the scan function
 	state->column_ids = input.column_ids;
+
+	if (!bind_data.is_external_source) {
+		// Native path: open the file and skip header lines
+		auto &fs = FileSystem::GetFileSystem(context);
+		state->handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ);
+
+		string skip;
+		for (idx_t i = 0; i < bind_data.header_info.skip_lines; i++) {
+			ReadLineFromHandle(*state->handle, skip);
+		}
+	}
+	// For external sources, data is materialized in bind_data; nothing to open
 
 	return std::move(state);
 }
@@ -314,8 +376,37 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		return;
 	}
 
-	auto &header = bind_data.header_info;
 	auto &column_ids = state.column_ids;
+
+	if (bind_data.is_external_source) {
+		// External source path: emit rows from materialized data
+		idx_t row_count = 0;
+		auto &rows = bind_data.materialized_rows;
+
+		while (row_count < STANDARD_VECTOR_SIZE && state.next_row_idx < rows.size()) {
+			auto &row_values = rows[state.next_row_idx];
+
+			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
+				auto file_col = column_ids[out_col];
+				if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+					continue;
+				}
+				output.data[out_col].SetValue(row_count, row_values[file_col]);
+			}
+
+			row_count++;
+			state.next_row_idx++;
+		}
+
+		if (row_count == 0) {
+			state.finished = true;
+		}
+		output.SetCardinality(row_count);
+		return;
+	}
+
+	// Native text file path
+	auto &header = bind_data.header_info;
 	idx_t row_count = 0;
 	string line;
 

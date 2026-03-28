@@ -182,6 +182,10 @@ string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<s
 //! Check if a file path refers to a parquet file.
 bool IsParquetFile(const string &path);
 
+//! Check if a path refers to a native PLINK format file.
+//! Returns true for .pvar, .bim, .psam, .fam, .pvar.zst, .psam.zst extensions.
+bool IsNativePlinkFormat(const string &path);
+
 //! Read the plinking_use_parquet_companions config option.
 bool GetUseParquetCompanions(ClientContext &context);
 
@@ -199,10 +203,21 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 //! Load sample info from a parquet file via DuckDB's parquet reader.
 SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path);
 
-//! Load variant metadata, auto-dispatching between parquet and native text.
+//! Load variant metadata from any DuckDB-readable source (CSV, table, view, etc.).
+//! Executes SELECT * FROM '<source>' via a separate Connection, maps columns by name
+//! (case-insensitive), synthesizes a pvar-format text buffer, and returns a standard
+//! VariantMetadataIndex.
+VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const string &source, const string &func_name);
+
+//! Load sample info from any DuckDB-readable source (CSV, table, view, etc.).
+//! Same approach: query via separate Connection, map columns, synthesize psam-format buffer,
+//! return standard SampleInfo.
+SampleInfo LoadSampleInfoFromSource(ClientContext &context, const string &source);
+
+//! Load variant metadata, auto-dispatching between parquet, native text, and arbitrary sources.
 VariantMetadataIndex LoadVariantMetadata(ClientContext &context, const string &path, const string &func_name);
 
-//! Load sample info, auto-dispatching between parquet and native text.
+//! Load sample info, auto-dispatching between parquet, native text, and arbitrary sources.
 SampleInfo LoadSampleMetadata(ClientContext &context, const string &path);
 
 // ---------------------------------------------------------------------------

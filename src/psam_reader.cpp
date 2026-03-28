@@ -2,10 +2,19 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+
+// Forward declaration from plink_common.hpp — avoid including the full header
+// to prevent name conflicts with local static SplitTabLine/SplitWhitespaceLine/ReadFileLines.
+namespace duckdb {
+bool IsNativePlinkFormat(const string &path);
+} // namespace duckdb
 
 namespace duckdb {
 
@@ -281,6 +290,12 @@ struct PsamBindData : public TableFunctionData {
 
 	//! Index of SEX column in the file (-1 if absent)
 	idx_t sex_col_idx = DConstants::INVALID_INDEX;
+
+	//! True if the source is a non-native format (CSV, parquet, table, view, etc.)
+	bool is_external_source = false;
+
+	//! Materialized rows from a non-native source.
+	vector<vector<Value>> materialized_rows;
 };
 
 // ---------------------------------------------------------------------------
@@ -323,25 +338,62 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 	auto result = make_uniq<PsamBindData>();
 	result->file_path = input.inputs[0].GetValue<string>();
 
-	auto header = ParsePsamHeader(context, result->file_path);
-	result->format = header.format;
-	result->column_names = header.column_names;
-	result->column_types = header.column_types;
+	if (IsNativePlinkFormat(result->file_path)) {
+		// Existing path: parse native text file
+		auto header = ParsePsamHeader(context, result->file_path);
+		result->format = header.format;
+		result->column_names = header.column_names;
+		result->column_types = header.column_types;
 
-	// Identify PAT/MAT columns for special missing-value handling
-	for (idx_t i = 0; i < header.column_names.size(); i++) {
-		if (header.column_names[i] == "PAT" || header.column_names[i] == "MAT") {
-			result->parent_col_indices.push_back(i);
+		// Identify PAT/MAT columns for special missing-value handling
+		for (idx_t i = 0; i < header.column_names.size(); i++) {
+			if (header.column_names[i] == "PAT" || header.column_names[i] == "MAT") {
+				result->parent_col_indices.push_back(i);
+			}
+			if (header.column_names[i] == COL_SEX) {
+				result->sex_col_idx = i;
+			}
 		}
-		if (header.column_names[i] == COL_SEX) {
-			result->sex_col_idx = i;
-		}
-	}
 
-	// Populate output schema
-	for (idx_t i = 0; i < header.column_names.size(); i++) {
-		names.push_back(header.column_names[i]);
-		return_types.push_back(header.column_types[i]);
+		// Populate output schema
+		for (idx_t i = 0; i < header.column_names.size(); i++) {
+			names.push_back(header.column_names[i]);
+			return_types.push_back(header.column_types[i]);
+		}
+	} else {
+		// Non-native source: query via Connection and materialize
+		result->is_external_source = true;
+
+		auto &db = DatabaseInstance::GetDatabase(context);
+		Connection conn(db);
+		auto escaped = StringUtil::Replace(result->file_path, "'", "''");
+		auto query_result = conn.Query("SELECT * FROM '" + escaped + "'");
+		if (query_result->HasError()) {
+			throw IOException("read_psam: failed to read source '%s': %s", result->file_path,
+			                  query_result->GetError());
+		}
+
+		// Use the result schema as the output schema
+		result->column_names = query_result->names;
+		result->column_types = query_result->types;
+		result->format = PsamFormat::PSAM_IID; // placeholder
+
+		for (idx_t i = 0; i < query_result->names.size(); i++) {
+			names.push_back(query_result->names[i]);
+			return_types.push_back(query_result->types[i]);
+		}
+
+		// Materialize all rows
+		unique_ptr<DataChunk> chunk;
+		while ((chunk = query_result->Fetch()) != nullptr && chunk->size() > 0) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> row_values;
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					row_values.push_back(chunk->GetValue(col, row));
+				}
+				result->materialized_rows.push_back(std::move(row_values));
+			}
+		}
 	}
 
 	return std::move(result);
@@ -369,28 +421,32 @@ static unique_ptr<GlobalTableFunctionState> PsamInitGlobal(ClientContext &contex
 		state->is_parent_col.push_back(is_parent);
 	}
 
-	auto lines = ReadFileLines(context, bind_data.file_path);
-	auto header = ParsePsamHeaderFromLines(lines, bind_data.file_path);
-	idx_t expected_cols = bind_data.column_names.size();
+	if (!bind_data.is_external_source) {
+		// Native path: read and parse the text file
+		auto lines = ReadFileLines(context, bind_data.file_path);
+		auto header = ParsePsamHeaderFromLines(lines, bind_data.file_path);
+		idx_t expected_cols = bind_data.column_names.size();
 
-	// Data lines start at index 1 for .psam (skip header), 0 for .fam
-	idx_t data_start = (bind_data.format != PsamFormat::FAM) ? 1 : 0;
+		// Data lines start at index 1 for .psam (skip header), 0 for .fam
+		idx_t data_start = (bind_data.format != PsamFormat::FAM) ? 1 : 0;
 
-	for (idx_t i = data_start; i < lines.size(); i++) {
-		auto &line = lines[i];
-		if (line.empty()) {
-			continue;
+		for (idx_t i = data_start; i < lines.size(); i++) {
+			auto &line = lines[i];
+			if (line.empty()) {
+				continue;
+			}
+
+			auto fields = SplitLine(line, header.format);
+
+			if (fields.size() != expected_cols) {
+				throw IOException("read_psam: file '%s' line %d has %d fields, expected %d", bind_data.file_path,
+				                  i + 1, fields.size(), expected_cols);
+			}
+
+			state->rows.push_back(std::move(fields));
 		}
-
-		auto fields = SplitLine(line, header.format);
-
-		if (fields.size() != expected_cols) {
-			throw IOException("read_psam: file '%s' line %d has %d fields, expected %d", bind_data.file_path, i + 1,
-			                  fields.size(), expected_cols);
-		}
-
-		state->rows.push_back(std::move(fields));
 	}
+	// For external sources, data is in bind_data.materialized_rows; nothing to load here
 
 	return std::move(state);
 }
@@ -408,6 +464,41 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 	auto &bind_data = input.bind_data->Cast<PsamBindData>();
 	auto &global_state = input.global_state->Cast<PsamGlobalState>();
 
+	auto &column_ids = global_state.column_ids;
+
+	if (bind_data.is_external_source) {
+		// External source path: emit rows from materialized data
+		idx_t start_idx;
+		idx_t batch_size;
+		{
+			lock_guard<mutex> guard(global_state.lock);
+			start_idx = global_state.next_row_idx;
+			batch_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, bind_data.materialized_rows.size() - start_idx);
+			global_state.next_row_idx += batch_size;
+		}
+
+		if (batch_size == 0) {
+			output.SetCardinality(0);
+			return;
+		}
+
+		for (idx_t row = 0; row < batch_size; row++) {
+			auto &row_values = bind_data.materialized_rows[start_idx + row];
+
+			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
+				auto file_col = column_ids[out_col];
+				if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+					continue;
+				}
+				output.data[out_col].SetValue(row, row_values[file_col]);
+			}
+		}
+
+		output.SetCardinality(batch_size);
+		return;
+	}
+
+	// Native text file path
 	// Claim a batch of rows
 	idx_t start_idx;
 	idx_t batch_size;
@@ -423,7 +514,6 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 		return;
 	}
 
-	auto &column_ids = global_state.column_ids;
 	auto &is_parent_col = global_state.is_parent_col;
 
 	for (idx_t row = 0; row < batch_size; row++) {
