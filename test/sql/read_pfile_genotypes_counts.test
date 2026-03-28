@@ -83,3 +83,73 @@ SELECT SUM(genotypes.hom_ref)
 FROM read_pfile('test/data/pgen_example', genotypes := 'counts');
 ----
 5
+
+# Cross-check: variant counts sum = total samples per variant
+# For rs2 (no missing): hom_ref + het + hom_alt = 4
+query I
+SELECT genotypes.hom_ref + genotypes.het + genotypes.hom_alt + genotypes.missing
+FROM read_pfile('test/data/pgen_example', genotypes := 'counts')
+WHERE ID = 'rs2';
+----
+4
+
+# Cross-check: sample counts sum = total variants per sample
+# SAMPLE1 has no missing across 4 variants: total = 4
+query I
+SELECT genotypes.hom_ref + genotypes.het + genotypes.hom_alt + genotypes.missing
+FROM read_pfile('test/data/pgen_example', orient := 'sample', genotypes := 'counts')
+WHERE IID = 'SAMPLE1';
+----
+4
+
+# Cross-check: sum of carrier_count across modes (variant counts matches sample counts)
+# Total het+hom_alt across all variants = total het+hom_alt across all samples
+query I
+SELECT (SELECT SUM(genotypes.het + genotypes.hom_alt)
+        FROM read_pfile('test/data/pgen_example', genotypes := 'counts'))
+     = (SELECT SUM(genotypes.het + genotypes.hom_alt)
+        FROM read_pfile('test/data/pgen_example', orient := 'sample', genotypes := 'counts'));
+----
+true
+
+# --- COUNTS with af_range filter ---
+
+query IIIII
+SELECT ID,
+       genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing
+FROM read_pfile('test/data/pgen_example', genotypes := 'counts', af_range := {max: 0.4});
+----
+rs4	2	1	1	0
+
+# --- COUNTS with variant filter ---
+
+query IIIII
+SELECT ID,
+       genotypes.hom_ref,
+       genotypes.het,
+       genotypes.hom_alt,
+       genotypes.missing
+FROM read_pfile('test/data/pgen_example', genotypes := 'counts', variants := ['rs1', 'rs2'])
+ORDER BY ID;
+----
+rs1	1	1	1	1
+rs2	1	2	1	0
+
+# --- COUNTS with larger dataset ---
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/large_example', genotypes := 'counts');
+----
+3000
+
+# Verify all counts sum to 8 (8 samples, no missing in large_example)
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM read_pfile('test/data/large_example', genotypes := 'counts')
+    WHERE genotypes.hom_ref + genotypes.het + genotypes.hom_alt + genotypes.missing != 8
+);
+----
+0
