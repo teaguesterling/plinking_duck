@@ -1,4 +1,5 @@
 #include "plink_common.hpp"
+#include "plink_profile.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -90,135 +91,111 @@ OrientMode ResolveOrientMode(const string &orient_str, const string &func_name) 
 // Offset-indexed variant metadata
 // ---------------------------------------------------------------------------
 
-size_t VariantMetadataIndex::LineEnd(idx_t vidx) const {
-	size_t end;
-	if (vidx + 1 < variant_ct) {
-		end = static_cast<size_t>(line_offsets[vidx + 1]);
+// ---------------------------------------------------------------------------
+// Columnar load helpers (shared between parquet and text paths)
+// ---------------------------------------------------------------------------
+
+//! Build chrom_offsets from the chroms column. Requires (CHROM, POS)-sorted
+//! input (PLINK spec). Detects non-contiguous chroms (a spec violation that
+//! generic sources like SQL views might produce) and throws rather than
+//! silently dropping runs. The rest of the code (binary search on POS) assumes
+//! contiguous runs, so this is a hard precondition.
+static void BuildChromOffsets(VariantMetadataIndex &idx, const string &source_label) {
+	idx.chrom_offsets.clear();
+	if (idx.chroms.empty()) {
+		return;
+	}
+	idx_t run_start = 0;
+	const string *current = &idx.chroms[0];
+	for (idx_t i = 1; i < idx.chroms.size(); i++) {
+		if (idx.chroms[i] != *current) {
+			auto inserted = idx.chrom_offsets.emplace(*current, std::make_pair(run_start, i));
+			if (!inserted.second) {
+				throw InvalidInputException("%s: chromosome '%s' appears in non-contiguous runs (variants must be "
+				                            "sorted by (CHROM, POS) as required by the PLINK spec; first run ended at "
+				                            "row %llu, found again at row %llu)",
+				                            source_label, current->c_str(),
+				                            static_cast<unsigned long long>(inserted.first->second.second),
+				                            static_cast<unsigned long long>(i));
+			}
+			current = &idx.chroms[i];
+			run_start = i;
+		}
+	}
+	auto inserted = idx.chrom_offsets.emplace(*current, std::make_pair(run_start, idx.chroms.size()));
+	if (!inserted.second) {
+		throw InvalidInputException(
+		    "%s: chromosome '%s' appears in non-contiguous runs (variants must be sorted by (CHROM, POS))",
+		    source_label, current->c_str());
+	}
+}
+
+//! Parse a single delimited field from [start, end) in buf (no allocation).
+//! Advances *field_start to the start of the next field (after the delimiter),
+//! sets *out_start and *out_len to the span of the current field within buf.
+//! Returns false if no more fields are found. Delim = '\t' for pvar, ' '/'\t' for bim.
+static bool NextField(const char *buf, size_t line_end, size_t *cursor, size_t *out_start, size_t *out_len,
+                      bool whitespace) {
+	size_t i = *cursor;
+	if (whitespace) {
+		while (i < line_end && (buf[i] == ' ' || buf[i] == '\t')) {
+			i++;
+		}
+		if (i >= line_end) {
+			return false;
+		}
+		size_t start = i;
+		while (i < line_end && buf[i] != ' ' && buf[i] != '\t') {
+			i++;
+		}
+		*out_start = start;
+		*out_len = i - start;
+		*cursor = i;
 	} else {
-		end = file_content.size();
-	}
-	// Strip trailing newline characters
-	while (end > static_cast<size_t>(line_offsets[vidx]) &&
-	       (file_content[end - 1] == '\n' || file_content[end - 1] == '\r')) {
-		end--;
-	}
-	return end;
-}
-
-string VariantMetadataIndex::GetField(idx_t vidx, idx_t field_idx) const {
-	auto start = static_cast<size_t>(line_offsets[vidx]);
-	auto line_end = LineEnd(vidx);
-
-	if (is_bim) {
-		// Whitespace-delimited: skip leading whitespace, then find fields
-		idx_t current_field = 0;
-		size_t i = start;
-		while (i < line_end) {
-			// Skip whitespace
-			while (i < line_end && (file_content[i] == ' ' || file_content[i] == '\t')) {
-				i++;
-			}
-			if (i >= line_end) {
-				break;
-			}
-			size_t field_start = i;
-			// Find end of field
-			while (i < line_end && file_content[i] != ' ' && file_content[i] != '\t') {
-				i++;
-			}
-			if (current_field == field_idx) {
-				return string(file_content.data() + field_start, i - field_start);
-			}
-			current_field++;
+		if (i > line_end) {
+			return false;
 		}
-	} else {
-		// Tab-delimited
-		idx_t current_field = 0;
-		size_t field_start = start;
-		for (size_t i = start; i < line_end; i++) {
-			if (file_content[i] == '\t') {
-				if (current_field == field_idx) {
-					return string(file_content.data() + field_start, i - field_start);
-				}
-				current_field++;
-				field_start = i + 1;
-			}
+		size_t start = i;
+		while (i < line_end && buf[i] != '\t') {
+			i++;
 		}
-		// Last field on the line
-		if (current_field == field_idx) {
-			return string(file_content.data() + field_start, line_end - field_start);
-		}
+		*out_start = start;
+		*out_len = i - start;
+		*cursor = i < line_end ? i + 1 : i; // step past the tab
 	}
-
-	throw InternalException("VariantMetadataIndex::GetField: field index %llu out of range for variant %llu",
-	                        static_cast<unsigned long long>(field_idx), static_cast<unsigned long long>(vidx));
-}
-
-string VariantMetadataIndex::GetChrom(idx_t vidx) const {
-	return GetField(vidx, chrom_idx);
-}
-
-int32_t VariantMetadataIndex::GetPos(idx_t vidx) const {
-	auto field = GetField(vidx, pos_idx);
-	char *end;
-	errno = 0;
-	long val = std::strtol(field.c_str(), &end, 10);
-	if (end == field.c_str() || *end != '\0' || errno != 0) {
-		throw InternalException("VariantMetadataIndex::GetPos: invalid POS value '%s' for variant %llu", field.c_str(),
-		                        static_cast<unsigned long long>(vidx));
-	}
-	return static_cast<int32_t>(val);
-}
-
-string VariantMetadataIndex::GetId(idx_t vidx) const {
-	auto field = GetField(vidx, id_idx);
-	if (field == ".") {
-		return "";
-	}
-	return field;
-}
-
-string VariantMetadataIndex::GetRef(idx_t vidx) const {
-	return GetField(vidx, ref_idx);
-}
-
-string VariantMetadataIndex::GetAlt(idx_t vidx) const {
-	auto field = GetField(vidx, alt_idx);
-	if (field == ".") {
-		return "";
-	}
-	return field;
+	return true;
 }
 
 VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const string &path, const string &func_name) {
+	BindPhaseTimer timer("LoadVariantMetadataIndex(text)");
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
 	auto file_size = handle->GetFileSize();
+	timer.Note("file_size=%llu", static_cast<unsigned long long>(file_size));
 
 	if (file_size == 0) {
 		throw InvalidInputException("%s: .pvar/.bim file '%s' is empty", func_name, path);
 	}
 
+	string file_content;
+	file_content.resize(file_size);
+	handle->Read(const_cast<char *>(file_content.data()), file_size);
+
 	VariantMetadataIndex idx;
-	idx.file_content.resize(file_size);
-	handle->Read(const_cast<char *>(idx.file_content.data()), file_size);
 
-	// Parse header from the in-memory buffer (same logic as LoadVariantMetadata)
+	// --- Header / column layout ---
 	size_t pos = 0;
-
-	// Skip ## comment/meta lines
 	while (pos < file_size) {
-		if (file_size - pos >= 2 && idx.file_content[pos] == '#' && idx.file_content[pos + 1] == '#') {
-			// Skip to next line
-			while (pos < file_size && idx.file_content[pos] != '\n') {
+		if (file_size - pos >= 2 && file_content[pos] == '#' && file_content[pos + 1] == '#') {
+			while (pos < file_size && file_content[pos] != '\n') {
 				pos++;
 			}
 			if (pos < file_size) {
-				pos++; // skip newline
+				pos++;
 			}
 			continue;
 		}
-		if (pos < file_size && idx.file_content[pos] == '\n') {
+		if (pos < file_size && file_content[pos] == '\n') {
 			pos++;
 			continue;
 		}
@@ -229,98 +206,169 @@ VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const stri
 		throw InvalidInputException("%s: .pvar/.bim file '%s' contains no header or data", func_name, path);
 	}
 
-	// Extract the header/first-data line to determine format
 	size_t header_start = pos;
 	size_t header_end = pos;
-	while (header_end < file_size && idx.file_content[header_end] != '\n') {
+	while (header_end < file_size && file_content[header_end] != '\n') {
 		header_end++;
 	}
-	// Strip trailing \r
 	size_t header_content_end = header_end;
-	if (header_content_end > header_start && idx.file_content[header_content_end - 1] == '\r') {
+	if (header_content_end > header_start && file_content[header_content_end - 1] == '\r') {
 		header_content_end--;
 	}
-	string header_line(idx.file_content.data() + header_start, header_content_end - header_start);
+	string header_line(file_content.data() + header_start, header_content_end - header_start);
 
-	vector<string> column_names;
+	idx_t chrom_field = DConstants::INVALID_INDEX;
+	idx_t pos_field = DConstants::INVALID_INDEX;
+	idx_t id_field = DConstants::INVALID_INDEX;
+	idx_t ref_field = DConstants::INVALID_INDEX;
+	idx_t alt_field = DConstants::INVALID_INDEX;
 
 	if (header_line.size() >= 6 && header_line.substr(0, 6) == "#CHROM") {
-		// .pvar format
 		idx.is_bim = false;
-		auto fields = SplitTabLine(header_line.substr(1)); // strip leading '#'
-		column_names = std::move(fields);
-		// Skip past header line
+		auto fields = SplitTabLine(header_line.substr(1));
+		for (idx_t i = 0; i < fields.size(); i++) {
+			if (fields[i] == "CHROM") {
+				chrom_field = i;
+			} else if (fields[i] == "POS") {
+				pos_field = i;
+			} else if (fields[i] == "ID") {
+				id_field = i;
+			} else if (fields[i] == "REF") {
+				ref_field = i;
+			} else if (fields[i] == "ALT") {
+				alt_field = i;
+			}
+		}
 		pos = header_end;
 		if (pos < file_size) {
-			pos++; // skip newline
+			pos++;
 		}
 	} else {
-		// Legacy .bim format: no header to skip, first line is data
 		idx.is_bim = true;
-		// .bim physical columns: CHROM(0) ID(1) CM(2) POS(3) ALT(4) REF(5)
-		// We store physical field indices directly
-		column_names = {"CHROM", "ID", "CM", "POS", "ALT", "REF"};
+		// .bim: CHROM(0) ID(1) CM(2) POS(3) ALT(4) REF(5)
+		chrom_field = 0;
+		id_field = 1;
+		pos_field = 3;
+		alt_field = 4;
+		ref_field = 5;
 	}
 
-	// Find physical column indices
-	idx.chrom_idx = DConstants::INVALID_INDEX;
-	idx.pos_idx = DConstants::INVALID_INDEX;
-	idx.id_idx = DConstants::INVALID_INDEX;
-	idx.ref_idx = DConstants::INVALID_INDEX;
-	idx.alt_idx = DConstants::INVALID_INDEX;
-
-	for (idx_t i = 0; i < column_names.size(); i++) {
-		const auto &name = column_names[i];
-		if (name == "CHROM") {
-			idx.chrom_idx = i;
-		} else if (name == "POS") {
-			idx.pos_idx = i;
-		} else if (name == "ID") {
-			idx.id_idx = i;
-		} else if (name == "REF") {
-			idx.ref_idx = i;
-		} else if (name == "ALT") {
-			idx.alt_idx = i;
-		}
-	}
-
-	if (idx.chrom_idx == DConstants::INVALID_INDEX || idx.pos_idx == DConstants::INVALID_INDEX ||
-	    idx.id_idx == DConstants::INVALID_INDEX || idx.ref_idx == DConstants::INVALID_INDEX ||
-	    idx.alt_idx == DConstants::INVALID_INDEX) {
+	if (chrom_field == DConstants::INVALID_INDEX || pos_field == DConstants::INVALID_INDEX ||
+	    id_field == DConstants::INVALID_INDEX || ref_field == DConstants::INVALID_INDEX ||
+	    alt_field == DConstants::INVALID_INDEX) {
 		throw InvalidInputException("%s: .pvar/.bim file '%s' is missing required columns "
 		                            "(need CHROM, POS, ID, REF, ALT)",
 		                            func_name, path);
 	}
 
-	// Build line offset index: one pass over the buffer
-	// Estimate capacity to avoid reallocation
-	if (file_size > 0) {
-		idx.line_offsets.reserve(file_size / 30); // rough estimate: ~30 bytes per line
-	}
+	// --- Pre-size vectors (rough estimate) ---
+	idx_t capacity = file_size / 30;
+	idx.chroms.reserve(capacity);
+	idx.positions.reserve(capacity);
+	idx.ids.reserve(capacity);
+	idx.refs.reserve(capacity);
+	idx.alts.reserve(capacity);
+
+	// --- Parse each data line directly into columnar vectors ---
+	const idx_t max_field = std::max({chrom_field, pos_field, id_field, ref_field, alt_field});
+	const char *buf = file_content.data();
+	const bool whitespace = idx.is_bim;
 
 	while (pos < file_size) {
-		// Skip empty lines
-		if (idx.file_content[pos] == '\n') {
-			pos++;
+		if (buf[pos] == '\n' || (buf[pos] == '\r' && pos + 1 < file_size && buf[pos + 1] == '\n')) {
+			pos += (buf[pos] == '\r') ? 2 : 1;
 			continue;
 		}
-		if (idx.file_content[pos] == '\r' && pos + 1 < file_size && idx.file_content[pos + 1] == '\n') {
-			pos += 2;
-			continue;
+		size_t line_end = pos;
+		while (line_end < file_size && buf[line_end] != '\n') {
+			line_end++;
+		}
+		size_t content_end = line_end;
+		if (content_end > pos && buf[content_end - 1] == '\r') {
+			content_end--;
 		}
 
-		idx.line_offsets.push_back(static_cast<uint64_t>(pos));
+		size_t cursor = pos;
+		size_t fstart = 0, flen = 0;
+		string chrom, id, ref, alt;
+		int32_t pos_val = 0;
+		// Track whether each required field was parsed (rather than left at default).
+		// Prevents silent data corruption on truncated/malformed lines.
+		bool got_chrom = false, got_pos = false, got_id = false, got_ref = false, got_alt = false;
+		for (idx_t f = 0; f <= max_field; f++) {
+			if (!NextField(buf, content_end, &cursor, &fstart, &flen, whitespace)) {
+				break;
+			}
+			if (f == chrom_field) {
+				chrom.assign(buf + fstart, flen);
+				got_chrom = true;
+			} else if (f == pos_field) {
+				// strtol on a non-nul-terminated span: copy into small local
+				char tmp[32];
+				idx_t n = flen < sizeof(tmp) - 1 ? flen : sizeof(tmp) - 1;
+				std::memcpy(tmp, buf + fstart, n);
+				tmp[n] = '\0';
+				char *end;
+				errno = 0;
+				long v = std::strtol(tmp, &end, 10);
+				if (end == tmp || *end != '\0' || errno != 0) {
+					throw InvalidInputException("%s: invalid POS value '%s' at line offset %llu", func_name, tmp,
+					                            static_cast<unsigned long long>(pos));
+				}
+				pos_val = static_cast<int32_t>(v);
+				got_pos = true;
+			} else if (f == id_field) {
+				if (flen == 1 && buf[fstart] == '.') {
+					// empty
+				} else {
+					id.assign(buf + fstart, flen);
+				}
+				got_id = true;
+			} else if (f == ref_field) {
+				ref.assign(buf + fstart, flen);
+				got_ref = true;
+			} else if (f == alt_field) {
+				if (flen == 1 && buf[fstart] == '.') {
+					// empty
+				} else {
+					alt.assign(buf + fstart, flen);
+				}
+				got_alt = true;
+			}
+		}
 
-		// Scan to next newline
-		while (pos < file_size && idx.file_content[pos] != '\n') {
-			pos++;
+		// Reject truncated/malformed lines (missing required columns) instead of
+		// silently pushing default-initialized values.
+		if (!got_chrom || !got_pos || !got_id || !got_ref || !got_alt) {
+			string missing;
+			if (!got_chrom)
+				missing += " CHROM";
+			if (!got_pos)
+				missing += " POS";
+			if (!got_id)
+				missing += " ID";
+			if (!got_ref)
+				missing += " REF";
+			if (!got_alt)
+				missing += " ALT";
+			throw InvalidInputException(
+			    "%s: .pvar/.bim file '%s' has a line missing required fields [%s] at byte offset %llu", func_name, path,
+			    missing.c_str(), static_cast<unsigned long long>(pos));
 		}
-		if (pos < file_size) {
-			pos++; // skip newline
-		}
+
+		idx.chroms.emplace_back(std::move(chrom));
+		idx.positions.push_back(pos_val);
+		idx.ids.emplace_back(std::move(id));
+		idx.refs.emplace_back(std::move(ref));
+		idx.alts.emplace_back(std::move(alt));
+
+		pos = line_end < file_size ? line_end + 1 : line_end;
 	}
 
-	idx.variant_ct = idx.line_offsets.size();
+	idx.variant_ct = idx.chroms.size();
+	idx.has_ids = true;
+	idx.has_alleles = true;
+	BuildChromOffsets(idx, path);
 	return idx;
 }
 
@@ -457,23 +505,21 @@ string FindCompanionFileWithParquet(ClientContext &context, FileSystem &fs, cons
 // Parquet companion loading
 // ---------------------------------------------------------------------------
 
-VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, const string &path,
-                                                    const string &func_name) {
-	// Use a separate connection to read the parquet file (avoids bind reentrancy)
-	auto &db = DatabaseInstance::GetDatabase(context);
-	Connection conn(db);
-	auto result = conn.TableFunction("parquet_scan", {Value(path)})->Execute();
-	if (result->HasError()) {
-		throw IOException("%s: failed to read parquet companion '%s': %s", func_name, path, result->GetError());
-	}
-
-	// Map columns by name (case-insensitive)
-	auto &col_names = result->names;
+//! Columnar ingestion helper. Scans a QueryResult and populates idx with
+//! columnar-typed vectors. Maps columns by name (case-insensitive).
+//! row_number_col: if != INVALID_INDEX, interpreted as a BIGINT file_row_number
+//! column; the resulting index is sparse (idx.vidx_map populated). Otherwise
+//! the index is dense (indexed by emit order).
+static void IngestVariantResult(QueryResult &result, const string &source_label, const string &func_name,
+                                VariantMetadataIndex &idx) {
+	auto &col_names = result.names;
+	auto &col_types = result.types;
 	idx_t chrom_col = DConstants::INVALID_INDEX;
 	idx_t pos_col = DConstants::INVALID_INDEX;
 	idx_t id_col = DConstants::INVALID_INDEX;
 	idx_t ref_col = DConstants::INVALID_INDEX;
 	idx_t alt_col = DConstants::INVALID_INDEX;
+	idx_t rn_col = DConstants::INVALID_INDEX;
 
 	for (idx_t i = 0; i < col_names.size(); i++) {
 		auto lower = StringUtil::Lower(col_names[i]);
@@ -487,87 +533,343 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 			ref_col = i;
 		} else if (lower == "alt") {
 			alt_col = i;
+		} else if (lower == "file_row_number") {
+			rn_col = i;
 		}
 	}
 
 	if (chrom_col == DConstants::INVALID_INDEX || pos_col == DConstants::INVALID_INDEX) {
-		throw InvalidInputException("%s: parquet companion '%s' missing required columns "
-		                            "(need CHROM and POS, found: %s)",
-		                            func_name, path, StringUtil::Join(col_names, ", "));
+		throw InvalidInputException("%s: %s missing required columns (need CHROM and POS, found: %s)", func_name,
+		                            source_label, StringUtil::Join(col_names, ", "));
 	}
 
-	// Synthesize a .pvar-format text buffer from the parquet data
-	string buf;
-	buf += "#CHROM\tPOS\tID\tREF\tALT\n";
+	auto pos_type_id = col_types[pos_col].id();
+	if (pos_type_id != LogicalTypeId::INTEGER && pos_type_id != LogicalTypeId::BIGINT &&
+	    pos_type_id != LogicalTypeId::UINTEGER && pos_type_id != LogicalTypeId::UBIGINT) {
+		throw InvalidInputException("%s: %s POS column has unsupported type %s (expected INTEGER/BIGINT)", func_name,
+		                            source_label, col_types[pos_col].ToString());
+	}
+	auto chrom_type_id = col_types[chrom_col].id();
+	bool chrom_is_integer = (chrom_type_id == LogicalTypeId::INTEGER || chrom_type_id == LogicalTypeId::BIGINT ||
+	                         chrom_type_id == LogicalTypeId::UINTEGER || chrom_type_id == LogicalTypeId::UBIGINT);
 
 	unique_ptr<DataChunk> chunk;
-	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			buf += chunk->GetValue(chrom_col, row).ToString();
-			buf += '\t';
-			buf += chunk->GetValue(pos_col, row).ToString();
-			buf += '\t';
-			buf += (id_col != DConstants::INVALID_INDEX) ? chunk->GetValue(id_col, row).ToString() : ".";
-			buf += '\t';
-			buf += (ref_col != DConstants::INVALID_INDEX) ? chunk->GetValue(ref_col, row).ToString() : ".";
-			buf += '\t';
-			buf += (alt_col != DConstants::INVALID_INDEX) ? chunk->GetValue(alt_col, row).ToString() : ".";
-			buf += '\n';
+	while ((chunk = result.Fetch()) != nullptr && chunk->size() > 0) {
+		idx_t n = chunk->size();
+
+		// CHROM — may be VARCHAR or numeric
+		{
+			auto &vec = chunk->data[chrom_col];
+			UnifiedVectorFormat uvf;
+			vec.ToUnifiedFormat(n, uvf);
+			if (chrom_is_integer) {
+				// Render numeric chrom as string for consistency with text .pvar
+				for (idx_t i = 0; i < n; i++) {
+					auto si = uvf.sel->get_index(i);
+					if (!uvf.validity.RowIsValid(si)) {
+						idx.chroms.emplace_back();
+					} else {
+						int64_t v;
+						if (chrom_type_id == LogicalTypeId::INTEGER) {
+							v = reinterpret_cast<const int32_t *>(uvf.data)[si];
+						} else if (chrom_type_id == LogicalTypeId::BIGINT) {
+							v = reinterpret_cast<const int64_t *>(uvf.data)[si];
+						} else if (chrom_type_id == LogicalTypeId::UINTEGER) {
+							v = reinterpret_cast<const uint32_t *>(uvf.data)[si];
+						} else {
+							v = static_cast<int64_t>(reinterpret_cast<const uint64_t *>(uvf.data)[si]);
+						}
+						idx.chroms.emplace_back(std::to_string(v));
+					}
+				}
+			} else {
+				auto data = reinterpret_cast<const string_t *>(uvf.data);
+				for (idx_t i = 0; i < n; i++) {
+					auto si = uvf.sel->get_index(i);
+					if (!uvf.validity.RowIsValid(si)) {
+						idx.chroms.emplace_back();
+					} else {
+						idx.chroms.emplace_back(data[si].GetData(), data[si].GetSize());
+					}
+				}
+			}
+		}
+
+		// POS — widen to int32 (pgen uses int32)
+		{
+			auto &vec = chunk->data[pos_col];
+			UnifiedVectorFormat uvf;
+			vec.ToUnifiedFormat(n, uvf);
+			for (idx_t i = 0; i < n; i++) {
+				auto si = uvf.sel->get_index(i);
+				int32_t v = 0;
+				if (uvf.validity.RowIsValid(si)) {
+					if (pos_type_id == LogicalTypeId::INTEGER) {
+						v = reinterpret_cast<const int32_t *>(uvf.data)[si];
+					} else if (pos_type_id == LogicalTypeId::BIGINT) {
+						v = static_cast<int32_t>(reinterpret_cast<const int64_t *>(uvf.data)[si]);
+					} else if (pos_type_id == LogicalTypeId::UINTEGER) {
+						v = static_cast<int32_t>(reinterpret_cast<const uint32_t *>(uvf.data)[si]);
+					} else {
+						v = static_cast<int32_t>(reinterpret_cast<const uint64_t *>(uvf.data)[si]);
+					}
+				}
+				idx.positions.push_back(v);
+			}
+		}
+
+		// ID — VARCHAR, "." → ""
+		{
+			if (id_col == DConstants::INVALID_INDEX) {
+				for (idx_t i = 0; i < n; i++) {
+					idx.ids.emplace_back();
+				}
+			} else {
+				auto &vec = chunk->data[id_col];
+				UnifiedVectorFormat uvf;
+				vec.ToUnifiedFormat(n, uvf);
+				auto data = reinterpret_cast<const string_t *>(uvf.data);
+				for (idx_t i = 0; i < n; i++) {
+					auto si = uvf.sel->get_index(i);
+					if (!uvf.validity.RowIsValid(si)) {
+						idx.ids.emplace_back();
+					} else {
+						auto sz = data[si].GetSize();
+						auto d = data[si].GetData();
+						if (sz == 1 && d[0] == '.') {
+							idx.ids.emplace_back();
+						} else {
+							idx.ids.emplace_back(d, sz);
+						}
+					}
+				}
+			}
+		}
+
+		// REF — VARCHAR (plain copy)
+		{
+			if (ref_col == DConstants::INVALID_INDEX) {
+				for (idx_t i = 0; i < n; i++) {
+					idx.refs.emplace_back();
+				}
+			} else {
+				auto &vec = chunk->data[ref_col];
+				UnifiedVectorFormat uvf;
+				vec.ToUnifiedFormat(n, uvf);
+				auto data = reinterpret_cast<const string_t *>(uvf.data);
+				for (idx_t i = 0; i < n; i++) {
+					auto si = uvf.sel->get_index(i);
+					if (!uvf.validity.RowIsValid(si)) {
+						idx.refs.emplace_back();
+					} else {
+						idx.refs.emplace_back(data[si].GetData(), data[si].GetSize());
+					}
+				}
+			}
+		}
+
+		// ALT — VARCHAR, "." → ""
+		{
+			if (alt_col == DConstants::INVALID_INDEX) {
+				for (idx_t i = 0; i < n; i++) {
+					idx.alts.emplace_back();
+				}
+			} else {
+				auto &vec = chunk->data[alt_col];
+				UnifiedVectorFormat uvf;
+				vec.ToUnifiedFormat(n, uvf);
+				auto data = reinterpret_cast<const string_t *>(uvf.data);
+				for (idx_t i = 0; i < n; i++) {
+					auto si = uvf.sel->get_index(i);
+					if (!uvf.validity.RowIsValid(si)) {
+						idx.alts.emplace_back();
+					} else {
+						auto sz = data[si].GetSize();
+						auto d = data[si].GetData();
+						if (sz == 1 && d[0] == '.') {
+							idx.alts.emplace_back();
+						} else {
+							idx.alts.emplace_back(d, sz);
+						}
+					}
+				}
+			}
+		}
+
+		// file_row_number → sparse vidx_map + local_to_vidx reverse map.
+		// Both are populated so callers iterating the loaded subset can map
+		// local → vidx in O(1) (e.g. ResolveByCpra, BuildVariantIdIndex).
+		if (rn_col != DConstants::INVALID_INDEX) {
+			auto &vec = chunk->data[rn_col];
+			UnifiedVectorFormat uvf;
+			vec.ToUnifiedFormat(n, uvf);
+			auto data = reinterpret_cast<const int64_t *>(uvf.data);
+			idx_t local_base = idx.chroms.size() - n;
+			if (idx.local_to_vidx.size() < idx.chroms.size()) {
+				idx.local_to_vidx.resize(idx.chroms.size());
+			}
+			for (idx_t i = 0; i < n; i++) {
+				auto si = uvf.sel->get_index(i);
+				if (!uvf.validity.RowIsValid(si)) {
+					throw IOException("%s: NULL file_row_number encountered (internal error)", func_name);
+				}
+				uint32_t vidx = static_cast<uint32_t>(data[si]);
+				uint32_t local = static_cast<uint32_t>(local_base + i);
+				idx.vidx_map.emplace(vidx, local);
+				idx.local_to_vidx[local] = vidx;
+			}
 		}
 	}
-
-	// Parse the synthetic buffer using the existing text parser
-	VariantMetadataIndex idx;
-	idx.file_content = std::move(buf);
-	idx.is_bim = false;
-	idx.chrom_idx = 0;
-	idx.pos_idx = 1;
-	idx.id_idx = 2;
-	idx.ref_idx = 3;
-	idx.alt_idx = 4;
-
-	// Build line offsets — skip the header line (first line ending with \n)
-	size_t pos = 0;
-	// Skip header line
-	while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
-		pos++;
-	}
-	if (pos < idx.file_content.size()) {
-		pos++; // skip newline
-	}
-
-	// Index data lines
-	while (pos < idx.file_content.size()) {
-		if (idx.file_content[pos] == '\n') {
-			pos++;
-			continue;
-		}
-		idx.line_offsets.push_back(static_cast<uint64_t>(pos));
-		while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
-			pos++;
-		}
-		if (pos < idx.file_content.size()) {
-			pos++;
-		}
-	}
-
-	idx.variant_ct = idx.line_offsets.size();
-	return idx;
 }
 
-SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path) {
+VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, const string &path,
+                                                    const string &func_name) {
+	BindPhaseTimer timer("LoadVariantMetadataFromParquet");
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 	auto result = conn.TableFunction("parquet_scan", {Value(path)})->Execute();
+	timer.Note("parquet_scan opened");
 	if (result->HasError()) {
-		throw IOException("Failed to read parquet companion '%s': %s", path, result->GetError());
+		throw IOException("%s: failed to read parquet companion '%s': %s", func_name, path, result->GetError());
 	}
 
-	// Map columns by name (case-insensitive)
-	auto &col_names = result->names;
+	VariantMetadataIndex idx;
+	idx.is_bim = false;
+	string label = "parquet companion '" + path + "'";
+	IngestVariantResult(*result, label, func_name, idx);
+	idx.variant_ct = idx.chroms.size();
+	idx.has_ids = true;
+	idx.has_alleles = true;
+	timer.Note("ingested %llu variants", (unsigned long long)idx.variant_ct);
+	BuildChromOffsets(idx, path);
+	timer.Note("built chrom_offsets (%llu chroms)", (unsigned long long)idx.chrom_offsets.size());
+	return idx;
+}
+
+//! Pick the chromosome column name. Different pvar producers use either
+//! "#CHROM" (plink2 native) or "CHROM" (custom exports). Introspecting via
+//! a LIMIT 0 scan is cheaper than a wrapped DESCRIBE: DuckDB only reads the
+//! parquet footer to get schema, no row groups touched.
+static string DetectChromColumn(Connection &conn, const string &path, const string &func_name) {
+	auto escaped_path = StringUtil::Replace(path, "'", "''");
+	auto result = conn.Query("SELECT * FROM read_parquet('" + escaped_path + "') LIMIT 0");
+	if (result->HasError()) {
+		throw IOException("%s: failed to read parquet schema for '%s': %s", func_name, path, result->GetError());
+	}
+	for (auto &name : result->names) {
+		auto lower = StringUtil::Lower(name);
+		if (lower == "#chrom") {
+			return "#CHROM";
+		}
+	}
+	for (auto &name : result->names) {
+		auto lower = StringUtil::Lower(name);
+		if (lower == "chrom") {
+			return "CHROM";
+		}
+	}
+	throw InvalidInputException("%s: parquet companion '%s' has no CHROM or #CHROM column (columns: %s)", func_name,
+	                            path, StringUtil::Join(result->names, ", "));
+}
+
+//! Region-pushdown loader: queries the parquet file with a WHERE clause so
+//! only matching rows are materialized. Returns a sparse index whose
+//! vidx_map keys are the file row numbers (pgenlib-compatible vidx).
+//!
+//! `variant_ct_hint` — the caller's expected total row count (typically
+//! `pgfi.raw_variant_ct` from the pgen header). Used as `idx.variant_ct` so
+//! the downstream count-mismatch check is effectively a sanity check against
+//! pgen (we don't re-scan the full parquet to count rows; trusting pgen keeps
+//! the region path O(region size), not O(file size)).
+VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context, const string &path,
+                                                          const string &chrom, int64_t pos_start, int64_t pos_end,
+                                                          idx_t variant_ct_hint, const string &func_name) {
+	BindPhaseTimer timer("LoadVariantMetadataFromParquetRegion");
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+
+	// Determine whether the file uses "#CHROM" or "CHROM" for its chrom column.
+	// Introspecting the schema upfront avoids the old error-driven retry that
+	// could mask POS-type or other schema errors as column-name failures.
+	auto chrom_col_name = DetectChromColumn(conn, path, func_name);
+	timer.Note("chrom column: %s", chrom_col_name.c_str());
+
+	// file_row_number gives pgenlib-compatible global vidx. stats pruning +
+	// column projection keep this O(region_size), not O(total).
+	//
+	// Path is embedded via quote-doubling (DuckDB follows SQL-standard string
+	// literals — no backslash escapes — so `''` is sufficient). The user-
+	// controlled chrom and position values use prepared-statement parameters.
+	auto escaped_path = StringUtil::Replace(path, "'", "''");
+	string sql = "SELECT \"" + chrom_col_name +
+	             "\" AS \"#CHROM\", POS, ID, REF, ALT, file_row_number " //
+	             "FROM read_parquet('" +
+	             escaped_path +
+	             "', file_row_number=true) " //
+	             "WHERE (CAST(\"" +
+	             chrom_col_name +
+	             "\" AS VARCHAR) = $1) AND POS BETWEEN $2 AND $3 " //
+	             "ORDER BY file_row_number";
+	auto pstmt = conn.Prepare(sql);
+	if (pstmt->HasError()) {
+		throw IOException("%s: region-pushdown prepare failed on '%s': %s", func_name, path, pstmt->GetError());
+	}
+	auto result = pstmt->Execute(chrom, pos_start, pos_end);
+	if (result->HasError()) {
+		throw IOException("%s: region-pushdown query failed on '%s': %s", func_name, path, result->GetError());
+	}
+	timer.Note("pushdown query returned");
+
+	VariantMetadataIndex idx;
+	idx.is_bim = false;
+	string label = "parquet companion '" + path + "' (region pushdown)";
+	IngestVariantResult(*result, label, func_name, idx);
+	// variant_ct = caller's hint (typically pgen's raw_variant_ct). The post-load
+	// count-mismatch check in the caller becomes a sanity check against pgen;
+	// we don't open the parquet file a second time to count rows.
+	idx.variant_ct = variant_ct_hint;
+	idx.has_ids = true;
+	idx.has_alleles = true;
+	// Single chrom in pushdown, single contiguous range of local indices
+	if (!idx.chroms.empty()) {
+		idx.chrom_offsets.emplace(idx.chroms.front(), std::make_pair(idx_t {0}, idx.chroms.size()));
+	}
+	timer.Note("ingested %llu region variants (variant_ct hint=%llu)", (unsigned long long)idx.chroms.size(),
+	           (unsigned long long)variant_ct_hint);
+	return idx;
+}
+
+//! Get total row count from a parquet file.
+//!
+//! Uses `SELECT COUNT(*) FROM read_parquet(...)`, which DuckDB optimizes to
+//! read row-group `num_rows` from the footer — O(num_row_groups), not a
+//! full scan. At biobank scale this is sub-millisecond (7M rows completed
+//! in <1ms in our profiling), but it is NOT literally O(1): files with
+//! many tiny row groups pay proportionally more. Use only for paths where
+//! the whole file hasn't already been opened (e.g. count-only psam mode).
+//! The region-pushdown path explicitly avoids this by trusting pgen's
+//! raw_variant_ct as the variant_ct.
+idx_t GetParquetRowCount(ClientContext &context, const string &path) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto escaped = StringUtil::Replace(path, "'", "''");
+	auto result = conn.Query("SELECT COUNT(*) FROM read_parquet('" + escaped + "')");
+	if (result->HasError()) {
+		throw IOException("Failed to get row count for '%s': %s", path, result->GetError());
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return 0;
+	}
+	return static_cast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
+}
+
+//! Columnar ingest helper for psam query results.
+static void IngestSampleResult(QueryResult &result, const string &source_label, SampleInfo &info, bool load_iids,
+                               bool load_fids) {
+	auto &col_names = result.names;
 	idx_t iid_col = DConstants::INVALID_INDEX;
 	idx_t fid_col = DConstants::INVALID_INDEX;
-
 	for (idx_t i = 0; i < col_names.size(); i++) {
 		auto lower = StringUtil::Lower(col_names[i]);
 		if (lower == "iid") {
@@ -576,33 +878,67 @@ SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path)
 			fid_col = i;
 		}
 	}
-
 	if (iid_col == DConstants::INVALID_INDEX) {
-		throw InvalidInputException("Parquet companion '%s' missing required IID column (found: %s)", path,
+		throw InvalidInputException("%s missing required IID column (found: %s)", source_label,
 		                            StringUtil::Join(col_names, ", "));
+	}
+	bool has_fid_col = (fid_col != DConstants::INVALID_INDEX);
+
+	idx_t total_rows = 0;
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result.Fetch()) != nullptr && chunk->size() > 0) {
+		idx_t n = chunk->size();
+		total_rows += n;
+
+		if (load_iids) {
+			auto &vec = chunk->data[iid_col];
+			UnifiedVectorFormat uvf;
+			vec.ToUnifiedFormat(n, uvf);
+			auto data = reinterpret_cast<const string_t *>(uvf.data);
+			for (idx_t i = 0; i < n; i++) {
+				auto si = uvf.sel->get_index(i);
+				if (!uvf.validity.RowIsValid(si)) {
+					info.iids.emplace_back();
+				} else {
+					info.iids.emplace_back(data[si].GetData(), data[si].GetSize());
+				}
+			}
+		}
+		if (load_fids && has_fid_col) {
+			auto &vec = chunk->data[fid_col];
+			UnifiedVectorFormat uvf;
+			vec.ToUnifiedFormat(n, uvf);
+			auto data = reinterpret_cast<const string_t *>(uvf.data);
+			for (idx_t i = 0; i < n; i++) {
+				auto si = uvf.sel->get_index(i);
+				if (!uvf.validity.RowIsValid(si)) {
+					info.fids.emplace_back();
+				} else {
+					info.fids.emplace_back(data[si].GetData(), data[si].GetSize());
+				}
+			}
+		}
+	}
+	if (!load_iids) {
+		info.sample_ct = total_rows;
+	}
+}
+
+SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path) {
+	BindPhaseTimer timer("LoadSampleInfoFromParquet");
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto result = conn.TableFunction("parquet_scan", {Value(path)})->Execute();
+	timer.Note("parquet_scan opened");
+	if (result->HasError()) {
+		throw IOException("Failed to read parquet companion '%s': %s", path, result->GetError());
 	}
 
 	SampleInfo info;
-	bool has_fid = (fid_col != DConstants::INVALID_INDEX);
-
-	unique_ptr<DataChunk> chunk;
-	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			auto iid = chunk->GetValue(iid_col, row).ToString();
-
-			if (info.iid_to_idx.count(iid)) {
-				throw IOException("Parquet companion '%s' has duplicate IID '%s'", path, iid);
-			}
-
-			info.iids.push_back(iid);
-			if (has_fid) {
-				info.fids.push_back(chunk->GetValue(fid_col, row).ToString());
-			}
-			info.iid_to_idx[iid] = info.iids.size() - 1;
-		}
-	}
-
+	string label = "parquet companion '" + path + "'";
+	IngestSampleResult(*result, label, info, /*load_iids=*/true, /*load_fids=*/true);
 	info.sample_ct = info.iids.size();
+	timer.Note("loaded %llu samples (iid_to_idx deferred)", (unsigned long long)info.sample_ct);
 	return info;
 }
 
@@ -628,137 +964,26 @@ static unique_ptr<MaterializedQueryResult> QuerySource(ClientContext &context, c
 
 VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const string &source,
                                                    const string &func_name) {
+	BindPhaseTimer timer("LoadVariantMetadataFromSource");
 	auto result = QuerySource(context, source, func_name);
 
-	// Map columns by name (case-insensitive) — same logic as parquet loader
-	auto &col_names = result->names;
-	idx_t chrom_col = DConstants::INVALID_INDEX;
-	idx_t pos_col = DConstants::INVALID_INDEX;
-	idx_t id_col = DConstants::INVALID_INDEX;
-	idx_t ref_col = DConstants::INVALID_INDEX;
-	idx_t alt_col = DConstants::INVALID_INDEX;
-
-	for (idx_t i = 0; i < col_names.size(); i++) {
-		auto lower = StringUtil::Lower(col_names[i]);
-		if (lower == "chrom" || lower == "#chrom") {
-			chrom_col = i;
-		} else if (lower == "pos") {
-			pos_col = i;
-		} else if (lower == "id") {
-			id_col = i;
-		} else if (lower == "ref") {
-			ref_col = i;
-		} else if (lower == "alt") {
-			alt_col = i;
-		}
-	}
-
-	if (chrom_col == DConstants::INVALID_INDEX || pos_col == DConstants::INVALID_INDEX) {
-		throw InvalidInputException("%s: source '%s' missing required columns "
-		                            "(need CHROM and POS, found: %s)",
-		                            func_name, source, StringUtil::Join(col_names, ", "));
-	}
-
-	// Synthesize a .pvar-format text buffer from the query result
-	string buf;
-	buf += "#CHROM\tPOS\tID\tREF\tALT\n";
-
-	unique_ptr<DataChunk> chunk;
-	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			buf += chunk->GetValue(chrom_col, row).ToString();
-			buf += '\t';
-			buf += chunk->GetValue(pos_col, row).ToString();
-			buf += '\t';
-			buf += (id_col != DConstants::INVALID_INDEX) ? chunk->GetValue(id_col, row).ToString() : ".";
-			buf += '\t';
-			buf += (ref_col != DConstants::INVALID_INDEX) ? chunk->GetValue(ref_col, row).ToString() : ".";
-			buf += '\t';
-			buf += (alt_col != DConstants::INVALID_INDEX) ? chunk->GetValue(alt_col, row).ToString() : ".";
-			buf += '\n';
-		}
-	}
-
-	// Parse the synthetic buffer using the existing text parser structure
 	VariantMetadataIndex idx;
-	idx.file_content = std::move(buf);
 	idx.is_bim = false;
-	idx.chrom_idx = 0;
-	idx.pos_idx = 1;
-	idx.id_idx = 2;
-	idx.ref_idx = 3;
-	idx.alt_idx = 4;
-
-	// Build line offsets — skip the header line (first line ending with \n)
-	size_t pos = 0;
-	while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
-		pos++;
-	}
-	if (pos < idx.file_content.size()) {
-		pos++; // skip newline
-	}
-
-	// Index data lines
-	while (pos < idx.file_content.size()) {
-		if (idx.file_content[pos] == '\n') {
-			pos++;
-			continue;
-		}
-		idx.line_offsets.push_back(static_cast<uint64_t>(pos));
-		while (pos < idx.file_content.size() && idx.file_content[pos] != '\n') {
-			pos++;
-		}
-		if (pos < idx.file_content.size()) {
-			pos++;
-		}
-	}
-
-	idx.variant_ct = idx.line_offsets.size();
+	string label = "source '" + source + "'";
+	IngestVariantResult(*result, label, func_name, idx);
+	idx.variant_ct = idx.chroms.size();
+	idx.has_ids = true;
+	idx.has_alleles = true;
+	BuildChromOffsets(idx, source);
 	return idx;
 }
 
 SampleInfo LoadSampleInfoFromSource(ClientContext &context, const string &source) {
+	BindPhaseTimer timer("LoadSampleInfoFromSource");
 	auto result = QuerySource(context, source, "LoadSampleInfoFromSource");
-
-	// Map columns by name (case-insensitive) — same logic as parquet loader
-	auto &col_names = result->names;
-	idx_t iid_col = DConstants::INVALID_INDEX;
-	idx_t fid_col = DConstants::INVALID_INDEX;
-
-	for (idx_t i = 0; i < col_names.size(); i++) {
-		auto lower = StringUtil::Lower(col_names[i]);
-		if (lower == "iid") {
-			iid_col = i;
-		} else if (lower == "fid") {
-			fid_col = i;
-		}
-	}
-
-	if (iid_col == DConstants::INVALID_INDEX) {
-		throw InvalidInputException("Source '%s' missing required IID column (found: %s)", source,
-		                            StringUtil::Join(col_names, ", "));
-	}
-
 	SampleInfo info;
-	bool has_fid = (fid_col != DConstants::INVALID_INDEX);
-
-	unique_ptr<DataChunk> chunk;
-	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			auto iid = chunk->GetValue(iid_col, row).ToString();
-
-			if (info.iid_to_idx.count(iid)) {
-				throw IOException("Source '%s' has duplicate IID '%s'", source, iid);
-			}
-
-			info.iids.push_back(iid);
-			if (has_fid) {
-				info.fids.push_back(chunk->GetValue(fid_col, row).ToString());
-			}
-			info.iid_to_idx[iid] = info.iids.size() - 1;
-		}
-	}
-
+	string label = "source '" + source + "'";
+	IngestSampleResult(*result, label, info, /*load_iids=*/true, /*load_fids=*/true);
 	info.sample_ct = info.iids.size();
 	return info;
 }
@@ -768,25 +993,41 @@ SampleInfo LoadSampleInfoFromSource(ClientContext &context, const string &source
 // ---------------------------------------------------------------------------
 
 VariantMetadataIndex LoadVariantMetadata(ClientContext &context, const string &path, const string &func_name) {
+	BindPhaseTimer timer("LoadVariantMetadata(dispatch:" + path + ")");
 	if (IsParquetFile(path)) {
 		return LoadVariantMetadataFromParquet(context, path, func_name);
 	}
 	if (IsNativePlinkFormat(path)) {
 		return LoadVariantMetadataIndex(context, path, func_name);
 	}
-	// Arbitrary source (CSV, table, view, etc.)
 	return LoadVariantMetadataFromSource(context, path, func_name);
 }
 
 SampleInfo LoadSampleMetadata(ClientContext &context, const string &path) {
+	BindPhaseTimer timer("LoadSampleMetadata(dispatch:" + path + ")");
 	if (IsParquetFile(path)) {
 		return LoadSampleInfoFromParquet(context, path);
 	}
 	if (IsNativePlinkFormat(path)) {
 		return LoadSampleInfo(context, path);
 	}
-	// Arbitrary source (CSV, table, view, etc.)
 	return LoadSampleInfoFromSource(context, path);
+}
+
+SampleInfo LoadSampleCount(ClientContext &context, const string &path) {
+	BindPhaseTimer timer("LoadSampleCount(" + path + ")");
+	SampleInfo info;
+	if (IsParquetFile(path)) {
+		info.sample_ct = GetParquetRowCount(context, path);
+		timer.Note("parquet metadata count = %llu", (unsigned long long)info.sample_ct);
+		return info;
+	}
+	// Text/source: no efficient metadata-only count, fall through to a full load
+	// then drop the IIDs to keep RSS predictable.
+	auto full = IsNativePlinkFormat(path) ? LoadSampleInfo(context, path) : LoadSampleInfoFromSource(context, path);
+	info.sample_ct = full.sample_ct;
+	timer.Note("text fallback count = %llu (iids discarded)", (unsigned long long)info.sample_ct);
+	return info;
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +1060,9 @@ vector<uint32_t> ResolveSampleIndices(const Value &samples_val, uint32_t raw_sam
 			                            "is available (no sample IDs to match against)",
 			                            func_name);
 		}
+		// Lazily build iid_to_idx — we only pay the ~500ms map-build cost at 7M
+		// samples when VARCHAR sample filter is actually used.
+		const_cast<SampleInfo *>(sample_info)->EnsureIidMap(func_name);
 		for (auto &child : children) {
 			auto iid = child.GetValue<string>();
 			auto it = sample_info->iid_to_idx.find(iid);
@@ -911,31 +1155,52 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 		throw InvalidInputException("%s: invalid region end position in '%s'", func_name, region_str);
 	}
 
-	// Scan variant metadata using on-demand field parsing
 	VariantRange range;
 	range.has_filter = true;
 
-	bool found_start = false;
-	for (uint32_t i = 0; i < static_cast<uint32_t>(variants.variant_ct); i++) {
-		auto v_chrom = variants.GetField(i, variants.chrom_idx);
-		if (v_chrom != chrom) {
-			if (found_start) {
-				break; // Past the matching chromosome block
+	// Fast path: chrom_offsets + binary search on POS (O(log N) per bound).
+	auto it = variants.chrom_offsets.find(chrom);
+	if (it == variants.chrom_offsets.end()) {
+		return range; // empty
+	}
+	idx_t lo_local = it->second.first;
+	idx_t hi_local = it->second.second;
+
+	auto lb_local = [&](int32_t target) {
+		idx_t lo = lo_local, hi = hi_local;
+		while (lo < hi) {
+			idx_t mid = lo + (hi - lo) / 2;
+			if (variants.positions[mid] < target) {
+				lo = mid + 1;
+			} else {
+				hi = mid;
 			}
-			continue;
 		}
-		auto v_pos = variants.GetPos(i);
-		if (v_pos >= static_cast<int32_t>(start_pos) && v_pos <= static_cast<int32_t>(end_pos)) {
-			if (!found_start) {
-				range.start_idx = i;
-				found_start = true;
+		return lo;
+	};
+	idx_t start_local = lb_local(static_cast<int32_t>(start_pos));
+	// Upper bound for end: first index with pos > end_pos.
+	idx_t end_local = lo_local;
+	{
+		idx_t lo = lo_local, hi = hi_local;
+		while (lo < hi) {
+			idx_t mid = lo + (hi - lo) / 2;
+			if (variants.positions[mid] <= static_cast<int32_t>(end_pos)) {
+				lo = mid + 1;
+			} else {
+				hi = mid;
 			}
-			range.end_idx = i + 1;
-		} else if (found_start && v_pos > static_cast<int32_t>(end_pos)) {
-			break; // Past the matching position range within the chromosome
 		}
+		end_local = lo;
 	}
 
+	// VariantRange is expressed in file-row vidx. In dense mode local == vidx.
+	// Sparse indexes shouldn't hit this path (they've been pre-filtered).
+	if (!variants.vidx_map.empty() && start_local < end_local) {
+		throw InternalException("ParseRegion: sparse variant index should not re-filter by region");
+	}
+	range.start_idx = static_cast<uint32_t>(start_local);
+	range.end_idx = static_cast<uint32_t>(end_local);
 	return range;
 }
 
@@ -1144,21 +1409,67 @@ static void ValidateVariantIndex(int64_t idx, uint32_t raw_variant_ct, const str
 	}
 }
 
-//! Build a map from variant ID to 0-based index.
-static unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &variants) {
+unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &variants) {
+	// Iterate the loaded subset (dense or sparse) by local index. In sparse mode
+	// the local slot's file-row vidx comes from local_to_vidx; in dense mode
+	// local == vidx. Using variant_ct to bound the loop is WRONG for sparse
+	// indexes (where variant_ct is the full source count, not the loaded size).
 	unordered_map<string, uint32_t> id_to_idx;
-	for (idx_t i = 0; i < variants.variant_ct; i++) {
-		auto id = variants.GetId(i);
+	id_to_idx.reserve(variants.chroms.size());
+	for (idx_t local = 0; local < variants.chroms.size(); local++) {
+		const auto &id = variants.ids[local];
 		if (!id.empty()) {
-			id_to_idx[id] = static_cast<uint32_t>(i);
+			id_to_idx[id] = variants.VidxForLocal(local);
 		}
 	}
 	return id_to_idx;
 }
 
+//! Lookup by (chrom, pos[, ref, alt]) using chrom_offsets + binary search on POS.
+//! Returns the file-row vidx. Falls back to linear scan if chrom_offsets unavailable.
+static uint32_t ResolveByCpra(const VariantMetadataIndex &variants, const string &chrom, int32_t pos,
+                              const string *ref_match, const string *alt_match, const string &desc,
+                              const string &func_name) {
+	idx_t lo_local = 0;
+	idx_t hi_local = variants.chroms.size();
+	if (!variants.chrom_offsets.empty()) {
+		auto it = variants.chrom_offsets.find(chrom);
+		if (it == variants.chrom_offsets.end()) {
+			throw InvalidInputException("%s: variant '%s' not found", func_name, desc);
+		}
+		lo_local = it->second.first;
+		hi_local = it->second.second;
+	}
+
+	// Binary search on positions[lo_local..hi_local) — POS is sorted ascending within chrom.
+	idx_t lo = lo_local, hi = hi_local;
+	while (lo < hi) {
+		idx_t mid = lo + (hi - lo) / 2;
+		if (variants.positions[mid] < pos) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	// Equal-range scan: there may be multiple variants at the same (chrom, pos) differing in alleles.
+	for (idx_t i = lo; i < hi_local && variants.positions[i] == pos; i++) {
+		if (variants.chrom_offsets.empty() && variants.chroms[i] != chrom) {
+			continue; // fallback path: chrom check needed
+		}
+		if (ref_match && alt_match) {
+			if (variants.refs[i] == *ref_match && variants.alts[i] == *alt_match) {
+				return variants.VidxForLocal(i);
+			}
+		} else {
+			return variants.VidxForLocal(i);
+		}
+	}
+
+	throw InvalidInputException("%s: variant '%s' not found", func_name, desc);
+}
+
 //! Resolve a single CPRA string (chrom:pos or chrom:pos:ref:alt) to a variant index.
 static uint32_t ResolveCpraString(const string &cpra, const VariantMetadataIndex &variants, const string &func_name) {
-	// Split on ':'
 	vector<string> parts;
 	size_t start = 0;
 	for (size_t i = 0; i <= cpra.size(); i++) {
@@ -1173,7 +1484,6 @@ static uint32_t ResolveCpraString(const string &cpra, const VariantMetadataIndex
 		                            cpra);
 	}
 
-	auto &chrom = parts[0];
 	char *end_ptr;
 	errno = 0;
 	long pos = std::strtol(parts[1].c_str(), &end_ptr, 10);
@@ -1182,25 +1492,8 @@ static uint32_t ResolveCpraString(const string &cpra, const VariantMetadataIndex
 	}
 
 	bool match_alleles = (parts.size() == 4);
-	string ref_match, alt_match;
-	if (match_alleles) {
-		ref_match = parts[2];
-		alt_match = parts[3];
-	}
-
-	for (idx_t i = 0; i < variants.variant_ct; i++) {
-		if (variants.GetChrom(i) == chrom && variants.GetPos(i) == static_cast<int32_t>(pos)) {
-			if (match_alleles) {
-				if (variants.GetRef(i) == ref_match && variants.GetAlt(i) == alt_match) {
-					return static_cast<uint32_t>(i);
-				}
-			} else {
-				return static_cast<uint32_t>(i);
-			}
-		}
-	}
-
-	throw InvalidInputException("%s: variant '%s' not found", func_name, cpra);
+	return ResolveByCpra(variants, parts[0], static_cast<int32_t>(pos), match_alleles ? &parts[2] : nullptr,
+	                     match_alleles ? &parts[3] : nullptr, cpra, func_name);
 }
 
 //! Resolve a single variant string (rsid or CPRA) to a variant index.
@@ -1245,24 +1538,12 @@ static uint32_t ResolveCpraStruct(const Value &val, const VariantMetadataIndex &
 	}
 
 	bool match_alleles = has_ref && has_alt;
-
-	for (idx_t i = 0; i < variants.variant_ct; i++) {
-		if (variants.GetChrom(i) == chrom && variants.GetPos(i) == pos) {
-			if (match_alleles) {
-				if (variants.GetRef(i) == ref_val && variants.GetAlt(i) == alt_val) {
-					return static_cast<uint32_t>(i);
-				}
-			} else {
-				return static_cast<uint32_t>(i);
-			}
-		}
-	}
-
 	string desc = chrom + ":" + std::to_string(pos);
 	if (match_alleles) {
 		desc += ":" + ref_val + ":" + alt_val;
 	}
-	throw InvalidInputException("%s: variant '%s' not found", func_name, desc);
+	return ResolveByCpra(variants, chrom, pos, match_alleles ? &ref_val : nullptr, match_alleles ? &alt_val : nullptr,
+	                     desc, func_name);
 }
 
 //! Resolve a range struct ({start, stop} with INTEGER or VARCHAR values) to variant indices.

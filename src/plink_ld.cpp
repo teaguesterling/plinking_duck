@@ -361,28 +361,20 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 
 	// --- Resolve pairwise variant indices ---
 	if (bind_data->mode == LdMode::PAIRWISE) {
-		// Look up variant1 by ID
-		bool found_a = false, found_b = false;
-		for (uint32_t i = 0; i < static_cast<uint32_t>(bind_data->variants.variant_ct); i++) {
-			auto vid = bind_data->variants.GetId(i);
-			if (vid == variant1_id) {
-				bind_data->pairwise_vidx_a = i;
-				found_a = true;
-			}
-			if (vid == variant2_id) {
-				bind_data->pairwise_vidx_b = i;
-				found_b = true;
-			}
-			if (found_a && found_b) {
-				break;
-			}
-		}
-		if (!found_a) {
+		// BuildVariantIdIndex handles both dense and sparse (pushdown) indexes,
+		// and is O(loaded subset size) — a single pass that's also faster than
+		// the previous double-ID search loop.
+		auto id_to_idx = BuildVariantIdIndex(bind_data->variants);
+		auto it_a = id_to_idx.find(variant1_id);
+		if (it_a == id_to_idx.end()) {
 			throw InvalidInputException("plink_ld: variant '%s' not found in .pvar", variant1_id);
 		}
-		if (!found_b) {
+		bind_data->pairwise_vidx_a = it_a->second;
+		auto it_b = id_to_idx.find(variant2_id);
+		if (it_b == id_to_idx.end()) {
 			throw InvalidInputException("plink_ld: variant '%s' not found in .pvar", variant2_id);
 		}
+		bind_data->pairwise_vidx_b = it_b->second;
 	}
 
 	// --- Register output columns ---

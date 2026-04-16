@@ -46,6 +46,41 @@ static bool IsParentMissing(const string &val) {
 // WHERE PHENO1 != '-9' if needed.
 
 // ---------------------------------------------------------------------------
+// SampleInfo lazy helpers
+// ---------------------------------------------------------------------------
+
+void SampleInfo::EnsureIidMap(const string &source_label) {
+	if (!iid_to_idx.empty()) {
+		return; // already built
+	}
+	if (iids.empty()) {
+		// iids was never populated — the caller took the count-only fast path
+		// (LoadSampleCount / parquet footer metadata) and is now asking for
+		// IID-keyed lookups. This is a bug in PfileBind's `needs_iids` decision:
+		// any call site that reaches EnsureIidMap must have triggered the full
+		// load. Surfacing this explicitly instead of a confusing downstream
+		// "sample 'X' not found" error.
+		if (sample_ct > 0) {
+			throw InternalException(
+			    "%s: IID lookup requested but IID strings were not loaded (bind chose the count-only "
+			    "fast path for %llu samples). This indicates PfileBind's needs_iids predicate missed "
+			    "a case that requires IID strings — please report.",
+			    source_label.c_str(), static_cast<unsigned long long>(sample_ct));
+		}
+		return; // genuinely empty psam (no samples)
+	}
+	iid_to_idx.reserve(iids.size());
+	for (idx_t i = 0; i < iids.size(); i++) {
+		auto inserted = iid_to_idx.emplace(iids[i], i);
+		if (!inserted.second) {
+			throw IOException("%s has duplicate IID '%s' (at sample %llu and %llu)", source_label.c_str(),
+			                  iids[i].c_str(), static_cast<unsigned long long>(inserted.first->second + 1),
+			                  static_cast<unsigned long long>(i + 1));
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Line splitting utilities
 // ---------------------------------------------------------------------------
 
@@ -253,21 +288,13 @@ SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
 			                  fields.size(), iid_idx + 1);
 		}
 
-		const auto &iid = fields[iid_idx];
-
-		// Duplicate IIDs are invalid — downstream code (read_pgen) relies on
-		// iid_to_idx being a 1:1 mapping for sample subsetting
-		if (info.iid_to_idx.count(iid)) {
-			throw IOException("read_psam: file '%s' line %d has duplicate IID '%s' "
-			                  "(first seen at sample %d)",
-			                  path, i + 1, iid, info.iid_to_idx[iid] + 1);
-		}
-
-		info.iids.push_back(iid);
+		// iid_to_idx is built lazily (see SampleInfo::EnsureIidMap) — this
+		// avoids ~7M string-hash inserts at biobank scale when the query
+		// doesn't use IID-based sample lookups.
+		info.iids.push_back(fields[iid_idx]);
 		if (has_fid) {
 			info.fids.push_back(fields[fid_idx]);
 		}
-		info.iid_to_idx[iid] = info.iids.size() - 1;
 	}
 
 	info.sample_ct = info.iids.size();

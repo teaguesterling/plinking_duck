@@ -110,45 +110,109 @@ struct AlignedBuffer {
 // Offset-indexed variant metadata (memory-efficient Scan-time access)
 // ---------------------------------------------------------------------------
 
-//! Offset-indexed variant metadata for memory-efficient Scan-time access.
-//! Stores raw file content in a single buffer and line byte offsets; parses
-//! fields on demand. Thread-safe for concurrent reads (all state is immutable
-//! after construction).
+//! Columnar variant metadata index.
+//!
+//! Two modes:
+//!  * Dense  (vidx_map empty): vectors are indexed directly by file-row vidx.
+//!  * Sparse (vidx_map non-empty): vectors hold a filtered subset; vidx_map
+//!    maps file-row vidx → local index. `variant_ct` still reflects the
+//!    total source row count (for count-mismatch validation), while
+//!    `chroms.size()` is the loaded subset size.
+//!
+//! All accessors take a file-row vidx. Thread-safe for concurrent reads
+//! once construction (or lazy EnsureAlleles/EnsureIds) has completed.
 struct VariantMetadataIndex {
-	//! Raw file content (single allocation)
-	string file_content;
+	//! Columnar typed backing
+	vector<string> chroms;
+	vector<int32_t> positions;
+	vector<string> ids; // "." normalized to "" at load time
+	vector<string> refs;
+	vector<string> alts; // "." normalized to "" at load time
 
-	//! Byte offset of each data line's start within file_content.
-	//! line_offsets[vidx] = byte offset of variant vidx's line.
-	vector<uint64_t> line_offsets;
+	//! Sparse mode: file-row vidx → local index in the vectors. Empty in dense mode.
+	unordered_map<uint32_t, uint32_t> vidx_map;
 
-	//! Whether the source is .bim format (whitespace-delimited, different column order)
-	bool is_bim = false;
+	//! Sparse mode: local index → file-row vidx (reverse of vidx_map).
+	//! Empty in dense mode (where local index == file-row vidx).
+	//! Keeping both directions lets Local()/GetChrom()/etc. stay O(1) AND lets
+	//! scan/filter code look up "what file-row vidx is this local row?" in O(1)
+	//! (used by ResolveByCpra and BuildVariantIdIndex in sparse mode).
+	vector<uint32_t> local_to_vidx;
 
-	//! Physical field indices for each logical field (after header parsing)
-	idx_t chrom_idx = 0;
-	idx_t pos_idx = 0;
-	idx_t id_idx = 0;
-	idx_t ref_idx = 0;
-	idx_t alt_idx = 0;
+	//! Chromosome offset index for fast region lookups (dense mode only).
+	//! chrom → [first_local_idx, past_end_local_idx). Assumes variants are
+	//! (CHROM, POS)-sorted as required by the PLINK spec.
+	unordered_map<string, std::pair<idx_t, idx_t>> chrom_offsets;
 
-	//! Total variant count
+	//! Total variant count in the source file (not the loaded subset).
 	idx_t variant_ct = 0;
 
-	//! Find the end of line vidx (exclusive, past trailing \r\n)
-	size_t LineEnd(idx_t vidx) const;
+	//! Whether the source was .bim format (affects column-name defaults only).
+	bool is_bim = false;
 
-	//! Extract the N-th delimited field from a line without allocating.
-	//! For .pvar: tab-delimited. For .bim: whitespace-delimited.
-	string GetField(idx_t vidx, idx_t field_idx) const;
+	//! Whether ID/REF/ALT are loaded. Dense text load always sets both true.
+	//! Parquet lazy paths may skip loading these if the query doesn't need them.
+	bool has_ids = true;
+	bool has_alleles = true;
 
-	//! On-demand field access (thread-safe: const on file_content)
-	string GetChrom(idx_t vidx) const;
-	int32_t GetPos(idx_t vidx) const;
-	string GetId(idx_t vidx) const;
-	string GetRef(idx_t vidx) const;
-	string GetAlt(idx_t vidx) const;
+	//! Local index for a file-row vidx.
+	inline idx_t Local(idx_t vidx) const {
+		if (vidx_map.empty()) {
+			return vidx;
+		}
+		auto it = vidx_map.find(static_cast<uint32_t>(vidx));
+		if (it == vidx_map.end()) {
+			throw InternalException("VariantMetadataIndex: vidx %llu not in loaded subset",
+			                        static_cast<unsigned long long>(vidx));
+		}
+		return it->second;
+	}
+
+	//! True iff this index is dense (fully loaded, indexed by vidx directly).
+	inline bool IsDense() const {
+		return vidx_map.empty();
+	}
+
+	//! Returns [first_local_idx, past_end_local_idx) for a chromosome; {0,0} if absent.
+	//! Dense mode only — sparse indexes have been pre-filtered.
+	inline std::pair<idx_t, idx_t> ChromRange(const string &chrom) const {
+		auto it = chrom_offsets.find(chrom);
+		return it == chrom_offsets.end() ? std::make_pair(idx_t {0}, idx_t {0}) : it->second;
+	}
+
+	inline const string &GetChrom(idx_t vidx) const {
+		return chroms[Local(vidx)];
+	}
+	inline int32_t GetPos(idx_t vidx) const {
+		return positions[Local(vidx)];
+	}
+	inline const string &GetId(idx_t vidx) const {
+		return ids[Local(vidx)];
+	}
+	inline const string &GetRef(idx_t vidx) const {
+		return refs[Local(vidx)];
+	}
+	inline const string &GetAlt(idx_t vidx) const {
+		return alts[Local(vidx)];
+	}
+
+	//! Map a local index (into chroms/positions/ids/refs/alts) back to a file-row vidx.
+	//! O(1) in both modes. Use this when iterating the loaded subset (e.g. all of
+	//! chroms.size()) and you need the pgenlib-compatible vidx for each row.
+	inline uint32_t VidxForLocal(idx_t local) const {
+		if (local_to_vidx.empty()) {
+			return static_cast<uint32_t>(local); // dense: local == vidx
+		}
+		return local_to_vidx[local];
+	}
 };
+
+//! Build a map from variant ID (rsid) to file-row vidx. Handles both dense and
+//! sparse variant indexes: in sparse mode only the loaded subset is indexed
+//! (which is the correct semantic — user-supplied rsids can only resolve to
+//! variants that are actually in the loaded subset, typically a region).
+//! Empty IDs are skipped.
+unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &variants);
 
 //! Build an offset-indexed metadata index from a .pvar/.bim file.
 //! Reads the file once into a single buffer, builds line offsets, and parses
@@ -200,6 +264,24 @@ string FindCompanionFileWithParquet(ClientContext &context, FileSystem &fs, cons
 VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, const string &path,
                                                     const string &func_name);
 
+//! Region-pushdown parquet loader — materializes only variants in [pos_start, pos_end]
+//! on the named chrom. Returns a sparse VariantMetadataIndex whose vidx_map keys are
+//! file row numbers (pgenlib-compatible global vidx).
+//!
+//! `variant_ct_hint` sets `idx.variant_ct`. Callers should pass the expected total
+//! (typically `pgfi.raw_variant_ct`) so the downstream count-mismatch check is a
+//! sanity check against pgen — we deliberately do NOT re-scan the full parquet to
+//! count rows, which would defeat the point of pushdown at 170M-variant scale.
+VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context, const string &path,
+                                                          const string &chrom, int64_t pos_start, int64_t pos_end,
+                                                          idx_t variant_ct_hint, const string &func_name);
+
+//! Row count from a parquet file via row-group metadata aggregation
+//! (DuckDB-optimized `COUNT(*)`). Typically sub-ms but O(num_row_groups),
+//! not literally O(1). Use for count-only metadata paths (psam fast path);
+//! the region-pushdown path avoids this entirely by trusting pgen's count.
+idx_t GetParquetRowCount(ClientContext &context, const string &path);
+
 //! Load sample info from a parquet file via DuckDB's parquet reader.
 SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path);
 
@@ -220,6 +302,14 @@ VariantMetadataIndex LoadVariantMetadata(ClientContext &context, const string &p
 
 //! Load sample info, auto-dispatching between parquet, native text, and arbitrary sources.
 SampleInfo LoadSampleMetadata(ClientContext &context, const string &path);
+
+//! Cheap count-only psam loader: returns SampleInfo with `sample_ct` set but
+//! `iids`/`fids`/`iid_to_idx` empty. For parquet, uses footer metadata (O(1)).
+//! For text/source, falls back to full load and discards strings to keep memory low.
+//! Use when the query doesn't need IID strings (no VARCHAR sample filter, no
+//! genotypes:='columns'/'struct', not orient='genotype'/'sample'). At biobank
+//! scale this saves the ~600ms columnar string copy of 7M IIDs.
+SampleInfo LoadSampleCount(ClientContext &context, const string &path);
 
 // ---------------------------------------------------------------------------
 // Sample subsetting (for PgrGetCounts / PgrGet)
