@@ -1,5 +1,6 @@
 #include "pfile_reader.hpp"
 #include "plink_common.hpp"
+#include "plink_profile.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
@@ -159,16 +160,11 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 				fields.push_back(val.IsNull() ? "" : val.ToString());
 			}
 
-			// Extract sample info
-			const auto &iid = fields[iid_idx];
-			if (sample_info_out.iid_to_idx.count(iid)) {
-				throw IOException("read_pfile: source '%s' has duplicate IID '%s'", source, iid);
-			}
-			sample_info_out.iids.push_back(iid);
+			// iid_to_idx is lazy (see SampleInfo::EnsureIidMap).
+			sample_info_out.iids.push_back(fields[iid_idx]);
 			if (has_fid) {
 				sample_info_out.fids.push_back(fields[fid_idx]);
 			}
-			sample_info_out.iid_to_idx[iid] = sample_info_out.iids.size() - 1;
 
 			meta.rows.push_back(std::move(fields));
 		}
@@ -243,18 +239,12 @@ static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const
 			fields = SplitTabLine(line);
 		}
 
-		// Extract sample info for IID lookups
+		// iid_to_idx is built lazily on demand (see SampleInfo::EnsureIidMap).
 		if (iid_idx < fields.size()) {
-			const auto &iid = fields[iid_idx];
-			if (sample_info_out.iid_to_idx.count(iid)) {
-				throw IOException("read_pfile: file '%s' line %llu has duplicate IID '%s'", path,
-				                  static_cast<unsigned long long>(i + 1), iid);
-			}
-			sample_info_out.iids.push_back(iid);
+			sample_info_out.iids.push_back(fields[iid_idx]);
 			if (has_fid && fid_idx < fields.size()) {
 				sample_info_out.fids.push_back(fields[fid_idx]);
 			}
-			sample_info_out.iid_to_idx[iid] = sample_info_out.iids.size() - 1;
 		}
 
 		meta.rows.push_back(std::move(fields));
@@ -453,6 +443,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 
 static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
+	BindPhaseTimer bind_timer("PfileBind(total)");
 	auto bind_data = make_uniq<PfileBindData>();
 
 	// --- Resolve file paths ---
@@ -554,6 +545,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	// --- Initialize pgenlib (Phase 1) to get counts ---
+	bind_timer.Note("file paths resolved, starting pgenlib init");
 	plink2::PgenFileInfo pgfi;
 	plink2::PreinitPgfi(&pgfi);
 
@@ -593,7 +585,21 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "read_pfile");
+	bind_timer.Note("pgenlib init done (raw_variant_ct=%u, raw_sample_ct=%u), loading variant metadata",
+	                bind_data->raw_variant_ct, bind_data->raw_sample_ct);
+	// Parquet + region: push the WHERE into the parquet scan so we only materialize
+	// the region's variants instead of all N (huge win at 170M).
+	if (bind_data->region.active && IsParquetFile(bind_data->pvar_path)) {
+		idx_t total_ct = GetParquetRowCount(context, bind_data->pvar_path);
+		bind_data->variants = LoadVariantMetadataFromParquetRegion(context, bind_data->pvar_path,
+		                                                           bind_data->region.chrom, bind_data->region.start,
+		                                                           bind_data->region.end, total_ct, "read_pfile");
+	} else {
+		bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "read_pfile");
+	}
+	bind_timer.Note("variant metadata loaded (%llu total variants, %llu loaded)",
+	                (unsigned long long)bind_data->variants.variant_ct,
+	                (unsigned long long)bind_data->variants.chroms.size());
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("read_pfile: variant count mismatch: .pgen has %u variants, "
@@ -603,13 +609,46 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	// --- Load sample info ---
-	// In genotype/sample orient modes, LoadPfileSampleMetadata populates both
-	// sample_info and sample_metadata from a single file read. Otherwise, use LoadSampleInfo.
+	// Determine whether the query actually needs IID strings. If not, we only
+	// need the row count — at biobank scale this saves ~600ms of string copies.
+	// Need IIDs when:
+	//   * orient = genotype/sample (full per-sample metadata)
+	//   * samples filter contains VARCHAR (IID-string lookup)
+	//   * genotypes := 'columns' or 'struct' in variant orient (column names from IIDs)
+	bool needs_iids = false;
+	if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
+		needs_iids = true;
+	}
+	{
+		auto it = input.named_parameters.find("samples");
+		if (it != input.named_parameters.end()) {
+			auto &child_type = ListType::GetChildType(it->second.type());
+			if (child_type.id() == LogicalTypeId::VARCHAR) {
+				needs_iids = true;
+			}
+		}
+	}
+	{
+		auto it = input.named_parameters.find("genotypes");
+		if (it != input.named_parameters.end() && bind_data->orient_mode == OrientMode::VARIANT) {
+			auto gv = StringUtil::Lower(it->second.GetValue<string>());
+			if (gv == "columns" || gv == "struct") {
+				needs_iids = true;
+			}
+		}
+	}
+
+	bind_timer.Note("loading sample metadata (needs_iids=%s)", needs_iids ? "yes" : "no");
 	if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		bind_data->sample_metadata = LoadPfileSampleMetadata(context, bind_data->psam_path, bind_data->sample_info);
-	} else {
+	} else if (needs_iids) {
 		bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
+	} else {
+		bind_data->sample_info = LoadSampleCount(context, bind_data->psam_path);
 	}
+	bind_timer.Note("sample metadata loaded (%llu samples, iids=%llu)",
+	                (unsigned long long)bind_data->sample_info.sample_ct,
+	                (unsigned long long)bind_data->sample_info.iids.size());
 
 	if (bind_data->sample_info.sample_ct != bind_data->raw_sample_ct) {
 		throw InvalidInputException("read_pfile: sample count mismatch: .pgen has %u samples, "
@@ -640,6 +679,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				bind_data->sample_indices.push_back(static_cast<uint32_t>(idx));
 			}
 		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
+			// Lazily build iid_to_idx only when VARCHAR filter is actually used.
+			bind_data->sample_info.EnsureIidMap("read_pfile: " + bind_data->psam_path);
 			auto &children = ListValue::GetChildren(samples_val);
 			for (auto &child : children) {
 				auto iid = child.GetValue<string>();
@@ -682,8 +723,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	// --- Build effective variant list (intersection of region + variant filter) ---
+	bind_timer.Note("building effective variant list");
 	{
-		// Start with all variants if no filter, or variant_indices if variant filter active
 		std::unordered_set<uint32_t> variant_set;
 		bool use_variant_set = bind_data->has_variant_filter;
 		if (use_variant_set) {
@@ -695,26 +736,83 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		bool any_filter_active = bind_data->region.active || bind_data->has_variant_filter;
 
 		if (any_filter_active) {
+			BindPhaseTimer evl_timer("effective-variant-list-scan");
 			bind_data->has_effective_variant_list = true;
 
-			for (uint32_t vidx = 0; vidx < bind_data->raw_variant_ct; vidx++) {
-				// Check region filter
-				if (bind_data->region.active) {
-					if (bind_data->variants.GetChrom(vidx) != bind_data->region.chrom) {
+			// Case A: sparse pvar index (parquet region pushdown). The loaded
+			// subset IS the region-matched set; iterate vidx_map keys directly.
+			if (!bind_data->variants.vidx_map.empty()) {
+				bind_data->effective_variant_indices.reserve(bind_data->variants.vidx_map.size());
+				for (auto &kv : bind_data->variants.vidx_map) {
+					if (use_variant_set && variant_set.find(kv.first) == variant_set.end()) {
 						continue;
 					}
-					int64_t pos = bind_data->variants.GetPos(vidx);
-					if (pos < bind_data->region.start || pos > bind_data->region.end) {
-						continue;
+					bind_data->effective_variant_indices.push_back(kv.first);
+				}
+				std::sort(bind_data->effective_variant_indices.begin(), bind_data->effective_variant_indices.end());
+				evl_timer.Note("sparse pvar: %llu region variants pre-filtered; %llu passed",
+				               (unsigned long long)bind_data->variants.vidx_map.size(),
+				               (unsigned long long)bind_data->effective_variant_indices.size());
+			} else if (bind_data->region.active && !bind_data->variants.chrom_offsets.empty()) {
+				// Case B: dense + region + chrom_offsets → O(log N) binary-search bounds.
+				auto it = bind_data->variants.chrom_offsets.find(bind_data->region.chrom);
+				if (it != bind_data->variants.chrom_offsets.end()) {
+					idx_t lo_local = it->second.first;
+					idx_t hi_local = it->second.second;
+					auto &positions = bind_data->variants.positions;
+					// binary search for pos >= region.start
+					idx_t lo = lo_local, hi = hi_local;
+					while (lo < hi) {
+						idx_t mid = lo + (hi - lo) / 2;
+						if (positions[mid] < bind_data->region.start) {
+							lo = mid + 1;
+						} else {
+							hi = mid;
+						}
+					}
+					idx_t start_idx = lo;
+					// binary search for pos > region.end
+					lo = lo_local;
+					hi = hi_local;
+					while (lo < hi) {
+						idx_t mid = lo + (hi - lo) / 2;
+						if (positions[mid] <= bind_data->region.end) {
+							lo = mid + 1;
+						} else {
+							hi = mid;
+						}
+					}
+					idx_t end_idx = lo;
+					bind_data->effective_variant_indices.reserve(end_idx - start_idx);
+					for (idx_t vidx = start_idx; vidx < end_idx; vidx++) {
+						if (use_variant_set && variant_set.find(static_cast<uint32_t>(vidx)) == variant_set.end()) {
+							continue;
+						}
+						bind_data->effective_variant_indices.push_back(static_cast<uint32_t>(vidx));
 					}
 				}
-
-				// Check variant filter
-				if (use_variant_set && variant_set.find(vidx) == variant_set.end()) {
-					continue;
+				evl_timer.Note("dense+region: chrom_offsets+bsearch → %llu passed",
+				               (unsigned long long)bind_data->effective_variant_indices.size());
+			} else {
+				// Case C: variant filter only (no region), or region without chrom_offsets.
+				// Full scan with cheap columnar access.
+				for (uint32_t vidx = 0; vidx < bind_data->raw_variant_ct; vidx++) {
+					if (bind_data->region.active) {
+						if (bind_data->variants.GetChrom(vidx) != bind_data->region.chrom) {
+							continue;
+						}
+						int64_t pos = bind_data->variants.GetPos(vidx);
+						if (pos < bind_data->region.start || pos > bind_data->region.end) {
+							continue;
+						}
+					}
+					if (use_variant_set && variant_set.find(vidx) == variant_set.end()) {
+						continue;
+					}
+					bind_data->effective_variant_indices.push_back(vidx);
 				}
-
-				bind_data->effective_variant_indices.push_back(vidx);
+				evl_timer.Note("linear fallback: %u variants scanned, %llu passed", bind_data->raw_variant_ct,
+				               (unsigned long long)bind_data->effective_variant_indices.size());
 			}
 		}
 	}

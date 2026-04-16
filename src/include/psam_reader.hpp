@@ -14,13 +14,26 @@ namespace duckdb {
 // ---------------------------------------------------------------------------
 
 //! Sample metadata extracted from .psam or .fam files.
-//! Used by read_psam for its own output and by read_pgen to look up sample
-//! information without re-parsing the file.
+//!
+//! At biobank scale (~7M samples), the iid_to_idx map is expensive to build
+//! (string hashing + allocations) and most queries do not need it (integer
+//! sample filters, or no sample filter at all). So iid_to_idx is **lazy**:
+//! call EnsureIidMap() before using it. Callers that do not need IID-based
+//! lookups never pay the cost.
+//!
+//! Similarly, `iids` may be empty when sample_ct is loaded from parquet
+//! metadata alone (cheap constant-time call). Callers that need the IID
+//! strings (for column names, VARCHAR lookups, etc.) must ensure iids is
+//! populated before access.
 struct SampleInfo {
-	vector<string> iids;                     //!< Individual IDs in file order
+	vector<string> iids;                     //!< Individual IDs in file order (possibly lazy)
 	vector<string> fids;                     //!< Family IDs (empty if no FID column)
-	idx_t sample_ct;                         //!< Total sample count
-	unordered_map<string, idx_t> iid_to_idx; //!< IID → file-order index
+	idx_t sample_ct;                         //!< Total sample count (always populated)
+	unordered_map<string, idx_t> iid_to_idx; //!< IID → file-order index (lazy; call EnsureIidMap)
+
+	//! Build iid_to_idx from iids. Validates uniqueness. Safe to call multiple times.
+	//! Throws if duplicate IIDs are found. Requires iids to be populated.
+	void EnsureIidMap(const string &source_label = "sample file");
 };
 
 //! Parse a .psam or .fam file and return sample metadata.
