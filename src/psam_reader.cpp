@@ -50,8 +50,24 @@ static bool IsParentMissing(const string &val) {
 // ---------------------------------------------------------------------------
 
 void SampleInfo::EnsureIidMap(const string &source_label) {
-	if (!iid_to_idx.empty() || iids.empty()) {
-		return;
+	if (!iid_to_idx.empty()) {
+		return; // already built
+	}
+	if (iids.empty()) {
+		// iids was never populated — the caller took the count-only fast path
+		// (LoadSampleCount / parquet footer metadata) and is now asking for
+		// IID-keyed lookups. This is a bug in PfileBind's `needs_iids` decision:
+		// any call site that reaches EnsureIidMap must have triggered the full
+		// load. Surfacing this explicitly instead of a confusing downstream
+		// "sample 'X' not found" error.
+		if (sample_ct > 0) {
+			throw InternalException(
+			    "%s: IID lookup requested but IID strings were not loaded (bind chose the count-only "
+			    "fast path for %llu samples). This indicates PfileBind's needs_iids predicate missed "
+			    "a case that requires IID strings — please report.",
+			    source_label.c_str(), static_cast<unsigned long long>(sample_ct));
+		}
+		return; // genuinely empty psam (no samples)
 	}
 	iid_to_idx.reserve(iids.size());
 	for (idx_t i = 0; i < iids.size(); i++) {

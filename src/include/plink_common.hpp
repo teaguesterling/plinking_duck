@@ -132,6 +132,13 @@ struct VariantMetadataIndex {
 	//! Sparse mode: file-row vidx → local index in the vectors. Empty in dense mode.
 	unordered_map<uint32_t, uint32_t> vidx_map;
 
+	//! Sparse mode: local index → file-row vidx (reverse of vidx_map).
+	//! Empty in dense mode (where local index == file-row vidx).
+	//! Keeping both directions lets Local()/GetChrom()/etc. stay O(1) AND lets
+	//! scan/filter code look up "what file-row vidx is this local row?" in O(1)
+	//! (used by ResolveByCpra and BuildVariantIdIndex in sparse mode).
+	vector<uint32_t> local_to_vidx;
+
 	//! Chromosome offset index for fast region lookups (dense mode only).
 	//! chrom → [first_local_idx, past_end_local_idx). Assumes variants are
 	//! (CHROM, POS)-sorted as required by the PLINK spec.
@@ -188,7 +195,24 @@ struct VariantMetadataIndex {
 	inline const string &GetAlt(idx_t vidx) const {
 		return alts[Local(vidx)];
 	}
+
+	//! Map a local index (into chroms/positions/ids/refs/alts) back to a file-row vidx.
+	//! O(1) in both modes. Use this when iterating the loaded subset (e.g. all of
+	//! chroms.size()) and you need the pgenlib-compatible vidx for each row.
+	inline uint32_t VidxForLocal(idx_t local) const {
+		if (local_to_vidx.empty()) {
+			return static_cast<uint32_t>(local); // dense: local == vidx
+		}
+		return local_to_vidx[local];
+	}
 };
+
+//! Build a map from variant ID (rsid) to file-row vidx. Handles both dense and
+//! sparse variant indexes: in sparse mode only the loaded subset is indexed
+//! (which is the correct semantic — user-supplied rsids can only resolve to
+//! variants that are actually in the loaded subset, typically a region).
+//! Empty IDs are skipped.
+unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &variants);
 
 //! Build an offset-indexed metadata index from a .pvar/.bim file.
 //! Reads the file once into a single buffer, builds line offsets, and parses
@@ -242,14 +266,20 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 
 //! Region-pushdown parquet loader — materializes only variants in [pos_start, pos_end]
 //! on the named chrom. Returns a sparse VariantMetadataIndex whose vidx_map keys are
-//! file row numbers (pgenlib-compatible global vidx). total_row_ct must be the total
-//! number of variants in the source file (used to populate idx.variant_ct for
-//! count-mismatch validation). Much faster than loading the full file at biobank scale.
+//! file row numbers (pgenlib-compatible global vidx).
+//!
+//! `variant_ct_hint` sets `idx.variant_ct`. Callers should pass the expected total
+//! (typically `pgfi.raw_variant_ct`) so the downstream count-mismatch check is a
+//! sanity check against pgen — we deliberately do NOT re-scan the full parquet to
+//! count rows, which would defeat the point of pushdown at 170M-variant scale.
 VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context, const string &path,
                                                           const string &chrom, int64_t pos_start, int64_t pos_end,
-                                                          idx_t total_row_ct, const string &func_name);
+                                                          idx_t variant_ct_hint, const string &func_name);
 
-//! Cheap row count via parquet footer metadata.
+//! Row count from a parquet file via row-group metadata aggregation
+//! (DuckDB-optimized `COUNT(*)`). Typically sub-ms but O(num_row_groups),
+//! not literally O(1). Use for count-only metadata paths (psam fast path);
+//! the region-pushdown path avoids this entirely by trusting pgen's count.
 idx_t GetParquetRowCount(ClientContext &context, const string &path);
 
 //! Load sample info from a parquet file via DuckDB's parquet reader.

@@ -346,12 +346,15 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 				                            "LIST(STRUCT(id VARCHAR, allele VARCHAR, weight DOUBLE))");
 			}
 
-			// Build variant ID → index map (respecting region filter)
+			// Build variant ID → file-row-vidx map restricted to the region.
+			// Iterating local indices (range is produced by ParseRegion in local
+			// space) and mapping through VidxForLocal keeps this correct in both
+			// dense and sparse VariantMetadataIndex modes.
 			unordered_map<string, uint32_t> variant_id_map;
-			for (uint32_t i = range_start; i < range_end; i++) {
-				auto vid = bind_data->variants.GetId(i);
+			for (uint32_t local = range_start; local < range_end; local++) {
+				const auto &vid = bind_data->variants.ids[local];
 				if (!vid.empty()) {
-					variant_id_map[vid] = i;
+					variant_id_map[vid] = bind_data->variants.VidxForLocal(local);
 				}
 			}
 

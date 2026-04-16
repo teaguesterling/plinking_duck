@@ -588,12 +588,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_timer.Note("pgenlib init done (raw_variant_ct=%u, raw_sample_ct=%u), loading variant metadata",
 	                bind_data->raw_variant_ct, bind_data->raw_sample_ct);
 	// Parquet + region: push the WHERE into the parquet scan so we only materialize
-	// the region's variants instead of all N (huge win at 170M).
+	// the region's variants instead of all N (huge win at 170M). Pass pgen's
+	// raw_variant_ct as the hint so the loader doesn't re-scan the file for
+	// a row count — the post-load check becomes a sanity check against pgen
+	// rather than a second full-file open.
 	if (bind_data->region.active && IsParquetFile(bind_data->pvar_path)) {
-		idx_t total_ct = GetParquetRowCount(context, bind_data->pvar_path);
-		bind_data->variants = LoadVariantMetadataFromParquetRegion(context, bind_data->pvar_path,
-		                                                           bind_data->region.chrom, bind_data->region.start,
-		                                                           bind_data->region.end, total_ct, "read_pfile");
+		bind_data->variants = LoadVariantMetadataFromParquetRegion(
+		    context, bind_data->pvar_path, bind_data->region.chrom, bind_data->region.start, bind_data->region.end,
+		    static_cast<idx_t>(bind_data->raw_variant_ct), "read_pfile");
 	} else {
 		bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "read_pfile");
 	}

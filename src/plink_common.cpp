@@ -95,8 +95,12 @@ OrientMode ResolveOrientMode(const string &orient_str, const string &func_name) 
 // Columnar load helpers (shared between parquet and text paths)
 // ---------------------------------------------------------------------------
 
-//! Build chrom_offsets from the chroms column. Assumes (CHROM, POS)-sorted input.
-static void BuildChromOffsets(VariantMetadataIndex &idx) {
+//! Build chrom_offsets from the chroms column. Requires (CHROM, POS)-sorted
+//! input (PLINK spec). Detects non-contiguous chroms (a spec violation that
+//! generic sources like SQL views might produce) and throws rather than
+//! silently dropping runs. The rest of the code (binary search on POS) assumes
+//! contiguous runs, so this is a hard precondition.
+static void BuildChromOffsets(VariantMetadataIndex &idx, const string &source_label) {
 	idx.chrom_offsets.clear();
 	if (idx.chroms.empty()) {
 		return;
@@ -105,12 +109,25 @@ static void BuildChromOffsets(VariantMetadataIndex &idx) {
 	const string *current = &idx.chroms[0];
 	for (idx_t i = 1; i < idx.chroms.size(); i++) {
 		if (idx.chroms[i] != *current) {
-			idx.chrom_offsets.emplace(*current, std::make_pair(run_start, i));
+			auto inserted = idx.chrom_offsets.emplace(*current, std::make_pair(run_start, i));
+			if (!inserted.second) {
+				throw InvalidInputException("%s: chromosome '%s' appears in non-contiguous runs (variants must be "
+				                            "sorted by (CHROM, POS) as required by the PLINK spec; first run ended at "
+				                            "row %llu, found again at row %llu)",
+				                            source_label, current->c_str(),
+				                            static_cast<unsigned long long>(inserted.first->second.second),
+				                            static_cast<unsigned long long>(i));
+			}
 			current = &idx.chroms[i];
 			run_start = i;
 		}
 	}
-	idx.chrom_offsets.emplace(*current, std::make_pair(run_start, idx.chroms.size()));
+	auto inserted = idx.chrom_offsets.emplace(*current, std::make_pair(run_start, idx.chroms.size()));
+	if (!inserted.second) {
+		throw InvalidInputException(
+		    "%s: chromosome '%s' appears in non-contiguous runs (variants must be sorted by (CHROM, POS))",
+		    source_label, current->c_str());
+	}
 }
 
 //! Parse a single delimited field from [start, end) in buf (no allocation).
@@ -275,12 +292,16 @@ VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const stri
 		size_t fstart = 0, flen = 0;
 		string chrom, id, ref, alt;
 		int32_t pos_val = 0;
+		// Track whether each required field was parsed (rather than left at default).
+		// Prevents silent data corruption on truncated/malformed lines.
+		bool got_chrom = false, got_pos = false, got_id = false, got_ref = false, got_alt = false;
 		for (idx_t f = 0; f <= max_field; f++) {
 			if (!NextField(buf, content_end, &cursor, &fstart, &flen, whitespace)) {
 				break;
 			}
 			if (f == chrom_field) {
 				chrom.assign(buf + fstart, flen);
+				got_chrom = true;
 			} else if (f == pos_field) {
 				// strtol on a non-nul-terminated span: copy into small local
 				char tmp[32];
@@ -295,21 +316,44 @@ VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const stri
 					                            static_cast<unsigned long long>(pos));
 				}
 				pos_val = static_cast<int32_t>(v);
+				got_pos = true;
 			} else if (f == id_field) {
 				if (flen == 1 && buf[fstart] == '.') {
 					// empty
 				} else {
 					id.assign(buf + fstart, flen);
 				}
+				got_id = true;
 			} else if (f == ref_field) {
 				ref.assign(buf + fstart, flen);
+				got_ref = true;
 			} else if (f == alt_field) {
 				if (flen == 1 && buf[fstart] == '.') {
 					// empty
 				} else {
 					alt.assign(buf + fstart, flen);
 				}
+				got_alt = true;
 			}
+		}
+
+		// Reject truncated/malformed lines (missing required columns) instead of
+		// silently pushing default-initialized values.
+		if (!got_chrom || !got_pos || !got_id || !got_ref || !got_alt) {
+			string missing;
+			if (!got_chrom)
+				missing += " CHROM";
+			if (!got_pos)
+				missing += " POS";
+			if (!got_id)
+				missing += " ID";
+			if (!got_ref)
+				missing += " REF";
+			if (!got_alt)
+				missing += " ALT";
+			throw InvalidInputException(
+			    "%s: .pvar/.bim file '%s' has a line missing required fields [%s] at byte offset %llu", func_name, path,
+			    missing.c_str(), static_cast<unsigned long long>(pos));
 		}
 
 		idx.chroms.emplace_back(std::move(chrom));
@@ -324,7 +368,7 @@ VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const stri
 	idx.variant_ct = idx.chroms.size();
 	idx.has_ids = true;
 	idx.has_alleles = true;
-	BuildChromOffsets(idx);
+	BuildChromOffsets(idx, path);
 	return idx;
 }
 
@@ -652,19 +696,27 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 			}
 		}
 
-		// file_row_number → sparse vidx_map
+		// file_row_number → sparse vidx_map + local_to_vidx reverse map.
+		// Both are populated so callers iterating the loaded subset can map
+		// local → vidx in O(1) (e.g. ResolveByCpra, BuildVariantIdIndex).
 		if (rn_col != DConstants::INVALID_INDEX) {
 			auto &vec = chunk->data[rn_col];
 			UnifiedVectorFormat uvf;
 			vec.ToUnifiedFormat(n, uvf);
 			auto data = reinterpret_cast<const int64_t *>(uvf.data);
 			idx_t local_base = idx.chroms.size() - n;
+			if (idx.local_to_vidx.size() < idx.chroms.size()) {
+				idx.local_to_vidx.resize(idx.chroms.size());
+			}
 			for (idx_t i = 0; i < n; i++) {
 				auto si = uvf.sel->get_index(i);
 				if (!uvf.validity.RowIsValid(si)) {
 					throw IOException("%s: NULL file_row_number encountered (internal error)", func_name);
 				}
-				idx.vidx_map.emplace(static_cast<uint32_t>(data[si]), static_cast<uint32_t>(local_base + i));
+				uint32_t vidx = static_cast<uint32_t>(data[si]);
+				uint32_t local = static_cast<uint32_t>(local_base + i);
+				idx.vidx_map.emplace(vidx, local);
+				idx.local_to_vidx[local] = vidx;
 			}
 		}
 	}
@@ -689,47 +741,82 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 	idx.has_ids = true;
 	idx.has_alleles = true;
 	timer.Note("ingested %llu variants", (unsigned long long)idx.variant_ct);
-	BuildChromOffsets(idx);
+	BuildChromOffsets(idx, path);
 	timer.Note("built chrom_offsets (%llu chroms)", (unsigned long long)idx.chrom_offsets.size());
 	return idx;
+}
+
+//! Pick the chromosome column name. Different pvar producers use either
+//! "#CHROM" (plink2 native) or "CHROM" (custom exports). Introspecting via
+//! a LIMIT 0 scan is cheaper than a wrapped DESCRIBE: DuckDB only reads the
+//! parquet footer to get schema, no row groups touched.
+static string DetectChromColumn(Connection &conn, const string &path, const string &func_name) {
+	auto escaped_path = StringUtil::Replace(path, "'", "''");
+	auto result = conn.Query("SELECT * FROM read_parquet('" + escaped_path + "') LIMIT 0");
+	if (result->HasError()) {
+		throw IOException("%s: failed to read parquet schema for '%s': %s", func_name, path, result->GetError());
+	}
+	for (auto &name : result->names) {
+		auto lower = StringUtil::Lower(name);
+		if (lower == "#chrom") {
+			return "#CHROM";
+		}
+	}
+	for (auto &name : result->names) {
+		auto lower = StringUtil::Lower(name);
+		if (lower == "chrom") {
+			return "CHROM";
+		}
+	}
+	throw InvalidInputException("%s: parquet companion '%s' has no CHROM or #CHROM column (columns: %s)", func_name,
+	                            path, StringUtil::Join(result->names, ", "));
 }
 
 //! Region-pushdown loader: queries the parquet file with a WHERE clause so
 //! only matching rows are materialized. Returns a sparse index whose
 //! vidx_map keys are the file row numbers (pgenlib-compatible vidx).
-//! total_row_ct lets caller set variant_ct correctly for count validation.
+//!
+//! `variant_ct_hint` — the caller's expected total row count (typically
+//! `pgfi.raw_variant_ct` from the pgen header). Used as `idx.variant_ct` so
+//! the downstream count-mismatch check is effectively a sanity check against
+//! pgen (we don't re-scan the full parquet to count rows; trusting pgen keeps
+//! the region path O(region size), not O(file size)).
 VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context, const string &path,
                                                           const string &chrom, int64_t pos_start, int64_t pos_end,
-                                                          idx_t total_row_ct, const string &func_name) {
+                                                          idx_t variant_ct_hint, const string &func_name) {
 	BindPhaseTimer timer("LoadVariantMetadataFromParquetRegion");
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
-	auto escaped_path = StringUtil::Replace(path, "'", "''");
-	auto escaped_chrom = StringUtil::Replace(chrom, "'", "''");
 
-	// file_row_number gives pgenlib-compatible global vidx; stats pruning + column
-	// projection keep this O(region_size), not O(total).
-	string sql = "SELECT \"#CHROM\" AS \"#CHROM\", POS, ID, REF, ALT, file_row_number "
+	// Determine whether the file uses "#CHROM" or "CHROM" for its chrom column.
+	// Introspecting the schema upfront avoids the old error-driven retry that
+	// could mask POS-type or other schema errors as column-name failures.
+	auto chrom_col_name = DetectChromColumn(conn, path, func_name);
+	timer.Note("chrom column: %s", chrom_col_name.c_str());
+
+	// file_row_number gives pgenlib-compatible global vidx. stats pruning +
+	// column projection keep this O(region_size), not O(total).
+	//
+	// Path is embedded via quote-doubling (DuckDB follows SQL-standard string
+	// literals — no backslash escapes — so `''` is sufficient). The user-
+	// controlled chrom and position values use prepared-statement parameters.
+	auto escaped_path = StringUtil::Replace(path, "'", "''");
+	string sql = "SELECT \"" + chrom_col_name +
+	             "\" AS \"#CHROM\", POS, ID, REF, ALT, file_row_number " //
 	             "FROM read_parquet('" +
 	             escaped_path +
-	             "', file_row_number=true) "
-	             "WHERE (CAST(\"#CHROM\" AS VARCHAR) = '" +
-	             escaped_chrom + "') AND POS BETWEEN " + std::to_string(pos_start) + " AND " + std::to_string(pos_end) +
-	             " ORDER BY file_row_number";
-	auto result = conn.Query(sql);
+	             "', file_row_number=true) " //
+	             "WHERE (CAST(\"" +
+	             chrom_col_name +
+	             "\" AS VARCHAR) = $1) AND POS BETWEEN $2 AND $3 " //
+	             "ORDER BY file_row_number";
+	auto pstmt = conn.Prepare(sql);
+	if (pstmt->HasError()) {
+		throw IOException("%s: region-pushdown prepare failed on '%s': %s", func_name, path, pstmt->GetError());
+	}
+	auto result = pstmt->Execute(chrom, pos_start, pos_end);
 	if (result->HasError()) {
-		// Retry without `#` prefix column alias if the file uses "CHROM" (alias still selects by position)
-		auto alt_sql = "SELECT CHROM AS \"#CHROM\", POS, ID, REF, ALT, file_row_number "
-		               "FROM read_parquet('" +
-		               escaped_path +
-		               "', file_row_number=true) "
-		               "WHERE (CAST(CHROM AS VARCHAR) = '" +
-		               escaped_chrom + "') AND POS BETWEEN " + std::to_string(pos_start) + " AND " +
-		               std::to_string(pos_end) + " ORDER BY file_row_number";
-		result = conn.Query(alt_sql);
-		if (result->HasError()) {
-			throw IOException("%s: region-pushdown query failed on '%s': %s", func_name, path, result->GetError());
-		}
+		throw IOException("%s: region-pushdown query failed on '%s': %s", func_name, path, result->GetError());
 	}
 	timer.Note("pushdown query returned");
 
@@ -737,19 +824,31 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	idx.is_bim = false;
 	string label = "parquet companion '" + path + "' (region pushdown)";
 	IngestVariantResult(*result, label, func_name, idx);
-	idx.variant_ct = total_row_ct; // total from parquet metadata (for count-mismatch validation)
+	// variant_ct = caller's hint (typically pgen's raw_variant_ct). The post-load
+	// count-mismatch check in the caller becomes a sanity check against pgen;
+	// we don't open the parquet file a second time to count rows.
+	idx.variant_ct = variant_ct_hint;
 	idx.has_ids = true;
 	idx.has_alleles = true;
 	// Single chrom in pushdown, single contiguous range of local indices
 	if (!idx.chroms.empty()) {
 		idx.chrom_offsets.emplace(idx.chroms.front(), std::make_pair(idx_t {0}, idx.chroms.size()));
 	}
-	timer.Note("ingested %llu region variants (total_ct=%llu)", (unsigned long long)idx.chroms.size(),
-	           (unsigned long long)total_row_ct);
+	timer.Note("ingested %llu region variants (variant_ct hint=%llu)", (unsigned long long)idx.chroms.size(),
+	           (unsigned long long)variant_ct_hint);
 	return idx;
 }
 
-//! Get total row count from a parquet file via its footer metadata (no row scan).
+//! Get total row count from a parquet file.
+//!
+//! Uses `SELECT COUNT(*) FROM read_parquet(...)`, which DuckDB optimizes to
+//! read row-group `num_rows` from the footer — O(num_row_groups), not a
+//! full scan. At biobank scale this is sub-millisecond (7M rows completed
+//! in <1ms in our profiling), but it is NOT literally O(1): files with
+//! many tiny row groups pay proportionally more. Use only for paths where
+//! the whole file hasn't already been opened (e.g. count-only psam mode).
+//! The region-pushdown path explicitly avoids this by trusting pgen's
+//! raw_variant_ct as the variant_ct.
 idx_t GetParquetRowCount(ClientContext &context, const string &path) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
@@ -875,7 +974,7 @@ VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const
 	idx.variant_ct = idx.chroms.size();
 	idx.has_ids = true;
 	idx.has_alleles = true;
-	BuildChromOffsets(idx);
+	BuildChromOffsets(idx, source);
 	return idx;
 }
 
@@ -1310,13 +1409,17 @@ static void ValidateVariantIndex(int64_t idx, uint32_t raw_variant_ct, const str
 	}
 }
 
-//! Build a map from variant ID to 0-based index.
-static unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &variants) {
+unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &variants) {
+	// Iterate the loaded subset (dense or sparse) by local index. In sparse mode
+	// the local slot's file-row vidx comes from local_to_vidx; in dense mode
+	// local == vidx. Using variant_ct to bound the loop is WRONG for sparse
+	// indexes (where variant_ct is the full source count, not the loaded size).
 	unordered_map<string, uint32_t> id_to_idx;
-	for (idx_t i = 0; i < variants.variant_ct; i++) {
-		auto id = variants.GetId(i);
+	id_to_idx.reserve(variants.chroms.size());
+	for (idx_t local = 0; local < variants.chroms.size(); local++) {
+		const auto &id = variants.ids[local];
 		if (!id.empty()) {
-			id_to_idx[id] = static_cast<uint32_t>(i);
+			id_to_idx[id] = variants.VidxForLocal(local);
 		}
 	}
 	return id_to_idx;
@@ -1355,29 +1458,10 @@ static uint32_t ResolveByCpra(const VariantMetadataIndex &variants, const string
 		}
 		if (ref_match && alt_match) {
 			if (variants.refs[i] == *ref_match && variants.alts[i] == *alt_match) {
-				// Map local idx back to file-row vidx
-				if (!variants.vidx_map.empty()) {
-					for (auto &kv : variants.vidx_map) {
-						if (kv.second == i) {
-							return kv.first;
-						}
-					}
-					throw InternalException("ResolveByCpra: local idx %llu missing from vidx_map",
-					                        static_cast<unsigned long long>(i));
-				}
-				return static_cast<uint32_t>(i);
+				return variants.VidxForLocal(i);
 			}
 		} else {
-			if (!variants.vidx_map.empty()) {
-				for (auto &kv : variants.vidx_map) {
-					if (kv.second == i) {
-						return kv.first;
-					}
-				}
-				throw InternalException("ResolveByCpra: local idx %llu missing from vidx_map",
-				                        static_cast<unsigned long long>(i));
-			}
-			return static_cast<uint32_t>(i);
+			return variants.VidxForLocal(i);
 		}
 	}
 
