@@ -4,6 +4,7 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include <pgenlib_misc.h>
@@ -17,27 +18,50 @@
 namespace duckdb {
 
 // ---------------------------------------------------------------------------
-// VFS line reader (same pattern as pvar_reader)
+// Buffered VFS line reader
 // ---------------------------------------------------------------------------
 
-static bool ReadLineFromHandle(FileHandle &handle, string &line) {
-	line.clear();
-	char buffer[1];
-	bool read_any = false;
-	while (true) {
-		auto bytes = handle.Read(buffer, 1);
-		if (bytes == 0) {
-			return read_any;
-		}
-		read_any = true;
-		if (buffer[0] == '\n') {
-			return true;
-		}
-		if (buffer[0] != '\r') {
-			line += buffer[0];
+static constexpr idx_t VCF_READ_BUF_SIZE = 65536;
+
+struct BufferedLineReader {
+	FileHandle &handle;
+	std::unique_ptr<char[]> buf;
+	idx_t buf_len = 0;
+	idx_t buf_pos = 0;
+
+	explicit BufferedLineReader(FileHandle &handle_p)
+	    : handle(handle_p), buf(new char[VCF_READ_BUF_SIZE]) {
+	}
+
+	bool ReadLine(string &line) {
+		line.clear();
+		bool read_any = false;
+		while (true) {
+			if (buf_pos >= buf_len) {
+				buf_len = handle.Read(buf.get(), VCF_READ_BUF_SIZE);
+				buf_pos = 0;
+				if (buf_len == 0) {
+					return read_any;
+				}
+			}
+			auto scan_start = buf_pos;
+			while (buf_pos < buf_len) {
+				char c = buf[buf_pos];
+				if (c == '\n') {
+					line.append(buf.get() + scan_start, buf_pos - scan_start);
+					buf_pos++;
+					if (!line.empty() && line.back() == '\r') {
+						line.pop_back();
+					}
+					return true;
+				}
+				buf_pos++;
+			}
+			line.append(buf.get() + scan_start, buf_pos - scan_start);
+			read_any = true;
 		}
 	}
-}
+};
 
 // ---------------------------------------------------------------------------
 // Bind data
@@ -86,9 +110,11 @@ struct VcfBindData : public TableFunctionData {
 struct VcfGlobalState : public GlobalTableFunctionState {
 	mutex lock;
 	unique_ptr<FileHandle> file_handle;
+	unique_ptr<BufferedLineReader> reader;
 	bool done = false;
 	uint64_t multiallelic_skipped = 0;
 	string line_buf;
+	bool warned_multiallelic = false;
 
 	// Projection pushdown
 	vector<column_t> column_ids;
@@ -199,10 +225,11 @@ static unique_ptr<FunctionData> VcfBind(ClientContext &context, TableFunctionBin
 	// --- Parse the VCF header ---
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto handle = fs.OpenFile(bind_data->file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+	BufferedLineReader header_reader(*handle);
 
 	string line;
 	bool found_header = false;
-	while (ReadLineFromHandle(*handle, line)) {
+	while (header_reader.ReadLine(line)) {
 		if (line.empty()) {
 			continue;
 		}
@@ -371,14 +398,12 @@ static unique_ptr<GlobalTableFunctionState> VcfInitGlobal(ClientContext &context
 		}
 	}
 
-	// Open file and skip past header lines. Since we can't seek backwards
-	// in all VFS implementations, we store the first data line in line_buf
-	// for the scan function to pick up.
 	auto &fs = FileSystem::GetFileSystem(context);
 	state->file_handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+	state->reader = make_uniq<BufferedLineReader>(*state->file_handle);
 
 	string line;
-	while (ReadLineFromHandle(*state->file_handle, line)) {
+	while (state->reader->ReadLine(line)) {
 		if (line.empty()) {
 			continue;
 		}
@@ -477,38 +502,41 @@ static void BuildParseContext(VcfParseContext &ctx, const VcfBindData &bind_data
 	ctx.qual_line_mins[1] = INT32_MIN;
 	ctx.qual_line_maxs[1] = INT32_MAX;
 
-	// GT must be at position 0 for the parser to work correctly
-	// (the parser expects sample data to start at GT field)
 	if (format_info.gt_pos != 0) {
-		// GT is not in position 0 — we can't apply quality filtering in this case
-		// since the plink2 parser assumes GT is first
 		return;
 	}
 
-	// Build quality field skips relative to GT (position 0)
-	// qual_field_skips[i] = number of ':' to skip from current position to reach quality field i
-	uint32_t qual_idx = 0;
-	int32_t last_pos = 0; // GT is at position 0
+	// Collect requested quality fields with their FORMAT positions, then sort
+	// by position so skip deltas are always non-negative.
+	struct QualField {
+		int32_t format_pos;
+		int32_t min_val;
+		int32_t max_val;
+	};
+	QualField fields[2];
+	uint32_t n_fields = 0;
 
-	// First quality field: GQ
 	if (bind_data.min_gq >= 0 && format_info.gq_pos > 0) {
-		ctx.qual_field_skips[qual_idx] = static_cast<uint32_t>(format_info.gq_pos - last_pos);
-		ctx.qual_line_mins[qual_idx] = bind_data.min_gq;
-		ctx.qual_line_maxs[qual_idx] = INT32_MAX;
-		last_pos = format_info.gq_pos;
-		qual_idx++;
+		fields[n_fields++] = {format_info.gq_pos, bind_data.min_gq, INT32_MAX};
+	}
+	if ((bind_data.min_dp >= 0 || bind_data.max_dp >= 0) && format_info.dp_pos > 0 && n_fields < 2) {
+		fields[n_fields++] = {format_info.dp_pos,
+		                      bind_data.min_dp >= 0 ? bind_data.min_dp : INT32_MIN,
+		                      bind_data.max_dp >= 0 ? bind_data.max_dp : INT32_MAX};
 	}
 
-	// Second quality field: DP
-	if ((bind_data.min_dp >= 0 || bind_data.max_dp >= 0) && format_info.dp_pos > 0 && qual_idx < 2) {
-		ctx.qual_field_skips[qual_idx] = static_cast<uint32_t>(format_info.dp_pos - last_pos);
-		ctx.qual_line_mins[qual_idx] = bind_data.min_dp >= 0 ? bind_data.min_dp : INT32_MIN;
-		ctx.qual_line_maxs[qual_idx] = bind_data.max_dp >= 0 ? bind_data.max_dp : INT32_MAX;
-		last_pos = format_info.dp_pos;
-		qual_idx++;
+	if (n_fields == 2 && fields[1].format_pos < fields[0].format_pos) {
+		std::swap(fields[0], fields[1]);
 	}
 
-	ctx.qual_field_ct = qual_idx;
+	int32_t last_pos = 0;
+	for (uint32_t i = 0; i < n_fields; i++) {
+		ctx.qual_field_skips[i] = static_cast<uint32_t>(fields[i].format_pos - last_pos);
+		ctx.qual_line_mins[i] = fields[i].min_val;
+		ctx.qual_line_maxs[i] = fields[i].max_val;
+		last_pos = fields[i].format_pos;
+	}
+	ctx.qual_field_ct = n_fields;
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +567,23 @@ static inline string GetField(const string &line, const vector<size_t> &tab_posi
 }
 
 // ---------------------------------------------------------------------------
+// POS parsing helper with validation
+// ---------------------------------------------------------------------------
+
+static int32_t ParseVcfPos(const string &line, const vector<size_t> &tab_positions) {
+	size_t start = tab_positions[1];
+	size_t end = (tab_positions.size() > 2) ? tab_positions[2] - 1 : line.size();
+	char *parse_end;
+	errno = 0;
+	long val = std::strtol(line.c_str() + start, &parse_end, 10);
+	if (parse_end == line.c_str() + start || errno != 0 || val < 0 || val > INT32_MAX) {
+		throw IOException("read_plink_vcf: invalid POS value '%s'",
+		                  line.substr(start, end - start));
+	}
+	return static_cast<int32_t>(val);
+}
+
+// ---------------------------------------------------------------------------
 // Scan function
 // ---------------------------------------------------------------------------
 
@@ -564,12 +609,11 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 				break;
 			}
 
-			// Check if we have a buffered first line from InitGlobal
 			if (!gstate.line_buf.empty()) {
 				line = std::move(gstate.line_buf);
 				gstate.line_buf.clear();
 			} else {
-				if (!ReadLineFromHandle(*gstate.file_handle, line)) {
+				if (!gstate.reader->ReadLine(line)) {
 					gstate.done = true;
 					break;
 				}
@@ -580,95 +624,74 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 			continue;
 		}
 
-		// Find tab positions
 		FindTabFields(line, tab_positions);
 
-		// VCF has 9 fixed columns (CHROM..FORMAT) + sample_ct sample columns
 		size_t min_fields = 9 + sample_ct;
 		if (tab_positions.size() < min_fields) {
-			// Might be a short line or EOF artifact — skip
 			continue;
 		}
 
-		// Extract fixed fields
-		auto chrom_field = GetField(line, tab_positions, 0);
-		auto pos_field = GetField(line, tab_positions, 1);
-		auto id_field = GetField(line, tab_positions, 2);
-		auto ref_field = GetField(line, tab_positions, 3);
-		auto alt_field = GetField(line, tab_positions, 4);
-		// fields 5=QUAL, 6=FILTER, 7=INFO, 8=FORMAT
-
-		// Region filter check
+		// Region filter — uses raw line positions to avoid string allocation
 		if (bind_data.has_region_filter) {
-			if (chrom_field != bind_data.filter_chrom) {
+			auto chrom = GetField(line, tab_positions, 0);
+			if (chrom != bind_data.filter_chrom) {
 				continue;
 			}
-			// Parse POS for range check
-			char *end_ptr;
-			errno = 0;
-			long pos_val = std::strtol(pos_field.c_str(), &end_ptr, 10);
+			int32_t pos_val = ParseVcfPos(line, tab_positions);
 			if (pos_val < bind_data.filter_start || pos_val > bind_data.filter_end) {
 				continue;
 			}
 		}
 
 		// Multiallelic check: skip if ALT contains a comma
-		if (alt_field.find(',') != string::npos) {
-			lock_guard<mutex> guard(gstate.lock);
-			gstate.multiallelic_skipped++;
-			continue;
+		{
+			size_t alt_start = tab_positions[4];
+			size_t alt_end = (tab_positions.size() > 5) ? tab_positions[5] - 1 : line.size();
+			if (line.find(',', alt_start) < alt_end) {
+				lock_guard<mutex> guard(gstate.lock);
+				gstate.multiallelic_skipped++;
+				continue;
+			}
 		}
 
 		// Parse genotypes if needed
 		if (gstate.need_genotypes) {
-			// Parse FORMAT field to find GT position and quality field positions
 			auto format_field = GetField(line, tab_positions, 8);
 			auto format_info = ParseFormatField(format_field.data(), format_field.size());
 
 			if (format_info.gt_pos < 0) {
-				// No GT field in FORMAT — treat all genotypes as missing
 				std::fill(lstate.genotype_bytes.begin(), lstate.genotype_bytes.end(), static_cast<int8_t>(-9));
 				if (bind_data.include_phased) {
 					std::fill(lstate.phased_pairs.begin(), lstate.phased_pairs.end(), static_cast<int8_t>(-9));
 				}
 			} else if (format_info.gt_pos != 0) {
-				// GT is not the first field — we need to skip to it in each sample
-				// For simplicity, treat as all missing (uncommon edge case in practice)
-				std::fill(lstate.genotype_bytes.begin(), lstate.genotype_bytes.end(), static_cast<int8_t>(-9));
-				if (bind_data.include_phased) {
-					std::fill(lstate.phased_pairs.begin(), lstate.phased_pairs.end(), static_cast<int8_t>(-9));
-				}
+				throw IOException("read_plink_vcf: GT must be the first FORMAT subfield, got '%s'",
+				                  format_field);
 			} else {
-				// GT is at position 0 — normal path
 				BuildParseContext(parse_ctx, bind_data, format_info);
 
-				// Get pointer to first sample's data (field 9)
 				const char *sample_data_ptr = line.c_str() + tab_positions[9];
-
 				auto *genovec = lstate.genovec_buf.As<uintptr_t>();
 
 				VcfGenoParseResult result;
 				if (bind_data.include_phased) {
 					auto *phasepresent = lstate.phasepresent_buf.As<uintptr_t>();
 					auto *phaseinfo = lstate.phaseinfo_buf.As<uintptr_t>();
-
-					// Zero the phase buffers before parsing
 					auto bitvec_word_ct = plink2::BitCtToAlignedWordCt(sample_ct);
 					memset(phasepresent, 0, bitvec_word_ct * sizeof(uintptr_t));
 					memset(phaseinfo, 0, bitvec_word_ct * sizeof(uintptr_t));
-
 					result = ParsePhasedBiallelicGT(parse_ctx, sample_data_ptr, genovec, phasepresent, phaseinfo);
 				} else {
 					result = ParseUnphasedBiallelicGT(parse_ctx, sample_data_ptr, genovec);
 				}
 
 				if (result != VcfGenoParseResult::OK) {
-					throw IOException("read_plink_vcf: failed to parse genotypes at %.*s:%.*s (error: %d)",
-					                  static_cast<int>(chrom_field.size()), chrom_field.data(),
-					                  static_cast<int>(pos_field.size()), pos_field.data(), static_cast<int>(result));
+					auto chrom = GetField(line, tab_positions, 0);
+					auto pos = GetField(line, tab_positions, 1);
+					throw IOException("read_plink_vcf: failed to parse genotypes at %s:%s (error: %d)",
+					                  chrom, pos, static_cast<int>(result));
 				}
 
-				// Convert genovec to bytes
 				plink2::GenoarrToBytesMinus9(genovec, sample_ct, lstate.genotype_bytes.data());
 
 				if (bind_data.include_phased) {
@@ -678,7 +701,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 			}
 		}
 
-		// Fill output vectors
+		// Fill output vectors — fixed columns first (shared), then genotype columns
 		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 			auto file_col = column_ids[out_col];
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
@@ -687,99 +710,73 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 
 			auto &vec = output.data[out_col];
 
-			if (bind_data.genotype_mode == GenotypeMode::COLUMNS) {
-				// Handle fixed columns and per-sample columns
-				if (file_col == VcfBindData::CHROM_COL) {
+			if (file_col == VcfBindData::CHROM_COL) {
+				FlatVector::GetData<string_t>(vec)[row_count] =
+				    StringVector::AddString(vec, GetField(line, tab_positions, 0));
+			} else if (file_col == VcfBindData::POS_COL) {
+				FlatVector::GetData<int32_t>(vec)[row_count] = ParseVcfPos(line, tab_positions);
+			} else if (file_col == VcfBindData::ID_COL) {
+				auto id_field = GetField(line, tab_positions, 2);
+				if (id_field == ".") {
+					FlatVector::SetNull(vec, row_count, true);
+				} else {
 					FlatVector::GetData<string_t>(vec)[row_count] =
-					    StringVector::AddString(vec, chrom_field);
-				} else if (file_col == VcfBindData::POS_COL) {
-					char *end_ptr;
-					FlatVector::GetData<int32_t>(vec)[row_count] =
-					    static_cast<int32_t>(std::strtol(pos_field.c_str(), &end_ptr, 10));
-				} else if (file_col == VcfBindData::ID_COL) {
-					if (id_field == ".") {
+					    StringVector::AddString(vec, id_field);
+				}
+			} else if (file_col == VcfBindData::REF_COL) {
+				FlatVector::GetData<string_t>(vec)[row_count] =
+				    StringVector::AddString(vec, GetField(line, tab_positions, 3));
+			} else if (file_col == VcfBindData::ALT_COL) {
+				auto alt_field = GetField(line, tab_positions, 4);
+				if (alt_field == ".") {
+					FlatVector::SetNull(vec, row_count, true);
+				} else {
+					FlatVector::GetData<string_t>(vec)[row_count] =
+					    StringVector::AddString(vec, alt_field);
+				}
+			} else if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
+			           file_col >= bind_data.columns_mode_first_geno_col &&
+			           file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+				auto sample_idx = static_cast<uint32_t>(file_col - bind_data.columns_mode_first_geno_col);
+				if (bind_data.include_phased) {
+					auto &child = ArrayVector::GetEntry(vec);
+					auto *child_data = FlatVector::GetData<int8_t>(child);
+					idx_t base = row_count * 2;
+					int8_t a1 = lstate.phased_pairs[sample_idx * 2];
+					int8_t a2 = lstate.phased_pairs[sample_idx * 2 + 1];
+					if (a1 == -9) {
+						FlatVector::SetNull(vec, row_count, true);
+						child_data[base] = 0;
+						child_data[base + 1] = 0;
+					} else {
+						child_data[base] = a1;
+						child_data[base + 1] = a2;
+					}
+				} else {
+					int8_t geno = lstate.genotype_bytes[sample_idx];
+					if (geno == -9) {
 						FlatVector::SetNull(vec, row_count, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[row_count] =
-						    StringVector::AddString(vec, id_field);
-					}
-				} else if (file_col == VcfBindData::REF_COL) {
-					FlatVector::GetData<string_t>(vec)[row_count] =
-					    StringVector::AddString(vec, ref_field);
-				} else if (file_col == VcfBindData::ALT_COL) {
-					if (alt_field == ".") {
-						FlatVector::SetNull(vec, row_count, true);
-					} else {
-						FlatVector::GetData<string_t>(vec)[row_count] =
-						    StringVector::AddString(vec, alt_field);
-					}
-				} else if (file_col >= bind_data.columns_mode_first_geno_col &&
-				           file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
-					// Per-sample genotype column
-					auto sample_idx = static_cast<uint32_t>(file_col - bind_data.columns_mode_first_geno_col);
-					if (bind_data.include_phased) {
-						// ARRAY(TINYINT, 2) per sample
-						auto &child = ArrayVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<int8_t>(child);
-						// Each row has 2 elements
-						// But for COLUMNS with ARRAY(TINYINT, 2), each cell is a fixed-size array of 2
-						idx_t base = row_count * 2;
-						int8_t a1 = lstate.phased_pairs[sample_idx * 2];
-						int8_t a2 = lstate.phased_pairs[sample_idx * 2 + 1];
-						if (a1 == -9) {
-							FlatVector::SetNull(vec, row_count, true);
-							child_data[base] = 0;
-							child_data[base + 1] = 0;
-						} else {
-							child_data[base] = a1;
-							child_data[base + 1] = a2;
-						}
-					} else {
-						// Scalar TINYINT per sample
-						int8_t geno = lstate.genotype_bytes[sample_idx];
-						if (geno == -9) {
-							FlatVector::SetNull(vec, row_count, true);
-						} else {
-							FlatVector::GetData<int8_t>(vec)[row_count] = geno;
-						}
+						FlatVector::GetData<int8_t>(vec)[row_count] = geno;
 					}
 				}
-			} else {
-				// ARRAY or LIST mode
-				if (file_col == VcfBindData::CHROM_COL) {
-					FlatVector::GetData<string_t>(vec)[row_count] =
-					    StringVector::AddString(vec, chrom_field);
-				} else if (file_col == VcfBindData::POS_COL) {
-					char *end_ptr;
-					FlatVector::GetData<int32_t>(vec)[row_count] =
-					    static_cast<int32_t>(std::strtol(pos_field.c_str(), &end_ptr, 10));
-				} else if (file_col == VcfBindData::ID_COL) {
-					if (id_field == ".") {
-						FlatVector::SetNull(vec, row_count, true);
-					} else {
-						FlatVector::GetData<string_t>(vec)[row_count] =
-						    StringVector::AddString(vec, id_field);
-					}
-				} else if (file_col == VcfBindData::REF_COL) {
-					FlatVector::GetData<string_t>(vec)[row_count] =
-					    StringVector::AddString(vec, ref_field);
-				} else if (file_col == VcfBindData::ALT_COL) {
-					if (alt_field == ".") {
-						FlatVector::SetNull(vec, row_count, true);
-					} else {
-						FlatVector::GetData<string_t>(vec)[row_count] =
-						    StringVector::AddString(vec, alt_field);
-					}
-				} else if (file_col == VcfBindData::GENOTYPES_COL) {
-					FillGenotypeVector(vec, row_count, bind_data.genotype_mode, sample_ct,
-					                   lstate.genotype_bytes.data(),
-					                   bind_data.include_phased ? lstate.phased_pairs.data() : nullptr,
-					                   bind_data.include_phased);
-				}
+			} else if (file_col == VcfBindData::GENOTYPES_COL) {
+				FillGenotypeVector(vec, row_count, bind_data.genotype_mode, sample_ct,
+				                   lstate.genotype_bytes.data(),
+				                   bind_data.include_phased ? lstate.phased_pairs.data() : nullptr,
+				                   bind_data.include_phased);
 			}
 		}
 
 		row_count++;
+	}
+
+	// Emit warning for skipped multiallelic variants (once per query)
+	if (row_count == 0 && gstate.multiallelic_skipped > 0 && !gstate.warned_multiallelic) {
+		gstate.warned_multiallelic = true;
+		Printer::Print(StringUtil::Format(
+		    "read_plink_vcf: skipped %llu multiallelic variant(s)",
+		    static_cast<unsigned long long>(gstate.multiallelic_skipped)));
 	}
 
 	output.SetCardinality(row_count);
