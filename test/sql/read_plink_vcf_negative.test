@@ -1,0 +1,41 @@
+# name: test/sql/read_plink_vcf_negative.test
+# description: Negative tests for read_plink_vcf table function
+# group: [sql]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# File not found
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_plink_vcf('test/data/nonexistent.vcf');
+----
+IO Error
+
+# ---------------------------------------------------------------------------
+# Invalid genotypes parameter
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_plink_vcf('test/data/example.vcf', genotypes := 'invalid');
+----
+Invalid Input Error
+
+# ---------------------------------------------------------------------------
+# Invalid halfcall parameter
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_plink_vcf('test/data/example.vcf', halfcall := 'invalid');
+----
+Invalid Input Error
+
+# ---------------------------------------------------------------------------
+# Invalid region format
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_plink_vcf('test/data/example.vcf', region := 'chr1:abc-def');
+----
+Invalid Input Error

@@ -1,0 +1,153 @@
+# name: test/sql/read_plink_vcf.test
+# description: Positive tests for read_plink_vcf table function
+# group: [sql]
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# Basic read
+# ---------------------------------------------------------------------------
+
+# Row count
+query I
+SELECT COUNT(*) FROM read_plink_vcf('test/data/example.vcf');
+----
+4
+
+# Variant metadata columns
+query TITTT
+SELECT CHROM, POS, ID, REF, ALT FROM read_plink_vcf('test/data/example.vcf') ORDER BY CHROM, POS;
+----
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A
+2	15000	rs4	T	C
+
+# Genotype array length matches sample count
+query I
+SELECT len(genotypes) FROM read_plink_vcf('test/data/example.vcf') LIMIT 1;
+----
+4
+
+# Known genotype values
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/example.vcf') WHERE ID = 'rs1';
+----
+rs1	[0, 1, 2, NULL]
+
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/example.vcf') WHERE ID = 'rs2';
+----
+rs2	[1, 1, 0, 2]
+
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/example.vcf') WHERE ID = 'rs3';
+----
+rs3	[2, NULL, 1, 0]
+
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/example.vcf') WHERE ID = 'rs4';
+----
+rs4	[0, 0, 1, 2]
+
+# ---------------------------------------------------------------------------
+# LIST mode
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/example.vcf', genotypes := 'list') WHERE ID = 'rs1';
+----
+rs1	[0, 1, 2, NULL]
+
+# ---------------------------------------------------------------------------
+# Projection pushdown (no genotypes)
+# ---------------------------------------------------------------------------
+
+query TI
+SELECT CHROM, POS FROM read_plink_vcf('test/data/example.vcf') ORDER BY CHROM, POS;
+----
+1	10000
+1	20000
+1	30000
+2	15000
+
+# ---------------------------------------------------------------------------
+# Columns mode
+# ---------------------------------------------------------------------------
+
+query IIII
+SELECT SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4 FROM read_plink_vcf('test/data/example.vcf', genotypes := 'columns') WHERE ID = 'rs1';
+----
+0	1	2	NULL
+
+# ---------------------------------------------------------------------------
+# Region filter
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM read_plink_vcf('test/data/example.vcf', region := '1');
+----
+3
+
+query I
+SELECT COUNT(*) FROM read_plink_vcf('test/data/example.vcf', region := '1:15000-25000');
+----
+1
+
+# ---------------------------------------------------------------------------
+# Phased mode
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/vcf_phased.vcf', phased := true) WHERE ID = 'rs1';
+----
+rs1	[[0, 0], [0, 1], [1, 0], [1, 1]]
+
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/vcf_phased.vcf', phased := true) WHERE ID = 'rs2';
+----
+rs2	[[0, 1], [1, 0], [0, 0], NULL]
+
+# ---------------------------------------------------------------------------
+# Quality filtering
+# ---------------------------------------------------------------------------
+
+# min_gq=20 should set rs2/SAMPLE2 (GQ=5) and rs4/SAMPLE3 (GQ=15) to missing
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/vcf_example.vcf', min_gq := 20) WHERE ID = 'rs2';
+----
+rs2	[1, NULL, 0, 2]
+
+query TT
+SELECT ID, genotypes FROM read_plink_vcf('test/data/vcf_example.vcf', min_gq := 20) WHERE ID = 'rs4';
+----
+rs4	[0, 0, NULL, 2]
+
+# ---------------------------------------------------------------------------
+# Multiallelic variants are skipped
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM read_plink_vcf('test/data/vcf_multiallelic.vcf');
+----
+2
+
+query T
+SELECT ID FROM read_plink_vcf('test/data/vcf_multiallelic.vcf') ORDER BY POS;
+----
+rs1
+rs2
+
+# ---------------------------------------------------------------------------
+# Cross-validation: VCF genotypes = pfile genotypes
+# ---------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT v.ID, v.genotypes as vcf_geno, p.genotypes as pfile_geno
+    FROM read_plink_vcf('test/data/example.vcf') v
+    JOIN read_pfile('test/data/pfile_example') p ON v.ID = p.ID
+    WHERE v.genotypes != p.genotypes OR (v.genotypes IS NULL) != (p.genotypes IS NULL)
+);
+----
+0
