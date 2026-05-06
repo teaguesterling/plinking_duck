@@ -24,6 +24,7 @@ set(EXTENSION_SOURCES
     src/plink_glm.cpp
     src/plink2_glm_logistic_math.cpp
     src/vcf_genotype_parse.cpp
+    src/vcf_reader.cpp
 )
 
 # plink_pca requires Eigen3 — added conditionally after find_package below

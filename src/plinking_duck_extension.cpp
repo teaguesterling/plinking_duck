@@ -11,6 +11,7 @@
 #include "plink_ld.hpp"
 #include "plink_score.hpp"
 #include "plink_glm.hpp"
+#include "vcf_reader.hpp"
 #ifdef PLINKING_HAVE_EIGEN3
 #include "plink_pca.hpp"
 #endif
@@ -72,6 +73,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPlinkLd(loader);
 	RegisterPlinkScore(loader);
 	RegisterPlinkGlm(loader);
+	RegisterPlinkVcfReader(loader);
 #ifdef PLINKING_HAVE_EIGEN3
 	RegisterPlinkPca(loader);
 #endif
