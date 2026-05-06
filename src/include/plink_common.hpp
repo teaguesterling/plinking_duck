@@ -457,6 +457,18 @@ void UnpackPhasedGenotypes(const int8_t *genotype_bytes, const uintptr_t *phasep
                            uint32_t sample_ct, int8_t *output_pairs);
 
 // ---------------------------------------------------------------------------
+// Shared genotype output vector filling
+// ---------------------------------------------------------------------------
+
+//! Fill a genotype output vector for one row in ARRAY or LIST mode.
+//! Handles unphased (genotype_bytes) and phased (phased_pairs) output.
+//! For unphased: writes int8 genotype values, -9 → NULL.
+//! For phased: writes ARRAY(TINYINT, 2) pairs, -9 → NULL pair.
+//! Does NOT handle COLUMNS, STRUCT, COUNTS, STATS, or dosage modes.
+void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t output_sample_ct,
+                        const int8_t *genotype_bytes, const int8_t *phased_pairs, bool include_phased);
+
+// ---------------------------------------------------------------------------
 // Unified variants parameter resolution
 // ---------------------------------------------------------------------------
 

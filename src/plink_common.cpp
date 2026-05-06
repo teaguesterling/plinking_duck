@@ -1719,4 +1719,104 @@ idx_t ApplyMaxThreadsCap(idx_t computed, uint32_t config_max_threads) {
 	return MinValue<idx_t>(computed, 16);
 }
 
+// ---------------------------------------------------------------------------
+// Shared genotype output vector filling
+// ---------------------------------------------------------------------------
+
+void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t output_sample_ct,
+                        const int8_t *genotype_bytes, const int8_t *phased_pairs, bool include_phased) {
+
+	if (include_phased) {
+		if (mode == GenotypeMode::ARRAY) {
+			auto &pair_vec = ArrayVector::GetEntry(vec);
+			auto &allele_vec = ArrayVector::GetEntry(pair_vec);
+			auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+			auto &pair_validity = FlatVector::Validity(pair_vec);
+
+			idx_t pair_base = row_idx * static_cast<idx_t>(output_sample_ct);
+			for (idx_t s = 0; s < output_sample_ct; s++) {
+				idx_t pair_idx = pair_base + s;
+				idx_t allele_base = pair_idx * 2;
+				int8_t a1 = phased_pairs[s * 2];
+				int8_t a2 = phased_pairs[s * 2 + 1];
+				if (a1 == -9) {
+					pair_validity.SetInvalid(pair_idx);
+					allele_data[allele_base] = 0;
+					allele_data[allele_base + 1] = 0;
+				} else {
+					allele_data[allele_base] = a1;
+					allele_data[allele_base + 1] = a2;
+				}
+			}
+		} else {
+			// LIST mode
+			auto list_offset = ListVector::GetListSize(vec);
+			ListVector::Reserve(vec, list_offset + output_sample_ct);
+			auto &pair_vec = ListVector::GetEntry(vec);
+			auto &allele_vec = ArrayVector::GetEntry(pair_vec);
+			auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+			auto &pair_validity = FlatVector::Validity(pair_vec);
+
+			for (idx_t s = 0; s < output_sample_ct; s++) {
+				idx_t pair_idx = list_offset + s;
+				idx_t allele_base = pair_idx * 2;
+				int8_t a1 = phased_pairs[s * 2];
+				int8_t a2 = phased_pairs[s * 2 + 1];
+				if (a1 == -9) {
+					pair_validity.SetInvalid(pair_idx);
+					allele_data[allele_base] = 0;
+					allele_data[allele_base + 1] = 0;
+				} else {
+					allele_data[allele_base] = a1;
+					allele_data[allele_base + 1] = a2;
+				}
+			}
+
+			auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+			list_data[row_idx].offset = list_offset;
+			list_data[row_idx].length = output_sample_ct;
+			ListVector::SetListSize(vec, list_offset + output_sample_ct);
+		}
+	} else {
+		// Unphased
+		if (mode == GenotypeMode::ARRAY) {
+			auto array_size = static_cast<idx_t>(output_sample_ct);
+			auto &child = ArrayVector::GetEntry(vec);
+			auto *child_data = FlatVector::GetData<int8_t>(child);
+			auto &child_validity = FlatVector::Validity(child);
+
+			idx_t base = row_idx * array_size;
+			for (idx_t s = 0; s < array_size; s++) {
+				int8_t geno = genotype_bytes[s];
+				if (geno == -9) {
+					child_validity.SetInvalid(base + s);
+					child_data[base + s] = 0;
+				} else {
+					child_data[base + s] = geno;
+				}
+			}
+		} else {
+			// LIST mode
+			auto list_offset = ListVector::GetListSize(vec);
+			ListVector::Reserve(vec, list_offset + output_sample_ct);
+			auto &child = ListVector::GetEntry(vec);
+			auto *child_data = FlatVector::GetData<int8_t>(child);
+			auto &child_validity = FlatVector::Validity(child);
+			for (idx_t s = 0; s < output_sample_ct; s++) {
+				int8_t geno = genotype_bytes[s];
+				if (geno == -9) {
+					child_validity.SetInvalid(list_offset + s);
+					child_data[list_offset + s] = 0;
+				} else {
+					child_data[list_offset + s] = geno;
+				}
+			}
+			auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+			list_data[row_idx].offset = list_offset;
+			list_data[row_idx].length = output_sample_ct;
+			ListVector::SetListSize(vec, list_offset + output_sample_ct);
+		}
+	}
+}
+
 } // namespace duckdb
