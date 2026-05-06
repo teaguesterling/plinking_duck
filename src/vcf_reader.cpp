@@ -276,7 +276,14 @@ static unique_ptr<FunctionData> VcfBind(ClientContext &context, TableFunctionBin
 
 	bind_data->genotype_mode = ResolveGenotypeMode(genotypes_str, bind_data->sample_ct, "read_plink_vcf");
 
-	// Validate: phased + counts/stats makes no sense
+	// Only ARRAY, LIST, and COLUMNS modes are supported — STRUCT/COUNTS/STATS require PgrGetCounts
+	if (bind_data->genotype_mode != GenotypeMode::ARRAY &&
+	    bind_data->genotype_mode != GenotypeMode::LIST &&
+	    bind_data->genotype_mode != GenotypeMode::COLUMNS) {
+		throw InvalidInputException("read_plink_vcf: genotypes := '%s' is not supported (use 'array', 'list', or 'columns')",
+		                            genotypes_str);
+	}
+
 	if (bind_data->include_phased && IsAggregateGenotypeMode(bind_data->genotype_mode)) {
 		throw InvalidInputException("read_plink_vcf: phased := true is incompatible with genotypes := '%s'",
 		                            genotypes_str);
@@ -714,7 +721,6 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 						// ARRAY(TINYINT, 2) per sample
 						auto &child = ArrayVector::GetEntry(vec);
 						auto *child_data = FlatVector::GetData<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
 						// Each row has 2 elements
 						// But for COLUMNS with ARRAY(TINYINT, 2), each cell is a fixed-size array of 2
 						idx_t base = row_count * 2;

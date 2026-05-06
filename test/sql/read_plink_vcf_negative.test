@@ -39,3 +39,22 @@ statement error
 SELECT * FROM read_plink_vcf('test/data/example.vcf', region := 'chr1:abc-def');
 ----
 Invalid Input Error
+
+# ---------------------------------------------------------------------------
+# Unsupported genotype modes (struct, counts, stats)
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_plink_vcf('test/data/example.vcf', genotypes := 'struct');
+----
+not supported
+
+statement error
+SELECT * FROM read_plink_vcf('test/data/example.vcf', genotypes := 'counts');
+----
+not supported
+
+statement error
+SELECT * FROM read_plink_vcf('test/data/example.vcf', genotypes := 'stats');
+----
+not supported
