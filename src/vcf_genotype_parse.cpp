@@ -26,7 +26,7 @@ namespace {
 // --------------------------------------------------------------------------
 typedef struct VcfImportContextBaseStruct {
 	uint32_t sample_ct;
-	uint32_t halfcall_mode;  // VcfHalfCall values (uint32_t enum)
+	uint32_t halfcall_mode; // VcfHalfCall values (uint32_t enum)
 	uint32_t error_on_polyploid;
 	uint32_t gt_exists;
 	STD_ARRAY_DECL(uint32_t, 2, qual_field_skips);
@@ -39,20 +39,17 @@ typedef struct VcfImportContextBaseStruct {
 // Copied from plink2_import.cc — VcfParseErr enum (lines 1109-1116)
 // --------------------------------------------------------------------------
 ENUM_U31_DEF_START()
-  kVcfParseOk,
-  kVcfParseMissingTokens,
-  kVcfParseInvalidGt,
-  kVcfParseHalfCallError,
-  kVcfParseInvalidDosage,
-  kVcfParsePolyploidError
-ENUM_U31_DEF_END(VcfParseErr);
+kVcfParseOk, kVcfParseMissingTokens, kVcfParseInvalidGt, kVcfParseHalfCallError, kVcfParseInvalidDosage,
+    kVcfParsePolyploidError ENUM_U31_DEF_END(VcfParseErr);
 
 // --------------------------------------------------------------------------
 // Copied from plink2_import.cc — VcfCheckQuals (lines 898-920)
 // --------------------------------------------------------------------------
 // returns 1 if a quality check failed
 // assumes either 1 or 2 qual fields, otherwise change this to a loop
-uint32_t VcfCheckQuals(STD_ARRAY_KREF(uint32_t, 2) qual_field_skips, STD_ARRAY_KREF(int32_t, 2) qual_line_mins, STD_ARRAY_KREF(int32_t, 2) qual_line_maxs, const char* gtext_iter, const char* gtext_end, uint32_t qual_field_ct) {
+uint32_t VcfCheckQuals(STD_ARRAY_KREF(uint32_t, 2) qual_field_skips, STD_ARRAY_KREF(int32_t, 2) qual_line_mins,
+                       STD_ARRAY_KREF(int32_t, 2) qual_line_maxs, const char *gtext_iter, const char *gtext_end,
+                       uint32_t qual_field_ct) {
 	const uint32_t skip0 = qual_field_skips[0];
 	if (skip0) {
 		gtext_iter = AdvToNthDelimChecked(gtext_iter, gtext_end, skip0, ':');
@@ -79,7 +76,8 @@ uint32_t VcfCheckQuals(STD_ARRAY_KREF(uint32_t, 2) qual_field_skips, STD_ARRAY_K
 // --------------------------------------------------------------------------
 // Copied from plink2_import.cc — VcfConvertUnphasedBiallelicLine (lines 1480-1578)
 // --------------------------------------------------------------------------
-VcfParseErr VcfConvertUnphasedBiallelicLine(const VcfImportBaseContext* vibcp, const char* linebuf_iter, uintptr_t* genovec) {
+VcfParseErr VcfConvertUnphasedBiallelicLine(const VcfImportBaseContext *vibcp, const char *linebuf_iter,
+                                            uintptr_t *genovec) {
 	const uint32_t sample_ct = vibcp->sample_ct;
 	const uint32_t sample_ctl2_m1 = (sample_ct - 1) / kBitsPerWordD2;
 	const uint32_t halfcall_mode = vibcp->halfcall_mode;
@@ -90,7 +88,7 @@ VcfParseErr VcfConvertUnphasedBiallelicLine(const VcfImportBaseContext* vibcp, c
 	const uint32_t qual_field_ct = vibcp->qual_field_ct;
 
 	uint32_t inner_loop_last = kBitsPerWordD2 - 1;
-	for (uint32_t widx = 0; ; ++widx) {
+	for (uint32_t widx = 0;; ++widx) {
 		if (widx >= sample_ctl2_m1) {
 			if (widx > sample_ctl2_m1) {
 				break;
@@ -99,12 +97,14 @@ VcfParseErr VcfConvertUnphasedBiallelicLine(const VcfImportBaseContext* vibcp, c
 		}
 		uintptr_t genovec_word = 0;
 		for (uint32_t sample_idx_lowbits = 0; sample_idx_lowbits <= inner_loop_last; ++sample_idx_lowbits) {
-			const char* cur_gtext_end = FirstPrespace(linebuf_iter);
-			if (unlikely((*cur_gtext_end != '\t') && ((sample_idx_lowbits != inner_loop_last) || (widx != sample_ctl2_m1)))) {
+			const char *cur_gtext_end = FirstPrespace(linebuf_iter);
+			if (unlikely((*cur_gtext_end != '\t') &&
+			             ((sample_idx_lowbits != inner_loop_last) || (widx != sample_ctl2_m1)))) {
 				return kVcfParseMissingTokens;
 			}
 			uintptr_t cur_geno;
-			if (qual_field_ct && VcfCheckQuals(qual_field_skips, qual_line_mins, qual_line_maxs, linebuf_iter, cur_gtext_end, qual_field_ct)) {
+			if (qual_field_ct && VcfCheckQuals(qual_field_skips, qual_line_mins, qual_line_maxs, linebuf_iter,
+			                                   cur_gtext_end, qual_field_ct)) {
 				cur_geno = 3;
 			} else {
 				const uint32_t is_haploid = (linebuf_iter[1] != '/') && (linebuf_iter[1] != '|');
@@ -172,7 +172,8 @@ VcfParseErr VcfConvertUnphasedBiallelicLine(const VcfImportBaseContext* vibcp, c
 // --------------------------------------------------------------------------
 // Copied from plink2_import.cc — VcfConvertPhasedBiallelicLine (lines 1962-2091)
 // --------------------------------------------------------------------------
-VcfParseErr VcfConvertPhasedBiallelicLine(const VcfImportBaseContext* vibcp, const char* linebuf_iter, uintptr_t* genovec, uintptr_t* phasepresent, uintptr_t* phaseinfo) {
+VcfParseErr VcfConvertPhasedBiallelicLine(const VcfImportBaseContext *vibcp, const char *linebuf_iter,
+                                          uintptr_t *genovec, uintptr_t *phasepresent, uintptr_t *phaseinfo) {
 	const uint32_t sample_ct = vibcp->sample_ct;
 	const uint32_t sample_ctl2_m1 = (sample_ct - 1) / kBitsPerWordD2;
 	const uint32_t halfcall_mode = vibcp->halfcall_mode;
@@ -181,11 +182,11 @@ VcfParseErr VcfConvertPhasedBiallelicLine(const VcfImportBaseContext* vibcp, con
 	STD_ARRAY_KREF(int32_t, 2) qual_line_mins = vibcp->qual_line_mins;
 	STD_ARRAY_KREF(int32_t, 2) qual_line_maxs = vibcp->qual_line_maxs;
 	const uint32_t qual_field_ct = vibcp->qual_field_ct;
-	Halfword* phasepresent_alias = R_CAST(Halfword*, phasepresent);
-	Halfword* phaseinfo_alias = R_CAST(Halfword*, phaseinfo);
+	Halfword *phasepresent_alias = R_CAST(Halfword *, phasepresent);
+	Halfword *phaseinfo_alias = R_CAST(Halfword *, phaseinfo);
 
 	uint32_t inner_loop_last = kBitsPerWordD2 - 1;
-	for (uint32_t widx = 0; ; ++widx) {
+	for (uint32_t widx = 0;; ++widx) {
 		if (widx >= sample_ctl2_m1) {
 			if (widx > sample_ctl2_m1) {
 				if (widx % 2) {
@@ -199,12 +200,14 @@ VcfParseErr VcfConvertPhasedBiallelicLine(const VcfImportBaseContext* vibcp, con
 		uint32_t phasepresent_hw = 0;
 		uint32_t phaseinfo_hw = 0;
 		for (uint32_t sample_idx_lowbits = 0; sample_idx_lowbits <= inner_loop_last; ++sample_idx_lowbits) {
-			const char* cur_gtext_end = FirstPrespace(linebuf_iter);
-			if (unlikely((*cur_gtext_end != '\t') && ((sample_idx_lowbits != inner_loop_last) || (widx != sample_ctl2_m1)))) {
+			const char *cur_gtext_end = FirstPrespace(linebuf_iter);
+			if (unlikely((*cur_gtext_end != '\t') &&
+			             ((sample_idx_lowbits != inner_loop_last) || (widx != sample_ctl2_m1)))) {
 				return kVcfParseMissingTokens;
 			}
 			uintptr_t cur_geno;
-			if (qual_field_ct && VcfCheckQuals(qual_field_skips, qual_line_mins, qual_line_maxs, linebuf_iter, cur_gtext_end, qual_field_ct)) {
+			if (qual_field_ct && VcfCheckQuals(qual_field_skips, qual_line_mins, qual_line_maxs, linebuf_iter,
+			                                   cur_gtext_end, qual_field_ct)) {
 				cur_geno = 3;
 			} else {
 				const uint32_t is_phased = (linebuf_iter[1] == '|');
@@ -294,10 +297,10 @@ VcfParseErr VcfConvertPhasedBiallelicLine(const VcfImportBaseContext* vibcp, con
 // --------------------------------------------------------------------------
 // Helper: populate VcfImportBaseContext from our public VcfParseContext
 // --------------------------------------------------------------------------
-void FillBaseContext(const VcfParseContext& ctx, VcfImportBaseContext* vibcp) {
+void FillBaseContext(const VcfParseContext &ctx, VcfImportBaseContext *vibcp) {
 	vibcp->sample_ct = ctx.sample_ct;
 	vibcp->halfcall_mode = static_cast<uint32_t>(ctx.halfcall_mode);
-	vibcp->error_on_polyploid = 1;  // always error on polyploid for our use
+	vibcp->error_on_polyploid = 1; // always error on polyploid for our use
 	vibcp->gt_exists = 1;
 	vibcp->qual_field_skips[0] = ctx.qual_field_skips[0];
 	vibcp->qual_field_skips[1] = ctx.qual_field_skips[1];
@@ -334,20 +337,15 @@ VcfGenoParseResult TranslateResult(VcfParseErr err) {
 // Public API
 // ==========================================================================
 
-VcfGenoParseResult ParseUnphasedBiallelicGT(const VcfParseContext& ctx,
-                                            const char* linebuf_iter,
-                                            uintptr_t* genovec) {
+VcfGenoParseResult ParseUnphasedBiallelicGT(const VcfParseContext &ctx, const char *linebuf_iter, uintptr_t *genovec) {
 	VcfImportBaseContext vibc;
 	FillBaseContext(ctx, &vibc);
 	VcfParseErr err = VcfConvertUnphasedBiallelicLine(&vibc, linebuf_iter, genovec);
 	return TranslateResult(err);
 }
 
-VcfGenoParseResult ParsePhasedBiallelicGT(const VcfParseContext& ctx,
-                                          const char* linebuf_iter,
-                                          uintptr_t* genovec,
-                                          uintptr_t* phasepresent,
-                                          uintptr_t* phaseinfo) {
+VcfGenoParseResult ParsePhasedBiallelicGT(const VcfParseContext &ctx, const char *linebuf_iter, uintptr_t *genovec,
+                                          uintptr_t *phasepresent, uintptr_t *phaseinfo) {
 	VcfImportBaseContext vibc;
 	FillBaseContext(ctx, &vibc);
 	VcfParseErr err = VcfConvertPhasedBiallelicLine(&vibc, linebuf_iter, genovec, phasepresent, phaseinfo);

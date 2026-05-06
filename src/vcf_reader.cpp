@@ -29,8 +29,7 @@ struct BufferedLineReader {
 	idx_t buf_len = 0;
 	idx_t buf_pos = 0;
 
-	explicit BufferedLineReader(FileHandle &handle_p)
-	    : handle(handle_p), buf(new char[VCF_READ_BUF_SIZE]) {
+	explicit BufferedLineReader(FileHandle &handle_p) : handle(handle_p), buf(new char[VCF_READ_BUF_SIZE]) {
 	}
 
 	bool ReadLine(string &line) {
@@ -304,11 +303,10 @@ static unique_ptr<FunctionData> VcfBind(ClientContext &context, TableFunctionBin
 	bind_data->genotype_mode = ResolveGenotypeMode(genotypes_str, bind_data->sample_ct, "read_plink_vcf");
 
 	// Only ARRAY, LIST, and COLUMNS modes are supported — STRUCT/COUNTS/STATS require PgrGetCounts
-	if (bind_data->genotype_mode != GenotypeMode::ARRAY &&
-	    bind_data->genotype_mode != GenotypeMode::LIST &&
+	if (bind_data->genotype_mode != GenotypeMode::ARRAY && bind_data->genotype_mode != GenotypeMode::LIST &&
 	    bind_data->genotype_mode != GenotypeMode::COLUMNS) {
-		throw InvalidInputException("read_plink_vcf: genotypes := '%s' is not supported (use 'array', 'list', or 'columns')",
-		                            genotypes_str);
+		throw InvalidInputException(
+		    "read_plink_vcf: genotypes := '%s' is not supported (use 'array', 'list', or 'columns')", genotypes_str);
 	}
 
 	if (bind_data->include_phased && IsAggregateGenotypeMode(bind_data->genotype_mode)) {
@@ -399,7 +397,8 @@ static unique_ptr<GlobalTableFunctionState> VcfInitGlobal(ClientContext &context
 	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	state->file_handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
+	state->file_handle =
+	    fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ | FileCompressionType::AUTO_DETECT);
 	state->reader = make_uniq<BufferedLineReader>(*state->file_handle);
 
 	string line;
@@ -491,7 +490,8 @@ static FormatParseResult ParseFormatField(const char *format_start, size_t forma
 // Build VcfParseContext for a given line's FORMAT field
 // ---------------------------------------------------------------------------
 
-static void BuildParseContext(VcfParseContext &ctx, const VcfBindData &bind_data, const FormatParseResult &format_info) {
+static void BuildParseContext(VcfParseContext &ctx, const VcfBindData &bind_data,
+                              const FormatParseResult &format_info) {
 	ctx.sample_ct = bind_data.sample_ct;
 	ctx.halfcall_mode = bind_data.halfcall_mode;
 	ctx.qual_field_ct = 0;
@@ -520,8 +520,7 @@ static void BuildParseContext(VcfParseContext &ctx, const VcfBindData &bind_data
 		fields[n_fields++] = {format_info.gq_pos, bind_data.min_gq, INT32_MAX};
 	}
 	if ((bind_data.min_dp >= 0 || bind_data.max_dp >= 0) && format_info.dp_pos > 0 && n_fields < 2) {
-		fields[n_fields++] = {format_info.dp_pos,
-		                      bind_data.min_dp >= 0 ? bind_data.min_dp : INT32_MIN,
+		fields[n_fields++] = {format_info.dp_pos, bind_data.min_dp >= 0 ? bind_data.min_dp : INT32_MIN,
 		                      bind_data.max_dp >= 0 ? bind_data.max_dp : INT32_MAX};
 	}
 
@@ -577,8 +576,7 @@ static int32_t ParseVcfPos(const string &line, const vector<size_t> &tab_positio
 	errno = 0;
 	long val = std::strtol(line.c_str() + start, &parse_end, 10);
 	if (parse_end == line.c_str() + start || errno != 0 || val < 0 || val > INT32_MAX) {
-		throw IOException("read_plink_vcf: invalid POS value '%s'",
-		                  line.substr(start, end - start));
+		throw IOException("read_plink_vcf: invalid POS value '%s'", line.substr(start, end - start));
 	}
 	return static_cast<int32_t>(val);
 }
@@ -665,8 +663,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 					std::fill(lstate.phased_pairs.begin(), lstate.phased_pairs.end(), static_cast<int8_t>(-9));
 				}
 			} else if (format_info.gt_pos != 0) {
-				throw IOException("read_plink_vcf: GT must be the first FORMAT subfield, got '%s'",
-				                  format_field);
+				throw IOException("read_plink_vcf: GT must be the first FORMAT subfield, got '%s'", format_field);
 			} else {
 				BuildParseContext(parse_ctx, bind_data, format_info);
 
@@ -688,8 +685,8 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 				if (result != VcfGenoParseResult::OK) {
 					auto chrom = GetField(line, tab_positions, 0);
 					auto pos = GetField(line, tab_positions, 1);
-					throw IOException("read_plink_vcf: failed to parse genotypes at %s:%s (error: %d)",
-					                  chrom, pos, static_cast<int>(result));
+					throw IOException("read_plink_vcf: failed to parse genotypes at %s:%s (error: %d)", chrom, pos,
+					                  static_cast<int>(result));
 				}
 
 				plink2::GenoarrToBytesMinus9(genovec, sample_ct, lstate.genotype_bytes.data());
@@ -720,8 +717,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 				if (id_field == ".") {
 					FlatVector::SetNull(vec, row_count, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row_count] =
-					    StringVector::AddString(vec, id_field);
+					FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, id_field);
 				}
 			} else if (file_col == VcfBindData::REF_COL) {
 				FlatVector::GetData<string_t>(vec)[row_count] =
@@ -731,8 +727,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 				if (alt_field == ".") {
 					FlatVector::SetNull(vec, row_count, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row_count] =
-					    StringVector::AddString(vec, alt_field);
+					FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, alt_field);
 				}
 			} else if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
 			           file_col >= bind_data.columns_mode_first_geno_col &&
@@ -761,8 +756,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 					}
 				}
 			} else if (file_col == VcfBindData::GENOTYPES_COL) {
-				FillGenotypeVector(vec, row_count, bind_data.genotype_mode, sample_ct,
-				                   lstate.genotype_bytes.data(),
+				FillGenotypeVector(vec, row_count, bind_data.genotype_mode, sample_ct, lstate.genotype_bytes.data(),
 				                   bind_data.include_phased ? lstate.phased_pairs.data() : nullptr,
 				                   bind_data.include_phased);
 			}
@@ -774,9 +768,8 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 	// Emit warning for skipped multiallelic variants (once per query)
 	if (row_count == 0 && gstate.multiallelic_skipped > 0 && !gstate.warned_multiallelic) {
 		gstate.warned_multiallelic = true;
-		Printer::Print(StringUtil::Format(
-		    "read_plink_vcf: skipped %llu multiallelic variant(s)",
-		    static_cast<unsigned long long>(gstate.multiallelic_skipped)));
+		Printer::Print(StringUtil::Format("read_plink_vcf: skipped %llu multiallelic variant(s)",
+		                                  static_cast<unsigned long long>(gstate.multiallelic_skipped)));
 	}
 
 	output.SetCardinality(row_count);

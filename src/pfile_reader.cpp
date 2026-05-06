@@ -1909,8 +1909,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					if (bind_data.include_phased) {
 						if (!bind_data.genotype_filter.active) {
 							// No genotype range filter: use shared output utility
-							FillGenotypeVector(vec, rows_emitted, bind_data.genotype_mode, output_sample_ct,
-							                   nullptr, lstate.phased_pairs.data(), true);
+							FillGenotypeVector(vec, rows_emitted, bind_data.genotype_mode, output_sample_ct, nullptr,
+							                   lstate.phased_pairs.data(), true);
 						} else if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 							auto &pair_vec = ArrayVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
@@ -1923,9 +1923,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 ||
-								    (!geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
+								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								                                             static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
@@ -1947,9 +1946,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 ||
-								    (!geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
+								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								                                             static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
@@ -2017,9 +2015,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 ||
-								    (!geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								                                               static_cast<double>(geno)))) {
 									child_validity.SetInvalid(base + s);
 									child_data[base + s] = 0;
 								} else {
@@ -2034,9 +2031,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 ||
-								    (!geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								                                               static_cast<double>(geno)))) {
 									child_validity.SetInvalid(list_offset + s);
 									child_data[list_offset + s] = 0;
 								} else {
