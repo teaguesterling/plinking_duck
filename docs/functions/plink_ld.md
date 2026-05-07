@@ -1,6 +1,6 @@
 # plink_ld
 
-Compute pairwise linkage disequilibrium statistics (r², D').
+Compute pairwise linkage disequilibrium statistics (signed r, r², D').
 
 ## Synopsis
 
@@ -10,7 +10,8 @@ plink_ld(path VARCHAR, variant1 := ..., variant2 := ...) -> TABLE
 
 -- Windowed mode: LD for all variant pairs within a window
 plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
-         region := ..., samples := ..., inter_chr := ...]) -> TABLE
+         region := ..., samples := ..., inter_chr := ...,
+         cache_genotypes := true]) -> TABLE
 ```
 
 ## Parameters
@@ -27,6 +28,7 @@ plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
 | `inter_chr` | `BOOLEAN` | `false` | Include cross-chromosome pairs (windowed mode) |
+| `cache_genotypes` | `BOOLEAN` | `true` | Cache the active region's packed genotypes per worker when the bounded cache is small enough; avoids repeated `.pgen` reads in dense regional LD scans. |
 
 See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
 
@@ -52,17 +54,18 @@ With `inter_chr := true`, cross-chromosome pairs are also tested (no distance fi
 | `CHROM_B` | `VARCHAR` | Chromosome of second variant |
 | `POS_B` | `INTEGER` | Position of second variant |
 | `ID_B` | `VARCHAR` | ID of second variant |
+| `R` | `DOUBLE` | Signed Pearson correlation between ALT dosages (NULL if invalid) |
 | `R2` | `DOUBLE` | Squared correlation coefficient (NULL if invalid) |
 | `D_PRIME` | `DOUBLE` | Normalized linkage disequilibrium coefficient (NULL if invalid) |
 | `OBS_CT` | `INTEGER` | Number of samples with non-missing genotypes at both variants |
 
-R2 and D_PRIME are NULL when the LD computation is invalid (monomorphic variants, fewer than 2 shared observations).
+R, R2, and D_PRIME are NULL when the LD computation is invalid (monomorphic variants, fewer than 2 shared observations).
 
 ## Description
 
 ### LD Statistics
 
-**r²** is the squared Pearson correlation between genotype dosages at two loci. Values range from 0 (no LD) to 1 (perfect LD).
+**R** is the signed Pearson correlation between genotype dosages at two loci. **r²** is `R * R`; values range from 0 (no LD) to 1 (perfect LD).
 
 **D'** is computed using the composite LD estimator (Weir 1979) from genotype-level statistics. D is the covariance between genotype dosages divided by 4, and D' = D / D_max where D_max depends on allele frequencies and the sign of D.
 
@@ -78,7 +81,7 @@ LD statistics are NULL when:
 
 ### Parallel Scan
 
-Windowed mode supports multi-threaded scanning where each thread claims anchor variants independently.
+Windowed mode supports multi-threaded scanning where each thread claims anchor variants independently. For bounded regional scans, `cache_genotypes := true` caches packed genotypes for the active region in each worker. This avoids rereading the same partner variant for many anchors. D' is only computed when the `D_PRIME` column is projected.
 
 ## Examples
 

@@ -16,9 +16,15 @@ static constexpr idx_t COL_ID_A = 2;
 static constexpr idx_t COL_CHROM_B = 3;
 static constexpr idx_t COL_POS_B = 4;
 static constexpr idx_t COL_ID_B = 5;
-static constexpr idx_t COL_R2 = 6;
-static constexpr idx_t COL_D_PRIME = 7;
-static constexpr idx_t COL_OBS_CT = 8;
+static constexpr idx_t COL_R = 6;
+static constexpr idx_t COL_R2 = 7;
+static constexpr idx_t COL_D_PRIME = 8;
+static constexpr idx_t COL_OBS_CT = 9;
+
+// Per-thread genotype caching prevents the windowed LD scan from rereading the
+// same partner variants thousands of times. Keep this bounded so whole-genome
+// or very large-region scans fall back to streaming PgrGet() calls.
+static constexpr uintptr_t LD_CACHE_MAX_BYTES_PER_THREAD = 128ULL * 1024ULL * 1024ULL;
 
 // ---------------------------------------------------------------------------
 // LD computation
@@ -27,6 +33,7 @@ static constexpr idx_t COL_OBS_CT = 8;
 enum class LdMode : uint8_t { PAIRWISE, WINDOWED };
 
 struct LdResult {
+	double r;
 	double r2;
 	double d_prime;
 	uint32_t obs_ct;
@@ -35,7 +42,8 @@ struct LdResult {
 
 //! Compute LD statistics from two packed 2-bit genotype arrays.
 //! Genotype encoding: 0=hom_ref, 1=het, 2=hom_alt, 3=missing.
-static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct) {
+static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct,
+                               bool compute_d_prime) {
 	double sum_a = 0, sum_b = 0, sum_ab = 0, sum_a2 = 0, sum_b2 = 0;
 	uint32_t n = 0;
 
@@ -71,6 +79,7 @@ static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *geno
 	LdResult result;
 	result.obs_ct = n;
 	result.is_valid = false;
+	result.r = 0;
 	result.r2 = 0;
 	result.d_prime = 0;
 
@@ -91,7 +100,12 @@ static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *geno
 	}
 
 	result.is_valid = true;
-	result.r2 = (cov_ab * cov_ab) / (var_a * var_b);
+	result.r = cov_ab / std::sqrt(var_a * var_b);
+	result.r2 = result.r * result.r;
+
+	if (!compute_d_prime) {
+		return result;
+	}
 
 	// D' via composite LD estimator (Weir 1979):
 	//   D = cov(gA, gB) / 4
@@ -154,6 +168,7 @@ struct PlinkLdBindData : public TableFunctionData {
 	int64_t window_bp = 1000000; // window_kb * 1000
 	double r2_threshold = 0.2;
 	bool inter_chr = false;
+	bool cache_genotypes = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +186,16 @@ struct PlinkLdGlobalState : public GlobalTableFunctionState {
 	// Windowed mode
 	std::atomic<uint32_t> next_anchor_idx {0};
 	uint32_t max_threads_config = 0;
+
+	// Projection pushdown
+	vector<column_t> column_ids;
+	bool need_d_prime = false;
+	bool need_any_output = false;
+
+	// Per-local-thread bounded genotype cache settings
+	bool use_genotype_cache = false;
+	uintptr_t genovec_word_ct = 0;
+	uintptr_t genovec_bytes = 0;
 
 	idx_t MaxThreads() const override {
 		if (mode == LdMode::PAIRWISE) {
@@ -196,6 +221,15 @@ struct PlinkLdLocalState : public LocalTableFunctionState {
 
 	AlignedBuffer genovec_a_buf; // anchor variant genotypes
 	AlignedBuffer genovec_b_buf; // partner variant genotypes
+
+	// Optional per-thread dense cache for all genotypes in the active region.
+	// This trades bounded memory for eliminating repeated PgrGet() calls in
+	// dense window scans.
+	AlignedBuffer genotype_cache_buf;
+	bool genotype_cache_ready = false;
+	uint32_t cache_start_variant_idx = 0;
+	uint32_t cache_end_variant_idx = 0;
+	uintptr_t cache_genovec_word_ct = 0;
 
 	// Windowed mode: state preservation across scan calls
 	bool in_window = false;
@@ -249,6 +283,8 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 			}
 		} else if (kv.first == "inter_chr") {
 			bind_data->inter_chr = kv.second.GetValue<bool>();
+		} else if (kv.first == "cache_genotypes") {
+			bind_data->cache_genotypes = kv.second.GetValue<bool>();
 		} else if (kv.first == "samples" || kv.first == "region") {
 			// Handled after pgenlib init
 		}
@@ -378,10 +414,12 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	}
 
 	// --- Register output columns ---
-	names = {"CHROM_A", "POS_A", "ID_A", "CHROM_B", "POS_B", "ID_B", "R2", "D_PRIME", "OBS_CT"};
+	// R is signed ALT-dosage correlation and is needed by fine-mapping / coloc
+	// methods such as SuSiE and ColocBoost. R2 is retained for compatibility.
+	names = {"CHROM_A", "POS_A", "ID_A", "CHROM_B", "POS_B", "ID_B", "R", "R2", "D_PRIME", "OBS_CT"};
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::INTEGER};
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE, LogicalType::INTEGER};
 
 	return std::move(bind_data);
 }
@@ -409,6 +447,26 @@ static unique_ptr<GlobalTableFunctionState> PlinkLdInitGlobal(ClientContext &con
 		state->next_anchor_idx.store(state->start_variant_idx);
 	}
 
+	state->column_ids = input.column_ids;
+	state->need_any_output = false;
+	state->need_d_prime = false;
+	for (auto col_id : input.column_ids) {
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		state->need_any_output = true;
+		if (col_id == COL_D_PRIME) {
+			state->need_d_prime = true;
+		}
+	}
+
+	uint32_t range = state->end_variant_idx - state->start_variant_idx;
+	state->genovec_word_ct = plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
+	state->genovec_bytes = state->genovec_word_ct * sizeof(uintptr_t);
+	uintptr_t cache_bytes = static_cast<uintptr_t>(range) * state->genovec_bytes;
+	state->use_genotype_cache = bind_data.cache_genotypes && state->mode == LdMode::WINDOWED && range > 0 &&
+	                            state->genovec_bytes > 0 && cache_bytes <= LD_CACHE_MAX_BYTES_PER_THREAD;
+
 	return std::move(state);
 }
 
@@ -419,6 +477,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkLdInitGlobal(ClientContext &con
 static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                             GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<PlinkLdBindData>();
+	auto &gstate = global_state->Cast<PlinkLdGlobalState>();
 	auto state = make_uniq<PlinkLdLocalState>();
 
 	// --- Initialize per-thread PgenFileInfo + PgenReader ---
@@ -478,12 +537,35 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 	}
 
 	// Allocate two genovec buffers (anchor + partner)
-	uintptr_t genovec_word_ct = plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
-	uintptr_t genovec_bytes = genovec_word_ct * sizeof(uintptr_t);
+	uintptr_t genovec_word_ct = gstate.genovec_word_ct ? gstate.genovec_word_ct : plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
+	uintptr_t genovec_bytes = gstate.genovec_bytes ? gstate.genovec_bytes : genovec_word_ct * sizeof(uintptr_t);
 	state->genovec_a_buf.Allocate(genovec_bytes);
 	state->genovec_b_buf.Allocate(genovec_bytes);
 	std::memset(state->genovec_a_buf.ptr, 0, genovec_bytes);
 	std::memset(state->genovec_b_buf.ptr, 0, genovec_bytes);
+
+	if (gstate.use_genotype_cache) {
+		uint32_t range = gstate.end_variant_idx - gstate.start_variant_idx;
+		uintptr_t cache_bytes = static_cast<uintptr_t>(range) * genovec_bytes;
+		state->genotype_cache_buf.Allocate(cache_bytes);
+		state->cache_start_variant_idx = gstate.start_variant_idx;
+		state->cache_end_variant_idx = gstate.end_variant_idx;
+		state->cache_genovec_word_ct = genovec_word_ct;
+		auto *cache = state->genotype_cache_buf.As<uintptr_t>();
+		for (uint32_t vidx = state->cache_start_variant_idx; vidx < state->cache_end_variant_idx; vidx++) {
+			auto *dest = cache + static_cast<uintptr_t>(vidx - state->cache_start_variant_idx) * genovec_word_ct;
+			const uintptr_t *sample_include = nullptr;
+			if (bind_data.has_sample_subset && bind_data.sample_subset) {
+				sample_include = bind_data.sample_subset->SampleInclude();
+			}
+			plink2::PglErr cache_err = plink2::PgrGet(sample_include, state->pssi, bind_data.effective_sample_ct, vidx,
+			                                         &state->pgr, dest);
+			if (cache_err != plink2::kPglRetSuccess) {
+				throw IOException("plink_ld: PgrGet failed while caching variant %u", vidx);
+			}
+		}
+		state->genotype_cache_ready = true;
+	}
 
 	state->initialized = true;
 	return std::move(state);
@@ -493,51 +575,75 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 // Helpers: emit an output row and read genotypes
 // ---------------------------------------------------------------------------
 
-static void EmitRow(DataChunk &output, idx_t row_idx, const PlinkLdBindData &bind_data, uint32_t vidx_a,
-                    uint32_t vidx_b, const LdResult &result) {
+static void EmitRow(DataChunk &output, idx_t row_idx, const PlinkLdBindData &bind_data,
+                    const PlinkLdGlobalState &gstate, uint32_t vidx_a, uint32_t vidx_b, const LdResult &result) {
 	auto &variants = bind_data.variants;
 
-	// CHROM_A
-	FlatVector::GetData<string_t>(output.data[COL_CHROM_A])[row_idx] =
-	    StringVector::AddString(output.data[COL_CHROM_A], variants.GetChrom(vidx_a));
-
-	// POS_A
-	FlatVector::GetData<int32_t>(output.data[COL_POS_A])[row_idx] = variants.GetPos(vidx_a);
-
-	// ID_A
-	auto id_a = variants.GetId(vidx_a);
-	if (id_a.empty()) {
-		FlatVector::SetNull(output.data[COL_ID_A], row_idx, true);
-	} else {
-		FlatVector::GetData<string_t>(output.data[COL_ID_A])[row_idx] =
-		    StringVector::AddString(output.data[COL_ID_A], id_a);
+	for (idx_t out_col = 0; out_col < gstate.column_ids.size(); out_col++) {
+		auto file_col = gstate.column_ids[out_col];
+		if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		auto &vec = output.data[out_col];
+		switch (file_col) {
+		case COL_CHROM_A:
+			FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, variants.GetChrom(vidx_a));
+			break;
+		case COL_POS_A:
+			FlatVector::GetData<int32_t>(vec)[row_idx] = variants.GetPos(vidx_a);
+			break;
+		case COL_ID_A: {
+			auto id_a = variants.GetId(vidx_a);
+			if (id_a.empty()) {
+				FlatVector::SetNull(vec, row_idx, true);
+			} else {
+				FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, id_a);
+			}
+			break;
+		}
+		case COL_CHROM_B:
+			FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, variants.GetChrom(vidx_b));
+			break;
+		case COL_POS_B:
+			FlatVector::GetData<int32_t>(vec)[row_idx] = variants.GetPos(vidx_b);
+			break;
+		case COL_ID_B: {
+			auto id_b = variants.GetId(vidx_b);
+			if (id_b.empty()) {
+				FlatVector::SetNull(vec, row_idx, true);
+			} else {
+				FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, id_b);
+			}
+			break;
+		}
+		case COL_R:
+			if (result.is_valid) {
+				FlatVector::GetData<double>(vec)[row_idx] = result.r;
+			} else {
+				FlatVector::SetNull(vec, row_idx, true);
+			}
+			break;
+		case COL_R2:
+			if (result.is_valid) {
+				FlatVector::GetData<double>(vec)[row_idx] = result.r2;
+			} else {
+				FlatVector::SetNull(vec, row_idx, true);
+			}
+			break;
+		case COL_D_PRIME:
+			if (result.is_valid) {
+				FlatVector::GetData<double>(vec)[row_idx] = result.d_prime;
+			} else {
+				FlatVector::SetNull(vec, row_idx, true);
+			}
+			break;
+		case COL_OBS_CT:
+			FlatVector::GetData<int32_t>(vec)[row_idx] = static_cast<int32_t>(result.obs_ct);
+			break;
+		default:
+			break;
+		}
 	}
-
-	// CHROM_B
-	FlatVector::GetData<string_t>(output.data[COL_CHROM_B])[row_idx] =
-	    StringVector::AddString(output.data[COL_CHROM_B], variants.GetChrom(vidx_b));
-
-	// POS_B
-	FlatVector::GetData<int32_t>(output.data[COL_POS_B])[row_idx] = variants.GetPos(vidx_b);
-
-	// ID_B
-	auto id_b = variants.GetId(vidx_b);
-	if (id_b.empty()) {
-		FlatVector::SetNull(output.data[COL_ID_B], row_idx, true);
-	} else {
-		FlatVector::GetData<string_t>(output.data[COL_ID_B])[row_idx] =
-		    StringVector::AddString(output.data[COL_ID_B], id_b);
-	}
-
-	// R2, D_PRIME, OBS_CT
-	if (result.is_valid) {
-		FlatVector::GetData<double>(output.data[COL_R2])[row_idx] = result.r2;
-		FlatVector::GetData<double>(output.data[COL_D_PRIME])[row_idx] = result.d_prime;
-	} else {
-		FlatVector::SetNull(output.data[COL_R2], row_idx, true);
-		FlatVector::SetNull(output.data[COL_D_PRIME], row_idx, true);
-	}
-	FlatVector::GetData<int32_t>(output.data[COL_OBS_CT])[row_idx] = static_cast<int32_t>(result.obs_ct);
 }
 
 static void ReadGenovec(PlinkLdLocalState &lstate, const PlinkLdBindData &bind_data, uint32_t vidx,
@@ -555,6 +661,16 @@ static void ReadGenovec(PlinkLdLocalState &lstate, const PlinkLdBindData &bind_d
 	}
 }
 
+static const uintptr_t *GetGenovec(PlinkLdLocalState &lstate, const PlinkLdBindData &bind_data, uint32_t vidx,
+                                   uintptr_t *fallback_buf) {
+	if (lstate.genotype_cache_ready && vidx >= lstate.cache_start_variant_idx && vidx < lstate.cache_end_variant_idx) {
+		auto *cache = lstate.genotype_cache_buf.As<uintptr_t>();
+		return cache + static_cast<uintptr_t>(vidx - lstate.cache_start_variant_idx) * lstate.cache_genovec_word_ct;
+	}
+	ReadGenovec(lstate, bind_data, vidx, fallback_buf);
+	return fallback_buf;
+}
+
 // ---------------------------------------------------------------------------
 // Scan function
 // ---------------------------------------------------------------------------
@@ -570,8 +686,10 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 	}
 
 	uint32_t sample_ct = bind_data.effective_sample_ct;
-	auto *genovec_a = lstate.genovec_a_buf.As<uintptr_t>();
-	auto *genovec_b = lstate.genovec_b_buf.As<uintptr_t>();
+	auto *genovec_a_buf = lstate.genovec_a_buf.As<uintptr_t>();
+	auto *genovec_b_buf = lstate.genovec_b_buf.As<uintptr_t>();
+	const uintptr_t *genovec_a = nullptr;
+	const uintptr_t *genovec_b = nullptr;
 
 	idx_t rows_emitted = 0;
 
@@ -585,15 +703,15 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		uint32_t vidx_a = bind_data.pairwise_vidx_a;
 		uint32_t vidx_b = bind_data.pairwise_vidx_b;
 
-		ReadGenovec(lstate, bind_data, vidx_a, genovec_a);
+		genovec_a = GetGenovec(lstate, bind_data, vidx_a, genovec_a_buf);
 		if (vidx_a == vidx_b) {
 			// Self-LD: use same buffer for both
-			auto result = ComputeLdStats(genovec_a, genovec_a, sample_ct);
-			EmitRow(output, 0, bind_data, vidx_a, vidx_b, result);
+			auto result = ComputeLdStats(genovec_a, genovec_a, sample_ct, gstate.need_d_prime);
+			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		} else {
-			ReadGenovec(lstate, bind_data, vidx_b, genovec_b);
-			auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct);
-			EmitRow(output, 0, bind_data, vidx_a, vidx_b, result);
+			genovec_b = GetGenovec(lstate, bind_data, vidx_b, genovec_b_buf);
+			auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_d_prime);
+			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		}
 		output.SetCardinality(1);
 		return;
@@ -613,6 +731,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 			// Resume scanning partners for current anchor
 			uint32_t ai = lstate.anchor_idx;
 			uint32_t j = lstate.next_j;
+			genovec_a = GetGenovec(lstate, bind_data, ai, genovec_a_buf);
 
 			if (!anchor_cached) {
 				anchor_chrom = variants.GetChrom(ai);
@@ -643,11 +762,11 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 					// Inter-chr: no distance filter
 				}
 
-				ReadGenovec(lstate, bind_data, j, genovec_b);
-				auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct);
+				genovec_b = GetGenovec(lstate, bind_data, j, genovec_b_buf);
+				auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_d_prime);
 
 				if (result.is_valid && result.r2 >= bind_data.r2_threshold) {
-					EmitRow(output, rows_emitted, bind_data, ai, j, result);
+					EmitRow(output, rows_emitted, bind_data, gstate, ai, j, result);
 					rows_emitted++;
 
 					if (rows_emitted >= STANDARD_VECTOR_SIZE) {
@@ -671,7 +790,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		}
 
 		// Load anchor genotypes
-		ReadGenovec(lstate, bind_data, anchor_idx, genovec_a);
+		genovec_a = GetGenovec(lstate, bind_data, anchor_idx, genovec_a_buf);
 
 		lstate.anchor_idx = anchor_idx;
 		lstate.next_j = anchor_idx + 1;
@@ -702,6 +821,8 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	plink_ld.named_parameters["region"] = LogicalType::VARCHAR;
 	plink_ld.named_parameters["samples"] = LogicalType::ANY;
 	plink_ld.named_parameters["inter_chr"] = LogicalType::BOOLEAN;
+	plink_ld.named_parameters["cache_genotypes"] = LogicalType::BOOLEAN;
+	plink_ld.projection_pushdown = true;
 
 	loader.RegisterFunction(plink_ld);
 }
