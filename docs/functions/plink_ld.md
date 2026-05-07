@@ -11,7 +11,7 @@ plink_ld(path VARCHAR, variant1 := ..., variant2 := ...) -> TABLE
 -- Windowed mode: LD for all variant pairs within a window
 plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
          region := ..., samples := ..., inter_chr := ...,
-         cache_genotypes := true]) -> TABLE
+         cache_genotypes := false]) -> TABLE
 ```
 
 ## Parameters
@@ -28,7 +28,7 @@ plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
 | `inter_chr` | `BOOLEAN` | `false` | Include cross-chromosome pairs (windowed mode) |
-| `cache_genotypes` | `BOOLEAN` | `true` | Cache the active region's packed genotypes per worker when the bounded cache is small enough; avoids repeated `.pgen` reads in dense regional LD scans. |
+| `cache_genotypes` | `BOOLEAN` | `false` | Cache the active region's packed genotypes per worker when the bounded cache is small enough; avoids repeated `.pgen` reads in dense regional LD scans, but can duplicate memory across many workers. |
 
 See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
 

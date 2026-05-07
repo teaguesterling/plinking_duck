@@ -43,7 +43,7 @@ struct LdResult {
 //! Compute LD statistics from two packed 2-bit genotype arrays.
 //! Genotype encoding: 0=hom_ref, 1=het, 2=hom_alt, 3=missing.
 static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct,
-                               bool compute_d_prime) {
+                               bool compute_r, bool compute_d_prime) {
 	double sum_a = 0, sum_b = 0, sum_ab = 0, sum_a2 = 0, sum_b2 = 0;
 	uint32_t n = 0;
 
@@ -100,8 +100,13 @@ static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *geno
 	}
 
 	result.is_valid = true;
-	result.r = cov_ab / std::sqrt(var_a * var_b);
-	result.r2 = result.r * result.r;
+	double var_prod = var_a * var_b;
+	if (compute_r) {
+		result.r = cov_ab / std::sqrt(var_prod);
+		result.r2 = result.r * result.r;
+	} else {
+		result.r2 = (cov_ab * cov_ab) / var_prod;
+	}
 
 	if (!compute_d_prime) {
 		return result;
@@ -168,7 +173,7 @@ struct PlinkLdBindData : public TableFunctionData {
 	int64_t window_bp = 1000000; // window_kb * 1000
 	double r2_threshold = 0.2;
 	bool inter_chr = false;
-	bool cache_genotypes = true;
+	bool cache_genotypes = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -189,6 +194,7 @@ struct PlinkLdGlobalState : public GlobalTableFunctionState {
 
 	// Projection pushdown
 	vector<column_t> column_ids;
+	bool need_r = false;
 	bool need_d_prime = false;
 	bool need_any_output = false;
 
@@ -449,13 +455,16 @@ static unique_ptr<GlobalTableFunctionState> PlinkLdInitGlobal(ClientContext &con
 
 	state->column_ids = input.column_ids;
 	state->need_any_output = false;
+	state->need_r = false;
 	state->need_d_prime = false;
 	for (auto col_id : input.column_ids) {
 		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
 			continue;
 		}
 		state->need_any_output = true;
-		if (col_id == COL_D_PRIME) {
+		if (col_id == COL_R) {
+			state->need_r = true;
+		} else if (col_id == COL_D_PRIME) {
 			state->need_d_prime = true;
 		}
 	}
@@ -706,11 +715,11 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		genovec_a = GetGenovec(lstate, bind_data, vidx_a, genovec_a_buf);
 		if (vidx_a == vidx_b) {
 			// Self-LD: use same buffer for both
-			auto result = ComputeLdStats(genovec_a, genovec_a, sample_ct, gstate.need_d_prime);
+			auto result = ComputeLdStats(genovec_a, genovec_a, sample_ct, gstate.need_r, gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		} else {
 			genovec_b = GetGenovec(lstate, bind_data, vidx_b, genovec_b_buf);
-			auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_d_prime);
+			auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_r, gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		}
 		output.SetCardinality(1);
@@ -763,7 +772,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 				}
 
 				genovec_b = GetGenovec(lstate, bind_data, j, genovec_b_buf);
-				auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_d_prime);
+				auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_r, gstate.need_d_prime);
 
 				if (result.is_valid && result.r2 >= bind_data.r2_threshold) {
 					EmitRow(output, rows_emitted, bind_data, gstate, ai, j, result);
