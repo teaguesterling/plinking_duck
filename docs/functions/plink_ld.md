@@ -11,7 +11,8 @@ plink_ld(path VARCHAR, variant1 := ..., variant2 := ...) -> TABLE
 -- Windowed mode: LD for all variant pairs within a window
 plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
          region := ..., samples := ..., inter_chr := ...,
-         cache_genotypes := true]) -> TABLE
+         cache_genotypes := true,
+         population_column := ..., population_weights := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -29,6 +30,8 @@ plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
 | `inter_chr` | `BOOLEAN` | `false` | Include cross-chromosome pairs (windowed mode) |
 | `cache_genotypes` | `BOOLEAN` | `true` | Cache the active region's packed genotypes per worker when the bounded cache is small enough; enables a faster popcount LD path for no-missing variants and falls back to streaming when the estimated total cache would be too large. |
+| `population_column` | `VARCHAR` | *(none)* | Optional `.psam`/`.fam` metadata column containing population/ancestry labels for GAUSS-like population-weighted LD. Must be supplied with `population_weights`. |
+| `population_weights` | `VARCHAR` | *(none)* | Comma-separated population weights, e.g. `'AFR=0.20,EUR=0.80'`. Weights are normalized, matched case-insensitively to `population_column`, and each population contributes its total requested weight regardless of sample count. |
 
 See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
 
@@ -66,6 +69,8 @@ R, R2, and D_PRIME are NULL when the LD computation is invalid (monomorphic vari
 ### LD Statistics
 
 **R** is the signed Pearson correlation between genotype dosages at two loci. **r²** is `R * R`; values range from 0 (no LD) to 1 (perfect LD).
+
+With `population_column` + `population_weights`, `plink_ld()` computes a GAUSS-like population-weighted correlation. Each included sample receives weight `population_weight / included_population_sample_count`; weighted moments are then computed over the non-missing sample pairs. This is useful when a study cohort has known or estimated ancestry proportions and the reference panel has different per-population sample sizes.
 
 **D'** is computed using the composite LD estimator (Weir 1979) from genotype-level statistics. D is the covariance between genotype dosages divided by 4, and D' = D / D_max where D_max depends on allele frequencies and the sign of D.
 
@@ -112,6 +117,16 @@ SELECT * FROM plink_ld('data/example.pgen',
 -- Include cross-chromosome LD
 SELECT * FROM plink_ld('data/example.pgen',
     inter_chr := true, r2_threshold := 0.8);
+```
+
+```sql
+-- GAUSS-like population-weighted LD from a PSAM ancestry column
+SELECT ID_A, ID_B, R, R2
+FROM plink_ld('data/1kg_chr22.pgen',
+    psam := 'data/1kg_chr22.psam',
+    region := '22:11300000-11400000',
+    population_column := 'SuperPop',
+    population_weights := 'AFR=0.20,AMR=0.20,EAS=0.20,EUR=0.20,SAS=0.20');
 ```
 
 ## See Also

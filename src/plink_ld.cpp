@@ -15,9 +15,15 @@
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <sstream>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -42,6 +48,73 @@ static constexpr idx_t COL_OBS_CT = 9;
 // or very large-region scans fall back to streaming PgrGet() calls.
 static constexpr uintptr_t LD_CACHE_MAX_BYTES_PER_THREAD = 128ULL * 1024ULL * 1024ULL;
 static constexpr uintptr_t LD_CACHE_MAX_BYTES_TOTAL = 512ULL * 1024ULL * 1024ULL;
+
+// ---------------------------------------------------------------------------
+// String / population-weight helpers
+// ---------------------------------------------------------------------------
+
+static string TrimCopy(const string &value) {
+	idx_t start = 0;
+	idx_t end = value.size();
+	while (start < end && std::isspace(static_cast<unsigned char>(value[start]))) {
+		start++;
+	}
+	while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+		end--;
+	}
+	return value.substr(start, end - start);
+}
+
+static string UpperCopy(string value) {
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return std::toupper(ch); });
+	return value;
+}
+
+static vector<string> SplitDelimited(const string &value, char delim) {
+	vector<string> out;
+	std::stringstream ss(value);
+	string item;
+	while (std::getline(ss, item, delim)) {
+		out.push_back(item);
+	}
+	return out;
+}
+
+static unordered_map<string, double> ParsePopulationWeightsSpec(const string &spec) {
+	unordered_map<string, double> weights;
+	double total = 0.0;
+	for (auto entry : SplitDelimited(spec, ',')) {
+		entry = TrimCopy(entry);
+		if (entry.empty()) {
+			continue;
+		}
+		auto eq = entry.find('=');
+		if (eq == string::npos) {
+			eq = entry.find(':');
+		}
+		if (eq == string::npos || eq == 0 || eq == entry.size() - 1) {
+			throw InvalidInputException("plink_ld: population_weights entries must be 'POP=weight' or 'POP:weight'");
+		}
+		string pop = UpperCopy(TrimCopy(entry.substr(0, eq)));
+		string weight_str = TrimCopy(entry.substr(eq + 1));
+		char *parse_end = nullptr;
+		errno = 0;
+		double weight = std::strtod(weight_str.c_str(), &parse_end);
+		if (parse_end == weight_str.c_str() || *parse_end != '\0' || errno != 0 || !std::isfinite(weight) ||
+		    weight < 0.0) {
+			throw InvalidInputException("plink_ld: invalid non-negative population weight '%s'", weight_str);
+		}
+		weights[pop] += weight;
+		total += weight;
+	}
+	if (weights.empty() || total <= 0.0) {
+		throw InvalidInputException("plink_ld: population_weights must contain at least one positive weight");
+	}
+	for (auto &kv : weights) {
+		kv.second /= total;
+	}
+	return weights;
+}
 
 // ---------------------------------------------------------------------------
 // LD computation
@@ -298,6 +371,96 @@ static LdResult ComputeLdStats(const uintptr_t *genovec_a, const uintptr_t *geno
 	return result;
 }
 
+static LdResult ComputeWeightedLdStats(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct,
+                                       const vector<double> &sample_weights, bool compute_r, bool compute_d_prime) {
+	if (sample_weights.size() != sample_ct) {
+		throw InternalException("plink_ld: sample weight count does not match effective sample count");
+	}
+
+	double sum_w = 0.0, sum_wx = 0.0, sum_wy = 0.0, sum_wxy = 0.0, sum_wx2 = 0.0, sum_wy2 = 0.0;
+	uint32_t obs_ct = 0;
+	uint32_t sample_idx = 0;
+	uint32_t word_ct = plink2::DivUp(sample_ct, plink2::kBitsPerWordD2);
+	for (uint32_t widx = 0; widx < word_ct; widx++) {
+		uintptr_t word_a = genovec_a[widx];
+		uintptr_t word_b = genovec_b[widx];
+
+		uint32_t samples_remaining = sample_ct - widx * plink2::kBitsPerWordD2;
+		uint32_t samples_in_word = std::min(samples_remaining, static_cast<uint32_t>(plink2::kBitsPerWordD2));
+		for (uint32_t sidx = 0; sidx < samples_in_word; sidx++, sample_idx++) {
+			uint32_t geno_a = word_a & 3;
+			uint32_t geno_b = word_b & 3;
+			word_a >>= 2;
+			word_b >>= 2;
+
+			double weight = sample_weights[sample_idx];
+			if (weight <= 0.0 || geno_a == 3 || geno_b == 3) {
+				continue;
+			}
+
+			double ga = static_cast<double>(geno_a);
+			double gb = static_cast<double>(geno_b);
+			sum_w += weight;
+			sum_wx += weight * ga;
+			sum_wy += weight * gb;
+			sum_wxy += weight * ga * gb;
+			sum_wx2 += weight * ga * ga;
+			sum_wy2 += weight * gb * gb;
+			obs_ct++;
+		}
+	}
+
+	LdResult result;
+	result.obs_ct = obs_ct;
+	result.is_valid = false;
+	result.r = 0;
+	result.r2 = 0;
+	result.d_prime = 0;
+
+	if (obs_ct < 2 || sum_w <= 0.0) {
+		return result;
+	}
+
+	double mean_a = sum_wx / sum_w;
+	double mean_b = sum_wy / sum_w;
+	double cov_ab = sum_wxy / sum_w - mean_a * mean_b;
+	double var_a = sum_wx2 / sum_w - mean_a * mean_a;
+	double var_b = sum_wy2 / sum_w - mean_b * mean_b;
+	if (var_a < 1e-15 || var_b < 1e-15) {
+		return result;
+	}
+
+	result.is_valid = true;
+	double var_prod = var_a * var_b;
+	if (compute_r) {
+		result.r = cov_ab / std::sqrt(var_prod);
+		result.r2 = result.r * result.r;
+	} else {
+		result.r2 = (cov_ab * cov_ab) / var_prod;
+	}
+
+	if (!compute_d_prime) {
+		return result;
+	}
+
+	double D = cov_ab / 4.0;
+	double p_a = sum_wx / (2.0 * sum_w);
+	double p_b = sum_wy / (2.0 * sum_w);
+	double D_max;
+	if (D >= 0) {
+		D_max = std::min(p_a * (1.0 - p_b), (1.0 - p_a) * p_b);
+	} else {
+		D_max = std::max(-p_a * p_b, -(1.0 - p_a) * (1.0 - p_b));
+	}
+	if (std::abs(D_max) < 1e-15) {
+		result.d_prime = 0.0;
+	} else {
+		result.d_prime = D / D_max;
+	}
+
+	return result;
+}
+
 // ---------------------------------------------------------------------------
 // Bind data
 // ---------------------------------------------------------------------------
@@ -336,7 +499,142 @@ struct PlinkLdBindData : public TableFunctionData {
 	double r2_threshold = 0.2;
 	bool inter_chr = false;
 	bool cache_genotypes = true;
+
+	// GAUSS-like population weighting. Each included sample receives
+	// population_weight / included_population_sample_count, so each population
+	// contributes the requested total weight regardless of sample count.
+	string population_column;
+	string population_weights_spec;
+	bool use_population_weights = false;
+	vector<double> sample_weights;
 };
+
+static vector<string> SplitPsamDataLine(const string &line) {
+	if (line.find('\t') != string::npos) {
+		return SplitTabLine(line);
+	}
+	return SplitWhitespaceLine(line);
+}
+
+static vector<string> LoadSamplePopulationLabels(ClientContext &context, const string &psam_path,
+                                                 const string &population_column, uint32_t raw_sample_ct) {
+	if (psam_path.empty()) {
+		throw InvalidInputException("plink_ld: population_column requires a .psam/.fam file");
+	}
+	if (population_column.empty()) {
+		throw InvalidInputException("plink_ld: population_column must not be empty when population_weights is supplied");
+	}
+
+	auto lines = ReadFileLines(context, psam_path);
+	if (lines.empty()) {
+		throw InvalidInputException("plink_ld: sample metadata file '%s' is empty", psam_path);
+	}
+
+	vector<string> columns;
+	idx_t data_start = 0;
+	if (!lines[0].empty() && lines[0][0] == '#') {
+		columns = SplitPsamDataLine(lines[0]);
+		if (!columns.empty() && !columns[0].empty() && columns[0][0] == '#') {
+			columns[0] = columns[0].substr(1);
+		}
+		data_start = 1;
+	} else {
+		columns = {"FID", "IID", "PAT", "MAT", "SEX", "PHENO"};
+	}
+
+	string requested = UpperCopy(population_column);
+	idx_t pop_col_idx = columns.size();
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (UpperCopy(columns[i]) == requested) {
+			pop_col_idx = i;
+			break;
+		}
+	}
+	if (pop_col_idx >= columns.size()) {
+		throw InvalidInputException("plink_ld: population_column '%s' not found in '%s'", population_column, psam_path);
+	}
+
+	vector<string> labels;
+	labels.reserve(raw_sample_ct);
+	for (idx_t line_idx = data_start; line_idx < lines.size(); line_idx++) {
+		auto line = TrimCopy(lines[line_idx]);
+		if (line.empty()) {
+			continue;
+		}
+		auto parts = SplitPsamDataLine(line);
+		if (pop_col_idx >= parts.size()) {
+			throw InvalidInputException("plink_ld: sample metadata row %llu has no population_column '%s'",
+			                            static_cast<unsigned long long>(line_idx + 1), population_column);
+		}
+		labels.push_back(UpperCopy(parts[pop_col_idx]));
+	}
+	if (labels.size() != raw_sample_ct) {
+		throw InvalidInputException("plink_ld: sample metadata '%s' has %llu rows, but .pgen has %u samples", psam_path,
+		                            static_cast<unsigned long long>(labels.size()), raw_sample_ct);
+	}
+	return labels;
+}
+
+static vector<uint32_t> IncludedSampleIndices(const PlinkLdBindData &bind_data) {
+	vector<uint32_t> included;
+	included.reserve(bind_data.effective_sample_ct);
+	if (bind_data.has_sample_subset && bind_data.sample_subset) {
+		const uintptr_t *sample_include = bind_data.sample_subset->SampleInclude();
+		for (uint32_t idx = 0; idx < bind_data.raw_sample_ct; idx++) {
+			if (plink2::IsSet(sample_include, idx)) {
+				included.push_back(idx);
+			}
+		}
+	} else {
+		for (uint32_t idx = 0; idx < bind_data.raw_sample_ct; idx++) {
+			included.push_back(idx);
+		}
+	}
+	return included;
+}
+
+static vector<double> BuildPopulationSampleWeights(const PlinkLdBindData &bind_data, const vector<string> &labels,
+                                                   const unordered_map<string, double> &population_weights) {
+	auto included = IncludedSampleIndices(bind_data);
+	unordered_map<string, uint32_t> included_pop_counts;
+	for (auto raw_idx : included) {
+		auto it = population_weights.find(labels[raw_idx]);
+		if (it != population_weights.end() && it->second > 0.0) {
+			included_pop_counts[labels[raw_idx]]++;
+		}
+	}
+
+	for (auto &kv : population_weights) {
+		if (kv.second > 0.0 && included_pop_counts[kv.first] == 0) {
+			throw InvalidInputException("plink_ld: population_weights includes '%s', but no included samples have that %s",
+			                            kv.first, bind_data.population_column);
+		}
+	}
+
+	vector<double> sample_weights;
+	sample_weights.reserve(included.size());
+	double total_weight = 0.0;
+	for (auto raw_idx : included) {
+		auto it = population_weights.find(labels[raw_idx]);
+		double weight = 0.0;
+		if (it != population_weights.end() && it->second > 0.0) {
+			weight = it->second / static_cast<double>(included_pop_counts[labels[raw_idx]]);
+		}
+		sample_weights.push_back(weight);
+		total_weight += weight;
+	}
+	if (sample_weights.empty() || total_weight <= 0.0) {
+		throw InvalidInputException("plink_ld: population_weights selected zero effective samples");
+	}
+
+	// Normalize after dropping unweighted populations so the weighted moments are
+	// stable even if the caller specified extra populations outside the current
+	// sample subset.
+	for (auto &weight : sample_weights) {
+		weight /= total_weight;
+	}
+	return sample_weights;
+}
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -454,9 +752,19 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 			bind_data->inter_chr = kv.second.GetValue<bool>();
 		} else if (kv.first == "cache_genotypes") {
 			bind_data->cache_genotypes = kv.second.GetValue<bool>();
+		} else if (kv.first == "population_column") {
+			bind_data->population_column = kv.second.GetValue<string>();
+		} else if (kv.first == "population_weights") {
+			bind_data->population_weights_spec = kv.second.GetValue<string>();
 		} else if (kv.first == "samples" || kv.first == "region") {
 			// Handled after pgenlib init
 		}
+	}
+
+	bind_data->use_population_weights = !bind_data->population_column.empty() || !bind_data->population_weights_spec.empty();
+	if (bind_data->use_population_weights &&
+	    (bind_data->population_column.empty() || bind_data->population_weights_spec.empty())) {
+		throw InvalidInputException("plink_ld: population_column and population_weights must be supplied together");
 	}
 
 	// --- Determine mode ---
@@ -560,6 +868,17 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
 		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
+	}
+
+	// --- Process GAUSS-like population weights ---
+	if (bind_data->use_population_weights) {
+		auto population_weights = ParsePopulationWeightsSpec(bind_data->population_weights_spec);
+		auto labels = LoadSamplePopulationLabels(context, bind_data->psam_path, bind_data->population_column,
+		                                      bind_data->raw_sample_ct);
+		bind_data->sample_weights = BuildPopulationSampleWeights(*bind_data, labels, population_weights);
+		if (bind_data->sample_weights.size() != bind_data->effective_sample_ct) {
+			throw InternalException("plink_ld: constructed sample weights do not match effective sample count");
+		}
 	}
 
 	// --- Process region parameter ---
@@ -860,9 +1179,13 @@ static const GenovecStats *GetCachedGenovecStats(const PlinkLdLocalState &lstate
 	return nullptr;
 }
 
-static LdResult ComputeLdStatsDispatch(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct,
-                                       const GenovecStats *stats_a, const GenovecStats *stats_b, bool compute_r,
-                                       bool compute_d_prime) {
+static LdResult ComputeLdStatsDispatch(const PlinkLdBindData &bind_data, const uintptr_t *genovec_a,
+                                       const uintptr_t *genovec_b, uint32_t sample_ct, const GenovecStats *stats_a,
+                                       const GenovecStats *stats_b, bool compute_r, bool compute_d_prime) {
+	if (bind_data.use_population_weights) {
+		return ComputeWeightedLdStats(genovec_a, genovec_b, sample_ct, bind_data.sample_weights, compute_r,
+		                              compute_d_prime);
+	}
 	if (stats_a && stats_b && stats_a->no_missing && stats_b->no_missing) {
 		return ComputeLdStatsNoMissing(genovec_a, genovec_b, sample_ct, *stats_a, *stats_b, compute_r, compute_d_prime);
 	}
@@ -907,14 +1230,14 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		stats_a = GetCachedGenovecStats(lstate, vidx_a);
 		if (vidx_a == vidx_b) {
 			// Self-LD: use same buffer for both
-			auto result = ComputeLdStatsDispatch(genovec_a, genovec_a, sample_ct, stats_a, stats_a, gstate.need_r,
-			                                    gstate.need_d_prime);
+			auto result = ComputeLdStatsDispatch(bind_data, genovec_a, genovec_a, sample_ct, stats_a, stats_a,
+			                                    gstate.need_r, gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		} else {
 			genovec_b = GetGenovec(lstate, bind_data, vidx_b, genovec_b_buf);
 			stats_b = GetCachedGenovecStats(lstate, vidx_b);
-			auto result = ComputeLdStatsDispatch(genovec_a, genovec_b, sample_ct, stats_a, stats_b, gstate.need_r,
-			                                    gstate.need_d_prime);
+			auto result = ComputeLdStatsDispatch(bind_data, genovec_a, genovec_b, sample_ct, stats_a, stats_b,
+			                                    gstate.need_r, gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		}
 		CompatSetOutputCardinality(output, 1);
@@ -969,8 +1292,8 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 
 				genovec_b = GetGenovec(lstate, bind_data, j, genovec_b_buf);
 				stats_b = GetCachedGenovecStats(lstate, j);
-				auto result = ComputeLdStatsDispatch(genovec_a, genovec_b, sample_ct, stats_a, stats_b, gstate.need_r,
-				                                    gstate.need_d_prime);
+				auto result = ComputeLdStatsDispatch(bind_data, genovec_a, genovec_b, sample_ct, stats_a, stats_b,
+				                                    gstate.need_r, gstate.need_d_prime);
 
 				if (result.is_valid && result.r2 >= bind_data.r2_threshold) {
 					EmitRow(output, rows_emitted, bind_data, gstate, ai, j, result);
@@ -1030,6 +1353,8 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	plink_ld.named_parameters["samples"] = LogicalType::ANY;
 	plink_ld.named_parameters["inter_chr"] = LogicalType::BOOLEAN;
 	plink_ld.named_parameters["cache_genotypes"] = LogicalType::BOOLEAN;
+	plink_ld.named_parameters["population_column"] = LogicalType::VARCHAR;
+	plink_ld.named_parameters["population_weights"] = LogicalType::VARCHAR;
 	plink_ld.projection_pushdown = true;
 
 	loader.RegisterFunction(plink_ld);
