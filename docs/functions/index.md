@@ -1,6 +1,6 @@
 # Function Reference
 
-PlinkingDuck provides 10 SQL table functions: 4 file readers and 6 analysis functions.
+PlinkingDuck provides 11 SQL table functions: 5 file readers and 6 analysis functions.
 
 ## File Readers
 
@@ -10,6 +10,7 @@ PlinkingDuck provides 10 SQL table functions: 4 file readers and 6 analysis func
 | [`read_psam(path)`](read_psam.md) | `.psam` / `.fam` | Sample metadata (FID, IID, SEX, phenotypes) |
 | [`read_pgen(path)`](read_pgen.md) | `.pgen` | Binary genotypes as `ARRAY(TINYINT, N)` |
 | [`read_pfile(prefix)`](read_pfile.md) | `.pgen` + `.pvar` + `.psam` | Complete fileset with orient mode support |
+| [`read_plink_vcf(path)`](read_plink_vcf.md) | `.vcf` / `.vcf.gz` | Fast biallelic genotype extraction from VCF |
 
 ## Analysis Functions
 

@@ -11,7 +11,7 @@ PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, lettin
 
 ## What's Included
 
-PlinkingDuck provides **four file readers** and **five analysis functions**:
+PlinkingDuck provides **five file readers** and **six analysis functions**:
 
 | Function | Purpose |
 |----------|---------|
@@ -19,6 +19,7 @@ PlinkingDuck provides **four file readers** and **five analysis functions**:
 | [`read_psam`](#read_psampath) | Read `.psam` / `.fam` sample metadata |
 | [`read_pgen`](#read_pgenpath--pvar-psam-samples) | Read `.pgen` binary genotypes |
 | [`read_pfile`](#read_pfileprefix--pgen-pvar-psam-orient-samples-variants-region) | Unified reader with orient modes, filtering |
+| [`read_plink_vcf`](#read_plink_vcfpath--genotypes-phased-region-min_gq-min_dp-max_dp) | Fast biallelic VCF genotype extraction |
 | [`plink_freq`](#plink_freqpath--pvar-psam-samples-region-counts) | Per-variant allele frequencies |
 | [`plink_hardy`](#plink_hardypath--pvar-psam-samples-region-midp) | Hardy-Weinberg equilibrium test |
 | [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-mode) | Per-variant or per-sample missingness |
@@ -164,6 +165,43 @@ plus scalar `genotype` (TINYINT). One row per variant x sample combination.
 | `samples` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific samples by IID or 0-based index |
 | `variants` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific variants by ID or 0-based index |
 | `region` | VARCHAR | Filter to genomic region (`chr:start-end` or `chr`) |
+
+### `read_plink_vcf(path [, genotypes, phased, region, min_gq, min_dp, max_dp])`
+
+Read biallelic genotypes from VCF files using plink-ng's optimized GT parsing. A fast path
+for genotype extraction — multiallelic variants are skipped, output matches `read_pfile()` format.
+
+```sql
+-- Count biallelic variants
+SELECT COUNT(*) FROM read_plink_vcf('cohort.vcf.gz');
+
+-- High-quality genotypes on chr1
+SELECT chrom, pos, id, genotypes
+FROM read_plink_vcf('wgs.vcf.gz', region := 'chr1', min_gq := 30, min_dp := 10);
+
+-- Phased haplotypes
+SELECT id, genotypes FROM read_plink_vcf('phased.vcf', phased := true);
+
+-- Per-sample columns
+SELECT SAMPLE1, SAMPLE2 FROM read_plink_vcf('trio.vcf', genotypes := 'columns');
+```
+
+**Output columns:** CHROM, POS, ID, REF, ALT, genotypes `ARRAY(TINYINT, N)`.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `genotypes` | VARCHAR | Output format: `'array'` (default), `'list'`, or `'columns'` |
+| `phased` | BOOLEAN | Output `ARRAY(TINYINT, 2)` haplotype pairs |
+| `region` | VARCHAR | Filter to genomic region (`chr` or `chr:start-end`) |
+| `min_gq` | INTEGER | Min genotype quality (samples below → NULL) |
+| `min_dp` | INTEGER | Min read depth (samples below → NULL) |
+| `max_dp` | INTEGER | Max read depth (samples above → NULL) |
+| `halfcall` | VARCHAR | Half-call handling: `'missing'`, `'reference'`, `'haploid'`, `'error'` |
+
+**Notes:** Supports `.vcf` and `.vcf.gz`. Multiallelic variants are skipped with a warning.
+For full VCF/BCF parsing (multiallelic, INFO fields), use [DuckHTS](https://github.com/teaguesterling/duckhts).
 
 ---
 
