@@ -80,6 +80,44 @@ static vector<string> SplitDelimited(const string &value, char delim) {
 	return out;
 }
 
+struct LdRegionSpec {
+	string chrom;
+	int64_t start = 0;
+	int64_t end = 0;
+	bool has_region = false;
+};
+
+static LdRegionSpec ParseLdRegionSpec(const string &region_str) {
+	auto colon = region_str.find(':');
+	if (colon == string::npos || colon == 0) {
+		throw InvalidInputException("plink_ld: invalid region format '%s' (expected 'chr:start-end')", region_str);
+	}
+	string chrom = region_str.substr(0, colon);
+	string range_part = region_str.substr(colon + 1);
+	auto dash = range_part.find('-');
+	if (dash == string::npos) {
+		throw InvalidInputException("plink_ld: invalid region format '%s' (expected 'chr:start-end')", region_str);
+	}
+	auto parse_pos = [&](const string &text, const char *label) -> int64_t {
+		char *parse_end = nullptr;
+		errno = 0;
+		long long value = std::strtoll(text.c_str(), &parse_end, 10);
+		if (parse_end == text.c_str() || *parse_end != '\0' || errno != 0 || value < 0) {
+			throw InvalidInputException("plink_ld: invalid region %s position in '%s'", label, region_str);
+		}
+		return static_cast<int64_t>(value);
+	};
+	LdRegionSpec spec;
+	spec.chrom = chrom;
+	spec.start = parse_pos(range_part.substr(0, dash), "start");
+	spec.end = parse_pos(range_part.substr(dash + 1), "end");
+	if (spec.start > spec.end) {
+		throw InvalidInputException("plink_ld: region start is greater than end in '%s'", region_str);
+	}
+	spec.has_region = true;
+	return spec;
+}
+
 static unordered_map<string, double> ParsePopulationWeightsSpec(const string &spec) {
 	unordered_map<string, double> weights;
 	double total = 0.0;
@@ -767,6 +805,12 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 		throw InvalidInputException("plink_ld: population_column and population_weights must be supplied together");
 	}
 
+	LdRegionSpec region_spec;
+	auto region_it = input.named_parameters.find("region");
+	if (region_it != input.named_parameters.end()) {
+		region_spec = ParseLdRegionSpec(region_it->second.GetValue<string>());
+	}
+
 	// --- Determine mode ---
 	if (!variant1_id.empty() && !variant2_id.empty()) {
 		bind_data->mode = LdMode::PAIRWISE;
@@ -835,7 +879,21 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	}
 
 	// --- Load variant metadata ---
-	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_ld");
+	bool metadata_region_pushed = false;
+	bool can_region_push_metadata = region_spec.has_region && bind_data->mode == LdMode::WINDOWED;
+	if (can_region_push_metadata && IsParquetFile(bind_data->pvar_path)) {
+		bind_data->variants = LoadVariantMetadataFromParquetRegion(context, bind_data->pvar_path, region_spec.chrom,
+		                                                        region_spec.start, region_spec.end,
+		                                                        bind_data->raw_variant_ct, "plink_ld");
+		metadata_region_pushed = true;
+	} else if (can_region_push_metadata && IsNativePlinkFormat(bind_data->pvar_path)) {
+		bind_data->variants = LoadVariantMetadataFromTextRegion(context, bind_data->pvar_path, region_spec.chrom,
+		                                                     region_spec.start, region_spec.end, bind_data->raw_variant_ct,
+		                                                     "plink_ld");
+		metadata_region_pushed = true;
+	} else {
+		bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_ld");
+	}
 
 	if (bind_data->variants.variant_ct != bind_data->raw_variant_ct) {
 		throw InvalidInputException("plink_ld: variant count mismatch: .pgen has %u variants, "
@@ -882,9 +940,16 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	}
 
 	// --- Process region parameter ---
-	auto region_it = input.named_parameters.find("region");
-	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_ld");
+	if (region_spec.has_region) {
+		if (metadata_region_pushed) {
+			bind_data->variant_range.has_filter = true;
+			if (!bind_data->variants.local_to_vidx.empty()) {
+				bind_data->variant_range.start_idx = bind_data->variants.local_to_vidx.front();
+				bind_data->variant_range.end_idx = bind_data->variants.local_to_vidx.back() + 1;
+			}
+		} else {
+			bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_ld");
+		}
 	}
 
 	// --- Resolve pairwise variant indices ---
