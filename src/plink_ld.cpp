@@ -17,6 +17,8 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <vector>
 
 namespace duckdb {
 
@@ -39,6 +41,7 @@ static constexpr idx_t COL_OBS_CT = 9;
 // same partner variants thousands of times. Keep this bounded so whole-genome
 // or very large-region scans fall back to streaming PgrGet() calls.
 static constexpr uintptr_t LD_CACHE_MAX_BYTES_PER_THREAD = 128ULL * 1024ULL * 1024ULL;
+static constexpr uintptr_t LD_CACHE_MAX_BYTES_TOTAL = 512ULL * 1024ULL * 1024ULL;
 
 // ---------------------------------------------------------------------------
 // LD computation
@@ -53,6 +56,149 @@ struct LdResult {
 	uint32_t obs_ct;
 	bool is_valid; // false if monomorphic, < 2 obs, etc.
 };
+
+struct GenovecStats {
+	double sum = 0;
+	double sum2 = 0;
+	uint32_t obs_ct = 0;
+	bool no_missing = true;
+};
+
+static inline uint32_t PopcountWord(uintptr_t x) {
+#if UINTPTR_MAX == UINT64_MAX
+	return static_cast<uint32_t>(__builtin_popcountll(static_cast<unsigned long long>(x)));
+#else
+	return static_cast<uint32_t>(__builtin_popcount(static_cast<unsigned int>(x)));
+#endif
+}
+
+static GenovecStats ComputeGenovecStats(const uintptr_t *genovec, uint32_t sample_ct) {
+	GenovecStats stats;
+	uint32_t word_ct = plink2::DivUp(sample_ct, plink2::kBitsPerWordD2);
+	for (uint32_t widx = 0; widx < word_ct; widx++) {
+		uintptr_t word = genovec[widx];
+		uint32_t samples_remaining = sample_ct - widx * plink2::kBitsPerWordD2;
+		uint32_t samples_in_word = std::min(samples_remaining, static_cast<uint32_t>(plink2::kBitsPerWordD2));
+		for (uint32_t sidx = 0; sidx < samples_in_word; sidx++) {
+			uint32_t geno = word & 3;
+			word >>= 2;
+			if (geno == 3) {
+				stats.no_missing = false;
+				continue;
+			}
+			stats.sum += static_cast<double>(geno);
+			stats.sum2 += static_cast<double>(geno * geno);
+			stats.obs_ct++;
+		}
+	}
+	return stats;
+}
+
+static inline uintptr_t MaskTrailingGenotypes(uintptr_t word, uint32_t samples_in_word) {
+	if (samples_in_word >= static_cast<uint32_t>(plink2::kBitsPerWordD2)) {
+		return word;
+	}
+	uintptr_t valid_bits = static_cast<uintptr_t>(samples_in_word) * 2;
+	uintptr_t valid_mask = (static_cast<uintptr_t>(1) << valid_bits) - 1;
+	return word & valid_mask;
+}
+
+static double DotNoMissingGenovec(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct) {
+	static constexpr uintptr_t even_bit_mask = ~static_cast<uintptr_t>(0) / 3;
+	double sum_ab = 0;
+	uint32_t word_ct = plink2::DivUp(sample_ct, plink2::kBitsPerWordD2);
+	for (uint32_t widx = 0; widx < word_ct; widx++) {
+		uintptr_t word_a = genovec_a[widx];
+		uintptr_t word_b = genovec_b[widx];
+		uint32_t samples_remaining = sample_ct - widx * plink2::kBitsPerWordD2;
+		uint32_t samples_in_word = std::min(samples_remaining, static_cast<uint32_t>(plink2::kBitsPerWordD2));
+		word_a = MaskTrailingGenotypes(word_a, samples_in_word);
+		word_b = MaskTrailingGenotypes(word_b, samples_in_word);
+
+		uintptr_t lo_a = word_a & even_bit_mask;
+		uintptr_t hi_a = (word_a >> 1) & even_bit_mask;
+		uintptr_t lo_b = word_b & even_bit_mask;
+		uintptr_t hi_b = (word_b >> 1) & even_bit_mask;
+
+		sum_ab += static_cast<double>(PopcountWord(lo_a & lo_b));
+		sum_ab += 2.0 * static_cast<double>(PopcountWord(lo_a & hi_b));
+		sum_ab += 2.0 * static_cast<double>(PopcountWord(hi_a & lo_b));
+		sum_ab += 4.0 * static_cast<double>(PopcountWord(hi_a & hi_b));
+	}
+	return sum_ab;
+}
+
+static LdResult FinalizeLdStats(double sum_a, double sum_b, double sum_ab, double sum_a2, double sum_b2, uint32_t n,
+                                bool compute_r, bool compute_d_prime) {
+	LdResult result;
+	result.obs_ct = n;
+	result.is_valid = false;
+	result.r = 0;
+	result.r2 = 0;
+	result.d_prime = 0;
+
+	if (n < 2) {
+		return result;
+	}
+
+	double dn = static_cast<double>(n);
+	double mean_a = sum_a / dn;
+	double mean_b = sum_b / dn;
+	double cov_ab = sum_ab / dn - mean_a * mean_b;
+	double var_a = sum_a2 / dn - mean_a * mean_a;
+	double var_b = sum_b2 / dn - mean_b * mean_b;
+
+	// Monomorphic variant — correlation undefined
+	if (var_a < 1e-15 || var_b < 1e-15) {
+		return result;
+	}
+
+	result.is_valid = true;
+	double var_prod = var_a * var_b;
+	if (compute_r) {
+		result.r = cov_ab / std::sqrt(var_prod);
+		result.r2 = result.r * result.r;
+	} else {
+		result.r2 = (cov_ab * cov_ab) / var_prod;
+	}
+
+	if (!compute_d_prime) {
+		return result;
+	}
+
+	// D' via composite LD estimator (Weir 1979):
+	//   D = cov(gA, gB) / 4
+	//   D' = D / D_max where D_max depends on sign of D
+	// Note: this estimator uses genotype-level (not haplotype-level) statistics,
+	// so D' can exceed 1.0 when samples deviate from Hardy-Weinberg equilibrium.
+	double D = cov_ab / 4.0;
+	double p_a = sum_a / (2.0 * dn);
+	double p_b = sum_b / (2.0 * dn);
+
+	double D_max;
+	if (D >= 0) {
+		D_max = std::min(p_a * (1.0 - p_b), (1.0 - p_a) * p_b);
+	} else {
+		D_max = std::max(-p_a * p_b, -(1.0 - p_a) * (1.0 - p_b));
+	}
+
+	if (std::abs(D_max) < 1e-15) {
+		result.d_prime = 0.0;
+	} else {
+		// D/D_max is always non-negative with this formula
+		result.d_prime = D / D_max;
+	}
+
+	return result;
+}
+
+static LdResult ComputeLdStatsNoMissing(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct,
+                                        const GenovecStats &stats_a, const GenovecStats &stats_b, bool compute_r,
+                                        bool compute_d_prime) {
+	double sum_ab = DotNoMissingGenovec(genovec_a, genovec_b, sample_ct);
+	return FinalizeLdStats(stats_a.sum, stats_b.sum, sum_ab, stats_a.sum2, stats_b.sum2, sample_ct, compute_r,
+	                       compute_d_prime);
+}
 
 //! Compute LD statistics from two packed 2-bit genotype arrays.
 //! Genotype encoding: 0=hom_ref, 1=het, 2=hom_alt, 3=missing.
@@ -189,7 +335,7 @@ struct PlinkLdBindData : public TableFunctionData {
 	int64_t window_bp = 1000000; // window_kb * 1000
 	double r2_threshold = 0.2;
 	bool inter_chr = false;
-	bool cache_genotypes = false;
+	bool cache_genotypes = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -248,6 +394,7 @@ struct PlinkLdLocalState : public LocalTableFunctionState {
 	// This trades bounded memory for eliminating repeated PgrGet() calls in
 	// dense window scans.
 	AlignedBuffer genotype_cache_buf;
+	vector<GenovecStats> genotype_cache_stats;
 	bool genotype_cache_ready = false;
 	uint32_t cache_start_variant_idx = 0;
 	uint32_t cache_end_variant_idx = 0;
@@ -493,8 +640,11 @@ static unique_ptr<GlobalTableFunctionState> PlinkLdInitGlobal(ClientContext &con
 	state->genovec_word_ct = plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
 	state->genovec_bytes = state->genovec_word_ct * sizeof(uintptr_t);
 	uintptr_t cache_bytes = static_cast<uintptr_t>(range) * state->genovec_bytes;
+	idx_t estimated_threads = state->mode == LdMode::PAIRWISE ? 1 : ApplyMaxThreadsCap(range / 50 + 1, state->max_threads_config);
+	bool cache_fits_per_thread = cache_bytes <= LD_CACHE_MAX_BYTES_PER_THREAD;
+	bool cache_fits_total = estimated_threads > 0 && cache_bytes <= (LD_CACHE_MAX_BYTES_TOTAL / estimated_threads);
 	state->use_genotype_cache = bind_data.cache_genotypes && state->mode == LdMode::WINDOWED && range > 0 &&
-	                            state->genovec_bytes > 0 && cache_bytes <= LD_CACHE_MAX_BYTES_PER_THREAD;
+	                            state->genovec_bytes > 0 && cache_fits_per_thread && cache_fits_total;
 
 	return std::move(state);
 }
@@ -582,6 +732,7 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 		state->cache_end_variant_idx = gstate.end_variant_idx;
 		state->cache_genovec_word_ct = genovec_word_ct;
 		auto *cache = state->genotype_cache_buf.As<uintptr_t>();
+		state->genotype_cache_stats.reserve(range);
 		for (uint32_t vidx = state->cache_start_variant_idx; vidx < state->cache_end_variant_idx; vidx++) {
 			auto *dest = cache + static_cast<uintptr_t>(vidx - state->cache_start_variant_idx) * genovec_word_ct;
 			const uintptr_t *sample_include = nullptr;
@@ -593,6 +744,7 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 			if (cache_err != plink2::kPglRetSuccess) {
 				throw IOException("plink_ld: PgrGet failed while caching variant %u", vidx);
 			}
+			state->genotype_cache_stats.push_back(ComputeGenovecStats(dest, bind_data.effective_sample_ct));
 		}
 		state->genotype_cache_ready = true;
 	}
@@ -701,6 +853,22 @@ static const uintptr_t *GetGenovec(PlinkLdLocalState &lstate, const PlinkLdBindD
 	return fallback_buf;
 }
 
+static const GenovecStats *GetCachedGenovecStats(const PlinkLdLocalState &lstate, uint32_t vidx) {
+	if (lstate.genotype_cache_ready && vidx >= lstate.cache_start_variant_idx && vidx < lstate.cache_end_variant_idx) {
+		return &lstate.genotype_cache_stats[vidx - lstate.cache_start_variant_idx];
+	}
+	return nullptr;
+}
+
+static LdResult ComputeLdStatsDispatch(const uintptr_t *genovec_a, const uintptr_t *genovec_b, uint32_t sample_ct,
+                                       const GenovecStats *stats_a, const GenovecStats *stats_b, bool compute_r,
+                                       bool compute_d_prime) {
+	if (stats_a && stats_b && stats_a->no_missing && stats_b->no_missing) {
+		return ComputeLdStatsNoMissing(genovec_a, genovec_b, sample_ct, *stats_a, *stats_b, compute_r, compute_d_prime);
+	}
+	return ComputeLdStats(genovec_a, genovec_b, sample_ct, compute_r, compute_d_prime);
+}
+
 // ---------------------------------------------------------------------------
 // Scan function
 // ---------------------------------------------------------------------------
@@ -720,6 +888,8 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 	auto *genovec_b_buf = lstate.genovec_b_buf.As<uintptr_t>();
 	const uintptr_t *genovec_a = nullptr;
 	const uintptr_t *genovec_b = nullptr;
+	const GenovecStats *stats_a = nullptr;
+	const GenovecStats *stats_b = nullptr;
 
 	idx_t rows_emitted = 0;
 
@@ -734,13 +904,17 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		uint32_t vidx_b = bind_data.pairwise_vidx_b;
 
 		genovec_a = GetGenovec(lstate, bind_data, vidx_a, genovec_a_buf);
+		stats_a = GetCachedGenovecStats(lstate, vidx_a);
 		if (vidx_a == vidx_b) {
 			// Self-LD: use same buffer for both
-			auto result = ComputeLdStats(genovec_a, genovec_a, sample_ct, gstate.need_r, gstate.need_d_prime);
+			auto result = ComputeLdStatsDispatch(genovec_a, genovec_a, sample_ct, stats_a, stats_a, gstate.need_r,
+			                                    gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		} else {
 			genovec_b = GetGenovec(lstate, bind_data, vidx_b, genovec_b_buf);
-			auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_r, gstate.need_d_prime);
+			stats_b = GetCachedGenovecStats(lstate, vidx_b);
+			auto result = ComputeLdStatsDispatch(genovec_a, genovec_b, sample_ct, stats_a, stats_b, gstate.need_r,
+			                                    gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		}
 		CompatSetOutputCardinality(output, 1);
@@ -762,6 +936,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 			uint32_t ai = lstate.anchor_idx;
 			uint32_t j = lstate.next_j;
 			genovec_a = GetGenovec(lstate, bind_data, ai, genovec_a_buf);
+			stats_a = GetCachedGenovecStats(lstate, ai);
 
 			if (!anchor_cached) {
 				anchor_chrom = variants.GetChrom(ai);
@@ -793,7 +968,9 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 				}
 
 				genovec_b = GetGenovec(lstate, bind_data, j, genovec_b_buf);
-				auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct, gstate.need_r, gstate.need_d_prime);
+				stats_b = GetCachedGenovecStats(lstate, j);
+				auto result = ComputeLdStatsDispatch(genovec_a, genovec_b, sample_ct, stats_a, stats_b, gstate.need_r,
+				                                    gstate.need_d_prime);
 
 				if (result.is_valid && result.r2 >= bind_data.r2_threshold) {
 					EmitRow(output, rows_emitted, bind_data, gstate, ai, j, result);
@@ -821,6 +998,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 
 		// Load anchor genotypes
 		genovec_a = GetGenovec(lstate, bind_data, anchor_idx, genovec_a_buf);
+		stats_a = GetCachedGenovecStats(lstate, anchor_idx);
 
 		lstate.anchor_idx = anchor_idx;
 		lstate.next_j = anchor_idx + 1;

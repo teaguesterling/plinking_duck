@@ -11,7 +11,7 @@ plink_ld(path VARCHAR, variant1 := ..., variant2 := ...) -> TABLE
 -- Windowed mode: LD for all variant pairs within a window
 plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
          region := ..., samples := ..., inter_chr := ...,
-         cache_genotypes := false]) -> TABLE
+         cache_genotypes := true]) -> TABLE
 ```
 
 ## Parameters
@@ -28,7 +28,7 @@ plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
 | `inter_chr` | `BOOLEAN` | `false` | Include cross-chromosome pairs (windowed mode) |
-| `cache_genotypes` | `BOOLEAN` | `false` | Cache the active region's packed genotypes per worker when the bounded cache is small enough; avoids repeated `.pgen` reads in dense regional LD scans, but can duplicate memory across many workers. |
+| `cache_genotypes` | `BOOLEAN` | `true` | Cache the active region's packed genotypes per worker when the bounded cache is small enough; enables a faster popcount LD path for no-missing variants and falls back to streaming when the estimated total cache would be too large. |
 
 See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
 
@@ -81,7 +81,7 @@ LD statistics are NULL when:
 
 ### Parallel Scan
 
-Windowed mode supports multi-threaded scanning where each thread claims anchor variants independently. For bounded regional scans, `cache_genotypes := true` caches packed genotypes for the active region in each worker. This avoids rereading the same partner variant for many anchors. D' is only computed when the `D_PRIME` column is projected.
+Windowed mode supports multi-threaded scanning where each thread claims anchor variants independently. For bounded regional scans, `cache_genotypes := true` caches packed genotypes for the active region in each worker and uses a popcount-based no-missing LD kernel when possible. This avoids rereading the same partner variant for many anchors. D' is only computed when the `D_PRIME` column is projected.
 
 ## Examples
 
