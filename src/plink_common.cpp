@@ -501,36 +501,23 @@ VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, c
 	uint32_t data_vidx = 0;
 	uint64_t line_number = 0;
 
-	// Read once, then parse in-place up to the requested sorted interval. This
-	// deliberately avoids materializing all variant strings while also avoiding
-	// per-line FileHandle::ReadLine() overhead on 75M-row whole-genome PVARs.
-	string file_content;
-	file_content.resize(file_size);
-	handle->Read(const_cast<char *>(file_content.data()), file_size);
-	const char *buf = file_content.data();
-	size_t pos = 0;
-	while (pos < file_size) {
-		size_t line_start = pos;
-		size_t line_end = pos;
-		while (line_end < file_size && buf[line_end] != '\n') {
-			line_end++;
-		}
-		size_t content_end = line_end;
-		if (content_end > line_start && buf[content_end - 1] == '\r') {
-			content_end--;
-		}
-		pos = line_end < file_size ? line_end + 1 : line_end;
+	// Stream fixed-size chunks and parse complete lines in-place. This keeps the
+	// native text region loader bounded-memory while avoiding the extreme syscall
+	// overhead of FileHandle::ReadLine() on 75M-row whole-genome PVARs.
+	auto process_line = [&](const char *line_buf, size_t line_len) -> bool {
 		line_number++;
-
-		if (content_end == line_start) {
-			continue;
+		if (line_len > 0 && line_buf[line_len - 1] == '\r') {
+			line_len--;
+		}
+		if (line_len == 0) {
+			return true;
 		}
 
 		if (!layout_ready) {
-			if (content_end - line_start >= 2 && buf[line_start] == '#' && buf[line_start + 1] == '#') {
-				continue;
+			if (line_len >= 2 && line_buf[0] == '#' && line_buf[1] == '#') {
+				return true;
 			}
-			string header_line(buf + line_start, content_end - line_start);
+			string header_line(line_buf, line_len);
 			ParseVariantHeaderLine(header_line, idx, chrom_field, pos_field, id_field, ref_field, alt_field);
 			if (chrom_field == DConstants::INVALID_INDEX || pos_field == DConstants::INVALID_INDEX ||
 			    id_field == DConstants::INVALID_INDEX || ref_field == DConstants::INVALID_INDEX ||
@@ -541,20 +528,19 @@ VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, c
 			}
 			layout_ready = true;
 			if (!idx.is_bim) {
-				continue; // header consumed; next line is data
+				return true; // header consumed; next line is data
 			}
 			// .bim has no header; fall through and parse this line as data.
 		}
 
-		if (!idx.is_bim && buf[line_start] == '#') {
-			continue;
+		if (!idx.is_bim && line_buf[0] == '#') {
+			return true;
 		}
 
 		string row_chrom, row_id, row_ref, row_alt;
 		int32_t row_pos = 0;
-		ParseVariantDataLine(buf + line_start, content_end - line_start, idx.is_bim, chrom_field, pos_field, id_field,
-		                     ref_field, alt_field, path, func_name, line_number, row_chrom, row_pos, row_id, row_ref,
-		                     row_alt);
+		ParseVariantDataLine(line_buf, line_len, idx.is_bim, chrom_field, pos_field, id_field, ref_field, alt_field,
+		                     path, func_name, line_number, row_chrom, row_pos, row_id, row_ref, row_alt);
 
 		bool chrom_match = (row_chrom == chrom);
 		if (chrom_match) {
@@ -569,12 +555,51 @@ VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, c
 				idx.refs.emplace_back(std::move(row_ref));
 				idx.alts.emplace_back(std::move(row_alt));
 			} else if (row_pos > pos_end) {
-				break; // sorted PVAR/BIM: interval is exhausted
+				return false; // sorted PVAR/BIM: interval is exhausted
 			}
 		} else if (saw_target_chrom) {
-			break; // sorted by chromosome; target chromosome is exhausted
+			return false; // sorted by chromosome; target chromosome is exhausted
 		}
 		data_vidx++;
+		return true;
+	};
+
+	static constexpr size_t READ_CHUNK_SIZE = 8ULL * 1024ULL * 1024ULL;
+	vector<char> read_buffer(READ_CHUNK_SIZE);
+	string carry;
+	string line_buffer;
+	line_buffer.reserve(READ_CHUNK_SIZE + 4096);
+	uint64_t remaining = static_cast<uint64_t>(file_size);
+	bool continue_scan = true;
+	while (remaining > 0 && continue_scan) {
+		size_t read_size = static_cast<size_t>(std::min<uint64_t>(remaining, READ_CHUNK_SIZE));
+		handle->Read(read_buffer.data(), read_size);
+		remaining -= read_size;
+
+		line_buffer.clear();
+		if (!carry.empty()) {
+			line_buffer.append(carry);
+		}
+		line_buffer.append(read_buffer.data(), read_size);
+
+		size_t line_start = 0;
+		while (line_start < line_buffer.size()) {
+			auto newline = line_buffer.find('\n', line_start);
+			if (newline == string::npos) {
+				break;
+			}
+			if (!process_line(line_buffer.data() + line_start, newline - line_start)) {
+				continue_scan = false;
+				break;
+			}
+			line_start = newline + 1;
+		}
+		if (continue_scan) {
+			carry.assign(line_buffer.data() + line_start, line_buffer.size() - line_start);
+		}
+	}
+	if (continue_scan && !carry.empty()) {
+		process_line(carry.data(), carry.size());
 	}
 
 	if (!layout_ready) {
