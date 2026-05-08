@@ -84,7 +84,7 @@ The function assumes variants are sorted by (CHROM, POS) as required by the PLIN
 
 Both `start` and `end` must be specified (chromosome-only filtering is not supported in this parameter; use a `WHERE` clause instead).
 
-**Used by:** `read_pfile`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`, `plink_glm`
+**Used by:** `read_pfile`, `read_plink_vcf`, `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld`, `plink_score`, `plink_glm`
 
 !!! note
     `read_pgen` and `read_pvar` do not have a `region` parameter. Use a SQL `WHERE` clause to filter their output by position.

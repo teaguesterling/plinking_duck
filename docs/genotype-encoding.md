@@ -19,7 +19,7 @@ Genotypes appear in two contexts depending on the function and mode:
 
 ### List Context
 
-In `read_pgen` and `read_pfile` default mode, genotypes are returned as an `ARRAY(TINYINT, N)` column named `genotypes`, where N is the sample count. Each array element corresponds to one sample, in the same order as the `.psam` file.
+In `read_pgen`, `read_pfile` default mode, and `read_plink_vcf`, genotypes are returned as an `ARRAY(TINYINT, N)` column named `genotypes`, where N is the sample count. Each array element corresponds to one sample, in the same order as the `.psam` file (or VCF header for `read_plink_vcf`).
 
 ```sql
 -- Each row has a list of genotypes, one per sample
@@ -56,7 +56,7 @@ FROM read_pfile('data', genotypes := 'columns');
 
 ### Phased Haplotype Output
 
-With `phased := true`, genotype elements change from scalar `TINYINT` to `ARRAY(TINYINT, 2)` representing `[allele1, allele2]` haplotype pairs:
+With `phased := true` (supported by `read_pfile` and `read_plink_vcf`), genotype elements change from scalar `TINYINT` to `ARRAY(TINYINT, 2)` representing `[allele1, allele2]` haplotype pairs:
 
 | Value | Meaning | VCF Equivalent |
 |-------|---------|----------------|

@@ -37,7 +37,7 @@ WHERE P_HWE < 1e-6;
 
 ## Functions
 
-PlinkingDuck provides **4 file readers** and **6 analysis functions**:
+PlinkingDuck provides **5 file readers** and **6 analysis functions**:
 
 ### File Readers
 
@@ -47,6 +47,7 @@ PlinkingDuck provides **4 file readers** and **6 analysis functions**:
 | [`read_psam(path)`](functions/read_psam.md) | Read `.psam` or `.fam` sample metadata |
 | [`read_pgen(path)`](functions/read_pgen.md) | Read `.pgen` binary genotype files |
 | [`read_pfile(prefix)`](functions/read_pfile.md) | Read a complete PLINK fileset with orient modes |
+| [`read_plink_vcf(path)`](functions/read_plink_vcf.md) | Fast biallelic genotype extraction from VCF |
 
 ### Analysis Functions
 
@@ -69,4 +70,5 @@ PlinkingDuck provides **4 file readers** and **6 analysis functions**:
 - **Filter pushdown** -- pre-filter variants by allele frequency, count, or genotype value
 - **GWAS regression** -- per-variant association testing with covariates and Firth correction
 - **Legacy format support** -- read PLINK 1 `.bim` and `.fam` files
+- **VCF import** -- fast biallelic genotype extraction from VCF files via plink-ng
 - **VFS integration** -- works with DuckDB's filesystem abstraction

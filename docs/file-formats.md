@@ -81,6 +81,18 @@ Special missing value conventions:
 - `0` in SEX means unknown sex (mapped to NULL)
 - `-9` in PHENO1 is left as the string `"-9"` (not mapped to NULL, since this is a PLINK-specific convention)
 
+## VCF Files
+
+PlinkingDuck can read biallelic genotypes directly from VCF files (`.vcf` and `.vcf.gz`) using [`read_plink_vcf()`](functions/read_plink_vcf.md). This uses plink-ng's optimized GT parsing, which is faster than htslib when only genotypes are needed.
+
+| Format | Supported | Notes |
+|--------|-----------|-------|
+| `.vcf` | Yes | Plain text VCF |
+| `.vcf.gz` | Yes | bgzf-compressed VCF (transparent decompression via DuckDB VFS) |
+| `.bcf` | No | Use [DuckHTS](https://github.com/teaguesterling/duckhts) `read_bcf()` for BCF |
+
+Multiallelic variants are skipped (a warning reports the count). Only the GT field is parsed — for INFO, QUAL, FILTER, or other FORMAT fields, use DuckHTS.
+
 ## Auto-Detection
 
 PlinkingDuck auto-detects file formats:
