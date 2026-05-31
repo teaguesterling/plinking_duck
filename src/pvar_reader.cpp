@@ -1,4 +1,5 @@
 #include "pvar_reader.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -372,7 +373,7 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 	auto &state = data_p.global_state->Cast<PvarGlobalState>();
 
 	if (state.finished) {
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 
@@ -401,7 +402,7 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		if (row_count == 0) {
 			state.finished = true;
 		}
-		output.SetCardinality(row_count);
+		CompatSetOutputCardinality(output, row_count);
 		return;
 	}
 
@@ -447,7 +448,7 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		state.finished = true;
 	}
 
-	output.SetCardinality(row_count);
+	CompatSetOutputCardinality(output, row_count);
 }
 
 // ---------------------------------------------------------------------------

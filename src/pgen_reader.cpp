@@ -1,4 +1,5 @@
 #include "pgen_reader.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -1032,7 +1033,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------

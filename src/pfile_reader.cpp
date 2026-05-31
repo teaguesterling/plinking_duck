@@ -1,4 +1,5 @@
 #include "pfile_reader.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 #include "plink_profile.hpp"
 #include "pvar_reader.hpp"
@@ -2084,7 +2085,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------
@@ -2387,7 +2388,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------
@@ -2690,7 +2691,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------

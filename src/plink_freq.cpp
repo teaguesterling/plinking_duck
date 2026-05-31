@@ -1,4 +1,5 @@
 #include "plink_freq.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
 #include <atomic>
@@ -549,7 +550,7 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------

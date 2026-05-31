@@ -1,4 +1,5 @@
 #include "plink_ld.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
 #include <atomic>
@@ -565,7 +566,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 	auto &lstate = data_p.local_state->Cast<PlinkLdLocalState>();
 
 	if (!lstate.initialized) {
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 
@@ -578,7 +579,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 	if (gstate.mode == LdMode::PAIRWISE) {
 		// --- Pairwise mode: emit a single pair ---
 		if (gstate.pair_emitted.exchange(true)) {
-			output.SetCardinality(0);
+			CompatSetOutputCardinality(output, 0);
 			return;
 		}
 
@@ -595,7 +596,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 			auto result = ComputeLdStats(genovec_a, genovec_b, sample_ct);
 			EmitRow(output, 0, bind_data, vidx_a, vidx_b, result);
 		}
-		output.SetCardinality(1);
+		CompatSetOutputCardinality(output, 1);
 		return;
 	}
 
@@ -682,7 +683,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 	}
 
 done:
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------
