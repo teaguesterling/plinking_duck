@@ -1725,7 +1725,6 @@ idx_t ApplyMaxThreadsCap(idx_t computed, uint32_t config_max_threads) {
 
 void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t output_sample_ct,
                         const int8_t *genotype_bytes, const int8_t *phased_pairs, bool include_phased) {
-
 	if (include_phased) {
 		if (mode == GenotypeMode::ARRAY) {
 			auto &pair_vec = ArrayVector::GetEntry(vec);

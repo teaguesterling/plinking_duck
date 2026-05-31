@@ -469,7 +469,6 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
-
 			// Compute genotype counts using PgrGetCounts fast-path
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			genocounts[0] = genocounts[1] = genocounts[2] = genocounts[3] = 0;
