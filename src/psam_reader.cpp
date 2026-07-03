@@ -255,14 +255,17 @@ SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
 	auto lines = ReadFileLines(context, path);
 	auto header = ParsePsamHeaderFromLines(lines, path);
 
-	// Find IID and FID column indices
+	// Find IID, FID, and SEX column indices
 	idx_t iid_idx = DConstants::INVALID_INDEX;
 	idx_t fid_idx = DConstants::INVALID_INDEX;
+	idx_t sex_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < header.column_names.size(); i++) {
 		if (header.column_names[i] == "IID") {
 			iid_idx = i;
 		} else if (header.column_names[i] == "FID") {
 			fid_idx = i;
+		} else if (header.column_names[i] == COL_SEX) {
+			sex_idx = i;
 		}
 	}
 
@@ -272,6 +275,7 @@ SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
 
 	SampleInfo info;
 	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
+	bool has_sex = (sex_idx != DConstants::INVALID_INDEX);
 
 	// Data lines start at index 1 for .psam (skip header), 0 for .fam
 	idx_t data_start = (header.format != PsamFormat::FAM) ? 1 : 0;
@@ -294,6 +298,19 @@ SampleInfo LoadSampleInfo(ClientContext &context, const string &path) {
 		info.iids.push_back(fields[iid_idx]);
 		if (has_fid) {
 			info.fids.push_back(fields[fid_idx]);
+		}
+		// SEX: 1 = male, 2 = female, everything else (0/NA/./out-of-range/absent) = 0 unknown.
+		// Used by ploidy-aware chrX/Y/MT statistics in plink_freq / plink_hardy.
+		if (has_sex) {
+			uint8_t sex_code = 0;
+			if (sex_idx < fields.size() && !IsMissingValue(fields[sex_idx])) {
+				if (fields[sex_idx] == "1") {
+					sex_code = 1;
+				} else if (fields[sex_idx] == "2") {
+					sex_code = 2;
+				}
+			}
+			info.sexes.push_back(sex_code);
 		}
 	}
 

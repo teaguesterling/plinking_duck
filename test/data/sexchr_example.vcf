@@ -1,0 +1,12 @@
+##fileformat=VCFv4.3
+##contig=<ID=1>
+##contig=<ID=X>
+##contig=<ID=Y>
+##contig=<ID=MT>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	M1	M2	M3	F1	F2	F3
+1	10000	a1	A	G	.	.	.	GT	0/1	0/0	1/1	0/0	0/1	1/1
+X	1000000	par1	A	G	.	.	.	GT	0/1	0/0	1/1	0/0	0/1	0/0
+X	50000000	x1	A	G	.	.	.	GT	1	0	0	0/1	0/0	1/1
+Y	5000000	y1	C	T	.	.	.	GT	1	1	0	.	.	.
+MT	500	mt1	A	G	.	.	.	GT	1	1	1	1	0	0

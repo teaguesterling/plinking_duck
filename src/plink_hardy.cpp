@@ -1,8 +1,10 @@
 #include "plink_hardy.hpp"
 #include "plink_common.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 
 namespace duckdb {
 
@@ -151,6 +153,11 @@ struct PlinkHardyBindData : public TableFunctionData {
 
 	// Options
 	bool midp = false;
+
+	// Ploidy/sex-aware handling for chrX/Y/MT
+	ParBounds par_bounds;        // pseudo-autosomal boundaries for the genome build
+	vector<uint8_t> aligned_sex; // sex per sample in effective (post-subset) order
+	bool have_sex = false;       // true iff aligned_sex is populated
 };
 
 // ---------------------------------------------------------------------------
@@ -184,6 +191,10 @@ struct PlinkHardyLocalState : public LocalTableFunctionState {
 
 	plink2::PgrSampleSubsetIndex pssi;
 
+	// Raw-hardcall buffers for the ploidy/sex-aware path (chrX/Y/MT only).
+	AlignedBuffer genovec_buf;
+	vector<int8_t> geno_bytes;
+
 	bool initialized = false;
 
 	~PlinkHardyLocalState() {
@@ -207,6 +218,7 @@ static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunc
 	auto &fs = FileSystem::GetFileSystem(context);
 
 	// --- Named parameters ---
+	string build_str = "GRCh38"; // default genome build for PAR boundary detection
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "pvar") {
 			bind_data->pvar_path = kv.second.GetValue<string>();
@@ -214,10 +226,13 @@ static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunc
 			bind_data->psam_path = kv.second.GetValue<string>();
 		} else if (kv.first == "midp") {
 			bind_data->midp = kv.second.GetValue<bool>();
+		} else if (kv.first == "build") {
+			build_str = kv.second.GetValue<string>();
 		} else if (kv.first == "samples" || kv.first == "region") {
 			// Handled after pgenlib init
 		}
 	}
+	bind_data->par_bounds = ResolveParBounds(build_str, "plink_hardy");
 
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
@@ -299,15 +314,31 @@ static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunc
 	// --- Process samples parameter ---
 	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
 
+	// Sorted-unique original indices matching pgenlib PgrGet subset ordering,
+	// used to align the sex array to effective sample order.
+	vector<uint32_t> subset_sorted;
+	bool has_subset = false;
+
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
 		auto indices =
 		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
 		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_hardy");
 
+		subset_sorted = indices;
+		std::sort(subset_sorted.begin(), subset_sorted.end());
+		subset_sorted.erase(std::unique(subset_sorted.begin(), subset_sorted.end()), subset_sorted.end());
+		has_subset = true;
+
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
 		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
+	}
+
+	// --- Build ploidy-aware sex array (aligned to effective sample order) ---
+	if (bind_data->has_sample_info && !bind_data->sample_info.sexes.empty()) {
+		bind_data->aligned_sex = BuildAlignedSex(bind_data->sample_info, has_subset ? &subset_sorted : nullptr);
+		bind_data->have_sex = !bind_data->aligned_sex.empty();
 	}
 
 	// --- Process region parameter ---
@@ -429,6 +460,12 @@ static unique_ptr<LocalTableFunctionState> PlinkHardyInitLocal(ExecutionContext 
 		plink2::PgrClearSampleSubsetIndex(&state->pgr, &state->pssi);
 	}
 
+	// Buffers for decoding raw hardcalls on sex/organelle chromosomes.
+	uintptr_t genovec_word_ct = plink2::NypCtToAlignedWordCt(bind_data.raw_sample_ct);
+	state->genovec_buf.Allocate(genovec_word_ct * sizeof(uintptr_t));
+	std::memset(state->genovec_buf.ptr, 0, genovec_word_ct * sizeof(uintptr_t));
+	state->geno_bytes.resize(bind_data.effective_sample_ct);
+
 	state->initialized = true;
 	return std::move(state);
 }
@@ -469,41 +506,100 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
 
-			// Compute genotype counts using PgrGetCounts fast-path
+			// Classify ploidy. Autosomes and the chrX PAR keep the fast diploid
+			// PgrGetCounts path (no behavior change). chrX non-PAR uses the female
+			// (diploid) stratum for HWE; chrY/chrMT are haploid → HWE undefined.
+			ChromPloidy ploidy = ChromPloidy::AUTOSOMAL;
+			if (gstate.need_genotype_counts) {
+				ploidy = ClassifyChromPloidy(bind_data.variants.GetChrom(vidx), bind_data.variants.GetPos(vidx),
+				                             bind_data.par_bounds);
+			}
+			bool sex_aware = (ploidy != ChromPloidy::AUTOSOMAL);
+
+			// Compute genotype counts
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			genocounts[0] = genocounts[1] = genocounts[2] = genocounts[3] = 0;
+			SexAwareCounts sac;
 
 			if (gstate.need_genotype_counts && lstate.initialized) {
-				plink2::PglErr err = plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,
-				                                          &lstate.pgr, genocounts);
-
-				if (err != plink2::kPglRetSuccess) {
-					throw IOException("plink_hardy: PgrGetCounts failed for variant %u", vidx);
+				if (sex_aware) {
+					plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
+					                                    lstate.genovec_buf.As<uintptr_t>());
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("plink_hardy: PgrGet failed for variant %u", vidx);
+					}
+					plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), sample_ct,
+					                             lstate.geno_bytes.data());
+					const uint8_t *sex_ptr = bind_data.have_sex ? bind_data.aligned_sex.data() : nullptr;
+					sac = ComputeSexAwareCounts(lstate.geno_bytes.data(), sample_ct, ploidy, sex_ptr,
+					                            bind_data.have_sex);
+				} else {
+					plink2::PglErr err = plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct,
+					                                          vidx, &lstate.pgr, genocounts);
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("plink_hardy: PgrGetCounts failed for variant %u", vidx);
+					}
 				}
 			}
 
-			// Compute derived values
-			uint32_t hom_ref = genocounts[0];
-			uint32_t het = genocounts[1];
-			uint32_t hom_alt = genocounts[2];
-			uint32_t obs = hom_ref + het + hom_alt;
+			// Compute derived values. Reported HOM/HET counts are the HWE-test
+			// stratum: females for chrX; haploid carriers for chrY/chrMT (HET=0).
+			int32_t out_hom_ref = 0;
+			int32_t out_het = 0;
+			int32_t out_hom_alt = 0;
+			double o_het = 0.0;
+			double e_het = 0.0;
+			double p_hwe = 1.0;
+			bool stats_are_null;      // NULL O_HET / E_HET / P_HWE
+			bool counts_are_null = false; // NULL HOM_REF_CT / HET_CT / HOM_ALT_CT
 
-			double o_het;
-			double e_het;
-			double p_hwe;
-			bool stats_are_null = (obs == 0);
-
-			if (stats_are_null) {
-				o_het = 0.0;
-				e_het = 0.0;
-				p_hwe = 1.0;
+			if (sex_aware) {
+				if (sac.sex_unavailable) {
+					// chrX/chrY with no sex info: cannot stratify → all NULL.
+					counts_are_null = true;
+					stats_are_null = true;
+				} else if (sac.hwe_defined) {
+					// chrX non-PAR: HWE on the female (diploid) stratum only.
+					out_hom_ref = static_cast<int32_t>(sac.hwe_hom_ref);
+					out_het = static_cast<int32_t>(sac.hwe_het);
+					out_hom_alt = static_cast<int32_t>(sac.hwe_hom_alt);
+					uint32_t fobs = sac.hwe_hom_ref + sac.hwe_het + sac.hwe_hom_alt;
+					if (fobs == 0) {
+						stats_are_null = true;
+					} else {
+						stats_are_null = false;
+						o_het = static_cast<double>(sac.hwe_het) / static_cast<double>(fobs);
+						double p = (2.0 * sac.hwe_hom_ref + sac.hwe_het) / (2.0 * fobs);
+						double q = 1.0 - p;
+						e_het = 2.0 * p * q;
+						p_hwe = HweExactTest(static_cast<int32_t>(sac.hwe_hom_ref), static_cast<int32_t>(sac.hwe_het),
+						                     static_cast<int32_t>(sac.hwe_hom_alt), bind_data.midp);
+					}
+				} else {
+					// chrY / chrMT: haploid → HWE undefined. Report haploid carrier
+					// counts (HET=0) and NULL O_HET / E_HET / P_HWE.
+					out_hom_ref = static_cast<int32_t>(sac.geno_hom_ref);
+					out_het = static_cast<int32_t>(sac.geno_het);
+					out_hom_alt = static_cast<int32_t>(sac.geno_hom_alt);
+					stats_are_null = true;
+				}
 			} else {
-				o_het = static_cast<double>(het) / static_cast<double>(obs);
-				double p = (2.0 * hom_ref + het) / (2.0 * obs);
-				double q = 1.0 - p;
-				e_het = 2.0 * p * q;
-				p_hwe = HweExactTest(static_cast<int32_t>(hom_ref), static_cast<int32_t>(het),
-				                     static_cast<int32_t>(hom_alt), bind_data.midp);
+				uint32_t hom_ref = genocounts[0];
+				uint32_t het = genocounts[1];
+				uint32_t hom_alt = genocounts[2];
+				uint32_t obs = hom_ref + het + hom_alt;
+				out_hom_ref = static_cast<int32_t>(hom_ref);
+				out_het = static_cast<int32_t>(het);
+				out_hom_alt = static_cast<int32_t>(hom_alt);
+				stats_are_null = (obs == 0);
+				if (!stats_are_null) {
+					o_het = static_cast<double>(het) / static_cast<double>(obs);
+					double p = (2.0 * hom_ref + het) / (2.0 * obs);
+					double q = 1.0 - p;
+					e_het = 2.0 * p * q;
+					p_hwe = HweExactTest(static_cast<int32_t>(hom_ref), static_cast<int32_t>(het),
+					                     static_cast<int32_t>(hom_alt), bind_data.midp);
+				}
 			}
 
 			// Fill projected columns
@@ -559,15 +655,27 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					break;
 				}
 				case COL_HOM_REF_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(hom_ref);
+					if (counts_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_ref;
+					}
 					break;
 				}
 				case COL_HET_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(het);
+					if (counts_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_het;
+					}
 					break;
 				}
 				case COL_HOM_ALT_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(hom_alt);
+					if (counts_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_alt;
+					}
 					break;
 				}
 				case COL_O_HET: {
@@ -621,6 +729,7 @@ void RegisterPlinkHardy(ExtensionLoader &loader) {
 	plink_hardy.named_parameters["samples"] = LogicalType::ANY;
 	plink_hardy.named_parameters["region"] = LogicalType::VARCHAR;
 	plink_hardy.named_parameters["midp"] = LogicalType::BOOLEAN;
+	plink_hardy.named_parameters["build"] = LogicalType::VARCHAR;
 
 	loader.RegisterFunction(plink_hardy);
 }
