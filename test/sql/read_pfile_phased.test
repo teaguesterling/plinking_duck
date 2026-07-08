@@ -265,3 +265,55 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ===================================================================
+# Regression: phased output for an ALL-UNPHASED file (uninitialized
+# phase-buffer UB).
+#
+# pfile_example has NO hphase track on any variant. For such variants
+# pgenlib's PgrGetP early-returns WITHOUT writing the phasepresent /
+# phaseinfo buffers (it only sets phasepresent_ct=0). Those buffers come
+# from cachealigned_malloc (not zeroed), so UnpackPhasedGenotypes used to
+# read uninitialized memory when deciding het order — producing a
+# NONDETERMINISTIC, semantically-wrong phase: a het could render as ALT|REF
+# [1, 0] instead of the canonical REF|ALT [0, 1]. In phased output the
+# element order IS the phase claim, so this was silent phase-channel
+# corruption, not benign rendering instability.
+#
+# Fix: zero the phase buffers per-PgrGetP-call. Every unphased het must now
+# render deterministically as REF|ALT [0, 1], hom_ref [0, 0], hom_alt
+# [1, 1], missing NULL. Values below are exhaustive and deterministic.
+# pfile_example unphased dosages: rs1=[0,1,2,.] rs2=[1,1,0,2]
+# rs3=[2,.,1,0] rs4=[0,0,1,2].
+
+# Variant orient (main scan path)
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', phased := true) ORDER BY ID;
+----
+rs1	[[0, 0], [0, 1], [1, 1], NULL]
+rs2	[[0, 1], [0, 1], [0, 0], [1, 1]]
+rs3	[[1, 1], NULL, [0, 1], [0, 0]]
+rs4	[[0, 0], [0, 0], [0, 1], [1, 1]]
+
+# Sample orient (exercises the sample-oriented pre-read decode path)
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/pfile_example', phased := true, orient := 'sample') ORDER BY IID;
+----
+SAMPLE1	[[0, 0], [0, 1], [1, 1], [0, 0]]
+SAMPLE2	[[0, 1], [0, 1], NULL, [0, 0]]
+SAMPLE3	[[1, 1], [0, 0], [0, 1], [0, 1]]
+SAMPLE4	[NULL, [1, 1], [0, 0], [1, 1]]
+
+# Genotype orient: no het may render as ALT|REF [1, 0]
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', phased := true, orient := 'genotype')
+    WHERE genotype = [1, 0]::TINYINT[2];
+----
+0
+
+# ...and every het that exists is present as REF|ALT [0, 1]
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', phased := true, orient := 'genotype')
+    WHERE genotype = [0, 1]::TINYINT[2];
+----
+5
