@@ -1949,7 +1949,6 @@ SexAwareCounts ComputeSexAwareCounts(const int8_t *geno_bytes, uint32_t sample_c
 
 void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t output_sample_ct,
                         const int8_t *genotype_bytes, const int8_t *phased_pairs, bool include_phased) {
-
 	if (include_phased) {
 		if (mode == GenotypeMode::ARRAY) {
 			auto &pair_vec = ArrayVector::GetEntry(vec);

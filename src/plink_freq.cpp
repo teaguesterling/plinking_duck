@@ -57,9 +57,9 @@ struct PlinkFreqBindData : public TableFunctionData {
 	bool file_has_dosage = false; // true if pgen file contains dosage data
 
 	// Ploidy/sex-aware handling for chrX/Y/MT
-	ParBounds par_bounds;         // pseudo-autosomal boundaries for the genome build
-	vector<uint8_t> aligned_sex;  // sex per sample in effective (post-subset) order
-	bool have_sex = false;        // true iff aligned_sex is populated
+	ParBounds par_bounds;        // pseudo-autosomal boundaries for the genome build
+	vector<uint8_t> aligned_sex; // sex per sample in effective (post-subset) order
+	bool have_sex = false;       // true iff aligned_sex is populated
 
 	// Dynamic column index for IMP_R2 (depends on whether counts is enabled)
 	idx_t imp_r2_col_idx = 0;
@@ -432,7 +432,6 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
-
 			// Classify ploidy from the chromosome (and X position vs PAR). Autosomes
 			// and the PAR keep the fast diploid PgrGetCounts path (no behavior change);
 			// chrX non-PAR / chrY / chrMT take the ploidy/sex-aware hardcall path.
@@ -460,8 +459,8 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), sample_ct,
 					                             lstate.geno_bytes.data());
 					const uint8_t *sex_ptr = bind_data.have_sex ? bind_data.aligned_sex.data() : nullptr;
-					sac = ComputeSexAwareCounts(lstate.geno_bytes.data(), sample_ct, ploidy, sex_ptr,
-					                            bind_data.have_sex);
+					sac =
+					    ComputeSexAwareCounts(lstate.geno_bytes.data(), sample_ct, ploidy, sex_ptr, bind_data.have_sex);
 				} else if (bind_data.include_dosage) {
 					plink2::PglErr err =
 					    plink2::PgrGetDCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,

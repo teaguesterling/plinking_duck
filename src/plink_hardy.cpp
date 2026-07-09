@@ -505,7 +505,6 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
-
 			// Classify ploidy. Autosomes and the chrX PAR keep the fast diploid
 			// PgrGetCounts path (no behavior change). chrX non-PAR uses the female
 			// (diploid) stratum for HWE; chrY/chrMT are haploid → HWE undefined.
@@ -531,8 +530,8 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), sample_ct,
 					                             lstate.geno_bytes.data());
 					const uint8_t *sex_ptr = bind_data.have_sex ? bind_data.aligned_sex.data() : nullptr;
-					sac = ComputeSexAwareCounts(lstate.geno_bytes.data(), sample_ct, ploidy, sex_ptr,
-					                            bind_data.have_sex);
+					sac =
+					    ComputeSexAwareCounts(lstate.geno_bytes.data(), sample_ct, ploidy, sex_ptr, bind_data.have_sex);
 				} else {
 					plink2::PglErr err = plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct,
 					                                          vidx, &lstate.pgr, genocounts);
@@ -550,7 +549,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 			double o_het = 0.0;
 			double e_het = 0.0;
 			double p_hwe = 1.0;
-			bool stats_are_null;      // NULL O_HET / E_HET / P_HWE
+			bool stats_are_null;          // NULL O_HET / E_HET / P_HWE
 			bool counts_are_null = false; // NULL HOM_REF_CT / HET_CT / HOM_ALT_CT
 
 			if (sex_aware) {

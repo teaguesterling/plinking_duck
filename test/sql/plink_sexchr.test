@@ -1,6 +1,7 @@
 # name: test/sql/plink_sexchr.test
 # description: Ploidy- and sex-aware MAF/HWE on chrX (PAR + non-PAR), chrY, chrMT
 # group: [sql]
+
 #
 # Fixture: test/data/sexchr_example.{pgen,pvar,psam} (see generate_sexchr_test_data.sh).
 # Cohort: males M1,M2,M3 (SEX=1); females F1,F2,F3 (SEX=2).
