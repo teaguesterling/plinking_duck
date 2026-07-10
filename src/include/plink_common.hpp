@@ -479,6 +479,80 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
                                           uint32_t raw_variant_ct, const string &func_name);
 
 // ---------------------------------------------------------------------------
+// Ploidy- and sex-aware statistics for sex/organelle chromosomes (chrX/Y/MT)
+// ---------------------------------------------------------------------------
+
+//! Ploidy class of a variant, determined by chromosome (and X position vs PAR).
+enum class ChromPloidy : uint8_t {
+	AUTOSOMAL, //!< Diploid for all samples (autosomes AND the chrX pseudo-autosomal region)
+	CHR_X,     //!< chrX non-PAR: females diploid, males haploid, unknown-sex excluded
+	CHR_Y,     //!< chrY: males haploid; females and unknown-sex excluded
+	CHR_MT     //!< mitochondrial: haploid for everyone (sex-independent)
+};
+
+//! Pseudo-autosomal region boundaries for a genome build (1-based, inclusive).
+//! chrX positions in [1, par1_end] (PAR1) or [par2_start, par2_end] (PAR2) are
+//! diploid in both sexes and thus classified AUTOSOMAL.
+struct ParBounds {
+	int32_t par1_end = 0;
+	int32_t par2_start = 0;
+	int32_t par2_end = 0;
+	bool active = false; //!< false → no coordinate-based PAR detection
+};
+
+//! Resolve a genome-build string to PAR boundaries. Recognizes GRCh38/hg38/b38,
+//! GRCh37/hg19/b37, and 'none'/'' (disables coordinate PAR detection so PAR is
+//! only recognized via explicit chromosome codes PAR1/PAR2/XY/25). Throws on an
+//! unrecognized non-empty value.
+ParBounds ResolveParBounds(const string &build, const string &func_name);
+
+//! Classify a variant's ploidy from its chromosome label and position.
+//! Chromosome matching is case-insensitive and ignores a leading "chr".
+//! Explicit PAR codes (PAR1/PAR2/XY/25) → AUTOSOMAL. For X/23, positions within
+//! `par` boundaries → AUTOSOMAL, otherwise CHR_X.
+ChromPloidy ClassifyChromPloidy(const string &chrom, int32_t pos, const ParBounds &par);
+
+//! Aggregated ploidy/sex-aware counts for one variant.
+struct SexAwareCounts {
+	//! Allele-based tallies for MAF/ALT_FREQ (haploid samples contribute 1 allele).
+	uint32_t alt_allele_ct = 0;
+	uint32_t obs_allele_ct = 0; //!< non-missing allele count (denominator)
+
+	//! Diploid genotype counts of the HWE stratum: females for CHR_X. All zero and
+	//! hwe_defined=false for CHR_Y/CHR_MT (HWE undefined on haploid data).
+	uint32_t hwe_hom_ref = 0;
+	uint32_t hwe_het = 0;
+	uint32_t hwe_hom_alt = 0;
+	bool hwe_defined = false;
+
+	//! Genotype-distribution counts over included samples (haploid samples counted
+	//! as homozygous). Feeds plink_freq's optional count columns.
+	uint32_t geno_hom_ref = 0;
+	uint32_t geno_het = 0;
+	uint32_t geno_hom_alt = 0;
+	uint32_t geno_missing = 0;
+
+	//! True when the chromosome needs sex to stratify (CHR_X/CHR_Y) but no sex
+	//! information was available → all derived stats should be emitted as NULL.
+	bool sex_unavailable = false;
+};
+
+//! Compute ploidy/sex-aware counts from decoded hardcall bytes.
+//! `geno_bytes[i]` ∈ {0,1,2} (ALT dosage) or -9 (missing), in effective-sample
+//! order. `sex[i]` ∈ {0,1,2} aligned to the same order. `have_sex` indicates
+//! whether `sex` is populated. On haploid strata a heterozygous hardcall
+//! (value 1) is treated as missing (plink2 convention). Never called for
+//! AUTOSOMAL — callers keep the fast PgrGetCounts path there.
+SexAwareCounts ComputeSexAwareCounts(const int8_t *geno_bytes, uint32_t sample_ct, ChromPloidy ploidy,
+                                     const uint8_t *sex, bool have_sex);
+
+//! Build a sex array aligned to effective (post-subset) sample order.
+//! Returns empty if the source has no sex data. `subset_sorted` lists original
+//! sample indices in ascending order when a sample subset is active (matching
+//! pgenlib's PgrGet ordering); pass nullptr for the full cohort.
+vector<uint8_t> BuildAlignedSex(const SampleInfo &sample_info, const vector<uint32_t> *subset_sorted);
+
+// ---------------------------------------------------------------------------
 // Max threads config helper
 // ---------------------------------------------------------------------------
 

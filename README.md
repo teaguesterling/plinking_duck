@@ -20,8 +20,8 @@ PlinkingDuck provides **five file readers** and **six analysis functions**:
 | [`read_pgen`](#read_pgenpath--pvar-psam-samples) | Read `.pgen` binary genotypes |
 | [`read_pfile`](#read_pfileprefix--pgen-pvar-psam-orient-samples-variants-region) | Unified reader with orient modes, filtering |
 | [`read_plink_vcf`](#read_plink_vcfpath--genotypes-phased-region-min_gq-min_dp-max_dp) | Fast biallelic VCF genotype extraction |
-| [`plink_freq`](#plink_freqpath--pvar-psam-samples-region-counts) | Per-variant allele frequencies |
-| [`plink_hardy`](#plink_hardypath--pvar-psam-samples-region-midp) | Hardy-Weinberg equilibrium test |
+| [`plink_freq`](#plink_freqpath--pvar-psam-samples-region-counts-build) | Per-variant allele frequencies |
+| [`plink_hardy`](#plink_hardypath--pvar-psam-samples-region-midp-build) | Hardy-Weinberg equilibrium test |
 | [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-mode) | Per-variant or per-sample missingness |
 | [`plink_ld`](#plink_ldpath--variant1-variant2-window_kb-r2_threshold-inter_chr) | Pairwise linkage disequilibrium |
 | [`plink_score`](#plink_scorepath--weights-no_mean_imputation) | Polygenic risk scoring |
@@ -209,7 +209,7 @@ For full VCF/BCF parsing (multiallelic, INFO fields), use [DuckHTS](https://gith
 
 These functions use pgenlib's fast counting paths (no genotype decompression), making them efficient even on large datasets. All support sample subsetting, region filtering, and parallel execution.
 
-### `plink_freq(path [, pvar, psam, samples, region, counts])`
+### `plink_freq(path [, pvar, psam, samples, region, counts, build])`
 
 Compute per-variant allele frequencies.
 
@@ -228,7 +228,13 @@ WHERE ALT_FREQ > 0.01 AND ALT_FREQ < 0.99;
 **Output columns:** CHROM, POS, ID, REF, ALT, ALT_FREQ, OBS_CT.
 With `counts := true`: also HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT.
 
-### `plink_hardy(path [, pvar, psam, samples, region, midp])`
+**Sex chromosomes / ploidy.** Allele frequency is ploidy- and sex-aware (see
+[Sex-chromosome handling](#sex-chromosome-handling)): haploid calls contribute
+one allele, so `OBS_CT` is an **allele count** (not `2 × samples`) and males on
+chrX non-PAR / chrY count as one allele. On the count columns, haploid samples
+are tallied as homozygous.
+
+### `plink_hardy(path [, pvar, psam, samples, region, midp, build])`
 
 Compute per-variant Hardy-Weinberg equilibrium exact test p-values.
 
@@ -246,6 +252,38 @@ WHERE P_HWE > 1e-6;
 
 **Output columns:** CHROM, POS, ID, REF, ALT, A1, HOM_REF_CT, HET_CT,
 HOM_ALT_CT, O_HET, E_HET, P_HWE.
+
+**Sex chromosomes.** On chrX non-PAR, HWE is computed on the **female (diploid)
+stratum only** and the reported HOM/HET counts are the female counts (matching
+`plink2 --hardy`'s `.hardy.x` female columns). On chrY and chrMT, HWE is
+**undefined** — `P_HWE`, `O_HET`, and `E_HET` are `NULL` (not a spurious 0 or
+p-value), while the count columns report haploid carriers with `HET_CT = 0`. See
+[Sex-chromosome handling](#sex-chromosome-handling).
+
+#### Sex-chromosome handling
+
+`plink_freq` and `plink_hardy` classify each variant by chromosome and treat
+ploidy accordingly. This requires a `.psam`/`.fam` **SEX** column (1 = male,
+2 = female); samples with unknown/missing sex are excluded from the
+sex-dependent stratum.
+
+| region | ploidy | MAF | HWE |
+|---|---|---|---|
+| autosomes | diploid | all samples | all samples |
+| chrX pseudo-autosomal (PAR) | diploid | all samples | all samples |
+| chrX non-PAR | males haploid, females diploid | 1 allele/male, 2/female | females only |
+| chrY | males haploid, females excluded | 1 allele/male | undefined → NULL |
+| chrMT | haploid (all) | 1 allele/sample | undefined → NULL |
+
+Chromosomes are recognized case-insensitively with or without a `chr` prefix
+(`X`/`23`, `Y`/`24`, `MT`/`M`/`26`). The pseudo-autosomal region is recognized
+either by an explicit chromosome code (`PAR1`/`PAR2`/`XY`/`25`, as emitted by
+`plink2 --split-par`) or by chrX coordinates for the genome build. The **`build`**
+parameter selects the PAR coordinates: `'GRCh38'`/`'hg38'` (default),
+`'GRCh37'`/`'hg19'`, or `'none'` to rely solely on explicit PAR chromosome codes.
+If no sex information is available, sex-dependent stats on chrX/chrY are emitted
+as `NULL` rather than silently assuming diploid; chrMT (sex-independent) is
+unaffected. A heterozygous hardcall on a haploid stratum is treated as missing.
 
 ### `plink_missing(path [, pvar, psam, samples, region, mode])`
 

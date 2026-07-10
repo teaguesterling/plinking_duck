@@ -26,8 +26,14 @@ namespace duckdb {
 //! strings (for column names, VARCHAR lookups, etc.) must ensure iids is
 //! populated before access.
 struct SampleInfo {
-	vector<string> iids;                     //!< Individual IDs in file order (possibly lazy)
-	vector<string> fids;                     //!< Family IDs (empty if no FID column)
+	vector<string> iids; //!< Individual IDs in file order (possibly lazy)
+	vector<string> fids; //!< Family IDs (empty if no FID column)
+	//! Biological sex per sample in file order, for ploidy-aware sex-chromosome
+	//! statistics (chrX/Y/MT). Encoding: 1 = male, 2 = female, 0 = unknown/missing
+	//! (PLINK SEX conventions; 0/NA/. → 0). Empty when the source has no SEX column
+	//! or the count-only fast path was taken — callers needing sex must trigger a
+	//! full load and check `!sexes.empty()`.
+	vector<uint8_t> sexes;
 	idx_t sample_ct;                         //!< Total sample count (always populated)
 	unordered_map<string, idx_t> iid_to_idx; //!< IID → file-order index (lazy; call EnsureIidMap)
 

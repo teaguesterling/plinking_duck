@@ -1,0 +1,10 @@
+##contig=<ID=1>
+##contig=<ID=X>
+##contig=<ID=Y>
+##contig=<ID=MT>
+#CHROM	POS	ID	REF	ALT
+1	10000	a1	A	G
+PAR1	1000000	par1	A	G
+X	50000000	x1	A	G
+Y	5000000	y1	C	T
+MT	500	mt1	A	G

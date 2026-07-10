@@ -18,7 +18,6 @@ namespace duckdb {
 //! become NAN. Throws on column not found or non-numeric values.
 static vector<double> LoadPsamColumnAsDouble(const vector<string> &lines, const PsamHeaderInfo &header,
                                              const string &psam_path, const string &column_name) {
-
 	// Find the column index
 	idx_t col_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < header.column_names.size(); i++) {
@@ -1303,7 +1302,6 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
-
 			// Compute regression if needed
 			GlmResult lr;
 			if (gstate.need_regression && lstate.initialized) {

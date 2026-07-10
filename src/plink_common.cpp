@@ -870,12 +870,15 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 	auto &col_names = result.names;
 	idx_t iid_col = DConstants::INVALID_INDEX;
 	idx_t fid_col = DConstants::INVALID_INDEX;
+	idx_t sex_col = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < col_names.size(); i++) {
 		auto lower = StringUtil::Lower(col_names[i]);
 		if (lower == "iid") {
 			iid_col = i;
 		} else if (lower == "fid") {
 			fid_col = i;
+		} else if (lower == "sex") {
+			sex_col = i;
 		}
 	}
 	if (iid_col == DConstants::INVALID_INDEX) {
@@ -883,12 +886,36 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 		                            StringUtil::Join(col_names, ", "));
 	}
 	bool has_fid_col = (fid_col != DConstants::INVALID_INDEX);
+	bool has_sex_col = (sex_col != DConstants::INVALID_INDEX);
 
 	idx_t total_rows = 0;
 	unique_ptr<DataChunk> chunk;
 	while ((chunk = result.Fetch()) != nullptr && chunk->size() > 0) {
 		idx_t n = chunk->size();
 		total_rows += n;
+
+		// SEX for ploidy-aware chrX/Y/MT stats. The column may be INTEGER (PLINK
+		// convention) or VARCHAR; coerce per row via Value. 1=male, 2=female, else 0.
+		// Only paid when a sex column exists.
+		if (has_sex_col) {
+			for (idx_t i = 0; i < n; i++) {
+				Value v = chunk->GetValue(sex_col, i);
+				uint8_t sex_code = 0;
+				if (!v.IsNull()) {
+					try {
+						int64_t s = v.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+						if (s == 1) {
+							sex_code = 1;
+						} else if (s == 2) {
+							sex_code = 2;
+						}
+					} catch (...) {
+						sex_code = 0;
+					}
+				}
+				info.sexes.push_back(sex_code);
+			}
+		}
 
 		if (load_iids) {
 			auto &vec = chunk->data[iid_col];
@@ -1720,12 +1747,208 @@ idx_t ApplyMaxThreadsCap(idx_t computed, uint32_t config_max_threads) {
 }
 
 // ---------------------------------------------------------------------------
+// Ploidy- and sex-aware statistics (chrX/Y/MT)
+// ---------------------------------------------------------------------------
+
+//! Normalize a chromosome label for comparison: lowercase, strip a leading "chr".
+static string NormalizeChrom(const string &chrom) {
+	string lower = StringUtil::Lower(chrom);
+	if (lower.rfind("chr", 0) == 0) {
+		lower = lower.substr(3);
+	}
+	return lower;
+}
+
+ParBounds ResolveParBounds(const string &build, const string &func_name) {
+	string b = StringUtil::Lower(build);
+	// Strip common separators/spaces so "GRCh38", "grch-38", "b38" all match.
+	string norm;
+	for (char c : b) {
+		if (c != '-' && c != '_' && c != ' ' && c != '.') {
+			norm.push_back(c);
+		}
+	}
+	ParBounds pb;
+	if (norm.empty() || norm == "none") {
+		pb.active = false; // rely solely on explicit PAR chromosome codes
+		return pb;
+	}
+	if (norm == "grch38" || norm == "hg38" || norm == "b38" || norm == "38") {
+		// GRCh38 PAR (1-based, inclusive): PAR1 X:10001-2781479, PAR2 X:155701383-156030895
+		pb.par1_end = 2781479;
+		pb.par2_start = 155701383;
+		pb.par2_end = 156030895;
+		pb.active = true;
+		return pb;
+	}
+	if (norm == "grch37" || norm == "hg19" || norm == "b37" || norm == "37") {
+		// GRCh37 PAR (1-based, inclusive): PAR1 X:60001-2699520, PAR2 X:154931044-155260560
+		pb.par1_end = 2699520;
+		pb.par2_start = 154931044;
+		pb.par2_end = 155260560;
+		pb.active = true;
+		return pb;
+	}
+	throw InvalidInputException("%s: unrecognized build '%s' (expected 'GRCh38'/'hg38', 'GRCh37'/'hg19', or 'none')",
+	                            func_name, build);
+}
+
+ChromPloidy ClassifyChromPloidy(const string &chrom, int32_t pos, const ParBounds &par) {
+	string c = NormalizeChrom(chrom);
+	// Explicit pseudo-autosomal chromosome codes → diploid in both sexes.
+	if (c == "par1" || c == "par2" || c == "xy" || c == "25") {
+		return ChromPloidy::AUTOSOMAL;
+	}
+	if (c == "y" || c == "24") {
+		return ChromPloidy::CHR_Y;
+	}
+	if (c == "mt" || c == "m" || c == "26" || c == "chrm") {
+		return ChromPloidy::CHR_MT;
+	}
+	if (c == "x" || c == "23") {
+		if (par.active && ((pos > 0 && pos <= par.par1_end) || (pos >= par.par2_start && pos <= par.par2_end))) {
+			return ChromPloidy::AUTOSOMAL; // pseudo-autosomal region
+		}
+		return ChromPloidy::CHR_X;
+	}
+	return ChromPloidy::AUTOSOMAL;
+}
+
+vector<uint8_t> BuildAlignedSex(const SampleInfo &sample_info, const vector<uint32_t> *subset_sorted) {
+	if (sample_info.sexes.empty()) {
+		return {};
+	}
+	if (subset_sorted == nullptr) {
+		return sample_info.sexes; // full cohort, file order == effective order
+	}
+	vector<uint8_t> aligned;
+	aligned.reserve(subset_sorted->size());
+	for (uint32_t idx : *subset_sorted) {
+		aligned.push_back(idx < sample_info.sexes.size() ? sample_info.sexes[idx] : uint8_t {0});
+	}
+	return aligned;
+}
+
+SexAwareCounts ComputeSexAwareCounts(const int8_t *geno_bytes, uint32_t sample_ct, ChromPloidy ploidy,
+                                     const uint8_t *sex, bool have_sex) {
+	SexAwareCounts r;
+
+	// chrX/chrY require sex to stratify ploidy; without it we cannot produce a
+	// correct number, so signal NULL rather than silently assuming diploid.
+	if ((ploidy == ChromPloidy::CHR_X || ploidy == ChromPloidy::CHR_Y) && !have_sex) {
+		r.sex_unavailable = true;
+		return r;
+	}
+
+	for (uint32_t i = 0; i < sample_ct; i++) {
+		int8_t g = geno_bytes[i];
+		uint8_t s = have_sex ? sex[i] : uint8_t {0};
+
+		switch (ploidy) {
+		case ChromPloidy::CHR_MT: {
+			// Haploid for everyone; a heterozygous hardcall is invalid → missing.
+			if (g == 0) {
+				r.obs_allele_ct += 1;
+				r.geno_hom_ref += 1;
+			} else if (g == 2) {
+				r.obs_allele_ct += 1;
+				r.alt_allele_ct += 1;
+				r.geno_hom_alt += 1;
+			} else {
+				r.geno_missing += 1; // g == -9 (missing) or g == 1 (invalid het)
+			}
+			break;
+		}
+		case ChromPloidy::CHR_Y: {
+			// Males haploid; females and unknown-sex excluded (no Y).
+			if (s != 1) {
+				r.geno_missing += 1;
+				break;
+			}
+			if (g == 0) {
+				r.obs_allele_ct += 1;
+				r.geno_hom_ref += 1;
+			} else if (g == 2) {
+				r.obs_allele_ct += 1;
+				r.alt_allele_ct += 1;
+				r.geno_hom_alt += 1;
+			} else {
+				r.geno_missing += 1; // missing or invalid het on haploid male
+			}
+			break;
+		}
+		case ChromPloidy::CHR_X: {
+			if (s == 2) {
+				// Female: diploid. HWE is defined on this stratum.
+				if (g == -9) {
+					r.geno_missing += 1;
+					break;
+				}
+				r.obs_allele_ct += 2;
+				r.alt_allele_ct += static_cast<uint32_t>(g);
+				if (g == 0) {
+					r.hwe_hom_ref += 1;
+					r.geno_hom_ref += 1;
+				} else if (g == 1) {
+					r.hwe_het += 1;
+					r.geno_het += 1;
+				} else { // g == 2
+					r.hwe_hom_alt += 1;
+					r.geno_hom_alt += 1;
+				}
+			} else if (s == 1) {
+				// Male: haploid. Contributes to allele/genotype tallies but NOT to
+				// the female-only HWE stratum. Invalid het → missing.
+				if (g == 0) {
+					r.obs_allele_ct += 1;
+					r.geno_hom_ref += 1;
+				} else if (g == 2) {
+					r.obs_allele_ct += 1;
+					r.alt_allele_ct += 1;
+					r.geno_hom_alt += 1;
+				} else {
+					r.geno_missing += 1;
+				}
+			} else {
+				// Unknown sex: cannot determine ploidy → exclude from stratum.
+				r.geno_missing += 1;
+			}
+			break;
+		}
+		case ChromPloidy::AUTOSOMAL:
+		default:
+			// Not expected here (callers use the fast diploid path); treat diploid.
+			if (g == -9) {
+				r.geno_missing += 1;
+			} else {
+				r.obs_allele_ct += 2;
+				r.alt_allele_ct += static_cast<uint32_t>(g);
+				if (g == 0) {
+					r.hwe_hom_ref += 1;
+					r.geno_hom_ref += 1;
+				} else if (g == 1) {
+					r.hwe_het += 1;
+					r.geno_het += 1;
+				} else {
+					r.hwe_hom_alt += 1;
+					r.geno_hom_alt += 1;
+				}
+			}
+			break;
+		}
+	}
+
+	// HWE is only defined on the diploid stratum of chrX non-PAR (females).
+	r.hwe_defined = (ploidy == ChromPloidy::CHR_X || ploidy == ChromPloidy::AUTOSOMAL);
+	return r;
+}
+
+// ---------------------------------------------------------------------------
 // Shared genotype output vector filling
 // ---------------------------------------------------------------------------
 
 void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t output_sample_ct,
                         const int8_t *genotype_bytes, const int8_t *phased_pairs, bool include_phased) {
-
 	if (include_phased) {
 		if (mode == GenotypeMode::ARRAY) {
 			auto &pair_vec = ArrayVector::GetEntry(vec);

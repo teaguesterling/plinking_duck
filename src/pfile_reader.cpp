@@ -1268,6 +1268,13 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				                                    preread_dosage_doubles.begin() + output_sample_ct);
 			} else if (bind_data->include_phased) {
 				uint32_t phasepresent_ct = 0;
+				// PgrGetP leaves the phase buffers untouched for variants without an
+				// hphase track; zero per-call so unphased hets decode deterministically
+				// as REF|ALT [0,1] and never inherit stale phase bits. cachealigned_malloc
+				// does not zero, so a one-time memset at allocation is insufficient.
+				uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
+				std::memset(preread_phasepresent.ptr, 0, phase_byte_ct);
+				std::memset(preread_phaseinfo.ptr, 0, phase_byte_ct);
 				err = plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr, genovec_buf2.As<uintptr_t>(),
 				                      preread_phasepresent.As<uintptr_t>(), preread_phaseinfo.As<uintptr_t>(),
 				                      &phasepresent_ct);
@@ -1703,6 +1710,15 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					                                lstate.dosage_main_buf.As<uint16_t>(), output_sample_ct, dosage_ct,
 					                                lstate.dosage_doubles.data());
 				} else if (bind_data.include_phased) {
+					// PgrGetP does NOT touch the phase buffers for variants without an
+					// hphase track (it early-returns after setting phasepresent_ct=0).
+					// Zero them per-call so unphased hets decode deterministically as
+					// REF|ALT [0,1] and never inherit stale phase bits from a prior
+					// (phased) variant. cachealigned_malloc does not zero, so a
+					// one-time memset at allocation is insufficient.
+					uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
+					std::memset(lstate.phasepresent_buf.ptr, 0, phase_byte_ct);
+					std::memset(lstate.phaseinfo_buf.ptr, 0, phase_byte_ct);
 					plink2::PglErr err =
 					    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
 					                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
@@ -2210,6 +2226,15 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
 				    lstate.dosage_main_buf.As<uint16_t>(), output_sample_ct, dosage_ct, lstate.dosage_doubles.data());
 			} else if (bind_data.include_phased) {
+				// PgrGetP does NOT touch the phase buffers for variants without an
+				// hphase track (it early-returns after setting phasepresent_ct=0).
+				// Zero them per-call so unphased hets decode deterministically as
+				// REF|ALT [0,1] and never inherit stale phase bits from a prior
+				// (phased) variant. cachealigned_malloc does not zero, so a
+				// one-time memset at allocation is insufficient.
+				uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
+				std::memset(lstate.phasepresent_buf.ptr, 0, phase_byte_ct);
+				std::memset(lstate.phaseinfo_buf.ptr, 0, phase_byte_ct);
 				plink2::PglErr err =
 				    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
 				                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
