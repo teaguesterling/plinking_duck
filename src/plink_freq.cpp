@@ -2,7 +2,9 @@
 #include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 
 namespace duckdb {
 
@@ -55,6 +57,11 @@ struct PlinkFreqBindData : public TableFunctionData {
 	bool include_dosage = false;
 	bool file_has_dosage = false; // true if pgen file contains dosage data
 
+	// Ploidy/sex-aware handling for chrX/Y/MT
+	ParBounds par_bounds;        // pseudo-autosomal boundaries for the genome build
+	vector<uint8_t> aligned_sex; // sex per sample in effective (post-subset) order
+	bool have_sex = false;       // true iff aligned_sex is populated
+
 	// Dynamic column index for IMP_R2 (depends on whether counts is enabled)
 	idx_t imp_r2_col_idx = 0;
 };
@@ -90,6 +97,10 @@ struct PlinkFreqLocalState : public LocalTableFunctionState {
 
 	plink2::PgrSampleSubsetIndex pssi;
 
+	// Raw-hardcall buffers for the ploidy/sex-aware path (chrX/Y/MT only).
+	AlignedBuffer genovec_buf;
+	vector<int8_t> geno_bytes;
+
 	bool initialized = false;
 
 	~PlinkFreqLocalState() {
@@ -113,6 +124,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	auto &fs = FileSystem::GetFileSystem(context);
 
 	// --- Named parameters ---
+	string build_str = "GRCh38"; // default genome build for PAR boundary detection
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "pvar") {
 			bind_data->pvar_path = kv.second.GetValue<string>();
@@ -122,10 +134,13 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 			bind_data->include_counts = kv.second.GetValue<bool>();
 		} else if (kv.first == "dosage") {
 			bind_data->include_dosage = kv.second.GetValue<bool>();
+		} else if (kv.first == "build") {
+			build_str = kv.second.GetValue<string>();
 		} else if (kv.first == "samples" || kv.first == "region") {
 			// Handled after pgenlib init
 		}
 	}
+	bind_data->par_bounds = ResolveParBounds(build_str, "plink_freq");
 
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
@@ -211,15 +226,31 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	// --- Process samples parameter ---
 	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
 
+	// Sorted-unique original indices matching pgenlib PgrGet subset ordering,
+	// used to align the sex array to effective sample order.
+	vector<uint32_t> subset_sorted;
+	bool has_subset = false;
+
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
 		auto indices =
 		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
 		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_freq");
 
+		subset_sorted = indices;
+		std::sort(subset_sorted.begin(), subset_sorted.end());
+		subset_sorted.erase(std::unique(subset_sorted.begin(), subset_sorted.end()), subset_sorted.end());
+		has_subset = true;
+
 		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
 		bind_data->has_sample_subset = true;
 		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
+	}
+
+	// --- Build ploidy-aware sex array (aligned to effective sample order) ---
+	if (bind_data->has_sample_info && !bind_data->sample_info.sexes.empty()) {
+		bind_data->aligned_sex = BuildAlignedSex(bind_data->sample_info, has_subset ? &subset_sorted : nullptr);
+		bind_data->have_sex = !bind_data->aligned_sex.empty();
 	}
 
 	// --- Process region parameter ---
@@ -357,6 +388,12 @@ static unique_ptr<LocalTableFunctionState> PlinkFreqInitLocal(ExecutionContext &
 		plink2::PgrClearSampleSubsetIndex(&state->pgr, &state->pssi);
 	}
 
+	// Buffers for decoding raw hardcalls on sex/organelle chromosomes.
+	uintptr_t genovec_word_ct = plink2::NypCtToAlignedWordCt(bind_data.raw_sample_ct);
+	state->genovec_buf.Allocate(genovec_word_ct * sizeof(uintptr_t));
+	std::memset(state->genovec_buf.ptr, 0, genovec_word_ct * sizeof(uintptr_t));
+	state->geno_bytes.resize(bind_data.effective_sample_ct);
+
 	state->initialized = true;
 	return std::move(state);
 }
@@ -396,14 +433,36 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
+			// Classify ploidy from the chromosome (and X position vs PAR). Autosomes
+			// and the PAR keep the fast diploid PgrGetCounts path (no behavior change);
+			// chrX non-PAR / chrY / chrMT take the ploidy/sex-aware hardcall path.
+			ChromPloidy ploidy = ChromPloidy::AUTOSOMAL;
+			if (gstate.need_frequencies) {
+				ploidy = ClassifyChromPloidy(bind_data.variants.GetChrom(vidx), bind_data.variants.GetPos(vidx),
+				                             bind_data.par_bounds);
+			}
+			bool sex_aware = (ploidy != ChromPloidy::AUTOSOMAL);
+
 			// Compute genotype counts
 			STD_ARRAY_DECL(uint32_t, 4, genocounts);
 			genocounts[0] = genocounts[1] = genocounts[2] = genocounts[3] = 0;
 			uint64_t all_dosages[2] = {0, 0};
 			double imp_r2 = 0.0;
+			SexAwareCounts sac;
 
 			if (gstate.need_frequencies && lstate.initialized) {
-				if (bind_data.include_dosage) {
+				if (sex_aware) {
+					plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
+					                                    lstate.genovec_buf.As<uintptr_t>());
+					if (err != plink2::kPglRetSuccess) {
+						throw IOException("plink_freq: PgrGet failed for variant %u", vidx);
+					}
+					plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), sample_ct,
+					                             lstate.geno_bytes.data());
+					const uint8_t *sex_ptr = bind_data.have_sex ? bind_data.aligned_sex.data() : nullptr;
+					sac =
+					    ComputeSexAwareCounts(lstate.geno_bytes.data(), sample_ct, ploidy, sex_ptr, bind_data.have_sex);
+				} else if (bind_data.include_dosage) {
 					plink2::PglErr err =
 					    plink2::PgrGetDCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct, vidx,
 					                          0, // is_minimac3_r2 = 0 (standard R²)
@@ -430,7 +489,30 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 			double alt_freq;
 			bool freq_is_null = false;
 
-			if (bind_data.include_dosage) {
+			// Count-column sources (may differ from genocounts on sex chromosomes).
+			int32_t out_hom_ref = static_cast<int32_t>(genocounts[0]);
+			int32_t out_het = static_cast<int32_t>(genocounts[1]);
+			int32_t out_hom_alt = static_cast<int32_t>(genocounts[2]);
+			int32_t out_missing = static_cast<int32_t>(genocounts[3]);
+			bool counts_are_null = false;
+
+			if (sex_aware) {
+				// Ploidy/sex-aware allele frequency: haploid samples contribute 1
+				// allele; OBS_CT is an allele count (not 2×sample_ct).
+				if (sac.sex_unavailable || sac.obs_allele_ct == 0) {
+					freq_is_null = true;
+					alt_freq = 0.0;
+					obs_ct = 0;
+					counts_are_null = sac.sex_unavailable; // no sex → genotype counts undefined too
+				} else {
+					alt_freq = static_cast<double>(sac.alt_allele_ct) / static_cast<double>(sac.obs_allele_ct);
+					obs_ct = sac.obs_allele_ct;
+				}
+				out_hom_ref = static_cast<int32_t>(sac.geno_hom_ref);
+				out_het = static_cast<int32_t>(sac.geno_het);
+				out_hom_alt = static_cast<int32_t>(sac.geno_hom_alt);
+				out_missing = static_cast<int32_t>(sac.geno_missing);
+			} else if (bind_data.include_dosage) {
 				// Dosage-weighted: all_dosages values are scaled by kDosageMid
 				uint64_t total_dosage = all_dosages[0] + all_dosages[1];
 				if (total_dosage == 0) {
@@ -466,7 +548,10 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 				// with static column constants (imp_r2_col_idx may equal COL_HOM_REF_CT
 				// when counts is disabled)
 				if (bind_data.include_dosage && file_col == bind_data.imp_r2_col_idx) {
-					if (bind_data.file_has_dosage) {
+					if (sex_aware) {
+						// IMP_R2 is not computed on the ploidy-aware hardcall path.
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else if (bind_data.file_has_dosage) {
 						// Note: file-level check. In files with mixed dosage/hardcall variants,
 						// PgrGetDCounts returns a hardcall-derived R² approximation for variants
 						// without dosage entries. Real imputed files typically have dosage for all
@@ -525,19 +610,35 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					break;
 				}
 				case COL_HOM_REF_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[0]);
+					if (counts_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_ref;
+					}
 					break;
 				}
 				case COL_HET_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[1]);
+					if (counts_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_het;
+					}
 					break;
 				}
 				case COL_HOM_ALT_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[2]);
+					if (counts_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_alt;
+					}
 					break;
 				}
 				case COL_MISSING_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(genocounts[3]);
+					if (counts_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_missing;
+					}
 					break;
 				}
 				default:
@@ -568,6 +669,7 @@ void RegisterPlinkFreq(ExtensionLoader &loader) {
 	plink_freq.named_parameters["region"] = LogicalType::VARCHAR;
 	plink_freq.named_parameters["counts"] = LogicalType::BOOLEAN;
 	plink_freq.named_parameters["dosage"] = LogicalType::BOOLEAN;
+	plink_freq.named_parameters["build"] = LogicalType::VARCHAR;
 
 	loader.RegisterFunction(plink_freq);
 }

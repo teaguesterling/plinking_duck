@@ -653,6 +653,15 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					                                lstate.dosage_main_buf.As<uint16_t>(), output_sample_ct, dosage_ct,
 					                                lstate.dosage_doubles.data());
 				} else if (bind_data.include_phased) {
+					// PgrGetP does NOT touch the phase buffers for variants without an
+					// hphase track (it early-returns after setting phasepresent_ct=0).
+					// Zero them per-call so unphased hets decode deterministically as
+					// REF|ALT [0,1] and never inherit stale phase bits from a prior
+					// (phased) variant. cachealigned_malloc does not zero, so a
+					// one-time memset at allocation is insufficient.
+					uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
+					std::memset(lstate.phasepresent_buf.ptr, 0, phase_byte_ct);
+					std::memset(lstate.phaseinfo_buf.ptr, 0, phase_byte_ct);
 					plink2::PglErr err =
 					    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
 					                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
