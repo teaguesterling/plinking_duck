@@ -1,4 +1,5 @@
 #include "plink_glm.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 #include "psam_reader.hpp"
 #include "plink2_glm_logistic_math.hpp"
@@ -1469,7 +1470,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------

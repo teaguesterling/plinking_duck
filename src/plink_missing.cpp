@@ -1,4 +1,5 @@
 #include "plink_missing.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -543,7 +544,7 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +614,7 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 		// Last thread to finish Phase 1 transitions to Phase 2
 		if (gstate.phase1_active.fetch_sub(1, std::memory_order_acq_rel) != 1) {
 			// Not the last thread — we're done
-			output.SetCardinality(0);
+			CompatSetOutputCardinality(output, 0);
 			return;
 		}
 		gstate.variant_scan_done.store(true, std::memory_order_release);
@@ -683,7 +684,7 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 		rows_emitted++;
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 #include "psam_reader.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -521,7 +522,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 		}
 
 		if (batch_size == 0) {
-			output.SetCardinality(0);
+			CompatSetOutputCardinality(output, 0);
 			return;
 		}
 
@@ -537,7 +538,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 			}
 		}
 
-		output.SetCardinality(batch_size);
+		CompatSetOutputCardinality(output, batch_size);
 		return;
 	}
 
@@ -553,7 +554,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 	}
 
 	if (batch_size == 0) {
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 
@@ -610,7 +611,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 		}
 	}
 
-	output.SetCardinality(batch_size);
+	CompatSetOutputCardinality(output, batch_size);
 }
 
 // ---------------------------------------------------------------------------

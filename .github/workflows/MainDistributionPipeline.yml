@@ -14,23 +14,28 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4.4
+      # Build/ship against the latest v1.5 RELEASE tag so the produced extension is
+      # loadable in released DuckDB (branch-tip builds produce non-loadable -dev
+      # binaries). The submodule pointers track the v1.5-variegata branch tips.
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5-variegata
       extension_name: plinking_duck
-      # plink-ng portability issues (not ours):
+      # plink-ng portability issues (not ours), independent of the DuckDB version:
       #   musl: SIMD segfault at runtime
       #   Windows MSVC: can't compile libdeflate (__attribute__ syntax)
       #   Windows MinGW: disabled pending further investigation
       #   Wasm: plink-ng requires POSIX APIs (pthreads, file I/O)
+      # Windows stays excluded: the libdeflate/MSVC blocker is a plink-ng source issue,
+      # not something a DuckDB/ci-tools bump can resolve.
       exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.4.4
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4.4
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5-variegata
       extension_name: plinking_duck
       format_checks: 'format;tidy'

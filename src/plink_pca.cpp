@@ -1,4 +1,5 @@
 #include "plink_pca.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -745,7 +746,7 @@ static void EmitSamplesMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalSta
 		}
 		rows_emitted++;
 	}
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 static void EmitPcsMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs, DataChunk &output) {
@@ -801,14 +802,14 @@ static void EmitPcsMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &
 		}
 		rows_emitted++;
 	}
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs, DataChunk &output) {
 	// Single row with nested structures
 	uint32_t emit_idx = gs.next_emit_idx.fetch_add(1);
 	if (emit_idx > 0) {
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 
@@ -850,7 +851,7 @@ static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState 
 			vec.SetValue(0, Value::LIST(std::move(eigenval_entries)));
 		}
 	}
-	output.SetCardinality(1);
+	CompatSetOutputCardinality(output, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -959,7 +960,7 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 
 	// --- Not participating ---
 	if (!ls.initialized || bind_data.effective_variants.empty() || ls.thread_id >= gs.thread_count) {
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 
@@ -968,7 +969,7 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	// the last thread is still doing merge/SVD. Return empty and wait.
 	uint32_t gen = gs.pass_generation.load(std::memory_order_acquire);
 	if (gen == ls.last_generation_seen) {
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 	ls.last_generation_seen = gen;
@@ -978,7 +979,7 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	// gen maps directly to the pass number.
 	uint32_t pass = gen;
 	if (pass >= gs.total_passes) {
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 
@@ -1000,7 +1001,7 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		// Not the last thread — return empty. DuckDB will re-call us and
 		// we'll wait on pass_generation at the top until the last thread
 		// finishes the merge and advances the generation.
-		output.SetCardinality(0);
+		CompatSetOutputCardinality(output, 0);
 		return;
 	}
 
@@ -1050,7 +1051,7 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 			// pass_generation == last_generation_seen and wait until
 			// the actual last thread finishes and merges.
 			ls.last_generation_seen = gs.pass_generation.load(std::memory_order_acquire);
-			output.SetCardinality(0);
+			CompatSetOutputCardinality(output, 0);
 			return;
 		}
 

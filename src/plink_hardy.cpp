@@ -1,4 +1,5 @@
 #include "plink_hardy.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
 #include <algorithm>
@@ -710,7 +711,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 		}
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------

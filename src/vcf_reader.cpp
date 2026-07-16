@@ -1,4 +1,5 @@
 #include "vcf_reader.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 #include "vcf_genotype_parse.hpp"
 
@@ -772,7 +773,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 		                                  static_cast<unsigned long long>(gstate.multiallelic_skipped)));
 	}
 
-	output.SetCardinality(row_count);
+	CompatSetOutputCardinality(output, row_count);
 }
 
 // ---------------------------------------------------------------------------

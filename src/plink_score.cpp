@@ -1,4 +1,5 @@
 #include "plink_score.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -652,7 +653,7 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 
 			// Last thread transitions to Phase 2
 			if (gstate.phase1_active.fetch_sub(1, std::memory_order_acq_rel) != 1) {
-				output.SetCardinality(0);
+				CompatSetOutputCardinality(output, 0);
 				return;
 			}
 			gstate.scoring_done.store(true, std::memory_order_release);
@@ -734,7 +735,7 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 		rows_emitted++;
 	}
 
-	output.SetCardinality(rows_emitted);
+	CompatSetOutputCardinality(output, rows_emitted);
 }
 
 // ---------------------------------------------------------------------------
