@@ -388,8 +388,11 @@ struct CountFilter {
 
 //! Parse a STRUCT value into a RangeFilter with optional min/max fields.
 //! valid_min/valid_max define the legal range for values (e.g. 0.0-1.0 for AF).
+//! When include_missing_out is non-null, an "include_missing" BOOLEAN field is
+//! also accepted and written out (used by genotype_range); otherwise that field
+//! name is rejected like any other unknown field.
 RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double valid_min, double valid_max,
-                             const string &func_name);
+                             const string &func_name, bool *include_missing_out = nullptr);
 
 //! Check if a variant passes count-based filters given its genotype counts.
 //! genocounts: [hom_ref, het, hom_alt, missing] from PgrGetCounts.
@@ -405,12 +408,44 @@ struct GenotypeRangeResult {
 	bool all_pass; // every non-missing sample has value in [min, max]
 };
 
+//! Selects which hardcall genotype categories a genotype filter keeps.
+//! allowed[0..2] gate hom_ref / het / hom_alt (ALT dosage 0/1/2); include_missing
+//! gates missing (-9). Populated from either the `genotype_range` (numeric alias)
+//! or `include_genotypes` (named-category) parameter — both compile to this mask,
+//! so all engine sites use a single predicate.
 struct GenotypeRangeFilter {
-	RangeFilter range; // reuses Phase 1 RangeFilter
 	bool active = false;
+	bool allowed[3] = {false, false, false}; // hom_ref, het, hom_alt
+	bool include_missing = false;
+
+	//! True when a hardcall ALT dosage (0/1/2, or a phased diploid sum) is a
+	//! selected category. Non-integer or out-of-domain values never match. Takes a
+	//! double so it slots in where the old RangeFilter::Passes(double) was called.
+	bool AllowsCall(double dosage) const {
+		int v = static_cast<int>(dosage);
+		if (v < 0 || v > 2 || static_cast<double>(v) != dosage) {
+			return false;
+		}
+		return allowed[v];
+	}
+
+	//! Populate the mask from a numeric [min,max] range over {0,1,2} (the
+	//! `genotype_range` alias). include_missing comes from the range's own field.
+	void SetFromRange(const RangeFilter &range, bool inc_missing) {
+		for (int g = 0; g <= 2; g++) {
+			allowed[g] = range.Passes(static_cast<double>(g));
+		}
+		include_missing = inc_missing;
+		active = range.active;
+	}
 };
 
-GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts);
+GenotypeRangeResult CheckGenotypeRange(const GenotypeRangeFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts);
+
+//! Parse an `include_genotypes` LIST of category labels into a GenotypeRangeFilter.
+//! Accepts 'hom_ref', 'het', 'hom_alt', 'missing' (case-insensitive). Empty list
+//! is a no-op (inactive). Throws on unknown labels.
+void ParseIncludeGenotypes(const Value &val, GenotypeRangeFilter &out, const string &func_name);
 
 //! Combined pre-decompression filter check: count filter + genotype range.
 //! Returns: skip=true → skip variant entirely. skip=false → variant passes,

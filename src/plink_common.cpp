@@ -1236,7 +1236,7 @@ VariantRange ParseRegion(const string &region_str, const VariantMetadataIndex &v
 // ---------------------------------------------------------------------------
 
 RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double valid_min, double valid_max,
-                             const string &func_name) {
+                             const string &func_name, bool *include_missing_out) {
 	RangeFilter result;
 
 	if (val.type().id() != LogicalTypeId::STRUCT) {
@@ -1255,9 +1255,17 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double 
 		auto &field_name = child_types[i].first;
 		auto &child_val = children[i];
 
+		if (include_missing_out && field_name == "include_missing") {
+			if (!child_val.IsNull()) {
+				*include_missing_out = child_val.GetValue<bool>();
+			}
+			continue;
+		}
+
 		if (field_name != "min" && field_name != "max") {
-			throw InvalidInputException("%s: %s has unknown field '%s' (expected 'min' and/or 'max')", func_name,
-			                            param_name, field_name);
+			throw InvalidInputException("%s: %s has unknown field '%s' (expected %s)", func_name, param_name, field_name,
+			                            include_missing_out ? "'min', 'max', and/or 'include_missing'"
+			                                                : "'min' and/or 'max'");
 		}
 
 		if (child_val.IsNull()) {
@@ -1283,6 +1291,43 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double 
 
 	result.active = true;
 	return result;
+}
+
+void ParseIncludeGenotypes(const Value &val, GenotypeRangeFilter &out, const string &func_name) {
+	if (val.type().id() != LogicalTypeId::LIST) {
+		throw InvalidInputException("%s: include_genotypes must be a LIST of category names "
+		                            "(e.g. ['het', 'hom_alt'])",
+		                            func_name);
+	}
+
+	auto &children = ListValue::GetChildren(val);
+	if (children.empty()) {
+		return; // empty list = no filter
+	}
+
+	for (auto &child : children) {
+		if (child.IsNull()) {
+			throw InvalidInputException("%s: include_genotypes contains a NULL category name", func_name);
+		}
+		string label = child.GetValue<string>();
+		StringUtil::Trim(label);
+		label = StringUtil::Lower(label);
+		if (label == "hom_ref") {
+			out.allowed[0] = true;
+		} else if (label == "het") {
+			out.allowed[1] = true;
+		} else if (label == "hom_alt") {
+			out.allowed[2] = true;
+		} else if (label == "missing") {
+			out.include_missing = true;
+		} else {
+			throw InvalidInputException("%s: include_genotypes has unknown category '%s' "
+			                            "(expected 'hom_ref', 'het', 'hom_alt', and/or 'missing')",
+			                            func_name, label);
+		}
+	}
+
+	out.active = true;
 }
 
 bool VariantPassesCountFilter(const CountFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts,
@@ -1312,7 +1357,7 @@ bool VariantPassesCountFilter(const CountFilter &filter, const STD_ARRAY_REF(uin
 // Genotype range filtering (genotype_range)
 // ---------------------------------------------------------------------------
 
-GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts) {
+GenotypeRangeResult CheckGenotypeRange(const GenotypeRangeFilter &filter, const STD_ARRAY_REF(uint32_t, 4) genocounts) {
 	GenotypeRangeResult result;
 	result.any_pass = false;
 	result.all_pass = true;
@@ -1320,13 +1365,21 @@ GenotypeRangeResult CheckGenotypeRange(const RangeFilter &filter, const STD_ARRA
 	// genocounts: [hom_ref(0), het(1), hom_alt(2), missing(3)]
 	// Genotype values map directly to array indices 0, 1, 2
 	for (int g = 0; g <= 2; g++) {
-		bool in_range = filter.Passes(static_cast<double>(g));
-		if (in_range && genocounts[g] > 0) {
+		bool selected = filter.allowed[g];
+		if (selected && genocounts[g] > 0) {
 			result.any_pass = true;
 		}
-		if (!in_range && genocounts[g] > 0) {
+		if (!selected && genocounts[g] > 0) {
 			result.all_pass = false;
 		}
+	}
+
+	// Missing samples are retained only when include_missing is set; when they are,
+	// a variant whose only kept samples are missing must not be skipped by any_pass.
+	// all_pass is unaffected: missing hardcalls are already emitted as NULL, so the
+	// per-element null-out fast path does not need to account for them.
+	if (filter.include_missing && genocounts[3] > 0) {
+		result.any_pass = true;
 	}
 
 	return result;
@@ -1344,7 +1397,7 @@ PreDecompFilterResult CheckPreDecompFilters(const CountFilter &count_filter, con
 	}
 
 	if (genotype_filter.active) {
-		auto gr = CheckGenotypeRange(genotype_filter.range, genocounts);
+		auto gr = CheckGenotypeRange(genotype_filter, genocounts);
 		if (!gr.any_pass) {
 			result.skip = true;
 			return result;

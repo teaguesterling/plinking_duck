@@ -172,21 +172,30 @@ available from the .pgen header.
 
 DuckDB table function schemas are fixed at bind time. This means column-level
 skipping is architecturally impossible — you cannot remove a column during
-scan. Therefore, `genotype_range` **nulls out** values in all multi-sample
-output formats and only **skips rows** in genotype orient (where each row is
-a single scalar observation).
+scan. So along the *variant* axis the filter **nulls out** element values, and
+along any axis where a **row** is one sample/observation it also **skips rows**.
 
-| Orient | ARRAY/LIST (positional) | COLUMNS (named) | genotype orient (scalar) |
-|--------|------------------------|-----------------|------------------------|
-| **variant** | Null out elements | Null out values | — |
-| **sample** | Null out elements | Null out values | — |
-| **genotype** | — | — | Skip rows |
+> **Update (`include_genotypes` / row-skip):** the original design skipped rows
+> only in genotype orient and left every sample row in sample orient (nulling
+> out the variant axis). Sample orient now also **skips rows**: a sample is
+> emitted only if it has at least one matching genotype (or a matching
+> `missing` when selected), built as a `sample_keep` list at bind time so only
+> surviving rows materialize. In **counts/stats** aggregate modes the filter is
+> purely a row filter — out-of-range hardcalls are NOT nulled to `-9` (which
+> would miscount them as `missing`); the reported counts are the true genotype
+> distribution of each surviving sample.
+
+| Orient | ARRAY/LIST (positional) | COLUMNS (named) | COUNTS/STATS (aggregate) | genotype orient (scalar) |
+|--------|------------------------|-----------------|--------------------------|--------------------------|
+| **variant** | Null out elements | Null out values | true counts | — |
+| **sample** | Null out elements + skip empty rows | Null out values + skip empty rows | true counts + skip empty rows | — |
+| **genotype** | — | — | — | Skip rows |
 
 **Null out**: out-of-range genotype values replaced with NULL. Array/list
 length preserved, positional alignment maintained.
 
-**Skip rows**: in genotype orient, each row is one observation. Rows with
-out-of-range genotype values are simply not emitted.
+**Skip rows**: a row that is one sample/observation with no matching genotype
+is simply not emitted.
 
 **af_range / ac_range** always skip entire variants regardless of output
 format — the variant either passes or doesn't. In positional modes

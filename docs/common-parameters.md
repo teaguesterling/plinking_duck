@@ -126,19 +126,69 @@ Can be combined with `af_range`.
 
 **Used by:** `read_pgen`, `read_pfile`
 
+## `include_genotypes`
+
+| Type | Default |
+|------|---------|
+| `LIST(VARCHAR)` | All genotypes |
+
+Filter by hardcall genotype category. This is the canonical genotype filter; the
+categories are `'hom_ref'` (0), `'het'` (1), `'hom_alt'` (2), and `'missing'`
+(no call). Names are case-insensitive and whitespace-trimmed; an unknown name is
+an error. Any subset is allowed, including **non-contiguous** ones a numeric range
+cannot express (e.g. `['hom_ref', 'hom_alt']`). `'missing'` is a first-class
+category — include it to keep no-call genotypes/rows, omit it to drop them.
+
+How the filter reduces to rows depends on `orient` (because the meaning of a row
+differs):
+
+- **`variant`** — keep a variant if any sample matches; non-matching sample
+  values are set to NULL in the positional output.
+- **`genotype`** — emit only the (variant × sample) rows whose genotype matches
+  (applies regardless of which columns are selected).
+- **`sample`** — emit only the samples that have at least one matching genotype,
+  so a carrier query materializes just the matching subjects. In `counts`/`stats`
+  modes the reported counts are the sample's **true** genotype distribution
+  (out-of-range calls are never miscounted as missing).
+
+```sql
+-- Subjects carrying an ALT allele at a variant (het OR hom-alt), fast:
+SELECT IID
+FROM read_pfile('cohort', orient := 'sample', genotypes := 'counts',
+                variants := ['rs12345'], include_genotypes := ['het', 'hom_alt']);
+
+-- Homozygous subjects (non-contiguous set {0, 2}):
+SELECT IID
+FROM read_pfile('cohort', orient := 'sample',
+                variants := ['rs12345'], include_genotypes := ['hom_ref', 'hom_alt']);
+
+-- Keep carriers OR no-call subjects:
+SELECT IID
+FROM read_pfile('cohort', orient := 'sample',
+                variants := ['rs12345'], include_genotypes := ['het', 'hom_alt', 'missing']);
+```
+
+Incompatible with `dosages := true`.
+
+**Used by:** `read_pgen`, `read_pfile`
+
 ## `genotype_range`
 
 | Type | Default |
 |------|---------|
-| `STRUCT(min TINYINT, max TINYINT)` | All genotype values |
+| `STRUCT(min TINYINT, max TINYINT [, include_missing BOOLEAN])` | All genotype values |
 
-Filter individual genotype values. Genotypes outside the range are set to NULL. The domain is [0, 2]. Uses `PgrGetCounts` for pre-decompression optimization: variants where no values fall in range are skipped entirely.
+Numeric alias of [`include_genotypes`](#include_genotypes) for **contiguous**
+ranges over the domain [0, 2]. `{min: 1, max: 2}` is equivalent to
+`include_genotypes := ['het', 'hom_alt']`. The optional `include_missing := true`
+field keeps no-call genotypes (equivalent to adding `'missing'`). Specifying both
+`genotype_range` and `include_genotypes` is an error.
 
 ```sql
 -- Only heterozygous calls (genotype = 1)
 SELECT * FROM read_pgen('data.pgen', genotype_range := {min: 1, max: 1});
 
--- Het and hom-alt calls only
+-- Het and hom-alt calls only (== include_genotypes := ['het', 'hom_alt'])
 SELECT * FROM read_pfile('data', genotype_range := {min: 1, max: 2});
 ```
 

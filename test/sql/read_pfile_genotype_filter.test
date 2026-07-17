@@ -1,0 +1,278 @@
+# name: test/sql/read_pfile_genotype_filter.test
+# description: include_genotypes named-category filter, genotype_range alias, and sample-orient row-skip
+# group: [sql]
+
+require plinking_duck
+
+# --- Test data reference (pfile_example, 4 variants x 4 samples) ---
+# rs1: [0, 1, 2, NULL]   (SAMPLE1=hom_ref, SAMPLE2=het, SAMPLE3=hom_alt, SAMPLE4=missing)
+# rs2: [1, 1, 0, 2]
+# rs3: [2, NULL, 1, 0]
+# rs4: [0, 0, 1, 2]
+#
+# Sample-orient counts (across all 4 variants):
+#   SAMPLE1: hom_ref=2 het=1 hom_alt=1 missing=0
+#   SAMPLE2: hom_ref=1 het=2 hom_alt=0 missing=1
+#   SAMPLE3: hom_ref=1 het=2 hom_alt=1 missing=0
+#   SAMPLE4: hom_ref=1 het=0 hom_alt=2 missing=1
+
+# =====================================================================
+# Counts-corruption regression (headline bug): out-of-range hardcalls
+# must NOT be counted as missing. All 4 samples carry >=1 het/hom_alt,
+# so all are kept, and their counts must equal the TRUE distribution.
+# =====================================================================
+
+query TIIII
+SELECT IID, genotypes.hom_ref, genotypes.het, genotypes.hom_alt, genotypes.missing
+FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'counts',
+                include_genotypes := ['het', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE1	2	1	1	0
+SAMPLE2	1	2	0	1
+SAMPLE3	1	2	1	0
+SAMPLE4	1	0	2	1
+
+# =====================================================================
+# Sample-orient row-skip: single variant carrier list (the reported use case).
+# rs1 -> only SAMPLE2 (het) and SAMPLE3 (hom_alt); hom_ref and missing dropped.
+# =====================================================================
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'counts',
+                           variants := ['rs1'], include_genotypes := ['het', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE2
+SAMPLE3
+
+# genotype_range alias produces the identical result.
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'counts',
+                           variants := ['rs1'], genotype_range := {min: 1, max: 2})
+ORDER BY IID;
+----
+SAMPLE2
+SAMPLE3
+
+# =====================================================================
+# Non-contiguous category set: ['hom_ref', 'hom_alt'] = {0, 2}, which a
+# numeric range cannot express. rs1 -> SAMPLE1 (0) and SAMPLE3 (2).
+# =====================================================================
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                           variants := ['rs1'], include_genotypes := ['hom_ref', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE1
+SAMPLE3
+
+# =====================================================================
+# 'missing' is a first-class category.
+# rs1 + ['hom_alt', 'missing'] -> SAMPLE3 (hom_alt), SAMPLE4 (missing).
+# =====================================================================
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                           variants := ['rs1'], include_genotypes := ['hom_alt', 'missing'])
+ORDER BY IID;
+----
+SAMPLE3
+SAMPLE4
+
+# Category names are case-insensitive and whitespace-trimmed.
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                           variants := ['rs1'], include_genotypes := [' Hom_Alt ', 'MISSING'])
+ORDER BY IID;
+----
+SAMPLE3
+SAMPLE4
+
+# =====================================================================
+# Empty vs. include_missing on an all-missing dataset (2 variants x 2 samples).
+# =====================================================================
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', orient := 'sample', genotypes := 'counts',
+                                include_genotypes := ['het', 'hom_alt']);
+----
+0
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/all_missing', orient := 'sample', genotypes := 'counts',
+                                include_genotypes := ['het', 'hom_alt', 'missing']);
+----
+2
+
+# =====================================================================
+# Interaction: sample subset + row filter. The keep list is expressed in
+# output-sample positions and must map correctly through sample_indices.
+# Subset {SAMPLE1, SAMPLE3, SAMPLE4}, rs1, het/hom_alt -> only SAMPLE3.
+# =====================================================================
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', variants := ['rs1'],
+                           samples := ['SAMPLE1', 'SAMPLE3', 'SAMPLE4'],
+                           include_genotypes := ['het', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE3
+
+# =====================================================================
+# Interaction: af_range (variant filter) + include_genotypes (row filter)
+# in sample orient. af_range {max: 0.4} keeps only rs4 [0,0,1,2];
+# hom_alt row filter -> SAMPLE4.
+# =====================================================================
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'counts',
+                           af_range := {max: 0.4}, include_genotypes := ['hom_alt'])
+ORDER BY IID;
+----
+SAMPLE4
+
+# =====================================================================
+# Behavior change: array/list sample-orient now DROPS rows with no in-range
+# genotype (previously emitted an all-NULL genotypes array). Surviving rows
+# still null out out-of-range elements. rs1 + hom_alt -> only SAMPLE3, [2].
+# =====================================================================
+
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'list',
+                                      variants := ['rs1'], include_genotypes := ['hom_alt'])
+ORDER BY IID;
+----
+SAMPLE3	[2]
+
+# =====================================================================
+# Genotype orient: row-skip honors include_genotypes / 'missing' consistently.
+# =====================================================================
+
+query TI
+SELECT IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype',
+                                     variants := ['rs1'], include_genotypes := ['het', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE2	1
+SAMPLE3	2
+
+# rs1 + ['het', 'missing'] in genotype orient keeps the het row and the missing
+# row (missing genotype emitted as NULL).
+
+query TI
+SELECT IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype',
+                                     variants := ['rs1'], include_genotypes := ['het', 'missing'])
+ORDER BY IID;
+----
+SAMPLE2	1
+SAMPLE4	NULL
+
+# Genotype-orient filter must apply regardless of projection: whether or not the
+# genotype column is selected, COUNT(*)/SELECT IID must see the SAME filtered
+# rows (rs1 het+hom_alt -> SAMPLE2, SAMPLE3). Regression for the projection-
+# pushdown bug where an unselected genotype column skipped the per-sample filter.
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient := 'genotype',
+                                variants := ['rs1'], include_genotypes := ['het', 'hom_alt']);
+----
+2
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'genotype',
+                           variants := ['rs1'], include_genotypes := ['het', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE2
+SAMPLE3
+
+# Larger scale, genotype not projected: v10000 carriers = het+hom_alt = 4424.
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/wes_chr10', orient := 'genotype',
+                                variants := ['v10000'], include_genotypes := ['het', 'hom_alt']);
+----
+4424
+
+# =====================================================================
+# read_pgen (variant orient) accepts include_genotypes as a variant filter.
+# All 4 variants carry >=1 het/hom_alt.
+# =====================================================================
+
+query I
+SELECT COUNT(*) FROM read_pgen('test/data/pgen_example.pgen', include_genotypes := ['het', 'hom_alt']);
+----
+4
+
+# =====================================================================
+# Non-contiguous set in a per-element output mode (variant orient, columns):
+# ['hom_ref', 'hom_alt'] = {0, 2} nulls out het(1) and missing. rs1 = [0,1,2,NULL].
+# =====================================================================
+
+query TIIII
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4
+FROM read_pfile('test/data/pfile_example', genotypes := 'columns', variants := ['rs1'],
+                include_genotypes := ['hom_ref', 'hom_alt']);
+----
+rs1	0	NULL	2	NULL
+
+# genotype_range alias with include_missing field (post-refactor). rs1 + {2,2}+missing
+# -> SAMPLE3 (hom_alt) and SAMPLE4 (missing).
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'counts',
+                           variants := ['rs1'], genotype_range := {min: 2, max: 2, include_missing: true})
+ORDER BY IID;
+----
+SAMPLE3
+SAMPLE4
+
+# =====================================================================
+# Multi-batch / parallel row-skip: the sample-orient keep list is claimed in
+# batches across the scan, so it must be exercised with a surviving row count
+# that exceeds a single vector (>2048) while still dropping some rows.
+# wes_chr10 variant v10000: hom_ref=5576, het=3803, hom_alt=621 -> 4424 carriers
+# kept, 5576 dropped. Assert the kept set equals exactly the carriers (self-
+# consistent with variant-orient counts) and that it crosses a vector boundary.
+# =====================================================================
+
+query I
+SELECT (SELECT COUNT(*) FROM read_pfile('test/data/wes_chr10', orient := 'sample', genotypes := 'counts',
+                                        variants := ['v10000'], include_genotypes := ['het', 'hom_alt']))
+     = (SELECT genotypes.het + genotypes.hom_alt FROM read_pfile('test/data/wes_chr10', orient := 'variant',
+                                        genotypes := 'counts', variants := ['v10000']));
+----
+true
+
+query I
+SELECT c > 2048 AND c < 10000
+FROM (SELECT COUNT(*) c FROM read_pfile('test/data/wes_chr10', orient := 'sample', genotypes := 'counts',
+                                        variants := ['v10000'], include_genotypes := ['het', 'hom_alt']));
+----
+true
+
+# =====================================================================
+# Error cases.
+# =====================================================================
+
+statement error
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', variants := ['rs1'],
+                           include_genotypes := ['het'], genotype_range := {min: 1});
+----
+specify only one of include_genotypes or genotype_range
+
+statement error
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', variants := ['rs1'],
+                           include_genotypes := ['heterozygous']);
+----
+unknown category 'heterozygous'
+
+statement error
+SELECT IID FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'counts',
+                           dosages := true, include_genotypes := ['het']);
+----
+incompatible with dosages

@@ -7,7 +7,8 @@ Read PLINK 2 `.pgen` binary genotype files.
 ```sql
 read_pgen(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
           genotypes := ..., phased := ..., dosages := ...,
-          af_range := ..., ac_range := ..., genotype_range := ...]) -> TABLE
+          af_range := ..., ac_range := ...,
+          include_genotypes := ..., genotype_range := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -23,7 +24,8 @@ read_pgen(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
 | `dosages` | `BOOLEAN` | `false` | Output dosage values |
 | `af_range` | `STRUCT(min DOUBLE, max DOUBLE)` | All | Filter variants by allele frequency |
 | `ac_range` | `STRUCT(min INTEGER, max INTEGER)` | All | Filter variants by allele count |
-| `genotype_range` | `STRUCT(min TINYINT, max TINYINT)` | All | Filter individual genotype values |
+| `include_genotypes` | `LIST(VARCHAR)` | All | Filter by hardcall category: `'hom_ref'`, `'het'`, `'hom_alt'`, `'missing'` (any subset; canonical genotype filter) |
+| `genotype_range` | `STRUCT(min TINYINT, max TINYINT [, include_missing BOOLEAN])` | All | Numeric alias of `include_genotypes` for contiguous ranges over [0, 2] |
 
 See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and filter parameters.
 
@@ -71,7 +73,7 @@ Variant processing is parallelized across multiple threads. Each thread gets its
 
 ### Filter Pushdown
 
-`af_range` and `ac_range` filter variants by allele frequency or count using fast genotype counting (no decompression needed). `genotype_range` filters individual genotype values, setting non-matching values to NULL.
+`af_range` and `ac_range` filter variants by allele frequency or count using fast genotype counting (no decompression needed). `include_genotypes` (and its numeric alias `genotype_range`) filters by hardcall category (`'hom_ref'`, `'het'`, `'hom_alt'`, `'missing'`), setting non-matching values to NULL in the variant-orient output. See [Common Parameters](../common-parameters.md#include_genotypes).
 
 See [Common Parameters](../common-parameters.md) for details on filter parameters.
 

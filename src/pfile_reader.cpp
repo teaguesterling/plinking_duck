@@ -316,6 +316,13 @@ struct PfileBindData : public TableFunctionData {
 	// Dosage variant of genotype_matrix (-9.0 = missing)
 	vector<vector<double>> dosage_matrix;
 
+	// Sample-orient row-level genotype_range filter: output sample positions that
+	// survive the filter (a sample is kept iff at least one of its genotypes
+	// satisfies genotype_range, or is missing when include_missing is set).
+	// When has_sample_keep is false, all OutputSampleCt() samples are emitted.
+	bool has_sample_keep = false;
+	vector<uint32_t> sample_keep;
+
 	// Sample-orient column layout
 	// Sample metadata columns start at index 0, genotypes column is last
 	idx_t sample_orient_genotypes_col = 0; // computed in bind (ARRAY/LIST only)
@@ -833,16 +840,29 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
-	// --- Parse genotype_range filter ---
+	// --- Parse genotype filter: include_genotypes (canonical) or genotype_range (alias) ---
 	{
+		auto ig_it = input.named_parameters.find("include_genotypes");
 		auto gr_it = input.named_parameters.find("genotype_range");
-		if (gr_it != input.named_parameters.end()) {
+		bool has_ig = ig_it != input.named_parameters.end();
+		bool has_gr = gr_it != input.named_parameters.end();
+		if (has_ig && has_gr) {
+			throw InvalidInputException(
+			    "read_pfile: specify only one of include_genotypes or genotype_range (genotype_range is the numeric "
+			    "alias of include_genotypes)");
+		}
+		if (has_ig || has_gr) {
 			if (bind_data->include_dosages) {
-				throw InvalidInputException("read_pfile: genotype_range is incompatible with dosages := true");
+				throw InvalidInputException("read_pfile: %s is incompatible with dosages := true",
+				                            has_ig ? "include_genotypes" : "genotype_range");
 			}
-			bind_data->genotype_filter.range =
-			    ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile");
-			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
+		}
+		if (has_ig) {
+			ParseIncludeGenotypes(ig_it->second, bind_data->genotype_filter, "read_pfile");
+		} else if (has_gr) {
+			bool inc_missing = false;
+			RangeFilter range = ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile", &inc_missing);
+			bind_data->genotype_filter.SetFromRange(range, inc_missing);
 		}
 	}
 
@@ -1245,6 +1265,22 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		} else {
 			bind_data->genotype_matrix.resize(effective_variant_ct);
 		}
+
+		// Row-level genotype_range accumulators (sample orient): track, per output
+		// sample, whether it has any in-range genotype and any missing genotype
+		// across the effective variants. Computed from TRUE genotype values, before
+		// any per-element null-out, so aggregate counts and the keep decision are
+		// not confused by the -9 sentinel. dosages are incompatible with
+		// genotype_range (rejected at parse time), so only the non-dosage paths
+		// populate these.
+		const bool row_filter_active = bind_data->genotype_filter.active && !bind_data->include_dosages;
+		vector<uint8_t> sample_in_range;
+		vector<uint8_t> sample_has_missing;
+		if (row_filter_active) {
+			sample_in_range.assign(output_sample_ct, 0);
+			sample_has_missing.assign(output_sample_ct, 0);
+		}
+
 		for (uint32_t ev = 0; ev < effective_variant_ct; ev++) {
 			uint32_t vidx = bind_data->has_effective_variant_list ? bind_data->effective_variant_indices[ev] : ev;
 
@@ -1289,13 +1325,25 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
 				UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
 				                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct, preread_phased_pairs.data());
+				// Row-level keep accumulation (phased: diploid sum) from true values.
+				if (row_filter_active) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t a1 = preread_phased_pairs[s * 2];
+						if (a1 == -9) {
+							sample_has_missing[s] = 1;
+						} else if (bind_data->genotype_filter.AllowsCall(
+						               static_cast<double>(a1 + preread_phased_pairs[s * 2 + 1]))) {
+							sample_in_range[s] = 1;
+						}
+					}
+				}
 				// Apply genotype_range per-element filtering (phased: check diploid sum)
 				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
 				    !genotype_range_all_pass[ev]) {
 					for (uint32_t s = 0; s < output_sample_ct; s++) {
 						int8_t a1 = preread_phased_pairs[s * 2];
 						int8_t a2 = preread_phased_pairs[s * 2 + 1];
-						if (a1 != -9 && !bind_data->genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+						if (a1 != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(a1 + a2))) {
 							preread_phased_pairs[s * 2] = -9;
 							preread_phased_pairs[s * 2 + 1] = -9;
 						}
@@ -1313,12 +1361,26 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read", vidx);
 				}
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
-				// Apply genotype_range per-element filtering
-				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
-				    !genotype_range_all_pass[ev]) {
+				// Row-level keep accumulation from true values, before any null-out.
+				if (row_filter_active) {
 					for (uint32_t s = 0; s < output_sample_ct; s++) {
 						int8_t geno = tmp_bytes[s];
-						if (geno != -9 && !bind_data->genotype_filter.range.Passes(static_cast<double>(geno))) {
+						if (geno == -9) {
+							sample_has_missing[s] = 1;
+						} else if (bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
+							sample_in_range[s] = 1;
+						}
+					}
+				}
+				// Apply genotype_range per-element null-out for per-element output modes only.
+				// Aggregate modes (counts/stats) must keep true genotype values so that
+				// out-of-range calls are not miscounted as missing (-9) in the counts struct;
+				// genotype_range acts purely as a row filter there.
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
+				    !genotype_range_all_pass[ev] && !IsAggregateGenotypeMode(bind_data->genotype_mode)) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t geno = tmp_bytes[s];
+						if (geno != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
 							tmp_bytes[s] = -9;
 						}
 					}
@@ -1333,6 +1395,20 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			plink2::CleanupPgr(&tmp_pgr, &ce);
 			ce = plink2::kPglRetSuccess;
 			plink2::CleanupPgfi(&tmp_pgfi, &ce);
+		}
+
+		// Build the row-level keep list: a sample is emitted iff it has at least
+		// one genotype in range (or a missing genotype when include_missing is set).
+		// The scan iterates this list instead of all samples, so only surviving
+		// rows materialize.
+		if (row_filter_active) {
+			bind_data->sample_keep.reserve(output_sample_ct);
+			for (uint32_t s = 0; s < output_sample_ct; s++) {
+				if (sample_in_range[s] || (bind_data->genotype_filter.include_missing && sample_has_missing[s])) {
+					bind_data->sample_keep.push_back(s);
+				}
+			}
+			bind_data->has_sample_keep = true;
 		}
 	} else {
 		// Variant mode: same as read_pgen
@@ -1447,8 +1523,17 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 				break;
 			}
 		}
+		// A genotype filter must apply regardless of projection: the per-sample
+		// row-skip and its genotype decode are gated on need_genotypes, so force it
+		// on when the filter is active even if the genotype column is not selected.
+		// Otherwise `SELECT IID FROM ... orient:='genotype', include_genotypes:=[...]`
+		// (or any COUNT(*)) would emit every sample of each surviving variant unfiltered.
+		if (bind_data.genotype_filter.active) {
+			state->need_genotypes = true;
+		}
 	} else if (bind_data.orient_mode == OrientMode::SAMPLE) {
-		state->total_count = bind_data.OutputSampleCt();
+		state->total_count =
+		    bind_data.has_sample_keep ? static_cast<uint32_t>(bind_data.sample_keep.size()) : bind_data.OutputSampleCt();
 		// Check if genotypes column(s) are projected
 		state->need_genotypes = false;
 		for (auto col_id : input.column_ids) {
@@ -1802,7 +1887,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								int8_t geno = lstate.genotype_bytes[sample_pos];
 								if (geno == -9 ||
 								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								     !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -1847,7 +1932,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								int8_t geno = lstate.genotype_bytes[s];
 								if (geno == -9 ||
 								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								     !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(child_vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(child_vec)[rows_emitted] = geno;
@@ -1940,7 +2025,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.AllowsCall(
 								                                             static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
@@ -1963,7 +2048,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.AllowsCall(
 								                                             static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
@@ -2032,7 +2117,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.AllowsCall(
 								                                               static_cast<double>(geno)))) {
 									child_validity.SetInvalid(base + s);
 									child_data[base + s] = 0;
@@ -2048,7 +2133,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
+								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.AllowsCall(
 								                                               static_cast<double>(geno)))) {
 									child_validity.SetInvalid(list_offset + s);
 									child_data[list_offset + s] = 0;
@@ -2082,7 +2167,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								int8_t geno = lstate.genotype_bytes[sample_pos];
 								if (geno == -9 ||
 								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								     !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -2267,12 +2352,13 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				if (bind_data.include_phased) {
 					int8_t a1 = lstate.phased_pairs[lstate.current_sample_in_variant * 2];
 					if (a1 == -9) {
-						lstate.current_sample_in_variant++;
-						continue;
-					}
-					if (!lstate.geno_range_all_pass) {
+						if (!bind_data.genotype_filter.include_missing) {
+							lstate.current_sample_in_variant++;
+							continue;
+						}
+					} else if (!lstate.geno_range_all_pass) {
 						int8_t a2 = lstate.phased_pairs[lstate.current_sample_in_variant * 2 + 1];
-						if (!bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+						if (!bind_data.genotype_filter.AllowsCall(static_cast<double>(a1 + a2))) {
 							lstate.current_sample_in_variant++;
 							continue;
 						}
@@ -2280,11 +2366,12 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				} else if (!bind_data.include_dosages) {
 					int8_t geno = lstate.genotype_bytes[lstate.current_sample_in_variant];
 					if (geno == -9) {
-						lstate.current_sample_in_variant++;
-						continue;
-					}
-					if (!lstate.geno_range_all_pass &&
-					    !bind_data.genotype_filter.range.Passes(static_cast<double>(geno))) {
+						if (!bind_data.genotype_filter.include_missing) {
+							lstate.current_sample_in_variant++;
+							continue;
+						}
+					} else if (!lstate.geno_range_all_pass &&
+					           !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno))) {
 						lstate.current_sample_in_variant++;
 						continue;
 					}
@@ -2439,8 +2526,11 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		}
 		uint32_t batch_end = std::min(batch_start + claim_size, total_samples);
 
-		for (uint32_t sample_pos = batch_start; sample_pos < batch_end; sample_pos++) {
-			// Map scan-order sample index to file-order sample index
+		for (uint32_t claim_idx = batch_start; claim_idx < batch_end; claim_idx++) {
+			// When a genotype_range row filter is active, the claimed index addresses
+			// the surviving-sample list; otherwise it is the output sample position directly.
+			uint32_t sample_pos = bind_data.has_sample_keep ? bind_data.sample_keep[claim_idx] : claim_idx;
+			// Map output sample position to file-order sample index
 			uint32_t sample_file_idx = bind_data.has_sample_subset ? bind_data.sample_indices[sample_pos] : sample_pos;
 
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
@@ -2763,6 +2853,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	read_pfile.named_parameters["af_range"] = LogicalType::ANY;
 	read_pfile.named_parameters["ac_range"] = LogicalType::ANY;
 	read_pfile.named_parameters["genotype_range"] = LogicalType::ANY;
+	read_pfile.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
 
 	loader.RegisterFunction(read_pfile);
 }

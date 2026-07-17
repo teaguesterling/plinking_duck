@@ -101,9 +101,11 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - Count filters work in all orient modes and in both `read_pfile` and `read_pgen`; variant/genotype orient filter at scan time, sample orient filters at bind time (before schema)
 - AF denominator is `2 * non_missing_samples` (matches plink_freq), not `2 * total_samples`
 - `STD_ARRAY_DECL(uint32_t, 4, genocounts)` for PgrGetCounts (pgenlib uses std::array, not C arrays)
-- `genotype_range := {min: 1, max: 2}` filters individual genotype values; uses PgrGetCounts for pre-decompression optimization (skip variant if no values in range); per-element NULLing for partial matches
-- `genotype_range` incompatible with `dosages := true`; domain [0, 2]
-- `GenotypeRangeResult` from `CheckGenotypeRange`: `any_pass` = skip variant entirely when false; `all_pass` = skip per-element check when true (existing -9 handling suffices)
+- `include_genotypes := ['het', 'hom_alt']` filters by hardcall category — canonical genotype filter. Categories: `hom_ref` (0), `het` (1), `hom_alt` (2), `missing` (-9). Case-insensitive, whitespace-trimmed; unknown labels error. Arbitrary (incl. non-contiguous, e.g. `['hom_ref','hom_alt']`) subsets. `missing` is a first-class category — selecting it retains missing genotypes/rows.
+- `genotype_range := {min: 1, max: 2}` is the numeric alias of `include_genotypes` (contiguous ranges only over {0,1,2}); optional `include_missing := true` field retains missing. Specifying both `include_genotypes` and `genotype_range` errors.
+- Both compile to `GenotypeRangeFilter` (`allowed[3]` mask + `include_missing`); all engine sites use `AllowsCall(dosage)` / `CheckGenotypeRange`. `include_genotypes`/`genotype_range` incompatible with `dosages := true`.
+- Filter semantics by orient (row grain differs): **variant** orient — keep variant if any sample matches (`any_pass`), per-element NULL out non-matching sample values; **genotype** orient — skip rows whose genotype doesn't match; **sample** orient — skip sample rows with no matching genotype (built as a `sample_keep` list at bind, scan iterates it so only surviving rows materialize), per-element NULL out for array/list/columns, and **counts/stats aggregate modes report TRUE counts** (out-of-range hardcalls are NOT nulled to -9, so they are never miscounted as `missing`).
+- `GenotypeRangeResult` from `CheckGenotypeRange`: `any_pass` = skip variant entirely when false (true when a selected category or, with `include_missing`, missing is present); `all_pass` = skip per-element check when true.
 
 ## Extension Config Options
 
