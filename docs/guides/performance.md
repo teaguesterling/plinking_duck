@@ -34,7 +34,7 @@ Functions that process `.pgen` files use multi-threaded parallel scanning:
 |----------|----------|-------|
 | `read_plink_vcf` | No | Sequential text VCF parsing |
 | `read_pvar` | No | Sequential text file reading |
-| `read_psam` | No | Sequential text file reading; `.psam` files are small |
+| `read_psam` | No | Sequential text file reading |
 | `read_pgen` | Yes | Per-thread pgenlib readers |
 | `read_pfile` (default) | Yes | Same as `read_pgen` |
 | `read_pfile` (genotype orient) | No | Row expansion is single-threaded |
