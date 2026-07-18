@@ -7,6 +7,7 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -154,11 +155,34 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 
 	unique_ptr<DataChunk> chunk;
 	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			vector<string> fields;
-			for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-				auto val = chunk->GetValue(col, row);
-				fields.push_back(val.IsNull() ? "" : val.ToString());
+		const idx_t n = chunk->size();
+		const idx_t ncol = chunk->ColumnCount();
+
+		// Extract each column vectorized instead of boxing every cell with
+		// chunk->GetValue() (which allocates a Value per cell — the dominant cost
+		// at millions of rows). Cast each non-VARCHAR column to VARCHAR once, then
+		// read string_t directly through a UnifiedVectorFormat.
+		vector<Vector> cast_cols;    // owns cast results; must outlive `formats`
+		cast_cols.reserve(ncol);
+		vector<UnifiedVectorFormat> formats(ncol);
+		for (idx_t col = 0; col < ncol; col++) {
+			cast_cols.emplace_back(LogicalType::VARCHAR);
+			if (chunk->data[col].GetType().id() == LogicalTypeId::VARCHAR) {
+				chunk->data[col].ToUnifiedFormat(n, formats[col]);
+			} else {
+				VectorOperations::Cast(context, chunk->data[col], cast_cols[col], n);
+				cast_cols[col].ToUnifiedFormat(n, formats[col]);
+			}
+		}
+
+		for (idx_t row = 0; row < n; row++) {
+			vector<string> fields(ncol);
+			for (idx_t col = 0; col < ncol; col++) {
+				auto &fmt = formats[col];
+				idx_t vidx = fmt.sel->get_index(row);
+				if (fmt.validity.RowIsValid(vidx)) {
+					fields[col] = UnifiedVectorFormat::GetData<string_t>(fmt)[vidx].GetString();
+				}
 			}
 
 			// iid_to_idx is lazy (see SampleInfo::EnsureIidMap).
@@ -533,18 +557,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	if (bind_data->psam_path.empty()) {
-		if (!prefix.empty()) {
-			for (auto &ext : {".psam", ".fam"}) {
-				auto candidate = prefix + ext;
-				if (fs.FileExists(candidate)) {
-					bind_data->psam_path = candidate;
-					break;
-				}
-			}
-		}
-		if (bind_data->psam_path.empty()) {
-			bind_data->psam_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".psam", ".fam"});
-		}
+		// Prefer a .psam.parquet companion over the text .psam/.fam when present
+		// (honors plinking_use_parquet_companions) — mirrors the .pvar resolution
+		// above. Resolve from the prefix when given, else from the pgen path.
+		string psam_base = prefix.empty() ? bind_data->pgen_path : prefix + ".pgen";
+		bind_data->psam_path = FindCompanionFileWithParquet(context, fs, psam_base, {".psam", ".fam"});
 		if (bind_data->psam_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .psam or .fam file for '%s' "
 			                            "(use psam := 'path' to specify explicitly)",
