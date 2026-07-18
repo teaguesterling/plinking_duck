@@ -7,9 +7,11 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
@@ -95,14 +97,31 @@ static RegionFilter ParseRegion(const string &region_str) {
 //! Extended sample info for genotype orient mode: includes all psam columns.
 struct PfileSampleMetadata {
 	PsamHeaderInfo header;
-	//! All data rows from the .psam/.fam, in file order.
-	//! Each inner vector has one field per column.
+	//! All data rows from the .psam/.fam, in file order (TEXT path).
+	//! Each inner vector has one field per column. Empty when column_data is set.
 	vector<vector<string>> rows;
+
+	//! Native columnar storage of the sample rows (parquet/non-native source path).
+	//! When set, the scan reads NON-id psam column values from here instead of
+	//! `rows`, avoiding materializing every cell as a std::string. IID/FID come from
+	//! SampleInfo::iids/fids (extracted once at load). Row order matches file order;
+	//! column order matches `header.column_names`.
+	unique_ptr<ColumnDataCollection> column_data;
+	//! Cumulative starting row of each column_data chunk (size ChunkCount()+1), so a
+	//! file-order row maps to (chunk, offset) — CDC chunks are not 2048-aligned.
+	vector<idx_t> chunk_start_row;
+	//! IID / FID column positions in the header (for the column_data path).
+	idx_t iid_col_idx = DConstants::INVALID_INDEX;
+	idx_t fid_col_idx = DConstants::INVALID_INDEX;
 
 	//! Index of SEX column in the header (DConstants::INVALID_INDEX if absent)
 	idx_t sex_col_idx = DConstants::INVALID_INDEX;
 	//! Indices of PAT/MAT columns for special missing-value handling
 	vector<idx_t> parent_col_indices;
+
+	bool HasColumnData() const {
+		return column_data != nullptr;
+	}
 };
 
 //! Missing value sentinels (same as psam_reader)
@@ -153,49 +172,64 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 
 	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
 
-	unique_ptr<DataChunk> chunk;
-	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		const idx_t n = chunk->size();
-		const idx_t ncol = chunk->ColumnCount();
+	// Retain the query result's native columnar data instead of materializing every
+	// cell as a std::string. The scan reads psam column values directly from this
+	// ColumnDataCollection (see EmitSampleMetadataColumn); only the IID/FID columns
+	// are copied out into sample_info here, since those drive subsetting and column
+	// naming. This is the difference between ~3.5s and ~1s at 10M samples.
+	meta.iid_col_idx = iid_idx;
+	meta.fid_col_idx = fid_idx;
 
-		// Extract each column vectorized instead of boxing every cell with
-		// chunk->GetValue() (which allocates a Value per cell — the dominant cost
-		// at millions of rows). Cast each non-VARCHAR column to VARCHAR once, then
-		// read string_t directly through a UnifiedVectorFormat.
-		vector<Vector> cast_cols;    // owns cast results; must outlive `formats`
-		cast_cols.reserve(ncol);
-		vector<UnifiedVectorFormat> formats(ncol);
-		for (idx_t col = 0; col < ncol; col++) {
-			cast_cols.emplace_back(LogicalType::VARCHAR);
-			if (chunk->data[col].GetType().id() == LogicalTypeId::VARCHAR) {
-				chunk->data[col].ToUnifiedFormat(n, formats[col]);
-			} else {
-				VectorOperations::Cast(context, chunk->data[col], cast_cols[col], n);
-				cast_cols[col].ToUnifiedFormat(n, formats[col]);
+	auto &materialized = *result;
+	auto &collection = materialized.Collection();
+	const idx_t row_ct = collection.Count();
+	sample_info_out.iids.reserve(row_ct);
+	if (has_fid) {
+		sample_info_out.fids.reserve(row_ct);
+	}
+
+	// One vectorized scan: extract IID (and FID) as std::string (these drive
+	// subsetting + IID output) and record cumulative chunk offsets so the scan can
+	// map a file-order row to (chunk, offset) for the other columns. The scan's
+	// chunk boundaries match the physical CDC chunks used by FetchChunk.
+	vector<column_t> id_cols;
+	id_cols.push_back(iid_idx);
+	if (has_fid) {
+		id_cols.push_back(fid_idx);
+	}
+	ColumnDataScanState scan_state;
+	collection.InitializeScan(scan_state, id_cols);
+	DataChunk id_chunk;
+	collection.InitializeScanChunk(scan_state, id_chunk);
+	meta.chunk_start_row.push_back(0);
+	idx_t running = 0;
+	while (collection.Scan(scan_state, id_chunk)) {
+		const idx_t n = id_chunk.size();
+		auto extract = [&](idx_t chunk_col, vector<string> &out) {
+			Vector varchar_vec(LogicalType::VARCHAR);
+			Vector *src = &id_chunk.data[chunk_col];
+			if (src->GetType().id() != LogicalTypeId::VARCHAR) {
+				VectorOperations::Cast(context, *src, varchar_vec, n);
+				src = &varchar_vec;
 			}
-		}
-
-		for (idx_t row = 0; row < n; row++) {
-			vector<string> fields(ncol);
-			for (idx_t col = 0; col < ncol; col++) {
-				auto &fmt = formats[col];
+			UnifiedVectorFormat fmt;
+			src->ToUnifiedFormat(n, fmt);
+			auto data = UnifiedVectorFormat::GetData<string_t>(fmt);
+			for (idx_t row = 0; row < n; row++) {
 				idx_t vidx = fmt.sel->get_index(row);
-				if (fmt.validity.RowIsValid(vidx)) {
-					fields[col] = UnifiedVectorFormat::GetData<string_t>(fmt)[vidx].GetString();
-				}
+				out.push_back(fmt.validity.RowIsValid(vidx) ? data[vidx].GetString() : string());
 			}
-
-			// iid_to_idx is lazy (see SampleInfo::EnsureIidMap).
-			sample_info_out.iids.push_back(fields[iid_idx]);
-			if (has_fid) {
-				sample_info_out.fids.push_back(fields[fid_idx]);
-			}
-
-			meta.rows.push_back(std::move(fields));
+		};
+		extract(0, sample_info_out.iids);
+		if (has_fid) {
+			extract(1, sample_info_out.fids);
 		}
+		running += n;
+		meta.chunk_start_row.push_back(running);
 	}
 
 	sample_info_out.sample_ct = sample_info_out.iids.size();
+	meta.column_data = materialized.TakeCollection();
 	return meta;
 }
 
@@ -459,6 +493,11 @@ struct PfileLocalState : public LocalTableFunctionState {
 	bool batch_variant_loaded = false;      // genotypes decoded for current variant in batch
 	bool geno_range_all_pass = true;        // per-variant flag for genotype_range optimization
 	bool batch_exhausted = true;            // true initially to trigger first batch claim
+
+	// Per-thread cache of one column_data chunk for reading non-id psam columns at
+	// scan time (sample_metadata.column_data path). Populated lazily via FetchChunk.
+	DataChunk psam_chunk;
+	idx_t psam_chunk_idx = DConstants::INVALID_INDEX;
 
 	~PfileLocalState() {
 		if (initialized) {
@@ -2253,6 +2292,61 @@ static void FillSampleMetadataValue(Vector &vec, idx_t row_idx, const string &va
 	}
 }
 
+//! Emit one psam column value for a sample into an output vector, from whichever
+//! metadata representation is populated:
+//!  - text path: the std::string in PfileSampleMetadata::rows.
+//!  - column_data path: IID/FID come from the pre-extracted SampleInfo strings;
+//!    other columns are read from the retained ColumnDataCollection via a
+//!    per-thread cached chunk (mapping file-order row -> (chunk, offset) through
+//!    chunk_start_row). Value semantics go through FillSampleMetadataValue so the
+//!    SEX/PAT/MAT/missing handling is identical to the text path.
+static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileLocalState &lstate, Vector &out_vec,
+                                     idx_t out_row, idx_t sample_file_idx, idx_t psam_col_idx) {
+	auto &meta = bind_data.sample_metadata;
+
+	if (!meta.HasColumnData()) {
+		if (sample_file_idx < meta.rows.size() && psam_col_idx < meta.rows[sample_file_idx].size()) {
+			FillSampleMetadataValue(out_vec, out_row, meta.rows[sample_file_idx][psam_col_idx], psam_col_idx, meta);
+		} else {
+			FlatVector::SetNull(out_vec, out_row, true);
+		}
+		return;
+	}
+
+	// IID / FID: use the strings already extracted at load.
+	if (psam_col_idx == meta.iid_col_idx) {
+		const auto &iids = bind_data.sample_info.iids;
+		FillSampleMetadataValue(out_vec, out_row, sample_file_idx < iids.size() ? iids[sample_file_idx] : string(),
+		                        psam_col_idx, meta);
+		return;
+	}
+	if (psam_col_idx == meta.fid_col_idx) {
+		const auto &fids = bind_data.sample_info.fids;
+		FillSampleMetadataValue(out_vec, out_row, sample_file_idx < fids.size() ? fids[sample_file_idx] : string(),
+		                        psam_col_idx, meta);
+		return;
+	}
+
+	// Other columns: locate the chunk covering this row and read it (cast to string
+	// through Value — only hit when a non-id psam column is actually projected).
+	const auto &starts = meta.chunk_start_row;
+	if (starts.size() < 2 || sample_file_idx >= starts.back()) {
+		FlatVector::SetNull(out_vec, out_row, true);
+		return;
+	}
+	idx_t chunk_idx = (idx_t)(std::upper_bound(starts.begin(), starts.end(), sample_file_idx) - starts.begin()) - 1;
+	if (chunk_idx != lstate.psam_chunk_idx) {
+		if (lstate.psam_chunk.ColumnCount() == 0) {
+			meta.column_data->InitializeScanChunk(lstate.psam_chunk);
+		}
+		meta.column_data->FetchChunk(chunk_idx, lstate.psam_chunk);
+		lstate.psam_chunk_idx = chunk_idx;
+	}
+	idx_t local = sample_file_idx - starts[chunk_idx];
+	Value v = lstate.psam_chunk.data[psam_col_idx].GetValue(local);
+	FillSampleMetadataValue(out_vec, out_row, v.IsNull() ? string() : v.ToString(), psam_col_idx, meta);
+}
+
 static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<PfileBindData>();
 	auto &gstate = data_p.global_state->Cast<PfileGlobalState>();
@@ -2491,17 +2585,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					idx_t sample_col_rel = file_col - bind_data.geno_sample_col_start;
 					idx_t psam_col_idx = bind_data.geno_sample_col_to_psam_col[sample_col_rel];
 
-					if (sample_file_idx < bind_data.sample_metadata.rows.size()) {
-						auto &sample_row = bind_data.sample_metadata.rows[sample_file_idx];
-						if (psam_col_idx < sample_row.size()) {
-							FillSampleMetadataValue(vec, rows_emitted, sample_row[psam_col_idx], psam_col_idx,
-							                        bind_data.sample_metadata);
-						} else {
-							FlatVector::SetNull(vec, rows_emitted, true);
-						}
-					} else {
-						FlatVector::SetNull(vec, rows_emitted, true);
-					}
+					EmitSampleMetadataColumn(bind_data, lstate, vec, rows_emitted, sample_file_idx, psam_col_idx);
 				}
 			}
 
@@ -2527,6 +2611,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<PfileBindData>();
 	auto &gstate = data_p.global_state->Cast<PfileGlobalState>();
+	auto &lstate = data_p.local_state->Cast<PfileLocalState>();
 
 	auto &column_ids = gstate.column_ids;
 	uint32_t total_samples = gstate.total_count;
@@ -2805,17 +2890,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					// Sample metadata column
 					idx_t psam_col_idx = bind_data.sample_orient_col_to_psam_col[file_col];
 
-					if (sample_file_idx < bind_data.sample_metadata.rows.size()) {
-						auto &sample_row = bind_data.sample_metadata.rows[sample_file_idx];
-						if (psam_col_idx < sample_row.size()) {
-							FillSampleMetadataValue(vec, rows_emitted, sample_row[psam_col_idx], psam_col_idx,
-							                        bind_data.sample_metadata);
-						} else {
-							FlatVector::SetNull(vec, rows_emitted, true);
-						}
-					} else {
-						FlatVector::SetNull(vec, rows_emitted, true);
-					}
+					EmitSampleMetadataColumn(bind_data, lstate, vec, rows_emitted, sample_file_idx, psam_col_idx);
 				}
 			}
 
