@@ -161,3 +161,47 @@ statement error
 SELECT * FROM read_pgen('test/data/pgen_example.pgen', genotype_range := {min: 1}, dosages := true);
 ----
 genotype_range is incompatible with dosages
+
+# ========== include_genotypes (named-category filter) on read_pgen ==========
+
+# include_genotypes := ['het','hom_alt'] is the named form of genotype_range {1,2}:
+# identical output (hom_ref and missing nulled out per element).
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen',
+    include_genotypes := ['het', 'hom_alt']) ORDER BY ID;
+----
+rs1	[NULL, 1, 2, NULL]
+rs2	[1, 1, NULL, 2]
+rs3	[2, NULL, 1, NULL]
+rs4	[NULL, NULL, 1, 2]
+
+# Non-contiguous set ['hom_ref','hom_alt'] = {0, 2} — nulls out het(1) and missing.
+# A numeric genotype_range cannot express this.
+query TT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen',
+    include_genotypes := ['hom_ref', 'hom_alt']) ORDER BY ID;
+----
+rs1	[0, NULL, 2, NULL]
+rs2	[NULL, NULL, 0, 2]
+rs3	[2, NULL, NULL, 0]
+rs4	[0, 0, NULL, 2]
+
+# Specifying both include_genotypes and genotype_range is an error.
+statement error
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen',
+    include_genotypes := ['het'], genotype_range := {min: 1});
+----
+specify only one of include_genotypes or genotype_range
+
+# include_genotypes is incompatible with dosages.
+statement error
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen',
+    include_genotypes := ['het'], dosages := true);
+----
+incompatible with dosages
+
+# Unknown category label errors.
+statement error
+SELECT ID FROM read_pgen('test/data/pgen_example.pgen', include_genotypes := ['carrier']);
+----
+unknown category 'carrier'
