@@ -7,8 +7,11 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
@@ -94,14 +97,31 @@ static RegionFilter ParseRegion(const string &region_str) {
 //! Extended sample info for genotype orient mode: includes all psam columns.
 struct PfileSampleMetadata {
 	PsamHeaderInfo header;
-	//! All data rows from the .psam/.fam, in file order.
-	//! Each inner vector has one field per column.
+	//! All data rows from the .psam/.fam, in file order (TEXT path).
+	//! Each inner vector has one field per column. Empty when column_data is set.
 	vector<vector<string>> rows;
+
+	//! Native columnar storage of the sample rows (parquet/non-native source path).
+	//! When set, the scan reads NON-id psam column values from here instead of
+	//! `rows`, avoiding materializing every cell as a std::string. IID/FID come from
+	//! SampleInfo::iids/fids (extracted once at load). Row order matches file order;
+	//! column order matches `header.column_names`.
+	unique_ptr<ColumnDataCollection> column_data;
+	//! Cumulative starting row of each column_data chunk (size ChunkCount()+1), so a
+	//! file-order row maps to (chunk, offset) — CDC chunks are not 2048-aligned.
+	vector<idx_t> chunk_start_row;
+	//! IID / FID column positions in the header (for the column_data path).
+	idx_t iid_col_idx = DConstants::INVALID_INDEX;
+	idx_t fid_col_idx = DConstants::INVALID_INDEX;
 
 	//! Index of SEX column in the header (DConstants::INVALID_INDEX if absent)
 	idx_t sex_col_idx = DConstants::INVALID_INDEX;
 	//! Indices of PAT/MAT columns for special missing-value handling
 	vector<idx_t> parent_col_indices;
+
+	bool HasColumnData() const {
+		return column_data != nullptr;
+	}
 };
 
 //! Missing value sentinels (same as psam_reader)
@@ -152,26 +172,64 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 
 	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
 
-	unique_ptr<DataChunk> chunk;
-	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			vector<string> fields;
-			for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-				auto val = chunk->GetValue(col, row);
-				fields.push_back(val.IsNull() ? "" : val.ToString());
-			}
+	// Retain the query result's native columnar data instead of materializing every
+	// cell as a std::string. The scan reads psam column values directly from this
+	// ColumnDataCollection (see EmitSampleMetadataColumn); only the IID/FID columns
+	// are copied out into sample_info here, since those drive subsetting and column
+	// naming. This is the difference between ~3.5s and ~1s at 10M samples.
+	meta.iid_col_idx = iid_idx;
+	meta.fid_col_idx = fid_idx;
 
-			// iid_to_idx is lazy (see SampleInfo::EnsureIidMap).
-			sample_info_out.iids.push_back(fields[iid_idx]);
-			if (has_fid) {
-				sample_info_out.fids.push_back(fields[fid_idx]);
-			}
+	auto &materialized = *result;
+	auto &collection = materialized.Collection();
+	const idx_t row_ct = collection.Count();
+	sample_info_out.iids.reserve(row_ct);
+	if (has_fid) {
+		sample_info_out.fids.reserve(row_ct);
+	}
 
-			meta.rows.push_back(std::move(fields));
+	// One vectorized scan: extract IID (and FID) as std::string (these drive
+	// subsetting + IID output) and record cumulative chunk offsets so the scan can
+	// map a file-order row to (chunk, offset) for the other columns. The scan's
+	// chunk boundaries match the physical CDC chunks used by FetchChunk.
+	vector<column_t> id_cols;
+	id_cols.push_back(iid_idx);
+	if (has_fid) {
+		id_cols.push_back(fid_idx);
+	}
+	ColumnDataScanState scan_state;
+	collection.InitializeScan(scan_state, id_cols);
+	DataChunk id_chunk;
+	collection.InitializeScanChunk(scan_state, id_chunk);
+	meta.chunk_start_row.push_back(0);
+	idx_t running = 0;
+	while (collection.Scan(scan_state, id_chunk)) {
+		const idx_t n = id_chunk.size();
+		auto extract = [&](idx_t chunk_col, vector<string> &out) {
+			Vector varchar_vec(LogicalType::VARCHAR);
+			Vector *src = &id_chunk.data[chunk_col];
+			if (src->GetType().id() != LogicalTypeId::VARCHAR) {
+				VectorOperations::Cast(context, *src, varchar_vec, n);
+				src = &varchar_vec;
+			}
+			UnifiedVectorFormat fmt;
+			src->ToUnifiedFormat(n, fmt);
+			auto data = UnifiedVectorFormat::GetData<string_t>(fmt);
+			for (idx_t row = 0; row < n; row++) {
+				idx_t vidx = fmt.sel->get_index(row);
+				out.push_back(fmt.validity.RowIsValid(vidx) ? data[vidx].GetString() : string());
+			}
+		};
+		extract(0, sample_info_out.iids);
+		if (has_fid) {
+			extract(1, sample_info_out.fids);
 		}
+		running += n;
+		meta.chunk_start_row.push_back(running);
 	}
 
 	sample_info_out.sample_ct = sample_info_out.iids.size();
+	meta.column_data = materialized.TakeCollection();
 	return meta;
 }
 
@@ -316,6 +374,13 @@ struct PfileBindData : public TableFunctionData {
 	// Dosage variant of genotype_matrix (-9.0 = missing)
 	vector<vector<double>> dosage_matrix;
 
+	// Sample-orient row-level genotype_range filter: output sample positions that
+	// survive the filter (a sample is kept iff at least one of its genotypes
+	// satisfies genotype_range, or is missing when include_missing is set).
+	// When has_sample_keep is false, all OutputSampleCt() samples are emitted.
+	bool has_sample_keep = false;
+	vector<uint32_t> sample_keep;
+
 	// Sample-orient column layout
 	// Sample metadata columns start at index 0, genotypes column is last
 	idx_t sample_orient_genotypes_col = 0; // computed in bind (ARRAY/LIST only)
@@ -429,6 +494,11 @@ struct PfileLocalState : public LocalTableFunctionState {
 	bool geno_range_all_pass = true;        // per-variant flag for genotype_range optimization
 	bool batch_exhausted = true;            // true initially to trigger first batch claim
 
+	// Per-thread cache of one column_data chunk for reading non-id psam columns at
+	// scan time (sample_metadata.column_data path). Populated lazily via FetchChunk.
+	DataChunk psam_chunk;
+	idx_t psam_chunk_idx = DConstants::INVALID_INDEX;
+
 	~PfileLocalState() {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
@@ -526,18 +596,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	if (bind_data->psam_path.empty()) {
-		if (!prefix.empty()) {
-			for (auto &ext : {".psam", ".fam"}) {
-				auto candidate = prefix + ext;
-				if (fs.FileExists(candidate)) {
-					bind_data->psam_path = candidate;
-					break;
-				}
-			}
-		}
-		if (bind_data->psam_path.empty()) {
-			bind_data->psam_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".psam", ".fam"});
-		}
+		// Prefer a .psam.parquet companion over the text .psam/.fam when present
+		// (honors plinking_use_parquet_companions) — mirrors the .pvar resolution
+		// above. Resolve from the prefix when given, else from the pgen path.
+		string psam_base = prefix.empty() ? bind_data->pgen_path : prefix + ".pgen";
+		bind_data->psam_path = FindCompanionFileWithParquet(context, fs, psam_base, {".psam", ".fam"});
 		if (bind_data->psam_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .psam or .fam file for '%s' "
 			                            "(use psam := 'path' to specify explicitly)",
@@ -833,16 +896,29 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
-	// --- Parse genotype_range filter ---
+	// --- Parse genotype filter: include_genotypes (canonical) or genotype_range (alias) ---
 	{
+		auto ig_it = input.named_parameters.find("include_genotypes");
 		auto gr_it = input.named_parameters.find("genotype_range");
-		if (gr_it != input.named_parameters.end()) {
+		bool has_ig = ig_it != input.named_parameters.end();
+		bool has_gr = gr_it != input.named_parameters.end();
+		if (has_ig && has_gr) {
+			throw InvalidInputException(
+			    "read_pfile: specify only one of include_genotypes or genotype_range (genotype_range is the numeric "
+			    "alias of include_genotypes)");
+		}
+		if (has_ig || has_gr) {
 			if (bind_data->include_dosages) {
-				throw InvalidInputException("read_pfile: genotype_range is incompatible with dosages := true");
+				throw InvalidInputException("read_pfile: %s is incompatible with dosages := true",
+				                            has_ig ? "include_genotypes" : "genotype_range");
 			}
-			bind_data->genotype_filter.range =
-			    ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile");
-			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
+		}
+		if (has_ig) {
+			ParseIncludeGenotypes(ig_it->second, bind_data->genotype_filter, "read_pfile");
+		} else if (has_gr) {
+			bool inc_missing = false;
+			RangeFilter range = ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pfile", &inc_missing);
+			bind_data->genotype_filter.SetFromRange(range, inc_missing);
 		}
 	}
 
@@ -1245,6 +1321,22 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		} else {
 			bind_data->genotype_matrix.resize(effective_variant_ct);
 		}
+
+		// Row-level genotype_range accumulators (sample orient): track, per output
+		// sample, whether it has any in-range genotype and any missing genotype
+		// across the effective variants. Computed from TRUE genotype values, before
+		// any per-element null-out, so aggregate counts and the keep decision are
+		// not confused by the -9 sentinel. dosages are incompatible with
+		// genotype_range (rejected at parse time), so only the non-dosage paths
+		// populate these.
+		const bool row_filter_active = bind_data->genotype_filter.active && !bind_data->include_dosages;
+		vector<uint8_t> sample_in_range;
+		vector<uint8_t> sample_has_missing;
+		if (row_filter_active) {
+			sample_in_range.assign(output_sample_ct, 0);
+			sample_has_missing.assign(output_sample_ct, 0);
+		}
+
 		for (uint32_t ev = 0; ev < effective_variant_ct; ev++) {
 			uint32_t vidx = bind_data->has_effective_variant_list ? bind_data->effective_variant_indices[ev] : ev;
 
@@ -1289,13 +1381,25 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
 				UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
 				                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct, preread_phased_pairs.data());
+				// Row-level keep accumulation (phased: diploid sum) from true values.
+				if (row_filter_active) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t a1 = preread_phased_pairs[s * 2];
+						if (a1 == -9) {
+							sample_has_missing[s] = 1;
+						} else if (bind_data->genotype_filter.AllowsCall(
+						               static_cast<double>(a1 + preread_phased_pairs[s * 2 + 1]))) {
+							sample_in_range[s] = 1;
+						}
+					}
+				}
 				// Apply genotype_range per-element filtering (phased: check diploid sum)
 				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
 				    !genotype_range_all_pass[ev]) {
 					for (uint32_t s = 0; s < output_sample_ct; s++) {
 						int8_t a1 = preread_phased_pairs[s * 2];
 						int8_t a2 = preread_phased_pairs[s * 2 + 1];
-						if (a1 != -9 && !bind_data->genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+						if (a1 != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(a1 + a2))) {
 							preread_phased_pairs[s * 2] = -9;
 							preread_phased_pairs[s * 2 + 1] = -9;
 						}
@@ -1313,12 +1417,26 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read", vidx);
 				}
 				plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
-				// Apply genotype_range per-element filtering
-				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
-				    !genotype_range_all_pass[ev]) {
+				// Row-level keep accumulation from true values, before any null-out.
+				if (row_filter_active) {
 					for (uint32_t s = 0; s < output_sample_ct; s++) {
 						int8_t geno = tmp_bytes[s];
-						if (geno != -9 && !bind_data->genotype_filter.range.Passes(static_cast<double>(geno))) {
+						if (geno == -9) {
+							sample_has_missing[s] = 1;
+						} else if (bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
+							sample_in_range[s] = 1;
+						}
+					}
+				}
+				// Apply genotype_range per-element null-out for per-element output modes only.
+				// Aggregate modes (counts/stats) must keep true genotype values so that
+				// out-of-range calls are not miscounted as missing (-9) in the counts struct;
+				// genotype_range acts purely as a row filter there.
+				if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
+				    !genotype_range_all_pass[ev] && !IsAggregateGenotypeMode(bind_data->genotype_mode)) {
+					for (uint32_t s = 0; s < output_sample_ct; s++) {
+						int8_t geno = tmp_bytes[s];
+						if (geno != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
 							tmp_bytes[s] = -9;
 						}
 					}
@@ -1333,6 +1451,20 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			plink2::CleanupPgr(&tmp_pgr, &ce);
 			ce = plink2::kPglRetSuccess;
 			plink2::CleanupPgfi(&tmp_pgfi, &ce);
+		}
+
+		// Build the row-level keep list: a sample is emitted iff it has at least
+		// one genotype in range (or a missing genotype when include_missing is set).
+		// The scan iterates this list instead of all samples, so only surviving
+		// rows materialize.
+		if (row_filter_active) {
+			bind_data->sample_keep.reserve(output_sample_ct);
+			for (uint32_t s = 0; s < output_sample_ct; s++) {
+				if (sample_in_range[s] || (bind_data->genotype_filter.include_missing && sample_has_missing[s])) {
+					bind_data->sample_keep.push_back(s);
+				}
+			}
+			bind_data->has_sample_keep = true;
 		}
 	} else {
 		// Variant mode: same as read_pgen
@@ -1447,8 +1579,17 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 				break;
 			}
 		}
+		// A genotype filter must apply regardless of projection: the per-sample
+		// row-skip and its genotype decode are gated on need_genotypes, so force it
+		// on when the filter is active even if the genotype column is not selected.
+		// Otherwise `SELECT IID FROM ... orient:='genotype', include_genotypes:=[...]`
+		// (or any COUNT(*)) would emit every sample of each surviving variant unfiltered.
+		if (bind_data.genotype_filter.active) {
+			state->need_genotypes = true;
+		}
 	} else if (bind_data.orient_mode == OrientMode::SAMPLE) {
-		state->total_count = bind_data.OutputSampleCt();
+		state->total_count = bind_data.has_sample_keep ? static_cast<uint32_t>(bind_data.sample_keep.size())
+		                                               : bind_data.OutputSampleCt();
 		// Check if genotypes column(s) are projected
 		state->need_genotypes = false;
 		for (auto col_id : input.column_ids) {
@@ -1800,9 +1941,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -1845,9 +1985,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(child_vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(child_vec)[rows_emitted] = geno;
@@ -1940,8 +2079,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
-								                                             static_cast<double>(a1 + a2)))) {
+								if (a1 == -9 || (!geno_range_all_pass &&
+								                 !bind_data.genotype_filter.AllowsCall(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
@@ -1963,8 +2102,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
-								                                             static_cast<double>(a1 + a2)))) {
+								if (a1 == -9 || (!geno_range_all_pass &&
+								                 !bind_data.genotype_filter.AllowsCall(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
@@ -2032,8 +2171,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
-								                                               static_cast<double>(geno)))) {
+								if (geno == -9 || (!geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(base + s);
 									child_data[base + s] = 0;
 								} else {
@@ -2048,8 +2187,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 || (!geno_range_all_pass && !bind_data.genotype_filter.range.Passes(
-								                                               static_cast<double>(geno)))) {
+								if (geno == -9 || (!geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(list_offset + s);
 									child_data[list_offset + s] = 0;
 								} else {
@@ -2080,9 +2219,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -2149,6 +2287,61 @@ static void FillSampleMetadataValue(Vector &vec, idx_t row_idx, const string &va
 	} else {
 		FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, val);
 	}
+}
+
+//! Emit one psam column value for a sample into an output vector, from whichever
+//! metadata representation is populated:
+//!  - text path: the std::string in PfileSampleMetadata::rows.
+//!  - column_data path: IID/FID come from the pre-extracted SampleInfo strings;
+//!    other columns are read from the retained ColumnDataCollection via a
+//!    per-thread cached chunk (mapping file-order row -> (chunk, offset) through
+//!    chunk_start_row). Value semantics go through FillSampleMetadataValue so the
+//!    SEX/PAT/MAT/missing handling is identical to the text path.
+static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileLocalState &lstate, Vector &out_vec,
+                                     idx_t out_row, idx_t sample_file_idx, idx_t psam_col_idx) {
+	auto &meta = bind_data.sample_metadata;
+
+	if (!meta.HasColumnData()) {
+		if (sample_file_idx < meta.rows.size() && psam_col_idx < meta.rows[sample_file_idx].size()) {
+			FillSampleMetadataValue(out_vec, out_row, meta.rows[sample_file_idx][psam_col_idx], psam_col_idx, meta);
+		} else {
+			FlatVector::SetNull(out_vec, out_row, true);
+		}
+		return;
+	}
+
+	// IID / FID: use the strings already extracted at load.
+	if (psam_col_idx == meta.iid_col_idx) {
+		const auto &iids = bind_data.sample_info.iids;
+		FillSampleMetadataValue(out_vec, out_row, sample_file_idx < iids.size() ? iids[sample_file_idx] : string(),
+		                        psam_col_idx, meta);
+		return;
+	}
+	if (psam_col_idx == meta.fid_col_idx) {
+		const auto &fids = bind_data.sample_info.fids;
+		FillSampleMetadataValue(out_vec, out_row, sample_file_idx < fids.size() ? fids[sample_file_idx] : string(),
+		                        psam_col_idx, meta);
+		return;
+	}
+
+	// Other columns: locate the chunk covering this row and read it (cast to string
+	// through Value — only hit when a non-id psam column is actually projected).
+	const auto &starts = meta.chunk_start_row;
+	if (starts.size() < 2 || sample_file_idx >= starts.back()) {
+		FlatVector::SetNull(out_vec, out_row, true);
+		return;
+	}
+	idx_t chunk_idx = (idx_t)(std::upper_bound(starts.begin(), starts.end(), sample_file_idx) - starts.begin()) - 1;
+	if (chunk_idx != lstate.psam_chunk_idx) {
+		if (lstate.psam_chunk.ColumnCount() == 0) {
+			meta.column_data->InitializeScanChunk(lstate.psam_chunk);
+		}
+		meta.column_data->FetchChunk(chunk_idx, lstate.psam_chunk);
+		lstate.psam_chunk_idx = chunk_idx;
+	}
+	idx_t local = sample_file_idx - starts[chunk_idx];
+	Value v = lstate.psam_chunk.data[psam_col_idx].GetValue(local);
+	FillSampleMetadataValue(out_vec, out_row, v.IsNull() ? string() : v.ToString(), psam_col_idx, meta);
 }
 
 static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
@@ -2267,12 +2460,13 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				if (bind_data.include_phased) {
 					int8_t a1 = lstate.phased_pairs[lstate.current_sample_in_variant * 2];
 					if (a1 == -9) {
-						lstate.current_sample_in_variant++;
-						continue;
-					}
-					if (!lstate.geno_range_all_pass) {
+						if (!bind_data.genotype_filter.include_missing) {
+							lstate.current_sample_in_variant++;
+							continue;
+						}
+					} else if (!lstate.geno_range_all_pass) {
 						int8_t a2 = lstate.phased_pairs[lstate.current_sample_in_variant * 2 + 1];
-						if (!bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2))) {
+						if (!bind_data.genotype_filter.AllowsCall(static_cast<double>(a1 + a2))) {
 							lstate.current_sample_in_variant++;
 							continue;
 						}
@@ -2280,11 +2474,12 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				} else if (!bind_data.include_dosages) {
 					int8_t geno = lstate.genotype_bytes[lstate.current_sample_in_variant];
 					if (geno == -9) {
-						lstate.current_sample_in_variant++;
-						continue;
-					}
-					if (!lstate.geno_range_all_pass &&
-					    !bind_data.genotype_filter.range.Passes(static_cast<double>(geno))) {
+						if (!bind_data.genotype_filter.include_missing) {
+							lstate.current_sample_in_variant++;
+							continue;
+						}
+					} else if (!lstate.geno_range_all_pass &&
+					           !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno))) {
 						lstate.current_sample_in_variant++;
 						continue;
 					}
@@ -2387,17 +2582,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					idx_t sample_col_rel = file_col - bind_data.geno_sample_col_start;
 					idx_t psam_col_idx = bind_data.geno_sample_col_to_psam_col[sample_col_rel];
 
-					if (sample_file_idx < bind_data.sample_metadata.rows.size()) {
-						auto &sample_row = bind_data.sample_metadata.rows[sample_file_idx];
-						if (psam_col_idx < sample_row.size()) {
-							FillSampleMetadataValue(vec, rows_emitted, sample_row[psam_col_idx], psam_col_idx,
-							                        bind_data.sample_metadata);
-						} else {
-							FlatVector::SetNull(vec, rows_emitted, true);
-						}
-					} else {
-						FlatVector::SetNull(vec, rows_emitted, true);
-					}
+					EmitSampleMetadataColumn(bind_data, lstate, vec, rows_emitted, sample_file_idx, psam_col_idx);
 				}
 			}
 
@@ -2423,6 +2608,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<PfileBindData>();
 	auto &gstate = data_p.global_state->Cast<PfileGlobalState>();
+	auto &lstate = data_p.local_state->Cast<PfileLocalState>();
 
 	auto &column_ids = gstate.column_ids;
 	uint32_t total_samples = gstate.total_count;
@@ -2439,8 +2625,11 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		}
 		uint32_t batch_end = std::min(batch_start + claim_size, total_samples);
 
-		for (uint32_t sample_pos = batch_start; sample_pos < batch_end; sample_pos++) {
-			// Map scan-order sample index to file-order sample index
+		for (uint32_t claim_idx = batch_start; claim_idx < batch_end; claim_idx++) {
+			// When a genotype_range row filter is active, the claimed index addresses
+			// the surviving-sample list; otherwise it is the output sample position directly.
+			uint32_t sample_pos = bind_data.has_sample_keep ? bind_data.sample_keep[claim_idx] : claim_idx;
+			// Map output sample position to file-order sample index
 			uint32_t sample_file_idx = bind_data.has_sample_subset ? bind_data.sample_indices[sample_pos] : sample_pos;
 
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
@@ -2698,17 +2887,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					// Sample metadata column
 					idx_t psam_col_idx = bind_data.sample_orient_col_to_psam_col[file_col];
 
-					if (sample_file_idx < bind_data.sample_metadata.rows.size()) {
-						auto &sample_row = bind_data.sample_metadata.rows[sample_file_idx];
-						if (psam_col_idx < sample_row.size()) {
-							FillSampleMetadataValue(vec, rows_emitted, sample_row[psam_col_idx], psam_col_idx,
-							                        bind_data.sample_metadata);
-						} else {
-							FlatVector::SetNull(vec, rows_emitted, true);
-						}
-					} else {
-						FlatVector::SetNull(vec, rows_emitted, true);
-					}
+					EmitSampleMetadataColumn(bind_data, lstate, vec, rows_emitted, sample_file_idx, psam_col_idx);
 				}
 			}
 
@@ -2763,6 +2942,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	read_pfile.named_parameters["af_range"] = LogicalType::ANY;
 	read_pfile.named_parameters["ac_range"] = LogicalType::ANY;
 	read_pfile.named_parameters["genotype_range"] = LogicalType::ANY;
+	read_pfile.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
 
 	loader.RegisterFunction(read_pfile);
 }

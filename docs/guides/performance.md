@@ -68,7 +68,7 @@ This avoids reading genotype data for variants outside the region.
 
 ## Filter Pushdown
 
-The `af_range`, `ac_range`, and `genotype_range` parameters let you filter variants or genotype values before full decompression:
+The `af_range`, `ac_range`, `include_genotypes`, and `genotype_range` parameters let you filter variants or genotypes before full decompression:
 
 ```sql
 -- Skip variants outside MAF range (uses PgrGetCounts, no decompression)
@@ -77,10 +77,30 @@ SELECT * FROM read_pfile('biobank',
 
 -- Only keep heterozygous calls
 SELECT * FROM read_pgen('biobank.pgen',
-    genotype_range := {min: 1, max: 1});
+    include_genotypes := ['het']);
 ```
 
-`af_range` and `ac_range` use pgenlib's `PgrGetCounts` to count genotypes without decompressing, then skip variants that fail the filter. `genotype_range` also uses `PgrGetCounts` as a pre-check — if a variant has no genotypes in range, it is skipped entirely without decompression.
+`af_range` and `ac_range` use pgenlib's `PgrGetCounts` to count genotypes without decompressing, then skip variants that fail the filter. `include_genotypes` (and its numeric alias `genotype_range`) also uses `PgrGetCounts` as a pre-check — if a variant has no matching genotypes, it is skipped entirely without decompression.
+
+### Fast carrier lookups (subject IDs matching a genotype)
+
+To list the subjects matching a genotype at a variant, combine `orient := 'sample'`
+with `include_genotypes` so the scan emits **only the matching subjects** instead
+of one row per sample. At biobank scale (millions of individuals) this is the
+difference between materializing every subject and materializing just the carriers:
+
+```sql
+-- Subjects carrying an ALT allele at rs12345 (het or hom-alt)
+SELECT IID
+FROM read_pfile('biobank', orient := 'sample', genotypes := 'counts',
+                variants := ['rs12345'], include_genotypes := ['het', 'hom_alt']);
+```
+
+The row filter is evaluated during the scan, so only carrier rows are produced —
+a `WHERE` clause on the output cannot achieve this because the per-subject counts
+are computed inside the table function. The same works in `genotype` orient
+(one row per matching variant × subject), and the filter applies whether or not
+the genotype column itself is selected.
 
 ## Sample Subsetting
 

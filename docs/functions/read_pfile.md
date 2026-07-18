@@ -8,7 +8,8 @@ Read a complete PLINK 2 fileset (`.pgen` + `.pvar` + `.psam`) from a common pref
 read_pfile(prefix VARCHAR [, pgen := ..., pvar := ..., psam := ...,
            orient := ..., genotypes := ..., phased := ..., dosages := ...,
            samples := ..., variants := ..., region := ...,
-           af_range := ..., ac_range := ..., genotype_range := ...]) -> TABLE
+           af_range := ..., ac_range := ...,
+           include_genotypes := ..., genotype_range := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -28,7 +29,8 @@ read_pfile(prefix VARCHAR [, pgen := ..., pvar := ..., psam := ...,
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
 | `af_range` | `STRUCT(min DOUBLE, max DOUBLE)` | All | Filter variants by allele frequency range |
 | `ac_range` | `STRUCT(min INTEGER, max INTEGER)` | All | Filter variants by allele count range |
-| `genotype_range` | `STRUCT(min TINYINT, max TINYINT)` | All | Filter individual genotype values |
+| `include_genotypes` | `LIST(VARCHAR)` | All | Filter by hardcall category: `'hom_ref'`, `'het'`, `'hom_alt'`, `'missing'` (any subset; canonical genotype filter) |
+| `genotype_range` | `STRUCT(min TINYINT, max TINYINT [, include_missing BOOLEAN])` | All | Numeric alias of `include_genotypes` for contiguous ranges over [0, 2] |
 
 See [Common Parameters](../common-parameters.md) for details on `samples`, `region`, and filter parameters.
 
@@ -105,7 +107,7 @@ With `phased := true`, genotype elements change from `TINYINT` to `ARRAY(TINYINT
 
 ### Filter Pushdown
 
-`af_range` and `ac_range` filter variants by allele frequency or count using fast genotype counting (no decompression). `genotype_range` filters individual genotype values, setting non-matching values to NULL. See [Common Parameters](../common-parameters.md).
+`af_range` and `ac_range` filter variants by allele frequency or count using fast genotype counting (no decompression). `include_genotypes` (and its numeric alias `genotype_range`) filters by hardcall category — in `variant` orient it sets non-matching values to NULL; in `genotype` and `sample` orient it drops non-matching rows, so a carrier query in `sample` orient materializes only the matching subjects. See [Common Parameters](../common-parameters.md).
 
 ### Projection Pushdown
 

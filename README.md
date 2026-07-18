@@ -147,6 +147,13 @@ SELECT * FROM read_pfile('data/example', variants := ['rs1', 'rs2']);
 SELECT iid, genotype
 FROM read_pfile('data/example', orient := 'genotype',
     region := '1:10000-50000', samples := ['SAMPLE1']);
+
+-- Fast carrier lookup: subjects carrying an ALT allele at a variant.
+-- In sample orient the scan emits only the matching subjects (not one row
+-- per sample), so this stays cheap at millions of individuals.
+SELECT iid
+FROM read_pfile('data/example', orient := 'sample', genotypes := 'counts',
+    variants := ['rs1'], include_genotypes := ['het', 'hom_alt']);
 ```
 
 **Default mode output:** CHROM, POS, ID, REF, ALT, genotypes `ARRAY(TINYINT, N)` — same as `read_pgen`.
@@ -165,6 +172,10 @@ plus scalar `genotype` (TINYINT). One row per variant x sample combination.
 | `samples` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific samples by IID or 0-based index |
 | `variants` | LIST(VARCHAR) or LIST(INTEGER) | Filter to specific variants by ID or 0-based index |
 | `region` | VARCHAR | Filter to genomic region (`chr:start-end` or `chr`) |
+| `include_genotypes` | LIST(VARCHAR) | Filter by hardcall category: `'hom_ref'`, `'het'`, `'hom_alt'`, `'missing'` (sample orient drops non-matching subjects) |
+| `af_range` / `ac_range` | STRUCT(min, max) | Filter variants by allele frequency / count |
+
+See [Common Parameters](docs/common-parameters.md) for the full filter reference (`genotype_range` is the numeric alias of `include_genotypes`).
 
 ### `read_plink_vcf(path [, genotypes, phased, region, min_gq, min_dp, max_dp])`
 

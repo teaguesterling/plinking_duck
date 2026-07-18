@@ -9,3 +9,6 @@ glm_stress.psam
 glm_stress.log
 glm_stress_covariates.parquet
 glm_stress_phenotypes.parquet
+
+# Large benchmark fixtures (generate_large_sample_fixture.sh) — too big to commit
+large_samples/

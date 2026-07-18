@@ -341,15 +341,16 @@ genotype_range is incompatible with dosages
 # --- genotype_range combined with samples (regression test) ---
 
 # genotype_range + samples in genotype orient mode
-# 3 variants pass (rs4 has no carriers in subset), 2 samples = 6 rows
-# Non-carrier genotypes are NULLed but rows are kept
+# In genotype orient the filter SKIPS non-matching rows (applies regardless of
+# projection). Carriers among SAMPLE1/SAMPLE2 with genotype in {1,2}:
+#   rs1 -> SAMPLE2; rs2 -> SAMPLE1, SAMPLE2; rs3 -> SAMPLE1; rs4 -> none = 4 rows
 query I
 SELECT COUNT(*) FROM read_pfile('test/data/pfile_example',
     orient := 'genotype',
     samples := ['SAMPLE1', 'SAMPLE2'],
     genotype_range := {min: 1, max: 2});
 ----
-6
+4
 
 # genotype_range + samples in variant orient mode
 # 3 of 4 variants have at least one carrier among SAMPLE1/SAMPLE2

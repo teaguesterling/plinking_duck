@@ -295,15 +295,27 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		}
 	}
 
-	// --- Parse genotype_range filter ---
+	// --- Parse genotype filter: include_genotypes (canonical) or genotype_range (alias) ---
 	{
+		auto ig_it = input.named_parameters.find("include_genotypes");
 		auto gr_it = input.named_parameters.find("genotype_range");
-		if (gr_it != input.named_parameters.end()) {
-			if (bind_data->include_dosages) {
-				throw InvalidInputException("read_pgen: genotype_range is incompatible with dosages := true");
-			}
-			bind_data->genotype_filter.range = ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pgen");
-			bind_data->genotype_filter.active = bind_data->genotype_filter.range.active;
+		bool has_ig = ig_it != input.named_parameters.end();
+		bool has_gr = gr_it != input.named_parameters.end();
+		if (has_ig && has_gr) {
+			throw InvalidInputException(
+			    "read_pgen: specify only one of include_genotypes or genotype_range (genotype_range is the numeric "
+			    "alias of include_genotypes)");
+		}
+		if ((has_ig || has_gr) && bind_data->include_dosages) {
+			throw InvalidInputException("read_pgen: %s is incompatible with dosages := true",
+			                            has_ig ? "include_genotypes" : "genotype_range");
+		}
+		if (has_ig) {
+			ParseIncludeGenotypes(ig_it->second, bind_data->genotype_filter, "read_pgen");
+		} else if (has_gr) {
+			bool inc_missing = false;
+			RangeFilter range = ParseRangeFilter(gr_it->second, "genotype_range", 0.0, 2.0, "read_pgen", &inc_missing);
+			bind_data->genotype_filter.SetFromRange(range, inc_missing);
 		}
 	}
 
@@ -742,9 +754,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -787,9 +798,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(child_vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(child_vec)[rows_emitted] = geno;
@@ -878,9 +888,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
+								if (a1 == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                 !bind_data.genotype_filter.AllowsCall(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
@@ -903,9 +912,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								idx_t allele_base = pair_idx * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
-								if (a1 == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(a1 + a2)))) {
+								if (a1 == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                 !bind_data.genotype_filter.AllowsCall(static_cast<double>(a1 + a2)))) {
 									pair_validity.SetInvalid(pair_idx);
 									allele_data[allele_base] = 0;
 									allele_data[allele_base + 1] = 0;
@@ -970,9 +978,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(base + s);
 									child_data[base + s] = 0;
 								} else {
@@ -988,9 +995,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									child_validity.SetInvalid(list_offset + s);
 									child_data[list_offset + s] = 0;
 								} else {
@@ -1021,9 +1027,8 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
-								if (geno == -9 ||
-								    (bind_data.genotype_filter.active && !geno_range_all_pass &&
-								     !bind_data.genotype_filter.range.Passes(static_cast<double>(geno)))) {
+								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&
+								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
 									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
@@ -1066,6 +1071,7 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 	read_pgen.named_parameters["af_range"] = LogicalType::ANY;
 	read_pgen.named_parameters["ac_range"] = LogicalType::ANY;
 	read_pgen.named_parameters["genotype_range"] = LogicalType::ANY;
+	read_pgen.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
 	read_pgen.named_parameters["variants"] = LogicalType::ANY;
 
 	loader.RegisterFunction(read_pgen);
