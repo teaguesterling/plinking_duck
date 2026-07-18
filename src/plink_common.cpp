@@ -1263,9 +1263,9 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double 
 		}
 
 		if (field_name != "min" && field_name != "max") {
-			throw InvalidInputException("%s: %s has unknown field '%s' (expected %s)", func_name, param_name, field_name,
-			                            include_missing_out ? "'min', 'max', and/or 'include_missing'"
-			                                                : "'min' and/or 'max'");
+			throw InvalidInputException(
+			    "%s: %s has unknown field '%s' (expected %s)", func_name, param_name, field_name,
+			    include_missing_out ? "'min', 'max', and/or 'include_missing'" : "'min' and/or 'max'");
 		}
 
 		if (child_val.IsNull()) {
