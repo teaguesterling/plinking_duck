@@ -1,0 +1,66 @@
+# name: test/sql/read_pfile_psam_parquet.test
+# description: read_pfile reads psam columns natively from a parquet companion (ColumnDataCollection path) in sample/genotype orient
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# An explicit .parquet psam routes read_pfile's genotype/sample orient through the
+# native ColumnDataCollection path (LoadPfileSampleMetadataFromSource +
+# EmitSampleMetadataColumn / FetchChunk) instead of the text `rows` path — the
+# perf-critical code the text-.psam fixtures never exercise. pfile_example.psam has
+# FID (general varchar), IID (id column), and SEX (special: 0 -> NULL; SAMPLE3=0).
+
+statement ok
+COPY (SELECT * FROM read_psam('test/data/pfile_example.psam'))
+TO '/tmp/plinking_duck_cdc_test.psam.parquet' (FORMAT parquet);
+
+# --- Sample orient: FID + IID + SEX read from the CDC path (SEX 0 -> NULL preserved) ---
+query TTI
+SELECT FID, IID, SEX
+FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                psam := '/tmp/plinking_duck_cdc_test.psam.parquet', genotypes := 'counts')
+ORDER BY IID;
+----
+FAM001	SAMPLE1	1
+FAM001	SAMPLE2	2
+FAM002	SAMPLE3	NULL
+FAM002	SAMPLE4	1
+
+# --- CDC path + include_genotypes row-skip together: keep only hom_alt carriers.
+# Exercises the sample_keep -> sample_file_idx -> FetchChunk mapping. SAMPLE2 (no
+# hom_alt) is dropped. ---
+query TI
+SELECT IID, SEX
+FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                psam := '/tmp/plinking_duck_cdc_test.psam.parquet', genotypes := 'counts',
+                include_genotypes := ['hom_alt'])
+ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE3	NULL
+SAMPLE4	1
+
+# --- Genotype orient: psam columns from the CDC path, combined with a filter ---
+query TII
+SELECT IID, SEX, genotype
+FROM read_pfile('test/data/pfile_example', orient := 'genotype',
+                psam := '/tmp/plinking_duck_cdc_test.psam.parquet', variants := ['rs1'],
+                include_genotypes := ['het', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE2	2	1
+SAMPLE3	NULL	2
+
+# --- Equivalence: the CDC path must produce identical psam columns to the text path ---
+query I
+SELECT COUNT(*) FROM (
+  SELECT FID, IID, SEX FROM read_pfile('test/data/pfile_example', orient := 'sample',
+      psam := '/tmp/plinking_duck_cdc_test.psam.parquet', genotypes := 'counts')
+  EXCEPT
+  SELECT FID, IID, SEX FROM read_pfile('test/data/pfile_example', orient := 'sample',
+      genotypes := 'counts')
+);
+----
+0
