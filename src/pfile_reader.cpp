@@ -97,20 +97,16 @@ static RegionFilter ParseRegion(const string &region_str) {
 //! Extended sample info for genotype orient mode: includes all psam columns.
 struct PfileSampleMetadata {
 	PsamHeaderInfo header;
-	//! All data rows from the .psam/.fam, in file order (TEXT path).
-	//! Each inner vector has one field per column. Empty when column_data is set.
+	//! All data rows from the .psam/.fam, in file order (TEXT path only).
+	//! Each inner vector has one field per column. Empty for the parquet path, whose
+	//! column values are loaded projection-aware at InitGlobal (PfileGlobalState).
 	vector<vector<string>> rows;
 
-	//! Native columnar storage of the sample rows (parquet/non-native source path).
-	//! When set, the scan reads NON-id psam column values from here instead of
-	//! `rows`, avoiding materializing every cell as a std::string. IID/FID come from
-	//! SampleInfo::iids/fids (extracted once at load). Row order matches file order;
-	//! column order matches `header.column_names`.
-	unique_ptr<ColumnDataCollection> column_data;
-	//! Cumulative starting row of each column_data chunk (size ChunkCount()+1), so a
-	//! file-order row maps to (chunk, offset) — CDC chunks are not 2048-aligned.
-	vector<idx_t> chunk_start_row;
-	//! IID / FID column positions in the header (for the column_data path).
+	//! Source path for the parquet/non-native path — the projected column data is
+	//! (re-)queried from here at InitGlobal, not materialized at bind. Empty for text.
+	string source_path;
+
+	//! IID / FID column positions in the header (for the parquet path).
 	idx_t iid_col_idx = DConstants::INVALID_INDEX;
 	idx_t fid_col_idx = DConstants::INVALID_INDEX;
 
@@ -119,9 +115,9 @@ struct PfileSampleMetadata {
 	//! Indices of PAT/MAT columns for special missing-value handling
 	vector<idx_t> parent_col_indices;
 
-	bool HasColumnData() const {
-		return column_data != nullptr;
-	}
+	//! True when the psam came from a parquet/non-native source: column data is not
+	//! in `rows`; the scan reads it from the projection-aware CDC in the global state.
+	bool from_parquet = false;
 };
 
 //! Missing value sentinels (same as psam_reader)
@@ -129,30 +125,33 @@ static bool PfileIsMissingValue(const string &val) {
 	return val.empty() || val == "." || val == "NA" || val == "na";
 }
 
-//! Load full sample metadata from a non-native source for genotype/sample orient modes.
-//! Queries the source via Connection, populates both PfileSampleMetadata and SampleInfo.
+//! Load sample metadata SCHEMA (not data) from a non-native source (parquet/csv/table)
+//! for genotype/sample orient modes. The column values are loaded projection-aware at
+//! InitGlobal (see BuildProjectedPsamCdc), so a wide psam never materializes columns
+//! the query does not select. Only the header, special-column indices, and sample
+//! count are established here.
 static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &context, const string &source,
                                                              SampleInfo &sample_info_out) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 	auto escaped = StringUtil::Replace(source, "'", "''");
-	auto result = conn.Query("SELECT * FROM '" + escaped + "'");
-	if (result->HasError()) {
-		throw IOException("read_pfile: failed to read source '%s': %s", source, result->GetError());
+
+	// Schema only — LIMIT 0 reads the footer/metadata, no row groups.
+	auto schema_res = conn.Query("SELECT * FROM '" + escaped + "' LIMIT 0");
+	if (schema_res->HasError()) {
+		throw IOException("read_pfile: failed to read source '%s': %s", source, schema_res->GetError());
 	}
 
 	PfileSampleMetadata meta;
-
-	// Build header from result schema
+	meta.from_parquet = true;
+	meta.source_path = source;
 	meta.header.format = PsamFormat::PSAM_IID;
-	meta.header.column_names = result->names;
-	meta.header.column_types = result->types;
+	meta.header.column_names = schema_res->names;
+	meta.header.column_types = schema_res->types;
 
-	// Find special column indices (case-insensitive)
 	idx_t iid_idx = DConstants::INVALID_INDEX;
-	idx_t fid_idx = DConstants::INVALID_INDEX;
-	for (idx_t i = 0; i < result->names.size(); i++) {
-		auto lower = StringUtil::Lower(result->names[i]);
+	for (idx_t i = 0; i < schema_res->names.size(); i++) {
+		auto lower = StringUtil::Lower(schema_res->names[i]);
 		if (lower == "sex") {
 			meta.sex_col_idx = i;
 		} else if (lower == "pat" || lower == "mat") {
@@ -161,76 +160,79 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 		if (lower == "iid") {
 			iid_idx = i;
 		} else if (lower == "fid") {
-			fid_idx = i;
+			meta.fid_col_idx = i;
 		}
 	}
-
 	if (iid_idx == DConstants::INVALID_INDEX) {
 		throw IOException("read_pfile: source '%s' has no IID column (found: %s)", source,
-		                  StringUtil::Join(result->names, ", "));
+		                  StringUtil::Join(schema_res->names, ", "));
 	}
-
-	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
-
-	// Retain the query result's native columnar data instead of materializing every
-	// cell as a std::string. The scan reads psam column values directly from this
-	// ColumnDataCollection (see EmitSampleMetadataColumn); only the IID/FID columns
-	// are copied out into sample_info here, since those drive subsetting and column
-	// naming. This is the difference between ~3.5s and ~1s at 10M samples.
 	meta.iid_col_idx = iid_idx;
-	meta.fid_col_idx = fid_idx;
 
-	auto &materialized = *result;
-	auto &collection = materialized.Collection();
-	const idx_t row_ct = collection.Count();
-	sample_info_out.iids.reserve(row_ct);
-	if (has_fid) {
-		sample_info_out.fids.reserve(row_ct);
+	auto cnt_res = conn.Query("SELECT COUNT(*) FROM '" + escaped + "'");
+	if (cnt_res->HasError()) {
+		throw IOException("read_pfile: failed to count rows in source '%s': %s", source, cnt_res->GetError());
 	}
-
-	// One vectorized scan: extract IID (and FID) as std::string (these drive
-	// subsetting + IID output) and record cumulative chunk offsets so the scan can
-	// map a file-order row to (chunk, offset) for the other columns. The scan's
-	// chunk boundaries match the physical CDC chunks used by FetchChunk.
-	vector<column_t> id_cols;
-	id_cols.push_back(iid_idx);
-	if (has_fid) {
-		id_cols.push_back(fid_idx);
-	}
-	ColumnDataScanState scan_state;
-	collection.InitializeScan(scan_state, id_cols);
-	DataChunk id_chunk;
-	collection.InitializeScanChunk(scan_state, id_chunk);
-	meta.chunk_start_row.push_back(0);
-	idx_t running = 0;
-	while (collection.Scan(scan_state, id_chunk)) {
-		const idx_t n = id_chunk.size();
-		auto extract = [&](idx_t chunk_col, vector<string> &out) {
-			Vector varchar_vec(LogicalType::VARCHAR);
-			Vector *src = &id_chunk.data[chunk_col];
-			if (src->GetType().id() != LogicalTypeId::VARCHAR) {
-				VectorOperations::Cast(context, *src, varchar_vec, n);
-				src = &varchar_vec;
-			}
-			UnifiedVectorFormat fmt;
-			src->ToUnifiedFormat(n, fmt);
-			auto data = UnifiedVectorFormat::GetData<string_t>(fmt);
-			for (idx_t row = 0; row < n; row++) {
-				idx_t vidx = fmt.sel->get_index(row);
-				out.push_back(fmt.validity.RowIsValid(vidx) ? data[vidx].GetString() : string());
-			}
-		};
-		extract(0, sample_info_out.iids);
-		if (has_fid) {
-			extract(1, sample_info_out.fids);
-		}
-		running += n;
-		meta.chunk_start_row.push_back(running);
-	}
-
-	sample_info_out.sample_ct = sample_info_out.iids.size();
-	meta.column_data = materialized.TakeCollection();
+	sample_info_out.sample_ct = cnt_res->GetValue(0, 0).GetValue<int64_t>();
+	// iids are NOT materialized here — see EnsureSourceIids (only a VARCHAR sample
+	// subset needs them; IID output reads from the projected CDC at scan).
 	return meta;
+}
+
+//! Extract the string_t values of one VARCHAR-castable column of a fetched/scanned
+//! chunk into a std::string vector (NULL/invalid -> empty string).
+static void ExtractStringColumn(ClientContext &context, DataChunk &chunk, idx_t chunk_col, idx_t n,
+                                vector<string> &out) {
+	Vector varchar_vec(LogicalType::VARCHAR);
+	Vector *src = &chunk.data[chunk_col];
+	if (src->GetType().id() != LogicalTypeId::VARCHAR) {
+		VectorOperations::Cast(context, *src, varchar_vec, n);
+		src = &varchar_vec;
+	}
+	UnifiedVectorFormat fmt;
+	src->ToUnifiedFormat(n, fmt);
+	auto data = UnifiedVectorFormat::GetData<string_t>(fmt);
+	for (idx_t row = 0; row < n; row++) {
+		idx_t vidx = fmt.sel->get_index(row);
+		out.push_back(fmt.validity.RowIsValid(vidx) ? data[vidx].GetString() : string());
+	}
+}
+
+//! Lazily materialize SampleInfo::iids (and fids) for a parquet-source psam, by
+//! querying just the IID (and FID) columns. No-op if already populated or not a
+//! parquet source. Only a `samples := [IID strings]` subset needs this — IID/FID
+//! *output* reads natively from the projected CDC and never triggers it.
+static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &meta, SampleInfo &sample_info) {
+	if (!sample_info.iids.empty() || !meta.from_parquet) {
+		return;
+	}
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto escaped = StringUtil::Replace(meta.source_path, "'", "''");
+	const bool has_fid = meta.fid_col_idx != DConstants::INVALID_INDEX;
+	auto quote = [](const string &n) {
+		return "\"" + StringUtil::Replace(n, "\"", "\"\"") + "\"";
+	};
+	string cols = quote(meta.header.column_names[meta.iid_col_idx]);
+	if (has_fid) {
+		cols += ", " + quote(meta.header.column_names[meta.fid_col_idx]);
+	}
+	auto result = conn.Query("SELECT " + cols + " FROM '" + escaped + "'");
+	if (result->HasError()) {
+		throw IOException("read_pfile: failed to load IIDs from source '%s': %s", meta.source_path, result->GetError());
+	}
+	sample_info.iids.reserve(sample_info.sample_ct);
+	if (has_fid) {
+		sample_info.fids.reserve(sample_info.sample_ct);
+	}
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		const idx_t n = chunk->size();
+		ExtractStringColumn(context, *chunk, 0, n, sample_info.iids);
+		if (has_fid) {
+			ExtractStringColumn(context, *chunk, 1, n, sample_info.fids);
+		}
+	}
 }
 
 //! Load full sample metadata including all columns for genotype orient mode output.
@@ -443,6 +445,14 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	OrientMode orient_mode = OrientMode::VARIANT;
 	uint32_t max_threads_config = 0;
 
+	// Projection-aware psam column data (parquet source only). Built once here with
+	// ONLY the psam columns the query projects, so a wide biobank psam never
+	// materializes/reads unused covariate columns. Read at scan via a per-thread
+	// cached FetchChunk (thread-safe: FetchChunk on a shared const CDC).
+	unique_ptr<ColumnDataCollection> psam_cdc;
+	vector<idx_t> psam_chunk_start_row; // cumulative chunk offsets (size ChunkCount()+1)
+	vector<idx_t> psam_col_to_cdc;      // header col idx -> psam_cdc col idx (INVALID if not projected)
+
 	idx_t MaxThreads() const override {
 		if (orient_mode == OrientMode::GENOTYPE) {
 			// Each variant fans out to N sample rows — use smaller batch size (64)
@@ -494,8 +504,8 @@ struct PfileLocalState : public LocalTableFunctionState {
 	bool geno_range_all_pass = true;        // per-variant flag for genotype_range optimization
 	bool batch_exhausted = true;            // true initially to trigger first batch claim
 
-	// Per-thread cache of one column_data chunk for reading non-id psam columns at
-	// scan time (sample_metadata.column_data path). Populated lazily via FetchChunk.
+	// Per-thread cache of one chunk of the projected psam CDC (PfileGlobalState::psam_cdc),
+	// for reading psam column values at scan time. Populated lazily via FetchChunk.
 	DataChunk psam_chunk;
 	idx_t psam_chunk_idx = DConstants::INVALID_INDEX;
 
@@ -745,7 +755,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				bind_data->sample_indices.push_back(static_cast<uint32_t>(idx));
 			}
 		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
-			// Lazily build iid_to_idx only when VARCHAR filter is actually used.
+			// Lazily build iid_to_idx only when a VARCHAR sample filter is used. On the
+			// parquet path the IID strings are not materialized at load, so pull just the
+			// IID/FID columns from the source first (no-op on the text path).
+			EnsureSourceIids(context, bind_data->sample_metadata, bind_data->sample_info);
 			bind_data->sample_info.EnsureIidMap("read_pfile: " + bind_data->psam_path);
 			auto &children = ListValue::GetChildren(samples_val);
 			for (auto &child : children) {
@@ -1557,6 +1570,91 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	return std::move(bind_data);
 }
 
+//! Projection-aware load of the parquet-source psam columns into the global state.
+//! Determines which psam columns the query projects (from column_ids via the orient
+//! column maps), queries ONLY those from the source, and records chunk offsets. A
+//! query that projects no psam column (e.g. counts-only) builds nothing.
+static void BuildProjectedPsamCdc(ClientContext &context, const PfileBindData &bind_data, PfileGlobalState &gstate,
+                                  const vector<column_t> &column_ids) {
+	auto &meta = bind_data.sample_metadata;
+	if (!meta.from_parquet) {
+		return; // text path serves values from meta.rows
+	}
+	if (bind_data.orient_mode != OrientMode::SAMPLE && bind_data.orient_mode != OrientMode::GENOTYPE) {
+		return;
+	}
+
+	const idx_t ncol = meta.header.column_names.size();
+	gstate.psam_col_to_cdc.assign(ncol, DConstants::INVALID_INDEX);
+
+	// Collect the projected psam header columns (dedup, then sort ascending).
+	vector<idx_t> projected;
+	for (auto col_id : column_ids) {
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		idx_t psam_col = DConstants::INVALID_INDEX;
+		if (bind_data.orient_mode == OrientMode::SAMPLE) {
+			// psam metadata columns are always the leading output columns (indices
+			// 0..N-1); the genotypes/per-variant columns are beyond that, in every
+			// genotypes mode (array/list/counts/stats/struct/columns).
+			if (col_id < bind_data.sample_orient_col_to_psam_col.size()) {
+				psam_col = bind_data.sample_orient_col_to_psam_col[col_id];
+			}
+		} else { // GENOTYPE
+			if (col_id >= bind_data.geno_sample_col_start && col_id < bind_data.geno_genotype_col) {
+				idx_t rel = col_id - bind_data.geno_sample_col_start;
+				if (rel < bind_data.geno_sample_col_to_psam_col.size()) {
+					psam_col = bind_data.geno_sample_col_to_psam_col[rel];
+				}
+			}
+		}
+		if (psam_col != DConstants::INVALID_INDEX && psam_col < ncol &&
+		    gstate.psam_col_to_cdc[psam_col] == DConstants::INVALID_INDEX) {
+			gstate.psam_col_to_cdc[psam_col] = 0; // mark; real CDC index assigned below
+			projected.push_back(psam_col);
+		}
+	}
+	if (projected.empty()) {
+		return; // no psam column projected — nothing to load
+	}
+	std::sort(projected.begin(), projected.end());
+	for (idx_t i = 0; i < projected.size(); i++) {
+		gstate.psam_col_to_cdc[projected[i]] = i;
+	}
+
+	auto quote = [](const string &n) {
+		return "\"" + StringUtil::Replace(n, "\"", "\"\"") + "\"";
+	};
+	string cols;
+	for (idx_t i = 0; i < projected.size(); i++) {
+		cols += (i ? ", " : "") + quote(meta.header.column_names[projected[i]]);
+	}
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto escaped = StringUtil::Replace(meta.source_path, "'", "''");
+	auto result = conn.Query("SELECT " + cols + " FROM '" + escaped + "'");
+	if (result->HasError()) {
+		throw IOException("read_pfile: failed to load psam columns from '%s': %s", meta.source_path,
+		                  result->GetError());
+	}
+
+	auto &collection = result->Collection();
+	gstate.psam_chunk_start_row.push_back(0);
+	idx_t running = 0;
+	{
+		ColumnDataScanState scan_state;
+		collection.InitializeScan(scan_state);
+		DataChunk size_chunk;
+		collection.InitializeScanChunk(scan_state, size_chunk);
+		while (collection.Scan(scan_state, size_chunk)) {
+			running += size_chunk.size();
+			gstate.psam_chunk_start_row.push_back(running);
+		}
+	}
+	gstate.psam_cdc = result->TakeCollection();
+}
+
 // ---------------------------------------------------------------------------
 // Init global
 // ---------------------------------------------------------------------------
@@ -1644,6 +1742,10 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	}
 	state->need_pgen_reader = state->need_genotypes || bind_data.count_filter.HasFilter() ||
 	                          bind_data.genotype_filter.active || need_aggregate_pgen;
+
+	// Projection-aware psam column load (parquet source): materialize only the psam
+	// columns this query actually selects.
+	BuildProjectedPsamCdc(context, bind_data, *state, input.column_ids);
 
 	return std::move(state);
 }
@@ -2289,19 +2391,19 @@ static void FillSampleMetadataValue(Vector &vec, idx_t row_idx, const string &va
 	}
 }
 
-//! Emit one psam column value for a sample into an output vector, from whichever
-//! metadata representation is populated:
+//! Emit one psam column value for a sample into an output vector:
 //!  - text path: the std::string in PfileSampleMetadata::rows.
-//!  - column_data path: IID/FID come from the pre-extracted SampleInfo strings;
-//!    other columns are read from the retained ColumnDataCollection via a
-//!    per-thread cached chunk (mapping file-order row -> (chunk, offset) through
-//!    chunk_start_row). Value semantics go through FillSampleMetadataValue so the
-//!    SEX/PAT/MAT/missing handling is identical to the text path.
-static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileLocalState &lstate, Vector &out_vec,
-                                     idx_t out_row, idx_t sample_file_idx, idx_t psam_col_idx) {
+//!  - parquet path: read from the projection-aware CDC in the global state via a
+//!    per-thread cached FetchChunk. The CDC holds ONLY the projected psam columns
+//!    (psam_col_to_cdc maps header col -> CDC col), so a wide psam never fetches
+//!    unused columns. VARCHAR columns read string_t directly (no Value boxing);
+//!    rarely-projected non-VARCHAR columns box the single value. All values go
+//!    through FillSampleMetadataValue for identical SEX/PAT/MAT/missing handling.
+static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileGlobalState &gstate, PfileLocalState &lstate,
+                                     Vector &out_vec, idx_t out_row, idx_t sample_file_idx, idx_t psam_col_idx) {
 	auto &meta = bind_data.sample_metadata;
 
-	if (!meta.HasColumnData()) {
+	if (!meta.from_parquet) {
 		if (sample_file_idx < meta.rows.size() && psam_col_idx < meta.rows[sample_file_idx].size()) {
 			FillSampleMetadataValue(out_vec, out_row, meta.rows[sample_file_idx][psam_col_idx], psam_col_idx, meta);
 		} else {
@@ -2310,23 +2412,14 @@ static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileLocalS
 		return;
 	}
 
-	// IID / FID: use the strings already extracted at load.
-	if (psam_col_idx == meta.iid_col_idx) {
-		const auto &iids = bind_data.sample_info.iids;
-		FillSampleMetadataValue(out_vec, out_row, sample_file_idx < iids.size() ? iids[sample_file_idx] : string(),
-		                        psam_col_idx, meta);
+	// Parquet path. Map the header column to its column in the projected CDC.
+	if (!gstate.psam_cdc || psam_col_idx >= gstate.psam_col_to_cdc.size() ||
+	    gstate.psam_col_to_cdc[psam_col_idx] == DConstants::INVALID_INDEX) {
+		FlatVector::SetNull(out_vec, out_row, true);
 		return;
 	}
-	if (psam_col_idx == meta.fid_col_idx) {
-		const auto &fids = bind_data.sample_info.fids;
-		FillSampleMetadataValue(out_vec, out_row, sample_file_idx < fids.size() ? fids[sample_file_idx] : string(),
-		                        psam_col_idx, meta);
-		return;
-	}
-
-	// Other columns: locate the chunk covering this row and read it (cast to string
-	// through Value — only hit when a non-id psam column is actually projected).
-	const auto &starts = meta.chunk_start_row;
+	idx_t cdc_col = gstate.psam_col_to_cdc[psam_col_idx];
+	const auto &starts = gstate.psam_chunk_start_row;
 	if (starts.size() < 2 || sample_file_idx >= starts.back()) {
 		FlatVector::SetNull(out_vec, out_row, true);
 		return;
@@ -2334,14 +2427,41 @@ static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileLocalS
 	idx_t chunk_idx = (idx_t)(std::upper_bound(starts.begin(), starts.end(), sample_file_idx) - starts.begin()) - 1;
 	if (chunk_idx != lstate.psam_chunk_idx) {
 		if (lstate.psam_chunk.ColumnCount() == 0) {
-			meta.column_data->InitializeScanChunk(lstate.psam_chunk);
+			gstate.psam_cdc->InitializeScanChunk(lstate.psam_chunk);
 		}
-		meta.column_data->FetchChunk(chunk_idx, lstate.psam_chunk);
+		gstate.psam_cdc->FetchChunk(chunk_idx, lstate.psam_chunk);
+		lstate.psam_chunk.Flatten(); // FlatVector access below; only the projected cols
 		lstate.psam_chunk_idx = chunk_idx;
 	}
 	idx_t local = sample_file_idx - starts[chunk_idx];
-	Value v = lstate.psam_chunk.data[psam_col_idx].GetValue(local);
-	FillSampleMetadataValue(out_vec, out_row, v.IsNull() ? string() : v.ToString(), psam_col_idx, meta);
+	Vector &src = lstate.psam_chunk.data[cdc_col];
+
+	// SEX/PAT/MAT and any VARCHAR-typed output column go through the string-based
+	// FillSampleMetadataValue (SEX 0->NULL, PAT/MAT "0"->NULL, missing sentinels).
+	bool is_special = (psam_col_idx == meta.sex_col_idx);
+	for (auto p : meta.parent_col_indices) {
+		if (p == psam_col_idx) {
+			is_special = true;
+			break;
+		}
+	}
+	if (is_special || out_vec.GetType().id() == LogicalTypeId::VARCHAR) {
+		if (src.GetType().id() == LogicalTypeId::VARCHAR) {
+			if (!FlatVector::Validity(src).RowIsValid(local)) {
+				FillSampleMetadataValue(out_vec, out_row, string(), psam_col_idx, meta);
+			} else {
+				FillSampleMetadataValue(out_vec, out_row, FlatVector::GetData<string_t>(src)[local].GetString(),
+				                        psam_col_idx, meta);
+			}
+		} else {
+			Value v = src.GetValue(local);
+			FillSampleMetadataValue(out_vec, out_row, v.IsNull() ? string() : v.ToString(), psam_col_idx, meta);
+		}
+	} else {
+		// Typed covariate column (INTEGER/DOUBLE/...): output type matches the source
+		// parquet type, so copy the value natively rather than through a string.
+		out_vec.SetValue(out_row, src.GetValue(local));
+	}
 }
 
 static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
@@ -2582,7 +2702,8 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					idx_t sample_col_rel = file_col - bind_data.geno_sample_col_start;
 					idx_t psam_col_idx = bind_data.geno_sample_col_to_psam_col[sample_col_rel];
 
-					EmitSampleMetadataColumn(bind_data, lstate, vec, rows_emitted, sample_file_idx, psam_col_idx);
+					EmitSampleMetadataColumn(bind_data, gstate, lstate, vec, rows_emitted, sample_file_idx,
+					                         psam_col_idx);
 				}
 			}
 
@@ -2887,7 +3008,8 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					// Sample metadata column
 					idx_t psam_col_idx = bind_data.sample_orient_col_to_psam_col[file_col];
 
-					EmitSampleMetadataColumn(bind_data, lstate, vec, rows_emitted, sample_file_idx, psam_col_idx);
+					EmitSampleMetadataColumn(bind_data, gstate, lstate, vec, rows_emitted, sample_file_idx,
+					                         psam_col_idx);
 				}
 			}
 

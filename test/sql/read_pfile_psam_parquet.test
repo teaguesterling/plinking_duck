@@ -64,3 +64,103 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# =====================================================================
+# Typed (non-VARCHAR) psam columns via parquet. A parquet psam preserves column
+# types, so an INTEGER/DOUBLE covariate is output with that type — the value must
+# be copied natively, not stringified (that previously crashed with a type
+# mismatch). AGE = INTEGER, BMI = DOUBLE.
+# =====================================================================
+
+statement ok
+COPY (SELECT FID, IID, SEX, CAST(SUBSTR(IID, 7, 1) AS INTEGER) AS AGE,
+             CAST(SUBSTR(IID, 7, 1) AS DOUBLE) * 1.5 AS BMI
+      FROM read_psam('test/data/pfile_example.psam'))
+TO '/tmp/plinking_duck_typed.psam.parquet' (FORMAT parquet);
+
+query TIR
+SELECT IID, AGE, BMI
+FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                psam := '/tmp/plinking_duck_typed.psam.parquet', genotypes := 'counts')
+ORDER BY IID;
+----
+SAMPLE1	1	1.5
+SAMPLE2	2	3.0
+SAMPLE3	3	4.5
+SAMPLE4	4	6.0
+
+# Typed column + genotype orient + filter (native read of a DOUBLE through the CDC).
+query TR
+SELECT IID, BMI
+FROM read_pfile('test/data/pfile_example', orient := 'genotype',
+                psam := '/tmp/plinking_duck_typed.psam.parquet', variants := ['rs1'],
+                include_genotypes := ['het', 'hom_alt'])
+ORDER BY IID;
+----
+SAMPLE2	3.0
+SAMPLE3	4.5
+
+# =====================================================================
+# samples := [IID strings] over a parquet psam: IID strings are not materialized
+# at load, so this exercises the lazy EnsureSourceIids build feeding the IID map.
+# =====================================================================
+
+query TI
+SELECT IID, AGE
+FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                psam := '/tmp/plinking_duck_typed.psam.parquet', genotypes := 'counts',
+                samples := ['SAMPLE3', 'SAMPLE1'])
+ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE3	3
+
+# =====================================================================
+# PAT/MAT special-casing ("0" -> NULL) through the parquet CDC path.
+# =====================================================================
+
+statement ok
+COPY (SELECT FID, IID,
+             CASE WHEN IID = 'SAMPLE1' THEN '0' ELSE 'PA_' || IID END AS PAT,
+             CASE WHEN IID = 'SAMPLE2' THEN '0' ELSE 'MA_' || IID END AS MAT, SEX
+      FROM read_psam('test/data/pfile_example.psam'))
+TO '/tmp/plinking_duck_patmat.psam.parquet' (FORMAT parquet);
+
+query TTT
+SELECT IID, PAT, MAT
+FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                psam := '/tmp/plinking_duck_patmat.psam.parquet', genotypes := 'counts')
+ORDER BY IID;
+----
+SAMPLE1	NULL	MA_SAMPLE1
+SAMPLE2	PA_SAMPLE2	NULL
+SAMPLE3	PA_SAMPLE3	MA_SAMPLE3
+SAMPLE4	PA_SAMPLE4	MA_SAMPLE4
+
+# =====================================================================
+# psam columns must be emitted from the parquet CDC in every genotypes mode,
+# including 'columns' and 'struct' (where the genotype columns are not a single
+# trailing column). Regression: a mode guard once left these NULL.
+# =====================================================================
+
+query TI
+SELECT IID, SEX
+FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'columns',
+                psam := '/tmp/plinking_duck_cdc_test.psam.parquet')
+ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE2	2
+SAMPLE3	NULL
+SAMPLE4	1
+
+query TI
+SELECT IID, SEX
+FROM read_pfile('test/data/pfile_example', orient := 'sample', genotypes := 'struct',
+                psam := '/tmp/plinking_duck_cdc_test.psam.parquet')
+ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE2	2
+SAMPLE3	NULL
+SAMPLE4	1
