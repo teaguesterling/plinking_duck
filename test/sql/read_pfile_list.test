@@ -1,0 +1,115 @@
+# name: test/sql/read_pfile_list.test
+# description: read_pfile accepts a LIST(VARCHAR) of pfile prefixes, row-concatenating variants (Phase 1: variant + genotype orient)
+# group: [sql]
+
+require plinking_duck
+
+# --- Single-file behavior is unchanged ---
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_example');
+----
+4
+
+# --- Variant orient: row-concat two shards (same file twice -> identical samples) = 2x ---
+query I
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example']);
+----
+8
+
+# Distinct variant positions still 4 (the same 4 variants twice)
+query I
+SELECT count(DISTINCT POS) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example']);
+----
+4
+
+# --- Genotype orient: row-concat = 2 x (4 variants x 4 samples) = 32 ---
+query I
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], orient := 'genotype');
+----
+32
+
+# Genotype VALUES survive the per-thread reader swap at the source boundary:
+# every multi-file genotype string must appear in the single-file result (no garbling).
+query I
+WITH s AS (SELECT genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example')),
+     m AS (SELECT genotypes::VARCHAR g FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example']))
+SELECT count(*) FROM m WHERE g NOT IN (SELECT g FROM s);
+----
+0
+
+# Genotype-orient value spot check across the source boundary (ordered)
+query TITI
+SELECT CHROM, POS, IID, genotype
+FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], orient := 'genotype')
+ORDER BY POS, IID, genotype NULLS LAST
+LIMIT 4;
+----
+1	10000	SAMPLE1	0
+1	10000	SAMPLE1	0
+1	10000	SAMPLE2	1
+1	10000	SAMPLE2	1
+
+# --- Projection pushdown across the list (no genotype decode) ---
+query II
+SELECT count(*), count(DISTINCT POS) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example']);
+----
+8	4
+
+# --- Count filter (af_range) applies across shards ---
+query I
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], af_range := {max: 0.5});
+----
+8
+
+# --- Genotype-category filter (include_genotypes) across shards: 2 x single het count (5) = 10 ---
+query I
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], orient := 'genotype', include_genotypes := ['het']);
+----
+10
+
+# --- genotypes := 'columns' in variant orient (samples identical across shards) ---
+query I
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], genotypes := 'columns');
+----
+8
+
+# --- genotypes := 'counts' aggregate mode across shards (rides need_aggregate_pgen, not
+# need_genotypes): must be non-NULL and per-variant counts must match the single-file run.
+# Uses large_example (distinct rows) so a source-selection bug is visible.
+query I
+WITH s AS (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', genotypes := 'counts')),
+     m AS (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/large_example', 'test/data/large_example'], genotypes := 'counts'))
+SELECT (SELECT count(*) FROM m WHERE g IS NULL)
+     + (SELECT count(*) FROM m JOIN s USING (ID) WHERE m.g IS DISTINCT FROM s.g);
+----
+0
+
+# --- A single-element list behaves like the scalar form ---
+query I
+SELECT count(*) FROM read_pfile(['test/data/pgen_example']);
+----
+4
+
+# --- Negative: sample_ct mismatch across files (pgen_example=4 vs large_example=8) ---
+statement error
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/large_example']);
+----
+sample count mismatch across files
+
+# --- Negative: sample orient with multiple files is not yet supported (Phase 2) ---
+statement error
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], orient := 'sample');
+----
+orient := 'sample' with multiple files is not yet supported
+
+# --- Negative: single-file sample orient still works ---
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_example', orient := 'sample');
+----
+4
+
+# --- Negative: named pgen/pvar/psam override + multi-element list is ambiguous ---
+statement error
+SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], pvar := 'test/data/pgen_example.pvar');
+----
+overrides cannot be combined with a multi-file list

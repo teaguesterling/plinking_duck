@@ -457,6 +457,23 @@ string ReplaceExtension(const string &path, const string &new_ext) {
 	return path.substr(0, dot) + new_ext;
 }
 
+vector<string> ResolvePathList(const Value &input, const char *fn_name) {
+	vector<string> paths;
+	if (input.type().id() == LogicalTypeId::LIST) {
+		for (auto &child : ListValue::GetChildren(input)) {
+			if (!child.IsNull()) {
+				paths.push_back(child.GetValue<string>());
+			}
+		}
+		if (paths.empty()) {
+			throw InvalidInputException("%s: empty file list provided", fn_name);
+		}
+	} else {
+		paths.push_back(input.GetValue<string>());
+	}
+	return paths;
+}
+
 string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions) {
 	for (auto &ext : extensions) {
 		auto candidate = ReplaceExtension(pgen_path, ext);

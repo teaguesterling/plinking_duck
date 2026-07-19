@@ -47,7 +47,13 @@ SELECT * FROM read_pvar('path/to/file.bim');
 SELECT CHROM, POS, ID, REF, ALT
 FROM read_pvar('data/variants.pvar')
 WHERE CHROM = '22';
+
+-- Multi-file: read several variant files as one table (row-concatenated)
+SELECT * FROM read_pvar(['chr1.pvar', 'chr2.pvar', 'chr3.pvar']);
 ```
+
+The first argument accepts either a single path or a `LIST(VARCHAR)` of paths
+(mirroring `read_csv`); a list row-concatenates variants in file order.
 
 **Output columns (.pvar):** CHROM, POS, ID, REF, ALT, and any optional columns
 present in the header (QUAL, FILTER, INFO, CM).
@@ -129,6 +135,9 @@ Supports multiple orient modes, sample subsetting, variant filtering, and region
 -- Read all variants (one row per variant, genotypes as list)
 SELECT * FROM read_pfile('data/example');
 
+-- Multi-file: read variant-sharded filesets (identical .psam) as one table
+SELECT COUNT(*) FROM read_pfile(['data/chr1', 'data/chr2', 'data/chr3']);
+
 -- Genotype orient mode (one row per variant x sample)
 SELECT chrom, pos, iid, genotype
 FROM read_pfile('data/example', orient := 'genotype');
@@ -160,6 +169,16 @@ FROM read_pfile('data/example', orient := 'sample', genotypes := 'counts',
 
 **Genotype orient mode output:** CHROM, POS, ID, REF, ALT, plus all `.psam` columns (FID, IID, SEX, etc.),
 plus scalar `genotype` (TINYINT). One row per variant x sample combination.
+
+**Multi-file input:** The first argument accepts a single prefix or a `LIST(VARCHAR)`
+of prefixes (mirroring `read_csv`), row-concatenating variants across files — the
+biobank-scale, variant-sharded layout where every file shares one identical `.psam`.
+All files must have the **same samples in the same order**; alignment is positional
+(no per-file identity check), but a mismatched sample count is a hard error. Metadata
+is taken from the first file. `variant` and `genotype` orient support multi-file input;
+`orient := 'sample'` with multiple files is not yet supported (single file works).
+Explicit `pgen`/`pvar`/`psam` overrides are single-file only. Row order across files
+is not guaranteed — use `ORDER BY` if needed. (`read_pgen` multi-file input is planned.)
 
 **Parameters:**
 

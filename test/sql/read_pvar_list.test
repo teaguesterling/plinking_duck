@@ -1,0 +1,38 @@
+# name: test/sql/read_pvar_list.test
+# description: read_pvar accepts a LIST(VARCHAR) of paths, row-concatenating in file order
+# group: [sql]
+
+require plinking_duck
+
+# Single path (unchanged behavior)
+query I
+SELECT count(*) FROM read_pvar('test/data/pgen_example.pvar');
+----
+4
+
+# List of two (same file twice) -> row-concatenated = 2x
+query I
+SELECT count(*) FROM read_pvar(['test/data/pgen_example.pvar', 'test/data/pgen_example.pvar']);
+----
+8
+
+# Heterogeneous header lengths: large_example (3000, many ## contig lines) +
+# pgen_example (4) = 3004. Exercises the per-file header skip: reusing file[0]'s
+# skip_lines would drop or duplicate a row here.
+query I
+SELECT count(*) FROM read_pvar(['test/data/large_example.pvar', 'test/data/pgen_example.pvar']);
+----
+3004
+
+# Order reversed -> same total, and every ID distinct (no rows lost/duplicated)
+query I
+SELECT count(DISTINCT ID) FROM read_pvar(['test/data/pgen_example.pvar', 'test/data/large_example.pvar']);
+----
+3004
+
+# Projection pushdown still applies across the concatenated files
+query I
+SELECT count(*) FROM read_pvar(['test/data/large_example.pvar', 'test/data/large_example.pvar'])
+WHERE ID IS NOT NULL;
+----
+6000

@@ -1,0 +1,200 @@
+# P8-001: List input (multi-file reads)
+
+Accept `LIST(VARCHAR)` as the first positional argument of `read_pfile`,
+`read_pgen`, and `read_pvar` so a set of variant-sharded pfiles reads as one
+logical table. Motivated by biobank-scale sharding (chrom + K-megabase chunks)
+and by `pathmacro:`/`pathfunc:` catalog resolution, which returns a `VARCHAR[]`
+of shard prefixes.
+
+## Status
+
+- [x] Phase 0: `read_pvar` list input (row-concat, per-file header skip) — DONE
+- [ ] Phase 1: `read_pfile` variant + genotype orient (row-concat)
+- [ ] Phase 2: `read_pfile` sample orient (per-file genotype columns)
+- [ ] Phase 3: `read_pgen` list input
+- [ ] Tests
+
+## Prerequisites
+
+`read_pvar` list input (done, `test/sql/read_pvar_list.test`). Pairs with the
+scalarfs `pathmacro:`/`pathfunc:` filesystem (a catalog macro returns the shard
+prefixes; this feature consumes them). See DESIGN-GUIDE for shared conventions.
+
+## Branch
+
+`feature/P8-001-list-input-multifile-reads`
+
+---
+
+## Background
+
+At target scale the imputation panel is ~170M variants × ~7M samples, sharded
+per chromosome and moving to chrom + K-megabase chunks. **Every shard carries
+the same samples** (identical `.psam`); only the variants differ. Users want:
+
+- "give me gene X" — read the few shards covering a region.
+- "give me samples Y–Z" — read a shard's samples across variants.
+
+A `pathmacro:` macro selects the shard prefixes; `read_pfile([...])` then reads
+them as one table without the caller stitching results together.
+
+## Core invariant (all orients)
+
+The genotype payload is **always indexed by sample**, so across files the sample
+dimension must line up. Design decision (owner): **positional alignment, NO
+identity guard** — trust the caller that shards share an identical `.psam` (same
+IIDs, same order). Adding an IID/psam-content check at bind would reintroduce
+the psam-parse bottleneck (see the `projection-aware psam load` work) for no
+benefit on the real workload.
+
+Keep only the **free** safety check: opening each source's `.pgen` reads its
+header, which already reports that file's `sample_ct`. Compare it to the
+expected count (`sources[0]`) and error cleanly on mismatch — this costs
+nothing (the header is read regardless) and prevents a genuine mismatch from
+silently overflowing the sample buffers. It does **not** verify sample order;
+that is the caller's contract.
+
+## Input surface
+
+Register each reader as a `TableFunctionSet` with two overloads:
+`{VARCHAR}` and `{LIST(VARCHAR)}` (mirrors `read_csv`). Bind detects
+`input.inputs[0].type().id() == LogicalTypeId::LIST` and expands via a shared
+helper:
+
+```cpp
+// promote from pvar_reader.cpp static to plink_common
+vector<string> ResolvePathList(const Value &input, const char *fn_name);
+```
+
+Named `pgen`/`pvar`/`psam` overrides remain single-file only (error if combined
+with a multi-element list — they can't disambiguate per shard).
+
+## Data model
+
+`PfileBindData` is single-file today (one `pgen_path`, one `variants`, one
+`genotype_matrix`). Refactor to a per-source vector:
+
+```cpp
+struct PfileSource {
+    string pgen_path, pvar_path, psam_path;
+    VariantMetadataIndex variants;   // this shard's variants (post region/variant filter)
+    uint32_t raw_variant_ct = 0;
+    uint32_t raw_sample_ct  = 0;     // from .pgen header; used for the free sample_ct check
+    // sample-orient only: this shard's contribution (Phase 2)
+    vector<vector<int8_t>> genotype_matrix;
+    vector<vector<double>> dosage_matrix;
+};
+
+struct PfileBindData : TableFunctionData {
+    vector<PfileSource> sources;
+    vector<uint32_t> variant_offsets;   // cumulative; global vidx -> (source, local) via upper_bound
+    // shared, guaranteed-identical-by-contract:
+    SampleInfo sample_info;             // from sources[0]
+    PfileSampleMetadata sample_metadata;// from sources[0]
+    OrientMode orient_mode; GenotypeMode genotype_mode;
+    bool include_dosages, include_phased;
+    // filters (count/genotype range) unchanged — applied per row at scan
+    ...
+};
+```
+
+## Bind
+
+1. `ResolvePathList` → prefixes.
+2. For each prefix: existing companion discovery (`.pgen`/`.pvar`/`.psam` incl.
+   parquet companions) → a `PfileSource`; load its variant metadata (respecting
+   `region` / `variants` filters per shard).
+3. `sample_info` / `sample_metadata` from `sources[0]` only (identical by
+   contract). Do **not** parse other shards' psams.
+4. Build `variant_offsets` (cumulative variant counts across sources).
+5. Schema: unchanged for variant/genotype orient; per-file columns for sample
+   orient (Phase 2, see below).
+
+Note: Phase 1 binds every listed shard's `.pvar`, so a huge list with an active
+`region` filter still reads all pvars. Region-based file **pruning** (skip
+shards whose variant range can't intersect the region) is deferred (see below).
+
+## Global state & parallelism ("parallelize over pfiles")
+
+Work unit = **(source_idx, sub-batch) bounded to a single file** — never a flat
+global index, which would thrash reopens with many small shards. Precompute at
+InitGlobal:
+
+```cpp
+struct ScanBatch { uint32_t source_idx; uint32_t local_start, local_end; };
+vector<ScanBatch> batches;         // each within one source; sized ~1000 (variant) / ~64 (genotype)
+std::atomic<uint32_t> next_batch;  // threads claim batches
+```
+
+Variant/genotype orient: threads emit their batch's rows; DuckDB collects them.
+No merge step; row order across shards is not guaranteed (same as today's
+single-file parallel scan — callers `ORDER BY` if needed).
+
+## Local state
+
+`PfileLocalState` holds **one** `pgfi`/`pgr` for its *current* source plus a
+`current_source_idx`. On claiming a batch whose `source_idx` differs, close the
+current reader and open the new source's (`CleanupPgr`→`CleanupPgfi`, then init).
+Because samples are identical across shards, the sample-subset buffers
+(`sample_include`, `cumulative_popcounts`, `pssi`, genovec sizing) are built
+**once** per thread and reused — a file crossing swaps only `pgfi`/`pgr`.
+
+## Scan
+
+Claim batch → for `local_start..local_end` in `source_idx`: ensure the reader is
+that source's, decode genotypes via the shared per-thread buffers, emit variant
+metadata from `sources[source_idx].variants`. Genotype/count/range filters apply
+per row exactly as today.
+
+## Sample orient — Phase 2 (per-file columns)
+
+Output is one row per sample. Instead of concatenating variants into one array
+(dimensions differ per shard), emit **one genotypes column per file** for the
+single-column formats (`array | list | count(s) | stats | struct | map`), typed
+to that file's variant count. Column names derived from each shard's prefix.
+Rows are samples, **positionally** aligned across shards (identical psam). This
+is a positional column-merge: parallelize the per-file column computation, then
+assemble sample rows. `genotypes := 'columns'` is an **error** in sample-orient
+multi-file (per-variant columns differ per shard → ambiguous blowup).
+
+## read_pgen — Phase 3
+
+`read_pgen` only supports variant orient, so it reuses the Phase 1 machinery
+directly (row-concat, `(source, sub-batch)` claiming). `read_psam` list
+semantics (identical shards → dedup/first-wins) deferred; not needed for the
+sharded-genotype workload.
+
+## Deferred (explicit, not silent)
+
+- **Global `variants := [...]` across a multi-file list.** In Phase 1 `variants` resolves against a single file's index; across shards neither by-ID (an ID lives in one shard) nor by-index (indices are per-shard, not global) resolves correctly, so multi-file + `variants` is **guarded as an error** (use `region :=`). A follow-up should resolve `variants` against the global concatenated variant set (map global ID/index → (source, local) via `variant_offsets`).
+
+- **Region-based file pruning** — skip shards whose `.pvar` variant range can't
+  intersect an active `region`, so a 1000-shard list with `region := 'chr7:...'`
+  reads one shard's pvar, not all 1000. Needs a cheap per-shard min/max index.
+- **IID-join / `union_by_name`** — opt-in (`align := 'iid'`) to reconcile ragged
+  or reordered sample sets via a join (union with NULLs). Not the default; the
+  default remains positional.
+
+## Testing
+
+Fixtures: reuse `pgen_example.*` (4×4) and `large_example.*` (3000×8) — but note
+they have **different sample counts**, so a list mixing them must **error** on
+the free sample_ct check (a useful negative test). For positive multi-file
+tests, generate a small 2–3 shard fixture with identical `.psam` (same samples,
+disjoint variants) via `generate_test_data.sh`.
+
+Cases:
+- variant orient: `count(*)` over a 3-shard list = Σ per-shard; projection
+  pushdown; region + genotype filters across shards.
+- genotype orient: row-concat count = Σ (variants×samples).
+- sample orient: per-file columns present, correct dimensions; `columns` mode
+  errors; sample rows aligned.
+- negative: sample_ct mismatch errors; named `pgen`/`pvar`/`psam` + list errors.
+
+## Open questions
+
+1. Column naming for sample-orient per-file columns — full prefix, basename, or
+   an index (`geno_0`, `geno_1`)? Basename risks collisions across dirs.
+2. Should variant/genotype orient offer an opt-in stable ordering (emit shards
+   in list order) for reproducibility, or leave unordered like today?
+3. `read_psam` list — worth a first-wins mode now, or leave single-file?

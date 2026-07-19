@@ -6,10 +6,10 @@ PlinkingDuck provides 11 SQL table functions: 5 file readers and 6 analysis func
 
 | Function | Input | Description |
 |----------|-------|-------------|
-| [`read_pvar(path)`](read_pvar.md) | `.pvar` / `.bim` | Variant metadata (CHROM, POS, ID, REF, ALT) |
+| [`read_pvar(path)`](read_pvar.md) | `.pvar` / `.bim` (single or list) | Variant metadata (CHROM, POS, ID, REF, ALT) |
 | [`read_psam(path)`](read_psam.md) | `.psam` / `.fam` | Sample metadata (FID, IID, SEX, phenotypes) |
 | [`read_pgen(path)`](read_pgen.md) | `.pgen` | Binary genotypes as `ARRAY(TINYINT, N)` |
-| [`read_pfile(prefix)`](read_pfile.md) | `.pgen` + `.pvar` + `.psam` | Complete fileset with orient mode support |
+| [`read_pfile(prefix)`](read_pfile.md) | `.pgen` + `.pvar` + `.psam` (single or list) | Complete fileset with orient mode support |
 | [`read_plink_vcf(path)`](read_plink_vcf.md) | `.vcf` / `.vcf.gz` | Fast biallelic genotype extraction from VCF |
 
 ## Analysis Functions

@@ -1,0 +1,326 @@
+# name: test/sql/read_pfile_list_shards.test
+# description: read_pfile LIST(VARCHAR) multi-file reads over DISTINCT variant-disjoint
+# group: [sql]
+
+#   shards — ground-truth equivalence vs the whole file, region + genotype modes across
+#   the source boundary, and parallel correctness. Complements read_pfile_list.test
+#   (which only uses "same file twice"). See docs/planning/P8-001-list-input-multifile-reads.
+#
+# Fixtures shard1/shard2/shard3 are large_example (3000 variants x 8 samples, chroms
+# 1/2/3) split round-robin by variant ID into 3 disjoint 1000-variant shards, each
+# keeping ALL 8 samples (identical .psam). Every chromosome is spread across all 3
+# shards, so region filters genuinely span shards. Regenerate via
+# test/data/generate_shard_test_data.sh. Union of the 3 shards == large_example, so
+# read_pfile([shard1,shard2,shard3]) must reproduce the whole-file read exactly.
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# 1. Distinct-file concat (structural). large_example (3000) + streaming_example
+#    (50000) both have 8 samples -> the free sample_ct check passes; rows row-concat
+#    to 53000. Only sample_ct is checked (trust-the-caller), so IIDs need not match.
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM read_pfile(['test/data/large_example', 'test/data/streaming_example']);
+----
+53000
+
+# Projection pushdown across distinct files (no genotype decode). Both files use
+# chroms 1/2/3, so the union has 3 distinct CHROM values.
+query II
+SELECT count(*), count(DISTINCT CHROM) FROM read_pfile(['test/data/large_example', 'test/data/streaming_example']);
+----
+53000	3
+
+# ---------------------------------------------------------------------------
+# 2. Ground-truth equivalence (variant orient) — the strongest test.
+#    read_pfile([3 disjoint shards]) reproduces the whole-file variant set AND the
+#    genotype arrays. count(*) equality guards row loss/duplication (EXCEPT dedups,
+#    so symdiff alone would miss a double-emitted row); bidirectional EXCEPT guards
+#    value corruption at the source boundary.
+# ---------------------------------------------------------------------------
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'])) AS mf_ct,
+  (SELECT count(*) FROM read_pfile('test/data/large_example')) AS wf_ct;
+----
+3000	3000
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'])
+     EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example'))
+  UNION ALL
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example')
+     EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']))
+);
+----
+0
+
+# ---------------------------------------------------------------------------
+# 3. Ground-truth equivalence (genotype orient) — keyed on (ID, IID, genotype).
+# ---------------------------------------------------------------------------
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype')) AS mf_ct,
+  (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype')) AS wf_ct;
+----
+24000	24000
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID, genotype FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype')
+     EXCEPT SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype'))
+  UNION ALL
+  (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype')
+     EXCEPT SELECT ID, IID, genotype FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype'))
+);
+----
+0
+
+# ---------------------------------------------------------------------------
+# 4. Genotype modes across the source boundary — each ground-truthed vs whole-file.
+#    'list' / 'counts' / 'stats' expose a per-variant genotypes column keyed on ID.
+# ---------------------------------------------------------------------------
+# list mode
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'list')) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'list')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', genotypes := 'list'))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', genotypes := 'list')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'list'))
+  )) AS symdiff;
+----
+3000	0
+
+# counts mode (aggregate — rides need_aggregate_pgen, not need_genotypes)
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'counts')) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'counts')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', genotypes := 'counts'))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', genotypes := 'counts')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'counts'))
+  )) AS symdiff;
+----
+3000	0
+
+# stats mode (aggregate)
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'stats')) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'stats')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', genotypes := 'stats'))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', genotypes := 'stats')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'stats'))
+  )) AS symdiff;
+----
+3000	0
+
+# columns mode (one scalar TINYINT column per sample: SAMP1..SAMP8 — samples identical
+# across shards). Compare the full per-sample row vector keyed on ID.
+query II
+WITH mf AS (SELECT ID, concat_ws(',', SAMP1,SAMP2,SAMP3,SAMP4,SAMP5,SAMP6,SAMP7,SAMP8) v
+              FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], genotypes := 'columns')),
+     wf AS (SELECT ID, concat_ws(',', SAMP1,SAMP2,SAMP3,SAMP4,SAMP5,SAMP6,SAMP7,SAMP8) v
+              FROM read_pfile('test/data/large_example', genotypes := 'columns'))
+SELECT (SELECT count(*) FROM mf) AS mf_ct,
+       (SELECT count(*) FROM ((SELECT * FROM mf EXCEPT SELECT * FROM wf)
+                              UNION ALL (SELECT * FROM wf EXCEPT SELECT * FROM mf))) AS symdiff;
+----
+3000	0
+
+# dosages := true across the boundary (derived from hardcalls; both derive identically)
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], dosages := true)) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], dosages := true)
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', dosages := true))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', dosages := true)
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], dosages := true))
+  )) AS symdiff;
+----
+3000	0
+
+# phased := true across the boundary
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], phased := true)) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], phased := true)
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', phased := true))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', phased := true)
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], phased := true))
+  )) AS symdiff;
+----
+3000	0
+
+# ---------------------------------------------------------------------------
+# 5. Region filter across shards. chr1 variants are round-robin-spread across all 3
+#    shards, so region := '1:5000-50000' must pull from every shard. Result must match
+#    the whole-file read with the same region — same count and same variant set.
+# ---------------------------------------------------------------------------
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], region := '1:5000-50000')) AS mf_ct,
+  (SELECT count(*) FROM read_pfile('test/data/large_example', region := '1:5000-50000')) AS wf_ct;
+----
+451	451
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], region := '1:5000-50000')
+     EXCEPT SELECT ID FROM read_pfile('test/data/large_example', region := '1:5000-50000'))
+  UNION ALL
+  (SELECT ID FROM read_pfile('test/data/large_example', region := '1:5000-50000')
+     EXCEPT SELECT ID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], region := '1:5000-50000'))
+);
+----
+0
+
+# Region result contains only in-range chr1 variants, and comes from all 3 shards
+# (each shard holds ~334 of chr1's 1000 variants).
+query I
+SELECT count(DISTINCT CHROM) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], region := '1:5000-50000');
+----
+1
+
+# ---------------------------------------------------------------------------
+# 6. Parallelism. Under threads=4 the reader swaps pgen files across the source
+#    boundary within each thread. The multiset of rows/genotypes must equal the
+#    whole-file read: count(*) equality guards double-claim duplication / loss;
+#    bidirectional EXCEPT guards value garbling from the reader swap.
+# ---------------------------------------------------------------------------
+statement ok
+SET threads=4;
+
+# variant orient under parallelism
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'])) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'])
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example'))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']))
+  )) AS symdiff;
+----
+3000	0
+
+# genotype orient under parallelism (uses the 64-variant batch fan-out)
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype')) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, IID, genotype FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype')
+       EXCEPT SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype'))
+    UNION ALL
+    (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype')
+       EXCEPT SELECT ID, IID, genotype FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype'))
+  )) AS symdiff;
+----
+24000	0
+
+statement ok
+RESET threads;
+
+# ---------------------------------------------------------------------------
+# 7. Filter combinations across shards (each shard filtered, results concatenated).
+# ---------------------------------------------------------------------------
+# af_range that keeps everything (all variants share AF=0.5 in this fixture) vs
+# a boundary that excludes everything: the ->0 case proves the filter actually
+# fires on every shard rather than being skipped.
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], af_range := {max: 0.5})) AS keep_all,
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], af_range := {min: 0.6})) AS keep_none;
+----
+3000	0
+
+# ac_range across shards (AC=6 for every variant here) — boundary excluding all
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], ac_range := {min: 2, max: 10})) AS keep_all,
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], ac_range := {min: 12})) AS keep_none;
+----
+3000	0
+
+# include_genotypes := ['het'] (genotype orient) — a discriminating subset (het only),
+# ground-truthed against the whole-file read.
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype', include_genotypes := ['het'])) AS mf_ct,
+  (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het'])) AS wf_ct;
+----
+6000	6000
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype', include_genotypes := ['het'])
+     EXCEPT SELECT ID, IID FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het']))
+  UNION ALL
+  (SELECT ID, IID FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het'])
+     EXCEPT SELECT ID, IID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'genotype', include_genotypes := ['het']))
+);
+----
+0
+
+# `variants := [...]` over a MULTI-FILE list is guarded (it can't resolve globally
+# across shards yet: a by-ID list would throw for IDs absent from a shard, a by-index
+# list would return per-shard duplicates). Rejected cleanly; use region := instead.
+# (Global multi-file `variants` resolution is a documented follow-up.)
+statement error
+SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], variants := ['var1']);
+----
+variants := [...] with a multi-file list is not yet supported
+
+statement error
+SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], variants := [0, 1]);
+----
+not yet supported
+
+# ...but single-file `variants` and multi-file `region :=` are unaffected.
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1', variants := [0, 1]);
+----
+2
+
+# ---------------------------------------------------------------------------
+# 8. Edges / negatives.
+# ---------------------------------------------------------------------------
+# A 1-element list behaves exactly like the scalar form.
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1'])) AS list1,
+  (SELECT count(*) FROM read_pfile('test/data/shard1')) AS scalar1;
+----
+1000	1000
+
+# Empty (typed) list errors clearly.
+statement error
+SELECT count(*) FROM read_pfile([]::VARCHAR[]);
+----
+empty file list provided
+
+# A list with a nonexistent prefix errors clearly (names the missing prefix).
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1', 'test/data/does_not_exist']);
+----
+cannot find .pgen file for prefix 'test/data/does_not_exist'
+
+# sample_ct mismatch across distinct files is a hard error (shard1=8 vs pgen_example=4).
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1', 'test/data/pgen_example']);
+----
+sample count mismatch across files

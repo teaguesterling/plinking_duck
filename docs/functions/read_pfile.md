@@ -5,7 +5,7 @@ Read a complete PLINK 2 fileset (`.pgen` + `.pvar` + `.psam`) from a common pref
 ## Synopsis
 
 ```sql
-read_pfile(prefix VARCHAR [, pgen := ..., pvar := ..., psam := ...,
+read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := ...,
            orient := ..., genotypes := ..., phased := ..., dosages := ...,
            samples := ..., variants := ..., region := ...,
            af_range := ..., ac_range := ...,
@@ -16,7 +16,7 @@ read_pfile(prefix VARCHAR [, pgen := ..., pvar := ..., psam := ...,
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `prefix` | `VARCHAR` | *(required)* | Common file prefix (e.g., `'data/cohort'`) |
+| `prefix` | `VARCHAR` or `LIST(VARCHAR)` | *(required)* | Common file prefix (e.g., `'data/cohort'`), or a list of prefixes to read as one table (see [Multi-File Input](#multi-file-input)) |
 | `pgen` | `VARCHAR` | `prefix.pgen` | Explicit `.pgen` path |
 | `pvar` | `VARCHAR` | `prefix.pvar` | Explicit `.pvar` or `.bim` path |
 | `psam` | `VARCHAR` | `prefix.psam` | Explicit `.psam` or `.fam` path |
@@ -93,6 +93,28 @@ In sample orient mode, each row represents one sample. The genotypes array conta
 
 By default, `read_pfile` constructs file paths by appending extensions to the prefix: `prefix.pgen`, `prefix.pvar`, `prefix.psam`. Each can be overridden individually.
 
+### Multi-File Input
+
+The first argument may be a single prefix or a `LIST(VARCHAR)` of prefixes, mirroring the way `read_csv` and `read_json` accept a list. A list **row-concatenates** the variants from each file, in file order, into one logical table:
+
+```sql
+SELECT * FROM read_pfile(['/data/chr1', '/data/chr2', '/data/chr3']);
+```
+
+This targets the biobank-scale layout where a fileset is **sharded by variant** — many `.pgen`/`.pvar` files that all share one identical `.psam`. All files in a list must carry the **same sample set: the same IIDs in the same order**. Alignment is **positional** and trust-the-caller — there is no per-file sample-identity check by design (adding one would reintroduce the `.psam`-parse cost on the real workload). The only guard is a free one: each `.pgen` header reports its sample count, and a file whose sample count differs from the first is rejected as a hard error. Sample order is *not* verified; that remains the caller's contract.
+
+Sample and variant metadata are taken from the first file only (identical by contract). Row order across files is not guaranteed (same as today's single-file parallel scan) — add `ORDER BY` if you need a stable order.
+
+Current scope and limitations:
+
+- `variant` and `genotype` orient support multi-file input.
+- `orient := 'sample'` with **multiple** files is **not yet supported** (a single file still works).
+- `region :=` works across a list (each shard is filtered to the range; the union is returned).
+- `variants := [...]` is **not yet supported** with a multi-file list (variant IDs/indices don't resolve globally across shards yet) — use `region :=` for selection across files. It still works on a single file.
+- Explicit `pgen` / `pvar` / `psam` overrides are single-file only; combining them with a multi-element list is an error (they cannot disambiguate per shard).
+
+The list of prefixes can come from anywhere, including a catalog macro that returns a `VARCHAR[]` of shard prefixes (e.g. via the scalarfs `pathmacro:` protocol) fed directly to `read_pfile([...])`.
+
 ### Genotype Output Formats
 
 The `genotypes` parameter controls how genotype data is structured:
@@ -122,6 +144,11 @@ Default mode uses multi-threaded parallel scanning. Genotype orient mode is sing
 ```sql
 -- Read all variants in default mode
 SELECT * FROM read_pfile('data/example');
+```
+
+```sql
+-- Multi-file: read several variant-sharded filesets (identical .psam) as one table
+SELECT COUNT(*) FROM read_pfile(['data/chr1', 'data/chr2', 'data/chr3']);
 ```
 
 ```sql

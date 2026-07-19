@@ -5,16 +5,26 @@ Read PLINK 2 `.pvar` or legacy `.bim` variant metadata files.
 ## Synopsis
 
 ```sql
-read_pvar(path VARCHAR) -> TABLE
+read_pvar(path VARCHAR | LIST(VARCHAR)) -> TABLE
 ```
 
 ## Parameters
 
 | Name | Type | Description |
 |------|------|-------------|
-| `path` | `VARCHAR` | Path to a `.pvar` or `.bim` file |
+| `path` | `VARCHAR` or `LIST(VARCHAR)` | Path to a `.pvar` or `.bim` file, or a list of paths to read as one table (see [Multi-File Input](#multi-file-input)) |
 
 No named parameters. The file format is auto-detected from the file contents.
+
+### Multi-File Input
+
+The argument may be a single path or a `LIST(VARCHAR)` of paths, mirroring `read_csv`/`read_json`. A list **row-concatenates** the variants from each file, in file order, into one logical table (each file's header is handled independently):
+
+```sql
+SELECT * FROM read_pvar(['data/chr1.pvar', 'data/chr2.pvar', 'data/chr3.pvar']);
+```
+
+This is the pure-variant analogue of [`read_pfile`'s multi-file input](read_pfile.md#multi-file-input), for the variant-sharded layout. `.pvar` and `.bim` files may be mixed within a list.
 
 ## Output Columns
 

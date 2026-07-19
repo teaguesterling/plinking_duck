@@ -88,8 +88,19 @@ struct AlignedBuffer {
 		return *this;
 	}
 
-	//! Allocate a cache-aligned buffer of the given size in bytes.
+	//! Free any current allocation and reset to empty. Safe to call repeatedly.
+	void Reset() {
+		if (ptr) {
+			plink2::aligned_free(ptr);
+			ptr = nullptr;
+		}
+	}
+
+	//! Allocate a cache-aligned buffer of the given size in bytes. Frees any
+	//! existing allocation first (so a buffer can be re-Allocated, e.g. when a
+	//! per-thread reader reopens on a different source with a different vrec width).
 	void Allocate(uintptr_t size) {
+		Reset();
 		if (plink2::cachealigned_malloc(size, &ptr)) {
 			throw IOException("failed to allocate %llu bytes of aligned memory", static_cast<unsigned long long>(size));
 		}
@@ -238,6 +249,12 @@ vector<string> SplitWhitespaceLine(const string &line);
 
 //! Replace the extension of a file path.
 string ReplaceExtension(const string &path, const string &new_ext);
+
+//! Resolve the first positional argument (VARCHAR or LIST(VARCHAR)) to a list of
+//! prefixes/paths. A LIST is row-concatenated in order; used by
+//! read_pvar/read_pfile/read_pgen for multi-file input. NULL list elements are
+//! skipped; an empty list throws. A scalar VARCHAR yields a 1-element list.
+vector<string> ResolvePathList(const Value &input, const char *fn_name);
 
 //! Try to find a companion file by replacing the .pgen extension.
 //! Returns the first existing path from candidates, or empty string.

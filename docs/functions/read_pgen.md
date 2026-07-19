@@ -55,6 +55,9 @@ The `.psam` file is **optional**. Without it:
 - Genotype list length is determined from the `.pgen` header
 - The `samples` parameter only accepts `LIST(INTEGER)` (no IID matching)
 
+!!! note "Multi-file input"
+    `read_pgen` currently reads a single `.pgen` file. Multi-file (`LIST(VARCHAR)`) input for variant-sharded filesets is planned but not yet available; use [`read_pfile`](read_pfile.md#multi-file-input) with a list of prefixes for the multi-file path today.
+
 ### Projection Pushdown
 
 If the `genotypes` column is not referenced in the query, genotype decoding is skipped entirely. This makes metadata-only queries very fast:

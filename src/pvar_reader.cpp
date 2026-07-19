@@ -3,6 +3,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -14,6 +15,7 @@
 // to prevent name conflicts with local static SplitTabLine/SplitWhitespaceLine.
 namespace duckdb {
 bool IsNativePlinkFormat(const string &path);
+vector<string> ResolvePathList(const Value &input, const char *fn_name);
 } // namespace duckdb
 
 namespace duckdb {
@@ -188,8 +190,10 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 // ---------------------------------------------------------------------------
 
 struct PvarBindData : public TableFunctionData {
-	string file_path;
-	PvarHeaderInfo header_info;
+	// One or more source paths (row-concatenated in file order). A single VARCHAR
+	// argument yields a 1-element list; a LIST(VARCHAR) argument yields all of them.
+	vector<string> file_paths;
+	PvarHeaderInfo header_info; // schema taken from file_paths[0]; all files assumed same schema
 
 	//! True if the source is a non-native format (CSV, parquet, table, view, etc.)
 	//! In this case, data is materialized at bind time and emitted from materialized_rows.
@@ -202,6 +206,7 @@ struct PvarBindData : public TableFunctionData {
 
 struct PvarGlobalState : public GlobalTableFunctionState {
 	unique_ptr<FileHandle> handle;
+	idx_t current_file_idx = 0; //! index into bind_data.file_paths of the file `handle` is open on
 	bool finished = false;
 	vector<column_t> column_ids;
 
@@ -233,47 +238,50 @@ static vector<string> NormalizeBimFields(vector<string> &fields) {
 static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PvarBindData>();
-	bind_data->file_path = input.inputs[0].GetValue<string>();
+	bind_data->file_paths = ResolvePathList(input.inputs[0], "read_pvar");
 
-	// Check if this is a native PLINK format file
-	if (IsNativePlinkFormat(bind_data->file_path)) {
+	// Schema comes from the first file; all files are assumed to share it (row-concat).
+	if (IsNativePlinkFormat(bind_data->file_paths[0])) {
 		// Existing path: parse native text file
-		bind_data->header_info = ParsePvarHeader(context, bind_data->file_path);
+		bind_data->header_info = ParsePvarHeader(context, bind_data->file_paths[0]);
 		names = bind_data->header_info.column_names;
 		return_types = bind_data->header_info.column_types;
 	} else {
-		// Non-native source: query via Connection and materialize
+		// Non-native source(s): query via Connection and materialize, concatenating files.
 		bind_data->is_external_source = true;
 
 		auto &db = DatabaseInstance::GetDatabase(context);
 		Connection conn(db);
-		auto escaped = StringUtil::Replace(bind_data->file_path, "'", "''");
-		auto result = conn.Query("SELECT * FROM '" + escaped + "'");
-		if (result->HasError()) {
-			throw IOException("read_pvar: failed to read source '%s': %s", bind_data->file_path, result->GetError());
-		}
+		for (idx_t f = 0; f < bind_data->file_paths.size(); f++) {
+			auto escaped = StringUtil::Replace(bind_data->file_paths[f], "'", "''");
+			auto result = conn.Query("SELECT * FROM '" + escaped + "'");
+			if (result->HasError()) {
+				throw IOException("read_pvar: failed to read source '%s': %s", bind_data->file_paths[f],
+				                  result->GetError());
+			}
 
-		// Use the result schema as the output schema
-		for (idx_t i = 0; i < result->names.size(); i++) {
-			names.push_back(result->names[i]);
-			return_types.push_back(result->types[i]);
-		}
-
-		// Also populate header_info for consistency
-		bind_data->header_info.column_names = names;
-		bind_data->header_info.column_types = return_types;
-		bind_data->header_info.is_bim = false;
-		bind_data->header_info.skip_lines = 0;
-
-		// Materialize all rows
-		unique_ptr<DataChunk> chunk;
-		while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-			for (idx_t row = 0; row < chunk->size(); row++) {
-				vector<Value> row_values;
-				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-					row_values.push_back(chunk->GetValue(col, row));
+			if (f == 0) {
+				// Use the first result's schema as the output schema
+				for (idx_t i = 0; i < result->names.size(); i++) {
+					names.push_back(result->names[i]);
+					return_types.push_back(result->types[i]);
 				}
-				bind_data->materialized_rows.push_back(std::move(row_values));
+				bind_data->header_info.column_names = names;
+				bind_data->header_info.column_types = return_types;
+				bind_data->header_info.is_bim = false;
+				bind_data->header_info.skip_lines = 0;
+			}
+
+			// Materialize all rows from this file, appending to the concatenated set
+			unique_ptr<DataChunk> chunk;
+			while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+				for (idx_t row = 0; row < chunk->size(); row++) {
+					vector<Value> row_values;
+					for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+						row_values.push_back(chunk->GetValue(col, row));
+					}
+					bind_data->materialized_rows.push_back(std::move(row_values));
+				}
 			}
 		}
 	}
@@ -289,9 +297,10 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 	state->column_ids = input.column_ids;
 
 	if (!bind_data.is_external_source) {
-		// Native path: open the file and skip header lines
+		// Native path: open the first file and skip its header lines
 		auto &fs = FileSystem::GetFileSystem(context);
-		state->handle = fs.OpenFile(bind_data.file_path, FileFlags::FILE_FLAGS_READ);
+		state->handle = fs.OpenFile(bind_data.file_paths[0], FileFlags::FILE_FLAGS_READ);
+		state->current_file_idx = 0;
 
 		string skip;
 		for (idx_t i = 0; i < bind_data.header_info.skip_lines; i++) {
@@ -406,13 +415,30 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		return;
 	}
 
-	// Native text file path
+	// Native text file path (row-concatenated across bind_data.file_paths in order)
 	auto &header = bind_data.header_info;
+	auto &fs = FileSystem::GetFileSystem(context);
 	idx_t row_count = 0;
 	string line;
 
-	while (row_count < STANDARD_VECTOR_SIZE && ReadLineFromHandle(*state.handle, line)) {
-		if (line.empty()) {
+	while (row_count < STANDARD_VECTOR_SIZE) {
+		if (!ReadLineFromHandle(*state.handle, line)) {
+			// Current file exhausted — advance to the next file, if any.
+			if (state.current_file_idx + 1 >= bind_data.file_paths.size()) {
+				break; // all files done
+			}
+			state.current_file_idx++;
+			state.handle = fs.OpenFile(bind_data.file_paths[state.current_file_idx], FileFlags::FILE_FLAGS_READ);
+			// The new file's header is skipped by the '#'-prefix check below, which
+			// adapts to each file's own header length (## meta + #CHROM). Reusing
+			// file[0]'s skip_lines would mis-skip files with differently sized headers.
+			continue;
+		}
+
+		// Skip blank lines and header/meta lines. In .pvar/.bim, header lines are
+		// '#'-prefixed (## meta, #CHROM) and data lines never start with '#', so this
+		// correctly strips each file's own header during row-concatenation.
+		if (line.empty() || line[0] == '#') {
 			continue;
 		}
 
@@ -423,7 +449,8 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		if (fields.size() < expected) {
 			throw InvalidInputException("read_pvar: line has %llu fields, expected at least %llu in '%s'",
 			                            static_cast<unsigned long long>(fields.size()),
-			                            static_cast<unsigned long long>(expected), bind_data.file_path);
+			                            static_cast<unsigned long long>(expected),
+			                            bind_data.file_paths[state.current_file_idx]);
 		}
 
 		// Normalize .bim field order to match output column order
@@ -456,9 +483,17 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 // ---------------------------------------------------------------------------
 
 void RegisterPvarReader(ExtensionLoader &loader) {
-	TableFunction read_pvar("read_pvar", {LogicalType::VARCHAR}, PvarScan, PvarBind, PvarInitGlobal, PvarInitLocal);
-	read_pvar.projection_pushdown = true;
-	loader.RegisterFunction(read_pvar);
+	TableFunctionSet set("read_pvar");
+	// Single path
+	TableFunction one("read_pvar", {LogicalType::VARCHAR}, PvarScan, PvarBind, PvarInitGlobal, PvarInitLocal);
+	one.projection_pushdown = true;
+	set.AddFunction(one);
+	// List of paths (row-concatenated in order)
+	TableFunction many("read_pvar", {LogicalType::LIST(LogicalType::VARCHAR)}, PvarScan, PvarBind, PvarInitGlobal,
+	                   PvarInitLocal);
+	many.projection_pushdown = true;
+	set.AddFunction(many);
+	loader.RegisterFunction(set);
 }
 
 } // namespace duckdb
