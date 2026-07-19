@@ -1,0 +1,3 @@
+repo,local_head,scenario,source_pgen_zst,pgen,pvar,psam,region,variant_ct,window_kb,r2_threshold,n_pairs,sum_r2,elapsed_sec,user_sec,sys_sec,cpu_percent,max_rss_mb
+upstream,49eab7b,all_hg38_chr22_5mb,all_hg38.pgen.zst,all_hg38.pgen,all_hg38_rs.slim.pvar,hg38_corrected.psam,22:11300000-16300000,91882,100,0.2,1270300,709755.0334251781,149.93,2552.85,23.13,1718.0,21867.734375
+fork,cd95239,all_hg38_chr22_5mb,all_hg38.pgen.zst,all_hg38.pgen,all_hg38_rs.slim.pvar,hg38_corrected.psam,22:11300000-16300000,91882,100,0.2,1270300,709755.0334251773,138.93,2533.18,4.65,1826.0,699.1640625

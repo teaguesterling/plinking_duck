@@ -140,6 +140,20 @@ SELECT R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
 ----
 NULL	NULL	2
 
+# --- GAUSS-like population-weighted LD ---
+
+# POP A: SAMPLE1+SAMPLE2, POP B: SAMPLE3+SAMPLE4.
+# With A=0.25,B=0.75 and rs1 missing in SAMPLE4, shared observations have
+# weights proportional to [0.125, 0.125, 0.375], yielding r=-0.9185587.
+query RRI
+SELECT round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP',
+    population_weights := 'A=0.25,B=0.75');
+----
+-0.918559	0.84375	3
+
 # --- All-missing genotypes ---
 
 # Both variants fully missing → OBS_CT = 0, R2 = NULL

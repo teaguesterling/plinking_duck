@@ -372,6 +372,248 @@ VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const stri
 	return idx;
 }
 
+static void ParseVariantHeaderLine(const string &header_line, VariantMetadataIndex &idx, idx_t &chrom_field,
+                                   idx_t &pos_field, idx_t &id_field, idx_t &ref_field, idx_t &alt_field) {
+	if (header_line.size() >= 6 && header_line.substr(0, 6) == "#CHROM") {
+		idx.is_bim = false;
+		auto fields = SplitTabLine(header_line.substr(1));
+		for (idx_t i = 0; i < fields.size(); i++) {
+			if (fields[i] == "CHROM") {
+				chrom_field = i;
+			} else if (fields[i] == "POS") {
+				pos_field = i;
+			} else if (fields[i] == "ID") {
+				id_field = i;
+			} else if (fields[i] == "REF") {
+				ref_field = i;
+			} else if (fields[i] == "ALT") {
+				alt_field = i;
+			}
+		}
+	} else {
+		idx.is_bim = true;
+		// .bim: CHROM(0) ID(1) CM(2) POS(3) ALT(4) REF(5)
+		chrom_field = 0;
+		id_field = 1;
+		pos_field = 3;
+		alt_field = 4;
+		ref_field = 5;
+	}
+}
+
+static bool ParseVariantDataLine(const char *buf, size_t content_end, bool whitespace, idx_t chrom_field,
+                                 idx_t pos_field, idx_t id_field, idx_t ref_field, idx_t alt_field,
+                                 const string &path, const string &func_name, uint64_t line_number, string &chrom,
+                                 int32_t &pos_val, string &id, string &ref, string &alt) {
+	const idx_t max_field = std::max({chrom_field, pos_field, id_field, ref_field, alt_field});
+	size_t cursor = 0;
+	size_t fstart = 0, flen = 0;
+	bool got_chrom = false, got_pos = false, got_id = false, got_ref = false, got_alt = false;
+	for (idx_t f = 0; f <= max_field; f++) {
+		if (!NextField(buf, content_end, &cursor, &fstart, &flen, whitespace)) {
+			break;
+		}
+		if (f == chrom_field) {
+			chrom.assign(buf + fstart, flen);
+			got_chrom = true;
+		} else if (f == pos_field) {
+			char tmp[32];
+			idx_t n = flen < sizeof(tmp) - 1 ? flen : sizeof(tmp) - 1;
+			std::memcpy(tmp, buf + fstart, n);
+			tmp[n] = '\0';
+			char *end;
+			errno = 0;
+			long v = std::strtol(tmp, &end, 10);
+			if (end == tmp || *end != '\0' || errno != 0) {
+				throw InvalidInputException("%s: invalid POS value '%s' at line %llu in '%s'", func_name, tmp,
+				                            static_cast<unsigned long long>(line_number), path);
+			}
+			pos_val = static_cast<int32_t>(v);
+			got_pos = true;
+		} else if (f == id_field) {
+			if (!(flen == 1 && buf[fstart] == '.')) {
+				id.assign(buf + fstart, flen);
+			}
+			got_id = true;
+		} else if (f == ref_field) {
+			ref.assign(buf + fstart, flen);
+			got_ref = true;
+		} else if (f == alt_field) {
+			if (!(flen == 1 && buf[fstart] == '.')) {
+				alt.assign(buf + fstart, flen);
+			}
+			got_alt = true;
+		}
+	}
+
+	if (!got_chrom || !got_pos || !got_id || !got_ref || !got_alt) {
+		string missing;
+		if (!got_chrom)
+			missing += " CHROM";
+		if (!got_pos)
+			missing += " POS";
+		if (!got_id)
+			missing += " ID";
+		if (!got_ref)
+			missing += " REF";
+		if (!got_alt)
+			missing += " ALT";
+		throw InvalidInputException("%s: .pvar/.bim file '%s' line %llu missing required fields [%s]", func_name,
+		                            path, static_cast<unsigned long long>(line_number), missing.c_str());
+	}
+	return true;
+}
+
+VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, const string &path,
+                                                       const string &chrom, int64_t pos_start, int64_t pos_end,
+                                                       idx_t variant_ct_hint, const string &func_name) {
+	BindPhaseTimer timer("LoadVariantMetadataFromTextRegion");
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto file_size = handle->GetFileSize();
+	timer.Note("file_size=%llu", static_cast<unsigned long long>(file_size));
+
+	if (file_size == 0) {
+		throw InvalidInputException("%s: .pvar/.bim file '%s' is empty", func_name, path);
+	}
+
+	VariantMetadataIndex idx;
+	idx.variant_ct = variant_ct_hint;
+	idx.has_ids = true;
+	idx.has_alleles = true;
+	idx.chroms.reserve(1024);
+	idx.positions.reserve(1024);
+	idx.ids.reserve(1024);
+	idx.refs.reserve(1024);
+	idx.alts.reserve(1024);
+	idx.local_to_vidx.reserve(1024);
+
+	idx_t chrom_field = DConstants::INVALID_INDEX;
+	idx_t pos_field = DConstants::INVALID_INDEX;
+	idx_t id_field = DConstants::INVALID_INDEX;
+	idx_t ref_field = DConstants::INVALID_INDEX;
+	idx_t alt_field = DConstants::INVALID_INDEX;
+	bool layout_ready = false;
+	bool saw_target_chrom = false;
+	uint32_t data_vidx = 0;
+	uint64_t line_number = 0;
+
+	// Stream fixed-size chunks and parse complete lines in-place. This keeps the
+	// native text region loader bounded-memory while avoiding the extreme syscall
+	// overhead of FileHandle::ReadLine() on 75M-row whole-genome PVARs.
+	auto process_line = [&](const char *line_buf, size_t line_len) -> bool {
+		line_number++;
+		if (line_len > 0 && line_buf[line_len - 1] == '\r') {
+			line_len--;
+		}
+		if (line_len == 0) {
+			return true;
+		}
+
+		if (!layout_ready) {
+			if (line_len >= 2 && line_buf[0] == '#' && line_buf[1] == '#') {
+				return true;
+			}
+			string header_line(line_buf, line_len);
+			ParseVariantHeaderLine(header_line, idx, chrom_field, pos_field, id_field, ref_field, alt_field);
+			if (chrom_field == DConstants::INVALID_INDEX || pos_field == DConstants::INVALID_INDEX ||
+			    id_field == DConstants::INVALID_INDEX || ref_field == DConstants::INVALID_INDEX ||
+			    alt_field == DConstants::INVALID_INDEX) {
+				throw InvalidInputException("%s: .pvar/.bim file '%s' is missing required columns "
+				                            "(need CHROM, POS, ID, REF, ALT)",
+				                            func_name, path);
+			}
+			layout_ready = true;
+			if (!idx.is_bim) {
+				return true; // header consumed; next line is data
+			}
+			// .bim has no header; fall through and parse this line as data.
+		}
+
+		if (!idx.is_bim && line_buf[0] == '#') {
+			return true;
+		}
+
+		string row_chrom, row_id, row_ref, row_alt;
+		int32_t row_pos = 0;
+		ParseVariantDataLine(line_buf, line_len, idx.is_bim, chrom_field, pos_field, id_field, ref_field, alt_field,
+		                     path, func_name, line_number, row_chrom, row_pos, row_id, row_ref, row_alt);
+
+		bool chrom_match = (row_chrom == chrom);
+		if (chrom_match) {
+			saw_target_chrom = true;
+			if (row_pos >= pos_start && row_pos <= pos_end) {
+				uint32_t local = static_cast<uint32_t>(idx.chroms.size());
+				idx.vidx_map.emplace(data_vidx, local);
+				idx.local_to_vidx.push_back(data_vidx);
+				idx.chroms.emplace_back(std::move(row_chrom));
+				idx.positions.push_back(row_pos);
+				idx.ids.emplace_back(std::move(row_id));
+				idx.refs.emplace_back(std::move(row_ref));
+				idx.alts.emplace_back(std::move(row_alt));
+			} else if (row_pos > pos_end) {
+				return false; // sorted PVAR/BIM: interval is exhausted
+			}
+		} else if (saw_target_chrom) {
+			return false; // sorted by chromosome; target chromosome is exhausted
+		}
+		data_vidx++;
+		return true;
+	};
+
+	static constexpr size_t READ_CHUNK_SIZE = 8ULL * 1024ULL * 1024ULL;
+	vector<char> read_buffer(READ_CHUNK_SIZE);
+	string carry;
+	string line_buffer;
+	line_buffer.reserve(READ_CHUNK_SIZE + 4096);
+	uint64_t remaining = static_cast<uint64_t>(file_size);
+	bool continue_scan = true;
+	while (remaining > 0 && continue_scan) {
+		size_t read_size = static_cast<size_t>(std::min<uint64_t>(remaining, READ_CHUNK_SIZE));
+		handle->Read(read_buffer.data(), read_size);
+		remaining -= read_size;
+
+		line_buffer.clear();
+		if (!carry.empty()) {
+			line_buffer.append(carry);
+		}
+		line_buffer.append(read_buffer.data(), read_size);
+
+		size_t line_start = 0;
+		while (line_start < line_buffer.size()) {
+			auto newline = line_buffer.find('\n', line_start);
+			if (newline == string::npos) {
+				break;
+			}
+			if (!process_line(line_buffer.data() + line_start, newline - line_start)) {
+				continue_scan = false;
+				break;
+			}
+			line_start = newline + 1;
+		}
+		if (continue_scan) {
+			carry.assign(line_buffer.data() + line_start, line_buffer.size() - line_start);
+		}
+	}
+	if (continue_scan && !carry.empty()) {
+		process_line(carry.data(), carry.size());
+	}
+
+	if (!layout_ready) {
+		throw InvalidInputException("%s: .pvar/.bim file '%s' contains no header or data", func_name, path);
+	}
+	if (!idx.chroms.empty()) {
+		idx.chrom_offsets.emplace(idx.chroms.front(), std::make_pair(idx_t {0}, idx.chroms.size()));
+		if (!idx.local_to_vidx.empty() && idx.local_to_vidx.back() - idx.local_to_vidx.front() + 1 == idx.local_to_vidx.size()) {
+			idx.has_contiguous_vidx_range = true;
+			idx.contiguous_start_vidx = idx.local_to_vidx.front();
+		}
+	}
+	timer.Note("ingested %llu region variants (variant_ct hint=%llu)", (unsigned long long)idx.chroms.size(),
+	           (unsigned long long)variant_ct_hint);
+	return idx;
+}
+
 // ---------------------------------------------------------------------------
 // File utilities
 // ---------------------------------------------------------------------------
@@ -833,6 +1075,10 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	// Single chrom in pushdown, single contiguous range of local indices
 	if (!idx.chroms.empty()) {
 		idx.chrom_offsets.emplace(idx.chroms.front(), std::make_pair(idx_t {0}, idx.chroms.size()));
+		if (!idx.local_to_vidx.empty() && idx.local_to_vidx.back() - idx.local_to_vidx.front() + 1 == idx.local_to_vidx.size()) {
+			idx.has_contiguous_vidx_range = true;
+			idx.contiguous_start_vidx = idx.local_to_vidx.front();
+		}
 	}
 	timer.Note("ingested %llu region variants (variant_ct hint=%llu)", (unsigned long long)idx.chroms.size(),
 	           (unsigned long long)variant_ct_hint);
