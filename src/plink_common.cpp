@@ -1795,6 +1795,147 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 }
 
 // ---------------------------------------------------------------------------
+// Global multi-file variants resolution
+// ---------------------------------------------------------------------------
+
+void ResolveVariantsParameterMultiFile(const Value &val, const vector<const VariantMetadataIndex *> &source_variants,
+                                       const vector<uint32_t> &source_raw_variant_cts,
+                                       vector<vector<uint32_t>> &per_source_out, const string &func_name) {
+	const size_t n = source_variants.size();
+	per_source_out.assign(n, {});
+
+	// Cumulative RAW variant offsets across sources (list order). By-index positions are
+	// GLOBAL indices into the raw concatenation — matching single-file semantics, where
+	// `variants` indices are raw .pgen indices (then intersected with any region).
+	vector<uint64_t> raw_off(n + 1, 0);
+	for (size_t i = 0; i < n; i++) {
+		raw_off[i + 1] = raw_off[i] + source_raw_variant_cts[i];
+	}
+	const uint64_t total_raw = raw_off[n];
+
+	// Lazy per-source rsID indexes (only built when a by-ID string is resolved).
+	vector<unordered_map<string, uint32_t>> id_idx(n);
+	vector<char> id_built(n, 0);
+	auto ensure_id = [&](size_t s) {
+		if (!id_built[s]) {
+			id_idx[s] = BuildVariantIdIndex(*source_variants[s]);
+			id_built[s] = 1;
+		}
+	};
+
+	// by-index: global index → (source, local raw vidx).
+	auto add_global_index = [&](int64_t g) {
+		if (g < 0 || static_cast<uint64_t>(g) >= total_raw) {
+			throw InvalidInputException("%s: variant index %lld out of range (variant count: %llu)", func_name,
+			                            static_cast<long long>(g), static_cast<unsigned long long>(total_raw));
+		}
+		// upper_bound - 1 finds the owning source for this global position.
+		size_t s = static_cast<size_t>(std::upper_bound(raw_off.begin(), raw_off.end(), static_cast<uint64_t>(g)) -
+		                               raw_off.begin()) -
+		           1;
+		per_source_out[s].push_back(static_cast<uint32_t>(static_cast<uint64_t>(g) - raw_off[s]));
+	};
+
+	// by-ID (rsID or CPRA string): find the owning shard; error only if in NO shard.
+	auto add_by_id = [&](const string &id) {
+		bool has_colon = id.find(':') != string::npos;
+		for (size_t s = 0; s < n; s++) {
+			if (has_colon) {
+				// CPRA string — resolution throws when absent; try each shard.
+				try {
+					unordered_map<string, uint32_t> empty_map;
+					per_source_out[s].push_back(ResolveVariantString(id, *source_variants[s], empty_map, func_name));
+					return;
+				} catch (const InvalidInputException &) {
+					continue;
+				}
+			}
+			ensure_id(s);
+			auto it = id_idx[s].find(id);
+			if (it != id_idx[s].end()) {
+				per_source_out[s].push_back(it->second);
+				return;
+			}
+		}
+		throw InvalidInputException("%s: variant '%s' not found", func_name, id);
+	};
+
+	// by-ID (CPRA struct): find the owning shard; error only if in NO shard.
+	auto add_cpra_struct = [&](const Value &sval) {
+		for (size_t s = 0; s < n; s++) {
+			try {
+				per_source_out[s].push_back(ResolveCpraStruct(sval, *source_variants[s], func_name));
+				return;
+			} catch (const InvalidInputException &) {
+				continue;
+			}
+		}
+		// Rethrow with the source[0] error message (native "variant '...' not found").
+		ResolveCpraStruct(sval, *source_variants[0], func_name);
+	};
+
+	auto &type = val.type();
+	if (type.id() == LogicalTypeId::INTEGER || type.id() == LogicalTypeId::BIGINT) {
+		add_global_index(val.GetValue<int64_t>());
+	} else if (type.id() == LogicalTypeId::VARCHAR) {
+		add_by_id(val.GetValue<string>());
+	} else if (type.id() == LogicalTypeId::STRUCT) {
+		auto &child_types = StructType::GetChildTypes(type);
+		bool has_start = false, has_chrom = false;
+		for (auto &ct : child_types) {
+			if (ct.first == "start") {
+				has_start = true;
+			}
+			if (ct.first == "chrom") {
+				has_chrom = true;
+			}
+		}
+		if (has_start && has_chrom) {
+			throw InvalidInputException("%s: ambiguous variants struct — has both 'start' and 'chrom' fields.",
+			                            func_name);
+		} else if (has_start) {
+			// A range struct spans positions/indices that may cross shard boundaries in
+			// a variant-sharded list; its meaning over the concatenation is ill-defined.
+			throw InvalidInputException(
+			    "%s: variants range struct ({start, stop}) with a multi-file list is not supported "
+			    "(use region := for range selection across files, or by-ID / by-index variants)",
+			    func_name);
+		} else if (has_chrom) {
+			add_cpra_struct(val);
+		} else {
+			throw InvalidInputException(
+			    "%s: variants struct must have either 'start'/'stop' (range) or 'chrom'/'pos' (CPRA) fields",
+			    func_name);
+		}
+	} else if (type.id() == LogicalTypeId::LIST) {
+		auto &child_type = ListType::GetChildType(type);
+		auto &children = ListValue::GetChildren(val);
+		if (children.empty()) {
+			throw InvalidInputException("%s: variants list must not be empty", func_name);
+		}
+		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
+			for (auto &child : children) {
+				add_global_index(child.GetValue<int64_t>());
+			}
+		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
+			for (auto &child : children) {
+				add_by_id(child.GetValue<string>());
+			}
+		} else if (child_type.id() == LogicalTypeId::STRUCT) {
+			for (auto &child : children) {
+				add_cpra_struct(child);
+			}
+		} else {
+			throw InvalidInputException("%s: variants list elements must be INTEGER, VARCHAR, or STRUCT (got %s)",
+			                            func_name, child_type.ToString());
+		}
+	} else {
+		throw InvalidInputException("%s: variants parameter must be an integer, string, struct, or list (got %s)",
+		                            func_name, type.ToString());
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Max threads config helper
 // ---------------------------------------------------------------------------
 

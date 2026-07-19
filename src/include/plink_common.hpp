@@ -530,6 +530,19 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadataIndex &variants,
                                           uint32_t raw_variant_ct, const string &func_name);
 
+//! Resolve a variants parameter globally across a multi-file (variant-sharded) list,
+//! distributing each requested variant to its owning source. Fills per_source_out[i]
+//! with the local raw variant indices (vidx) for source i.
+//!   by-index: the requested indices are GLOBAL positions into the raw concatenation
+//!             (list order), mapped to (source, local) via cumulative raw offsets.
+//!             Out-of-range → "variant index N out of range".
+//!   by-ID (rsID / CPRA string or struct): the owning shard is located by search;
+//!             error only if the ID is present in NO shard.
+//! Range structs ({start, stop}) are unsupported over a list (ill-defined across shards).
+void ResolveVariantsParameterMultiFile(const Value &val, const vector<const VariantMetadataIndex *> &source_variants,
+                                       const vector<uint32_t> &source_raw_variant_cts,
+                                       vector<vector<uint32_t>> &per_source_out, const string &func_name);
+
 // ---------------------------------------------------------------------------
 // Ploidy- and sex-aware statistics for sex/organelle chromosomes (chrX/Y/MT)
 // ---------------------------------------------------------------------------

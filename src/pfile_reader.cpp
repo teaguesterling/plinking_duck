@@ -837,23 +837,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			throw InvalidInputException("read_pfile: pgen/pvar/psam overrides cannot be combined with a multi-file "
 			                            "list (they can't disambiguate per shard)");
 		}
-		// `variants` resolves against a single file's variant index; across a
-		// multi-file list neither by-ID (an ID lives in only one shard) nor by-index
-		// (indices are per-shard, not global) resolves correctly yet. Guard it rather
-		// than throw-on-missing or return per-shard duplicates. Use `region :=` for
-		// range selection across files. Global `variants` resolution is a follow-up.
-		if (input.named_parameters.find("variants") != input.named_parameters.end()) {
-			throw InvalidInputException("read_pfile: variants := [...] with a multi-file list is not yet supported; "
-			                            "use region := for selection across files");
-		}
 	}
 
-	// Resolve the `variants` param against the variant index below. Multi-file +
-	// `variants` is rejected above, so here it only ever applies to a single source.
+	// The `variants` param is resolved after all sources are loaded (below): single-file
+	// against the one source's index; multi-file GLOBALLY across the concatenated set.
 	auto variants_it = input.named_parameters.find("variants");
 	bind_data->has_variant_filter = variants_it != input.named_parameters.end();
 
-	// --- Build sources (one per prefix) ---
+	// --- Load all sources (one per prefix) + free cross-file sample_ct check ---
 	bind_timer.Note("resolving %llu source(s)", (unsigned long long)prefixes.size());
 	for (idx_t si = 0; si < prefixes.size(); si++) {
 		uint32_t src_sample_ct = 0;
@@ -873,18 +864,44 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			    src.pgen_path, src_sample_ct, bind_data->raw_sample_ct, bind_data->sources[0].pgen_path);
 		}
 
-		// Per-source effective variant list (region ∩ variants param, resolved per shard)
-		std::unordered_set<uint32_t> variant_set;
-		if (bind_data->has_variant_filter) {
-			auto resolved =
-			    ResolveVariantsParameter(variants_it->second, src.variants, src.raw_variant_ct, "read_pfile");
+		bind_data->sources.push_back(std::move(src));
+	}
+
+	// --- Resolve the `variants` param into a per-source set of local (vidx) indices ---
+	// Single-file: resolve against the one source's index (byte-for-byte as before).
+	// Multi-file: resolve GLOBALLY — by-index positions are global into the raw
+	// concatenation; by-ID variants are routed to their owning shard.
+	vector<std::unordered_set<uint32_t>> per_source_vset(bind_data->sources.size());
+	if (bind_data->has_variant_filter) {
+		if (!multi_file) {
+			auto resolved = ResolveVariantsParameter(variants_it->second, bind_data->sources[0].variants,
+			                                         bind_data->sources[0].raw_variant_ct, "read_pfile");
 			for (auto idx : resolved) {
-				variant_set.insert(idx);
+				per_source_vset[0].insert(idx);
+			}
+		} else {
+			vector<const VariantMetadataIndex *> svars;
+			vector<uint32_t> sraw;
+			svars.reserve(bind_data->sources.size());
+			sraw.reserve(bind_data->sources.size());
+			for (auto &s : bind_data->sources) {
+				svars.push_back(&s.variants);
+				sraw.push_back(s.raw_variant_ct);
+			}
+			vector<vector<uint32_t>> per_source_local;
+			ResolveVariantsParameterMultiFile(variants_it->second, svars, sraw, per_source_local, "read_pfile");
+			for (size_t si = 0; si < bind_data->sources.size(); si++) {
+				for (auto v : per_source_local[si]) {
+					per_source_vset[si].insert(v);
+				}
 			}
 		}
-		BuildEffectiveVariantList(src, bind_data->region, variant_set, bind_data->has_variant_filter);
+	}
 
-		bind_data->sources.push_back(std::move(src));
+	// --- Build each source's effective variant list (region ∩ resolved variants) ---
+	for (size_t si = 0; si < bind_data->sources.size(); si++) {
+		BuildEffectiveVariantList(bind_data->sources[si], bind_data->region, per_source_vset[si],
+		                          bind_data->has_variant_filter);
 	}
 
 	// Cumulative effective-variant offsets across sources (global scan positions)

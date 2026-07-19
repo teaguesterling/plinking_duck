@@ -276,21 +276,74 @@ SELECT count(*) FROM (
 ----
 0
 
-# `variants := [...]` over a MULTI-FILE list is guarded (it can't resolve globally
-# across shards yet: a by-ID list would throw for IDs absent from a shard, a by-index
-# list would return per-shard duplicates). Rejected cleanly; use region := instead.
-# (Global multi-file `variants` resolution is a documented follow-up.)
-statement error
-SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], variants := ['var1']);
+# `variants := [...]` over a MULTI-FILE list now resolves GLOBALLY across the shards.
+#
+# by-ID: each requested ID is routed to its owning shard (error only if in NO shard).
+# 'var1' lives in shard1; the list read returns exactly var1's row, matching the
+# whole-file read. count == 1 and bidirectional EXCEPT == 0 (value equivalence).
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := ['var1'])) AS ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := ['var1'])
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', variants := ['var1']))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', variants := ['var1'])
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := ['var1']))
+  )) AS symdiff;
 ----
-variants := [...] with a multi-file list is not yet supported
+1	0
 
-statement error
-SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], variants := [0, 1]);
+# by-index: the indices are GLOBAL positions into the list-order concatenation
+# (shard1 || shard2 || shard3), mapped to (source, local) via the cumulative variant
+# offsets. Because the shards are ROUND-ROBIN split, global [0,1] both fall in shard1
+# (= var1, var4) — NOT large_example[0,1]=var1,var2. Ground-truth vs the owning shard.
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := [0, 1])
+     EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/shard1', variants := [0, 1]))
+  UNION ALL
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/shard1', variants := [0, 1])
+     EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := [0, 1]))
+);
 ----
-not yet supported
+0
 
-# ...but single-file `variants` and multi-file `region :=` are unaffected.
+# by-index cross-shard: global [0, 1000, 2000] picks the FIRST variant of each shard
+# (shard1[0]=var1, shard2[0]=var2, shard3[0]=var3), which equals large_example[0,1,2].
+# This proves the resolved indices are distributed to all 3 shards. count==3, symdiff==0.
+query II
+SELECT
+  (SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := [0, 1000, 2000])) AS ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := [0, 1000, 2000])
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', variants := [0, 1, 2]))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/large_example', variants := [0, 1, 2])
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := [0, 1000, 2000]))
+  )) AS symdiff;
+----
+3	0
+
+# by-ID CPRA struct is routed to its owning shard (var2 = chr1:200 lives in shard2).
+query I
+SELECT ID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := {chrom: '1', pos: 200});
+----
+var2
+
+# Out-of-range GLOBAL index errors (total = 3000, so index 3000 is out of range).
+statement error
+SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], variants := [3000]);
+----
+out of range
+
+# A by-ID absent from EVERY shard errors ("not found").
+statement error
+SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], variants := ['nonexistent_id']);
+----
+not found
+
+# Single-file `variants` is unaffected.
 query I
 SELECT count(*) FROM read_pfile('test/data/shard1', variants := [0, 1]);
 ----

@@ -5,7 +5,7 @@ Read PLINK 2 `.pgen` binary genotype files.
 ## Synopsis
 
 ```sql
-read_pgen(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
+read_pgen(path VARCHAR | LIST(VARCHAR) [, pvar := ..., psam := ..., samples := ...,
           genotypes := ..., phased := ..., dosages := ...,
           af_range := ..., ac_range := ...,
           include_genotypes := ..., genotype_range := ...]) -> TABLE
@@ -15,7 +15,7 @@ read_pgen(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `path` | `VARCHAR` | *(required)* | Path to the `.pgen` file |
+| `path` | `VARCHAR` or `LIST(VARCHAR)` | *(required)* | Path to the `.pgen` file, or a list of `.pgen` paths to read as one table (see [Multi-file input](#multi-file-input)) |
 | `pvar` | `VARCHAR` | Auto-discovered | Path to `.pvar` or `.bim` companion file |
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` companion file |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All samples | Subset to specific samples |
@@ -55,8 +55,16 @@ The `.psam` file is **optional**. Without it:
 - Genotype list length is determined from the `.pgen` header
 - The `samples` parameter only accepts `LIST(INTEGER)` (no IID matching)
 
-!!! note "Multi-file input"
-    `read_pgen` currently reads a single `.pgen` file. Multi-file (`LIST(VARCHAR)`) input for variant-sharded filesets is planned but not yet available; use [`read_pfile`](read_pfile.md#multi-file-input) with a list of prefixes for the multi-file path today.
+### Multi-file input
+
+The first argument may be a single `.pgen` path or a `LIST(VARCHAR)` of `.pgen` paths. A list **row-concatenates** the variants from each file, in file order, into one logical table — the same variant-sharded model as [`read_pfile`](read_pfile.md#multi-file-input):
+
+```sql
+-- Read several variant-sharded .pgen files (identical .psam) as one table
+SELECT count(*) FROM read_pgen(['data/chr1.pgen', 'data/chr2.pgen', 'data/chr3.pgen']);
+```
+
+All files in a list must carry the **same sample set** (same IIDs, same order). Alignment is **positional** and trust-the-caller; the only guard is free — each `.pgen` header reports its sample count, and a file whose count differs from the first is a hard error. `read_pgen` is variant-orient only, so a list is a pure variant row-concat. The companion `.pvar` (and optional `.psam`) are auto-discovered per file. Explicit `pvar` / `psam` overrides are single-file only. `variants := [...]` is not yet resolved globally across a `read_pgen` list — use [`read_pfile`](read_pfile.md#multi-file-input), which supports global by-ID / by-index `variants` across a list.
 
 ### Projection Pushdown
 

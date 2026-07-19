@@ -1,0 +1,148 @@
+# name: test/sql/read_pgen_list.test
+# description: read_pgen LIST(VARCHAR) multi-file reads (Phase 3) — variant-orient
+# group: [sql]
+
+#   row-concat across variant-sharded .pgen files. read_pgen is variant-orient only, so
+#   this is pure row-concat. Ground-truthed against the whole-file read.
+#
+# Fixtures shard1/shard2/shard3 are large_example (3000 variants x 8 samples) split
+# round-robin by variant ID into 3 disjoint 1000-variant shards, each keeping ALL 8
+# samples (identical .psam). Union of the 3 shards == large_example. Note read_pgen
+# takes a full .pgen PATH (companion .pvar auto-discovered), unlike read_pfile's prefix.
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# 1. Single vs list counts. Each shard is 1000 variants; the 3-shard list is 3000.
+# ---------------------------------------------------------------------------
+query II
+SELECT
+  (SELECT count(*) FROM read_pgen('test/data/shard1.pgen')) AS single,
+  (SELECT count(*) FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'])) AS list;
+----
+1000	3000
+
+# A 1-element list behaves exactly like the scalar form.
+query II
+SELECT
+  (SELECT count(*) FROM read_pgen(['test/data/shard1.pgen'])) AS list1,
+  (SELECT count(*) FROM read_pgen('test/data/shard1.pgen')) AS scalar1;
+----
+1000	1000
+
+# ---------------------------------------------------------------------------
+# 2. Ground-truth equivalence (variant orient) — the strongest test.
+#    read_pgen([3 disjoint shards]) reproduces the whole-file variant set AND the
+#    genotype arrays. count(*) equality guards row loss/duplication; bidirectional
+#    EXCEPT on (ID, genotypes::VARCHAR) guards value corruption at the source boundary.
+# ---------------------------------------------------------------------------
+query II
+SELECT
+  (SELECT count(*) FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'])) AS mf_ct,
+  (SELECT count(*) FROM read_pgen('test/data/large_example.pgen')) AS wf_ct;
+----
+3000	3000
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes::VARCHAR g FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'])
+     EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pgen('test/data/large_example.pgen'))
+  UNION ALL
+  (SELECT ID, genotypes::VARCHAR g FROM read_pgen('test/data/large_example.pgen')
+     EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen']))
+);
+----
+0
+
+# ---------------------------------------------------------------------------
+# 3. Projection pushdown across files (no genotype decode).
+# ---------------------------------------------------------------------------
+query II
+SELECT count(*), count(DISTINCT CHROM)
+  FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen']);
+----
+3000	3
+
+# ---------------------------------------------------------------------------
+# 4. Parallelism. Under threads=4 the reader swaps .pgen files across the source
+#    boundary within each thread. The multiset of rows/genotypes must equal the
+#    whole-file read.
+# ---------------------------------------------------------------------------
+statement ok
+SET threads=4;
+
+query II
+SELECT
+  (SELECT count(*) FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'])) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'])
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pgen('test/data/large_example.pgen'))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pgen('test/data/large_example.pgen')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen']))
+  )) AS symdiff;
+----
+3000	0
+
+statement ok
+RESET threads;
+
+# ---------------------------------------------------------------------------
+# 5. Genotype modes / options across the source boundary — each ground-truthed.
+# ---------------------------------------------------------------------------
+# counts mode (aggregate — rides need_aggregate_pgen, not need_genotypes)
+query II
+SELECT
+  (SELECT count(*) FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'], genotypes := 'counts')) AS mf_ct,
+  (SELECT count(*) FROM (
+    (SELECT ID, genotypes::VARCHAR g FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'], genotypes := 'counts')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pgen('test/data/large_example.pgen', genotypes := 'counts'))
+    UNION ALL
+    (SELECT ID, genotypes::VARCHAR g FROM read_pgen('test/data/large_example.pgen', genotypes := 'counts')
+       EXCEPT SELECT ID, genotypes::VARCHAR g FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'], genotypes := 'counts'))
+  )) AS symdiff;
+----
+3000	0
+
+# af_range across shards — a boundary that excludes everything proves the filter fires
+# on every shard (all variants share AF=0.5 in this fixture).
+query II
+SELECT
+  (SELECT count(*) FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'], af_range := {max: 0.5})) AS keep_all,
+  (SELECT count(*) FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen','test/data/shard3.pgen'], af_range := {min: 0.6})) AS keep_none;
+----
+3000	0
+
+# ---------------------------------------------------------------------------
+# 6. Negatives.
+# ---------------------------------------------------------------------------
+# sample_ct mismatch across files is a hard error (shard1=8 vs pgen_example=4).
+statement error
+SELECT count(*) FROM read_pgen(['test/data/shard1.pgen', 'test/data/pgen_example.pgen']);
+----
+sample count mismatch across files
+
+# Empty (typed) list errors clearly.
+statement error
+SELECT count(*) FROM read_pgen([]::VARCHAR[]);
+----
+empty file list provided
+
+# A list with a nonexistent path errors clearly (companion discovery fails first,
+# naming the missing file).
+statement error
+SELECT count(*) FROM read_pgen(['test/data/shard1.pgen', 'test/data/does_not_exist.pgen']);
+----
+does_not_exist.pgen
+
+# `variants := [...]` over a multi-file list is guarded (global resolution deferred for
+# read_pgen; use read_pfile for that). Single-file variants still works.
+statement error
+SELECT count(*) FROM read_pgen(['test/data/shard1.pgen','test/data/shard2.pgen'], variants := [0, 1]);
+----
+not yet supported
+
+query I
+SELECT count(*) FROM read_pgen('test/data/shard1.pgen', variants := [0, 1]);
+----
+2

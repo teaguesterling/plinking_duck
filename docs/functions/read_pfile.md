@@ -110,7 +110,7 @@ Current scope and limitations:
 - `variant` and `genotype` orient support multi-file input.
 - `orient := 'sample'` with **multiple** files is **not yet supported** (a single file still works).
 - `region :=` works across a list (each shard is filtered to the range; the union is returned).
-- `variants := [...]` is **not yet supported** with a multi-file list (variant IDs/indices don't resolve globally across shards yet) — use `region :=` for selection across files. It still works on a single file.
+- `variants := [...]` resolves **globally** across a multi-file list. **By-ID** (rsID or CPRA string/struct): each requested variant is routed to the shard whose `.pvar` contains it; an ID absent from *every* shard is an error. **By-index**: the requested indices are **global positions** into the list-order concatenation (`shard1 || shard2 || …`), mapped to `(shard, local)` via the cumulative variant offsets — an index past the total is out of range. (A `{start, stop}` *range* struct is not supported over a list, since a range can straddle shards; use `region :=` for range selection across files.)
 - Explicit `pgen` / `pvar` / `psam` overrides are single-file only; combining them with a multi-element list is an error (they cannot disambiguate per shard).
 
 The list of prefixes can come from anywhere, including a catalog macro that returns a `VARCHAR[]` of shard prefixes (e.g. via the scalarfs `pathmacro:` protocol) fed directly to `read_pfile([...])`.

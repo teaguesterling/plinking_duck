@@ -9,10 +9,29 @@ of shard prefixes.
 ## Status
 
 - [x] Phase 0: `read_pvar` list input (row-concat, per-file header skip) — DONE
-- [ ] Phase 1: `read_pfile` variant + genotype orient (row-concat)
+- [x] Phase 1: `read_pfile` variant + genotype orient (row-concat) — DONE, shipped v0.7.0
 - [ ] Phase 2: `read_pfile` sample orient (per-file genotype columns)
-- [ ] Phase 3: `read_pgen` list input
-- [ ] Tests
+- [x] Phase 3: `read_pgen` list input — DONE (`test/sql/read_pgen_list.test`)
+- [x] Global `variants := [...]` across a multi-file list — DONE for `read_pfile` (by-ID
+      routes to owning shard; by-index is a global position via cumulative offsets; range
+      struct guarded). Still guarded for `read_pgen`.
+- [x] Tests
+
+## Phase 2/3 decisions (resolved)
+
+- **Sample-orient column naming**: one genotypes column per file, named from the
+  file prefix **basename** (`/data/chr1` → `chr1`); on a basename collision,
+  suffix with the source index (`chr1`, `chr1_1`, ...). `genotypes := 'columns'`
+  stays an error in sample-orient multi-file.
+- **Row ordering**: **unordered** across files (consistent with variant/genotype
+  orient and today's single-file parallel scan). No opt-in stable order yet.
+- **Global `variants`**: resolve the `variants := [...]` param against the
+  **concatenated** variant set — by-ID: find the owning shard (error only if the
+  ID is in *no* shard); by-index: map the global index → `(source, local)` via
+  the existing cumulative `variant_offsets`. Then remove the multi-file guard.
+- **`read_pgen` (Phase 3)**: variant-orient only, so it reuses the Phase-1
+  machinery directly (a `PgenSource` vector + the same `(source, sub-batch)`
+  claiming / reopen-per-source). No new semantics.
 
 ## Prerequisites
 

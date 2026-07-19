@@ -177,8 +177,11 @@ All files must have the **same samples in the same order**; alignment is positio
 (no per-file identity check), but a mismatched sample count is a hard error. Metadata
 is taken from the first file. `variant` and `genotype` orient support multi-file input;
 `orient := 'sample'` with multiple files is not yet supported (single file works).
-Explicit `pgen`/`pvar`/`psam` overrides are single-file only. Row order across files
-is not guaranteed — use `ORDER BY` if needed. (`read_pgen` multi-file input is planned.)
+Explicit `pgen`/`pvar`/`psam` overrides are single-file only. `variants := [...]`
+resolves **globally** across a multi-file `read_pfile` list (by-ID routes to the owning
+shard; by-index is a global position). Row order across files is not guaranteed — use
+`ORDER BY` if needed. `read_pgen` also accepts a `LIST(VARCHAR)` of `.pgen` paths
+(variant row-concat; global `variants` there is not yet supported).
 
 **Parameters:**
 
