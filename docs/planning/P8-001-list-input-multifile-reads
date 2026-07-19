@@ -10,7 +10,10 @@ of shard prefixes.
 
 - [x] Phase 0: `read_pvar` list input (row-concat, per-file header skip) — DONE
 - [x] Phase 1: `read_pfile` variant + genotype orient (row-concat) — DONE, shipped v0.7.0
-- [ ] Phase 2: `read_pfile` sample orient (per-file genotype columns)
+- [x] Phase 2: `read_pfile` sample orient (per-file genotype columns) — DONE
+      (`test/sql/read_pfile_sample_multifile.test`). One row per sample; one genotypes
+      column per file (basename-named, collision-suffixed), typed to that file's own
+      variant count. count/genotype filters + `genotypes := 'columns'` guarded as errors.
 - [x] Phase 3: `read_pgen` list input — DONE (`test/sql/read_pgen_list.test`)
 - [x] Global `variants := [...]` across a multi-file list — DONE for `read_pfile` (by-ID
       routes to owning shard; by-index is a global position via cumulative offsets; range

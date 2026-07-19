@@ -1,0 +1,236 @@
+# name: test/sql/read_pfile_sample_multifile.test
+# description: read_pfile orient := 'sample' over a multi-file LIST(VARCHAR) — one row
+# group: [sql]
+
+#   per sample, one genotypes column PER FILE (P8-001 Phase 2). Each per-file column
+#   is named from the file's prefix basename and typed to THAT file's own effective
+#   variant count. Samples align positionally across files (identical .psam by
+#   contract). Fixtures shard1/shard2/shard3 are large_example split into 3 disjoint
+#   1000-variant shards, all 8 samples. See docs/planning/P8-001-list-input-multifile-reads.
+
+require plinking_duck
+
+# ---------------------------------------------------------------------------
+# 1. Schema: sample-metadata columns + one genotypes column per shard, each
+#    ARRAY(TINYINT, 1000). Column names are the prefix basenames.
+# ---------------------------------------------------------------------------
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], orient := 'sample'));
+----
+IID	VARCHAR
+SEX	INTEGER
+shard1	TINYINT[1000]
+shard2	TINYINT[1000]
+shard3	TINYINT[1000]
+
+# One row per sample (8 samples), not per variant.
+query I
+SELECT count(*) FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], orient := 'sample');
+----
+8
+
+# ---------------------------------------------------------------------------
+# 2. Ground truth (values, not just shapes): each per-file column equals that
+#    sample's genotypes from the single-shard sample-orient read, value-for-value.
+#    equal == 8 means every sample's whole 1000-element array matched.
+# ---------------------------------------------------------------------------
+query III
+WITH multi AS (
+  SELECT IID, shard1, shard2, shard3
+  FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], orient := 'sample')
+),
+s1 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard1', orient := 'sample')),
+s2 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard2', orient := 'sample')),
+s3 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard3', orient := 'sample'))
+SELECT
+  sum(CASE WHEN m.shard1 = s1.g THEN 1 ELSE 0 END),
+  sum(CASE WHEN m.shard2 = s2.g THEN 1 ELSE 0 END),
+  sum(CASE WHEN m.shard3 = s3.g THEN 1 ELSE 0 END)
+FROM multi m JOIN s1 USING (IID) JOIN s2 USING (IID) JOIN s3 USING (IID);
+----
+8	8	8
+
+# Concrete spot check: known genotype values for the first two samples' shard1 column.
+query TTT
+SELECT IID, shard1[1:5]::VARCHAR, shard1[999:1000]::VARCHAR
+FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], orient := 'sample')
+ORDER BY IID LIMIT 2;
+----
+SAMP1	[1, 0, NULL, 2, 1]	[NULL, 2]
+SAMP2	[2, 1, 0, NULL, 2]	[0, NULL]
+
+# ---------------------------------------------------------------------------
+# 3. Projection pushdown: selecting only one shard column still yields correct
+#    values (per-source matrix indexing, not positional off-by-source).
+# ---------------------------------------------------------------------------
+query II
+WITH m AS (
+  SELECT IID, shard2
+  FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], orient := 'sample')
+),
+s2 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard2', orient := 'sample'))
+SELECT sum(CASE WHEN m.shard2 = s2.g THEN 1 ELSE 0 END), count(*) FROM m JOIN s2 USING (IID);
+----
+8	8
+
+# Projecting only metadata (no genotype decode) still returns all sample rows.
+query I
+SELECT count(*) FROM (SELECT IID FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample'));
+----
+8
+
+# ---------------------------------------------------------------------------
+# 4. genotypes := 'list' — per-file LIST(TINYINT) columns, values match single-shard.
+# ---------------------------------------------------------------------------
+query TT
+SELECT typeof(shard1), typeof(shard2)
+FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', genotypes := 'list') LIMIT 1;
+----
+TINYINT[]	TINYINT[]
+
+query II
+WITH m AS (
+  SELECT IID, shard1 FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', genotypes := 'list')
+),
+s1 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'list'))
+SELECT sum(CASE WHEN m.shard1 = s1.g THEN 1 ELSE 0 END), count(*) FROM m JOIN s1 USING (IID);
+----
+8	8
+
+# ---------------------------------------------------------------------------
+# 5. Aggregate + phased + dosage per-file columns (types + ground truth).
+# ---------------------------------------------------------------------------
+# counts: one STRUCT column per source; values match the single-shard counts.
+query II
+WITH m AS (
+  SELECT IID, shard1 FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', genotypes := 'counts')
+),
+s1 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'counts'))
+SELECT sum(CASE WHEN m.shard1 = s1.g THEN 1 ELSE 0 END), count(*) FROM m JOIN s1 USING (IID);
+----
+8	8
+
+query T
+SELECT typeof(shard1) FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', phased := true) LIMIT 1;
+----
+TINYINT[2][1000]
+
+query T
+SELECT typeof(shard1) FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', dosages := true) LIMIT 1;
+----
+DOUBLE[1000]
+
+# struct: one STRUCT column per source (per-variant fields); values match single-shard.
+query II
+WITH m AS (
+  SELECT IID, shard1 FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', genotypes := 'struct')
+),
+s1 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'struct'))
+SELECT sum(CASE WHEN m.shard1 = s1.g THEN 1 ELSE 0 END), count(*) FROM m JOIN s1 USING (IID);
+----
+8	8
+
+# ---------------------------------------------------------------------------
+# 5b. DISTINCT per-file dimensions — the core reason columns are separate. Mixing a
+#     1000-variant shard with the 3000-variant whole file (both 8 identical samples)
+#     yields TINYINT[1000] and TINYINT[3000]. This is the discriminating check: a bug
+#     that sized every column from source 0 would be invisible with equal-size shards.
+# ---------------------------------------------------------------------------
+query TT
+SELECT typeof(shard1), typeof(large_example)
+FROM read_pfile(['test/data/shard1', 'test/data/large_example'], orient := 'sample') LIMIT 1;
+----
+TINYINT[1000]	TINYINT[3000]
+
+query III
+WITH m AS (
+  SELECT IID, shard1, large_example
+  FROM read_pfile(['test/data/shard1', 'test/data/large_example'], orient := 'sample')
+),
+a AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard1', orient := 'sample')),
+b AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/large_example', orient := 'sample'))
+SELECT sum(CASE WHEN m.shard1 = a.g THEN 1 ELSE 0 END),
+       sum(CASE WHEN m.large_example = b.g THEN 1 ELSE 0 END),
+       count(*)
+FROM m JOIN a USING (IID) JOIN b USING (IID);
+----
+8	8	8
+
+# region filter across a multi-file sample-orient read: each column is sized to its
+# own region-filtered variant count, and values match the single-shard region read.
+query TTT
+SELECT typeof(shard1), typeof(shard2), typeof(shard3)
+FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], orient := 'sample', region := '1:100-1900')
+LIMIT 1;
+----
+TINYINT[7]	TINYINT[6]	TINYINT[6]
+
+query III
+WITH m AS (
+  SELECT IID, shard1, shard2, shard3
+  FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], orient := 'sample', region := '1:100-1900')
+),
+s1 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard1', orient := 'sample', region := '1:100-1900')),
+s2 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard2', orient := 'sample', region := '1:100-1900')),
+s3 AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard3', orient := 'sample', region := '1:100-1900'))
+SELECT sum(CASE WHEN m.shard1 = s1.g THEN 1 ELSE 0 END),
+       sum(CASE WHEN m.shard2 = s2.g THEN 1 ELSE 0 END),
+       sum(CASE WHEN m.shard3 = s3.g THEN 1 ELSE 0 END)
+FROM m JOIN s1 USING (IID) JOIN s2 USING (IID) JOIN s3 USING (IID);
+----
+8	8	8
+
+# ---------------------------------------------------------------------------
+# 6. Column naming: basename collision (same basename twice) -> source-index suffix.
+# ---------------------------------------------------------------------------
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard1'], orient := 'sample'));
+----
+IID	VARCHAR
+SEX	INTEGER
+shard1	TINYINT[1000]
+shard1_1	TINYINT[1000]
+
+# ---------------------------------------------------------------------------
+# 7. Guards.
+# ---------------------------------------------------------------------------
+# genotypes := 'columns' in multi-file sample orient is an error.
+statement error
+SELECT 1 FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', genotypes := 'columns') LIMIT 1;
+----
+genotypes := 'columns' with orient := 'sample' is not supported
+
+# count/genotype filters not yet supported in multi-file sample orient (explicit error).
+statement error
+SELECT 1 FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', include_genotypes := ['het']) LIMIT 1;
+----
+not yet supported with orient := 'sample'
+
+statement error
+SELECT 1 FROM read_pfile(['test/data/shard1', 'test/data/shard2'], orient := 'sample', af_range := {'min': 0.1, 'max': 0.5}) LIMIT 1;
+----
+not yet supported with orient := 'sample'
+
+# sample_ct mismatch across files still errors (shard1 has 8, pgen_example has 4).
+statement error
+SELECT 1 FROM read_pfile(['test/data/shard1', 'test/data/pgen_example'], orient := 'sample') LIMIT 1;
+----
+sample count mismatch across files
+
+# ---------------------------------------------------------------------------
+# 8. Single-file sample orient unchanged: a 1-element list routes through the
+#    single-file path and keeps the column name "genotypes".
+# ---------------------------------------------------------------------------
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_pfile(['test/data/shard1'], orient := 'sample'));
+----
+IID	VARCHAR
+SEX	INTEGER
+genotypes	TINYINT[1000]
+
+query II
+WITH a AS (SELECT IID, genotypes AS g FROM read_pfile(['test/data/shard1'], orient := 'sample')),
+     b AS (SELECT IID, genotypes AS g FROM read_pfile('test/data/shard1', orient := 'sample'))
+SELECT sum(CASE WHEN a.g = b.g THEN 1 ELSE 0 END), count(*) FROM a JOIN b USING (IID);
+----
+8	8
