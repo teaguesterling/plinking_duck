@@ -2,6 +2,8 @@
 #include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 
+#include "plink2_stats.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -29,103 +31,66 @@ static constexpr idx_t COL_E_HET = 10;
 static constexpr idx_t COL_P_HWE = 11;
 
 // ---------------------------------------------------------------------------
-// HWE exact test (Wigginton et al. 2005)
+// HWE exact test — wrappers over plink2's own routines
 // ---------------------------------------------------------------------------
+//
+// We call plink2's HweLnP (autosomal, Wigginton et al. 2005) and HweXchrLnP
+// (chrX non-PAR, Graffelman & Weir 2016) instead of a hand-rolled recurrence.
+// Both return ln(P); we exponentiate to a p-value. plink2's implementations add
+// >64k-genotype overflow safety, no malloc, and — crucially — the chrX test
+// incorporates male hemizygous allele counts, which the previous female-only
+// autosomal test dropped.
+//
+// Input validation up front: plink2_stats.cc includes <stdlib.h> // exit() and
+// some paths (the inverse-CDF quantile helpers we do NOT use) can exit() on bad
+// input. HweLnP/HweXchrLnP themselves assume counts are non-negative and
+// < 2^31; we guarantee that before calling.
 
-// Computes the Hardy-Weinberg equilibrium exact test p-value.
-// Algorithm: enumerate all valid heterozygote counts for fixed allele counts,
-// compute relative probabilities via a recurrence relation, then sum
-// probabilities of configurations as likely or less likely than observed.
-static double HweExactTest(int32_t obs_hom1, int32_t obs_hets, int32_t obs_hom2, bool midp) {
-	if (obs_hom1 + obs_hets + obs_hom2 == 0) {
+//! Convert a plink2 ln(P) to a p-value clamped to [0, 1]. A NaN ln(P) (which
+//! plink2 never returns for valid input, but guard anyway) maps to 1.0.
+static double LnPToPvalue(double ln_p) {
+	if (std::isnan(ln_p)) {
 		return 1.0;
 	}
-
-	// Order so obs_homr <= obs_homc (rare/common homozygotes)
-	int32_t obs_homc = std::max(obs_hom1, obs_hom2);
-	int32_t obs_homr = std::min(obs_hom1, obs_hom2);
-
-	int32_t rare_copies = 2 * obs_homr + obs_hets;
-	int32_t common_copies = 2 * obs_homc + obs_hets;
-	int32_t n = obs_homc + obs_homr + obs_hets;
-
-	// het counts must have same parity as rare_copies
-	// Find the mode: expected het count under HWE
-	int32_t mid = static_cast<int32_t>(static_cast<double>(rare_copies) * common_copies / (2.0 * n));
-	// Ensure same parity as rare_copies
-	if ((mid % 2) != (rare_copies % 2)) {
-		mid++;
-	}
-
-	// Allocate probability array for valid het counts (0..rare_copies, stepping by 2)
-	// We store all entries but only use those with correct parity
-	vector<double> het_probs(rare_copies + 1, 0.0);
-	het_probs[mid] = 1.0;
-	double sum = 1.0;
-
-	// Fill upward from mid (increasing het count)
-	int32_t curr_hets = mid;
-	int32_t curr_homr = (rare_copies - mid) / 2;
-	int32_t curr_homc = (common_copies - mid) / 2;
-
-	while (curr_hets <= rare_copies - 2) {
-		// P(k+2)/P(k) = 4 * homr * homc / ((k+1) * (k+2))
-		het_probs[curr_hets + 2] = het_probs[curr_hets] * 4.0 * curr_homr * curr_homc /
-		                           ((static_cast<double>(curr_hets) + 1.0) * (static_cast<double>(curr_hets) + 2.0));
-		sum += het_probs[curr_hets + 2];
-		curr_homr--;
-		curr_homc--;
-		curr_hets += 2;
-	}
-
-	// Fill downward from mid (decreasing het count)
-	curr_hets = mid;
-	curr_homr = (rare_copies - mid) / 2;
-	curr_homc = (common_copies - mid) / 2;
-
-	while (curr_hets >= 2) {
-		// P(k-2)/P(k) = k * (k-1) / (4 * (homr+1) * (homc+1))
-		het_probs[curr_hets - 2] =
-		    het_probs[curr_hets] * static_cast<double>(curr_hets) * (static_cast<double>(curr_hets) - 1.0) /
-		    (4.0 * (static_cast<double>(curr_homr) + 1.0) * (static_cast<double>(curr_homc) + 1.0));
-		sum += het_probs[curr_hets - 2];
-		curr_homr++;
-		curr_homc++;
-		curr_hets -= 2;
-	}
-
-	// Sum probabilities of all het counts with P <= P(observed)
-	double obs_prob = het_probs[obs_hets] / sum;
-	double p_value = 0.0;
-
-	// Use a small tolerance for floating-point comparison
-	double threshold = obs_prob * (1.0 + 1e-8);
-
-	for (int32_t i = 0; i <= rare_copies; i += 2) {
-		if (het_probs[i] / sum <= threshold) {
-			p_value += het_probs[i] / sum;
-		}
-	}
-	// Also check odd values if rare_copies parity is odd
-	if (rare_copies % 2 == 1) {
-		for (int32_t i = 1; i <= rare_copies; i += 2) {
-			if (het_probs[i] / sum <= threshold) {
-				p_value += het_probs[i] / sum;
-			}
-		}
-	}
-
-	if (midp) {
-		p_value -= obs_prob * 0.5;
-	}
-
-	if (p_value < 0.0) {
+	double p = std::exp(ln_p);
+	if (p < 0.0) {
 		return 0.0;
 	}
-	if (p_value > 1.0) {
+	if (p > 1.0) {
 		return 1.0;
 	}
-	return p_value;
+	return p;
+}
+
+//! Autosomal / chrX-PAR / female-stratum HWE exact-test p-value via HweLnP.
+static double HweExactTestAutosomal(int32_t obs_hom_ref, int32_t obs_hets, int32_t obs_hom_alt, bool midp) {
+	// Non-negativity is guaranteed by the count derivation, but guard against a
+	// bad call reaching plink2 (which assumes nonnegative, <2^31 inputs).
+	if (obs_hom_ref < 0 || obs_hets < 0 || obs_hom_alt < 0) {
+		return 1.0;
+	}
+	if (obs_hom_ref + obs_hets + obs_hom_alt == 0) {
+		return 1.0;
+	}
+	// HweLnP treats hom1/hom2 symmetrically (it orders them internally), so the
+	// REF/ALT assignment is arbitrary.
+	return LnPToPvalue(plink2::HweLnP(obs_hets, obs_hom_ref, obs_hom_alt, midp ? 1U : 0U));
+}
+
+//! chrX non-PAR HWE exact-test p-value via HweXchrLnP: female diploid genotype
+//! counts plus male hemizygous ref/alt allele counts (Graffelman & Weir 2016).
+static double HweExactTestXchr(int32_t female_hom_ref, int32_t female_hets, int32_t female_hom_alt, int32_t male_ref,
+                               int32_t male_alt, bool midp) {
+	if (female_hom_ref < 0 || female_hets < 0 || female_hom_alt < 0 || male_ref < 0 || male_alt < 0) {
+		return 1.0;
+	}
+	if (female_hom_ref + female_hets + female_hom_alt + male_ref + male_alt == 0) {
+		return 1.0;
+	}
+	// female_hom1 ↔ REF, female_hom2 ↔ ALT, male1 ↔ REF-allele hemizygotes,
+	// male2 ↔ ALT-allele hemizygotes (n1/n2 in HweXchrLnP pair hom1 with male1).
+	return LnPToPvalue(
+	    plink2::HweXchrLnP(female_hets, female_hom_ref, female_hom_alt, male_ref, male_alt, midp ? 1U : 0U));
 }
 
 // ---------------------------------------------------------------------------
@@ -568,12 +533,25 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 						stats_are_null = true;
 					} else {
 						stats_are_null = false;
+						// O_HET / E_HET stay female-only (matching plink2's .hardy.x
+						// female columns); only the p-value incorporates males.
 						o_het = static_cast<double>(sac.hwe_het) / static_cast<double>(fobs);
 						double p = (2.0 * sac.hwe_hom_ref + sac.hwe_het) / (2.0 * fobs);
 						double q = 1.0 - p;
 						e_het = 2.0 * p * q;
-						p_hwe = HweExactTest(static_cast<int32_t>(sac.hwe_hom_ref), static_cast<int32_t>(sac.hwe_het),
-						                     static_cast<int32_t>(sac.hwe_hom_alt), bind_data.midp);
+						// Recover male hemizygous allele counts from the sex-aware
+						// tallies: on chrX every male contributes only to geno_hom_*
+						// (invalid het → missing) while every female contributes to
+						// both geno_* and hwe_* identically, so
+						//   male_ref = geno_hom_ref - hwe_hom_ref
+						//   male_alt = geno_hom_alt - hwe_hom_alt
+						int32_t male_ref =
+						    static_cast<int32_t>(sac.geno_hom_ref) - static_cast<int32_t>(sac.hwe_hom_ref);
+						int32_t male_alt =
+						    static_cast<int32_t>(sac.geno_hom_alt) - static_cast<int32_t>(sac.hwe_hom_alt);
+						p_hwe =
+						    HweExactTestXchr(static_cast<int32_t>(sac.hwe_hom_ref), static_cast<int32_t>(sac.hwe_het),
+						                     static_cast<int32_t>(sac.hwe_hom_alt), male_ref, male_alt, bind_data.midp);
 					}
 				} else {
 					// chrY / chrMT: haploid → HWE undefined. Report haploid carrier
@@ -597,8 +575,8 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					double p = (2.0 * hom_ref + het) / (2.0 * obs);
 					double q = 1.0 - p;
 					e_het = 2.0 * p * q;
-					p_hwe = HweExactTest(static_cast<int32_t>(hom_ref), static_cast<int32_t>(het),
-					                     static_cast<int32_t>(hom_alt), bind_data.midp);
+					p_hwe = HweExactTestAutosomal(static_cast<int32_t>(hom_ref), static_cast<int32_t>(het),
+					                              static_cast<int32_t>(hom_alt), bind_data.midp);
 				}
 			}
 

@@ -4,6 +4,8 @@
 #include "psam_reader.hpp"
 #include "plink2_glm_logistic_math.hpp"
 
+#include "plink2_stats.h"
+
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -113,121 +115,44 @@ static constexpr idx_t COL_OR = 14;
 static constexpr idx_t COL_FIRTH_YN = 15;
 
 // ---------------------------------------------------------------------------
-// T-distribution p-value via regularized incomplete beta function
+// P-value / distribution layer — wrappers over plink2's own routines
 // ---------------------------------------------------------------------------
+//
+// We call plink2's TstatToP2 (two-tailed t p-value) and ChisqToP (used as the
+// two-tailed standard-normal p-value via ChisqToP(z^2, 1)) instead of
+// hand-rolling the regularized incomplete beta / normal CDF. QuantileToZscore
+// (the inverse-normal p→z map) is exposed by the same header but is not needed
+// here — the GLM path only converts statistics forward to p-values.
+//
+// plink2_stats.cc includes <stdlib.h> // exit() and some inverse-CDF paths can
+// exit() on bad input, so we validate (finite statistic, positive df) up front;
+// the forward TstatToP2 / ChisqToP paths we use do not call exit().
 
-static double LogGamma(double x) {
-	static const double c[] = {0.99999999999980993,  676.5203681218851,     -1259.1392167224028,
-	                           771.32342877765313,   -176.61502916214059,   12.507343278686905,
-	                           -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7};
-	if (x < 0.5) {
-		return std::log(M_PI / std::sin(M_PI * x)) - LogGamma(1.0 - x);
-	}
-	x -= 1.0;
-	double a = c[0];
-	double t = x + 7.5;
-	for (int i = 1; i < 9; i++) {
-		a += c[i] / (x + i);
-	}
-	return 0.5 * std::log(2.0 * M_PI) + (x + 0.5) * std::log(t) - t + std::log(a);
-}
-
-//! Regularized incomplete beta function I_x(a, b) via continued fraction.
-static double BetaIncomplete(double a, double b, double x) {
-	if (x <= 0.0) {
-		return 0.0;
-	}
-	if (x >= 1.0) {
-		return 1.0;
-	}
-
-	// Use symmetry relation for better convergence
-	if (x > (a + 1.0) / (a + b + 2.0)) {
-		return 1.0 - BetaIncomplete(b, a, 1.0 - x);
-	}
-
-	double lbeta = LogGamma(a) + LogGamma(b) - LogGamma(a + b);
-	double prefix = std::exp(a * std::log(x) + b * std::log(1.0 - x) - lbeta) / a;
-
-	static constexpr double TINY = 1e-30;
-	static constexpr double EPS = 1e-14;
-	static constexpr int MAX_ITER = 200;
-
-	double c_val = 1.0;
-	double d = 1.0 - (a + b) * x / (a + 1.0);
-	if (std::abs(d) < TINY) {
-		d = TINY;
-	}
-	d = 1.0 / d;
-	double result = d;
-
-	for (int m = 1; m <= MAX_ITER; m++) {
-		// Even step
-		double num = m * (b - m) * x / ((a + 2.0 * m - 1.0) * (a + 2.0 * m));
-		d = 1.0 + num * d;
-		if (std::abs(d) < TINY) {
-			d = TINY;
-		}
-		c_val = 1.0 + num / c_val;
-		if (std::abs(c_val) < TINY) {
-			c_val = TINY;
-		}
-		d = 1.0 / d;
-		result *= d * c_val;
-
-		// Odd step
-		num = -(a + m) * (a + b + m) * x / ((a + 2.0 * m) * (a + 2.0 * m + 1.0));
-		d = 1.0 + num * d;
-		if (std::abs(d) < TINY) {
-			d = TINY;
-		}
-		c_val = 1.0 + num / c_val;
-		if (std::abs(c_val) < TINY) {
-			c_val = TINY;
-		}
-		d = 1.0 / d;
-		double delta = d * c_val;
-		result *= delta;
-
-		if (std::abs(delta - 1.0) < EPS) {
-			break;
-		}
-	}
-
-	return prefix * result;
-}
-
-//! Two-tailed p-value from t-statistic with df degrees of freedom.
-//! Uses the identity: P = I_x(df/2, 1/2) where x = df/(df + t^2).
+//! Two-tailed p-value from t-statistic with df degrees of freedom, via plink2's
+//! thread-safe TstatToP2. cached_gamma_mult is TstatToP2's documented contract:
+//!   exp(lgamma(df/2 + 0.5) - lgamma(df/2) - lgamma(0.5)).
+//! df varies per variant with missingness, so we compute it per call.
 static double TstatToPvalue(double t_stat, double df) {
 	if (df <= 0.0 || !std::isfinite(t_stat)) {
 		return NAN;
 	}
-	if (t_stat == 0.0) {
-		return 1.0;
+	double cached_gamma_mult = std::exp(std::lgamma(df * 0.5 + 0.5) - std::lgamma(df * 0.5) - std::lgamma(0.5));
+	double p = plink2::TstatToP2(t_stat, df, cached_gamma_mult);
+	// TstatToP2 returns -9 as an error sentinel for invalid (negative) inputs;
+	// our guards make that unreachable, but map it to NaN defensively.
+	if (p < 0.0) {
+		return NAN;
 	}
-	double x = df / (df + t_stat * t_stat);
-	return BetaIncomplete(df / 2.0, 0.5, x);
+	return p;
 }
 
-// ---------------------------------------------------------------------------
-// Normal distribution p-value (for logistic regression z-statistic)
-// ---------------------------------------------------------------------------
-
-//! Standard normal CDF via error function.
-static double NormalCdf(double x) {
-	return 0.5 * (1.0 + std::erf(x / std::sqrt(2.0)));
-}
-
-//! Two-tailed p-value from z-statistic (standard normal).
+//! Two-tailed p-value from a Wald z-statistic (standard normal), via plink2's
+//! ChisqToP: P(|Z| > |z|) = P(Z^2 > z^2) = ChisqToP(z^2, 1).
 static double ZstatToPvalue(double z_stat) {
 	if (!std::isfinite(z_stat)) {
 		return NAN;
 	}
-	if (z_stat == 0.0) {
-		return 1.0;
-	}
-	return 2.0 * (1.0 - NormalCdf(std::abs(z_stat)));
+	return plink2::ChisqToP(z_stat * z_stat, 1);
 }
 
 // plink2's LinearRegressionInv is a header-inline that calls into plink2_matrix.

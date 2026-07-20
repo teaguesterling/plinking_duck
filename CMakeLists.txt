@@ -125,8 +125,12 @@ set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 check_symbol_exists(rawmemchr "string.h" HAVE_RAWMEMCHR)
 
 # --- pgenlib (C++ library) ---
-# Read-path only — pgenlib_write.cc, plink2_bitmap.cc, plink2_stats.cc
-# are intentionally excluded. plink2_fmath.cc is included for LogisticSseF.
+# Read-path only — pgenlib_write.cc, plink2_bitmap.cc are intentionally
+# excluded. plink2_fmath.cc is included for LogisticSseF. plink2_stats.cc is
+# included to wrap plink2's own statistical functions (HweLnP / HweXchrLnP for
+# HWE, TstatToP2 / ChisqToP for GLM p-values) instead of reimplementing them;
+# it depends only on plink2_stats.h + plink2_string.h (both already linked) and
+# has no bigstack/thread/CLI entanglement.
 add_library(pgenlib STATIC
     ${PGENLIB_DIR}/plink2_base.cc
     ${PGENLIB_DIR}/plink2_bits.cc
@@ -134,6 +138,7 @@ add_library(pgenlib STATIC
     ${PGENLIB_DIR}/plink2_fmath.cc
     ${PGENLIB_DIR}/plink2_htable.cc
     ${PGENLIB_DIR}/plink2_memory.cc
+    ${PGENLIB_DIR}/plink2_stats.cc
     ${PGENLIB_DIR}/plink2_string.cc
     ${PGENLIB_DIR}/plink2_text.cc
     ${PGENLIB_DIR}/plink2_thread.cc

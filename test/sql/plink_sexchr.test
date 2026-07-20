@@ -93,11 +93,15 @@ FROM plink_hardy('test/data/sexchr_example.pgen') WHERE ID = 'par1';
 ----
 par1	3	2	1	0.333333	0.444444	1.0
 
-# --- chrX non-PAR: HWE computed on FEMALES only ---
-# WRONG (all-diploid, males as hom): counts (3,1,2), O_HET 0.166667,
-#        E_HET 0.486111, P_HWE 0.151515
-# CORRECT (females only): counts (1,1,1), O_HET 0.333333, E_HET 0.5, P_HWE 1.0
-#        (matches plink2 --hardy .hardy.x female columns)
+# --- chrX non-PAR: HWE via plink2 HweXchrLnP (Graffelman & Weir 2016) ---
+# Counts + O_HET/E_HET are the FEMALE diploid stratum (matching plink2's
+# .hardy.x FEMALE_* columns): counts (1,1,1), O_HET 0.333333, E_HET 0.5.
+# P_HWE now uses HweXchrLnP, which additionally incorporates the male
+# hemizygous allele counts (male_ref=2, male_alt=1) instead of the previous
+# female-only autosomal HweExactTest.
+# plink2 cross-check (sexstd.hardy.x): MALE_A1_CT=2, MALE_AX_CT=1, P=1.
+# The standard p-value is coincidentally still 1.0 for this balanced case; the
+# mid-p variant below is where the correctness fix becomes visible.
 query TIIIRRR
 SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, ROUND(O_HET, 6), ROUND(E_HET, 6), ROUND(P_HWE, 6)
 FROM plink_hardy('test/data/sexchr_example.pgen') WHERE ID = 'x1';
@@ -123,12 +127,16 @@ FROM plink_hardy('test/data/sexchr_example.pgen') WHERE ID = 'mt1';
 ----
 mt1	2	0	4	1
 
-# --- mid-p on the female chrX stratum still works ---
+# --- mid-p on chrX via HweXchrLnP ---
+# CORRECTNESS FIX: the previous female-only HweExactTest gave mid-p 0.7 (same as
+# an autosomal (1,1,1) locus, because males were dropped). plink2's HweXchrLnP,
+# which includes the male allele counts, gives 0.714286 — matching plink2
+# --hardy midp on this fixture (sexmidp.hardy.x MIDP column = 0.714286).
 query TR
 SELECT ID, ROUND(P_HWE, 6)
 FROM plink_hardy('test/data/sexchr_example.pgen', midp := true) WHERE ID = 'x1';
 ----
-x1	0.7
+x1	0.714286
 
 # ===========================================================================
 # plink_freq counts columns on sex chromosomes
