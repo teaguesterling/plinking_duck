@@ -58,15 +58,25 @@ clean buckets.
    smell being audited, not a justification. **One build-list change plausibly unlocks both
    wraps** — highest leverage in the report.
 
-2. **🟡 #2 — `plink2_glm_logistic_math.cpp` (vendored verbatim extract).** A reformatted copy
-   of `plink2_glm_logistic.cc` L147–1012 (bodies byte-identical modulo clang-format). Works and
-   is faithful, but is a manual-drift burden that must be re-synced whenever the submodule pin
-   moves. Extraction was genuinely necessary (home TU is 7106 lines with 77 bigstack/ThreadGroup
-   refs). Keep, but track upstream explicitly.
+2. **🟡 #2 — `plink2_glm_logistic_math.cpp` (vendored extract).** ✅ **Documented + canaried.**
+   A **selective, reordered** extract of `plink2_glm_logistic.cc` L147–1012 — bodies are
+   byte-identical to upstream, but it omits `LogisticRegressionResidualizedF`, moves
+   `CopyAndMeanCenterF` into the `__LP64__` SIMD block, and adds `static` qualifiers to some
+   helpers (so "verbatim contiguous copy" was imprecise; corrected in the file's pin block).
+   Works and is faithful, but is a manual-drift burden that must be re-synced whenever the
+   submodule pin moves. Extraction was genuinely necessary (home TU is 7106 lines with 77
+   bigstack/ThreadGroup refs). **Now pinned** (upstream commit + range + re-sync steps in the
+   file header) and covered by `scripts/check_vendored_drift.sh`.
 
-3. **🟡 #3 — `vcf_genotype_parse.cpp` (vendored extract).** Copies
-   `VcfConvertUnphasedBiallelicLine` / `VcfConvertPhasedBiallelicLine` / `VcfCheckQuals` out of
-   `plink2_import.cc`. Same drift burden; extraction defensible (import.cc is CLI/pipeline-bound).
+3. **🟡 #3 — `vcf_genotype_parse.cpp` (vendored extract).** ✅ **Documented + canaried.** Copies
+   `VcfConvertUnphasedBiallelicLine` / `VcfConvertPhasedBiallelicLine` / `VcfCheckQuals` (plus the
+   `VcfImportBaseContext` struct + `VcfParseErr` enum) out of `plink2_import.cc`. **Caveat found
+   during follow-up:** the copies are *not* byte-identical — they apply two behavior-neutral
+   renamings (`VcfHalfCall` type → `uint32_t`; `kVcfHalfCall*` constants → `kHalfCall*`, via a
+   local enum in `src/include/vcf_genotype_parse.hpp`). Same drift burden; extraction defensible
+   (import.cc is CLI/pipeline-bound). **Now pinned** (commit + per-piece line ranges + re-sync
+   steps in the file header) and covered by `scripts/check_vendored_drift.sh`, which reapplies
+   the two renamings so the comparison stays an exact body match.
 
 4. **🟡 #4 — `plink_ld.cpp` genotype-covariance r² / Weir D'.** Forced reimplementation
    (`plink2_ld.cc` is bigstack/CLI-entangled and not linkable), **but** it uses a genotype-level
@@ -104,13 +114,13 @@ clean buckets.
 - **Feature:** float-precision IRLS logistic (`LogisticRegressionF`) + penalized Firth (`FirthRegressionF`) regression and all supporting SIMD kernels; lives in `namespace plink2`.
 - **Provenance:** **verbatim extract** of `plink2_glm_logistic.cc` L147–1012. Signatures match upstream exactly (`LogisticRegressionF` upstream L589, `FirthRegressionF` L860, plus `ComputeHessianF`, `CholeskyDecompositionF`, `SolveLinearSystemF`, `LogisticSseF`, etc.); whitespace-normalized bodies show **zero** code differences — deltas are only comment banners and clang-format re-wrapping. Its dense linear algebra is delegated to the linked `plink2_matrix.cc` (`ColMajorFmatrix*`, `InvertSymmdefFmatrix*`).
 - **Was extraction necessary?** The two entry points are non-static (callable in principle), but their home TU is 7106 lines with **77** `g_bigstack`/`ThreadGroup`/CLI references and ~15 file-local static helpers. Pulling the solvers into a standalone `namespace plink2` TU that links only `plink2_matrix.cc` + pgenlib was the pragmatic way to reuse plink2's exact numerics without its thread-pool/CLI model.
-- **Score:** 🟡 **YELLOW.** This is the "extracted-and-vendored" category by definition — correct and faithful, but a maintenance/drift burden. It should track the submodule pin (e.g. a comment recording the exact upstream line range + commit, and a re-sync check when the pin moves).
+- **Score:** 🟡 **YELLOW.** This is the "extracted-and-vendored" category by definition — correct and faithful, but a maintenance/drift burden. ✅ **Follow-up done:** a `VENDORED-CODE PIN` block at the top of the file now records the upstream commit (`4ce97faa…`), the L147–1012 span, the exact function list, and the **selective/reordered** nature (omits `LogisticRegressionResidualizedF`, relocates `CopyAndMeanCenterF`, adds `static`) — correcting the "verbatim contiguous" framing. `scripts/check_vendored_drift.sh` compares each function body to the pinned upstream and fails on drift.
 
 ### 🟡 `vcf_genotype_parse.cpp` — vendored VCF GT parser
 
 - **Feature:** biallelic VCF `GT`/dosage line parsing (unphased + phased) and quality-field checks.
 - **Provenance:** header comment + inline banners state it copies `VcfConvertUnphasedBiallelicLine`, `VcfConvertPhasedBiallelicLine`, `VcfCheckQuals`, `VcfImportBaseContext`, and `VcfParseErr` from `plink2_import.cc`. Upstream functions are non-static (`plink2_import.cc:1480,1962`) but the file is a large CLI/import-pipeline TU; the copied functions "depend only on header-inline utilities from `plink2_base.h`/`plink2_string.h`."
-- **Score:** 🟡 **YELLOW.** Same extracted-and-vendored drift burden as the GLM math TU; extraction is defensible because `plink2_import.cc` cannot be linked wholesale.
+- **Score:** 🟡 **YELLOW.** Same extracted-and-vendored drift burden as the GLM math TU; extraction is defensible because `plink2_import.cc` cannot be linked wholesale. ✅ **Follow-up done:** a `VENDORED-CODE PIN` block now records the upstream commit + per-piece line ranges (struct L869–881, `VcfCheckQuals` L898–920, enum L1109–1116, `VcfConvertUnphasedBiallelicLine` L1480–1579, `VcfConvertPhasedBiallelicLine` L1962–2091). **Correction:** the bodies are *not* byte-identical — they apply two behavior-neutral renamings (`VcfHalfCall`→`uint32_t`, `kVcfHalfCall*`→`kHalfCall*`). `scripts/check_vendored_drift.sh` reapplies those renamings to the upstream side and fails on any further drift.
 
 ### 🟡 `plink_ld.cpp` — pairwise LD (r², D')
 
@@ -118,7 +128,7 @@ clean buckets.
 - **Wraps:** genotype fetch via `PgrGet` (`:551`); bit-layout constants (`DivUp`, `NypCtToAlignedWordCt`).
 - **Reimplements:** `ComputeLdStats` (`:39–121`) walks 2-bit words inline, accumulates sums, and computes a **genotype-level Pearson** r² = cov²/(varₐ·var_b) (`:95`) plus a **Weir-1979 composite** D' (`:102–117`).
 - **Callable upstream equivalent:** none usable. `plink2_ld.cc` entry points (`IndepPairwise`, `LdConsole`, …) take plink2-internal structs, use `g_bigstack`, `SetThreadFuncAndData`, and are pruning/console-oriented — not a per-pair r²/D' function. Not linked.
-- **Score:** 🟡 **YELLOW.** Reimplementation is forced, but flagged for review: the genotype-covariance estimator differs from plink2's phased-haplotype r², and the code itself notes D' can exceed 1 under HWE deviation. Correctness-drift concern independent of wrappability.
+- **Score:** 🟡 **YELLOW.** Reimplementation is forced, but flagged for review: the genotype-covariance estimator differs from plink2's phased-haplotype r², and the code itself notes D' can exceed 1 under HWE deviation. Correctness-drift concern independent of wrappability. ✅ **Follow-up done:** a file-top caveat now records that this is a conscious genotype-covariance estimator choice (not plink2's haplotype r²), that D' can exceed 1, and that no callable plink2 equivalent is linkable. (No behavior change; the reimplementation stands.)
 
 ### 🟡 `plink_pca.cpp` — PCA
 
@@ -126,7 +136,7 @@ clean buckets.
 - **Wraps:** `PgrGetCounts` (`:375`, freq + monomorphic skip), `PgrGet` (`:878`), `GenoarrToBytesMinus9` (`:884`).
 - **Reimplements:** genotype normalization (`ComputeVariantNorm`/`NormalizeGenotypes`, `plink_common.cpp:1432/1446`), a bespoke DuckDB-threaded randomized-subspace accumulator (`AccumulateStepA/B`, `MergePass`), and the SVD via **Eigen `BDCSVD`** (`RunKrylovSVD` `:667`, `RunFinalSVD` `:684`) — not LAPACK, not plink2.
 - **Callable upstream equivalent:** none usable. `CalcPca` (`plink2_matrix_calc.cc`) is saturated with `g_bigstack_*`, `PgenMtLoadInit`, `SetThreadFuncAndData(...Thread)`; the file is not compiled. Approach *mirrors* plink2's `--pca approx` randomized SVD but the implementation is independent.
-- **Score:** 🟡 **YELLOW.** Substantial independent numerical code (fails GREEN's "small + faithful") with genuine drift risk, but no callable equivalent exists → not RED. Recommend cross-checking eigenvalues/vectors against `plink2 --pca approx` on a fixture.
+- **Score:** 🟡 **YELLOW.** Substantial independent numerical code (fails GREEN's "small + faithful") with genuine drift risk, but no callable equivalent exists → not RED. Recommend cross-checking eigenvalues/vectors against `plink2 --pca approx` on a fixture. ✅ **Follow-up done:** a file-top caveat now records that `CalcPca` is bigstack/`PgenMtLoad`/thread-group entangled and not linkable, so the Eigen `BDCSVD` randomized-SVD reimplementation is forced (mirrors `--pca approx`), plus the fixture cross-check recommendation. (No behavior change.)
 
 ### 🟢 `pgen_reader.cpp` — genotype decode
 
@@ -210,9 +220,13 @@ clean buckets.
    `plink2_glm_logistic_math.cpp` and `vcf_genotype_parse.cpp` both copy non-static upstream
    functions because their home TUs (`plink2_glm_logistic.cc` at 7106 lines / 77 bigstack refs;
    `plink2_import.cc` CLI pipeline) cannot be linked wholesale. This is the correct trade-off
-   for plink2's architecture — but each is a manual-resync liability. Recommend: record the exact
-   upstream file + line range + submodule commit at the top of each vendored TU, and add a
-   pin-bump checklist item to diff against upstream.
+   for plink2's architecture — but each is a manual-resync liability. ✅ **Done:** each vendored
+   TU now carries a `VENDORED-CODE PIN` block (upstream file + commit + line range + function
+   list + re-sync steps), and `scripts/check_vendored_drift.sh` mechanizes the pin-bump diff
+   (fails when the pinned upstream body changes). Wire it into CI before a release (see
+   `scripts/README.md`). Note: during this follow-up the "byte-identical verbatim" description was
+   found imprecise — the GLM extract is selective/reordered and the VCF extract applies two
+   behavior-neutral renamings; both are now documented in-file and handled by the canary.
 
 3. **Forced reimplementations (PCA, LD) are fair YELLOWs, not REDs.** plink2's PCA
    (`CalcPca`) and LD (`plink2_ld.cc`) are inseparable from `g_bigstack` + `PgenMtLoad` +

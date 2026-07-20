@@ -1,13 +1,36 @@
 // Extracted logistic/Firth regression math functions from plink2_glm_logistic.cc.
 //
-// Original source: third_party/plink-ng/2.0/plink2_glm_logistic.cc lines 147-1012
-// Copyright (C) 2005-2026 Shaun Purcell, Christopher Chang.
-// Licensed under GPL v3+.
-//
-// Contains the core numerical solvers used by plink2 --glm:
-//   - LogisticRegressionF (IRLS logistic regression, float precision)
-//   - FirthRegressionF (penalized IRLS, logistf port)
-//   - Supporting math functions (Hessian, Cholesky, etc.)
+// ============================ VENDORED-CODE PIN =============================
+// Upstream file:      third_party/plink-ng/2.0/plink2_glm_logistic.cc
+// plink-ng submodule: pinned commit 4ce97faa08bc370bedb30dcc82b4eeeef1c7c1f4
+//                     (verify: git -C third_party/plink-ng rev-parse HEAD)
+// Source span:        upstream lines 147-1012 (from `kSmallFloatPairs` /
+//                     GenoarrToFloatsRemoveMissing through FirthRegressionF).
+// Extract type:       SELECTIVE + REORDERED copy, not a contiguous verbatim block:
+//                       * upstream's LogisticRegressionResidualizedF (L606-658) is
+//                         intentionally OMITTED (unused here);
+//                       * CopyAndMeanCenterF is moved up into the __LP64__ #if/#else
+//                         SIMD block (upstream places it after LogisticRegressionF);
+//                       * some helpers gain a `static` qualifier and clang-format
+//                         re-wrapping. Function BODIES are byte-identical to upstream.
+// Functions extracted (each may have __LP64__ SIMD + scalar variants):
+//   GenoarrToFloatsRemoveMissing, MultMatrixDxnVectNF, LogisticSseF,
+//   ComputeVAndPMinusYF, ComputeVF, TripleProductF, ComputeTwoDiagTripleProductF,
+//   ComputeThreeTripleProductF, ComputeTwoPlusOneTripleProductF, CopyAndMeanCenterF,
+//   ComputeLoglikCheckedF, ComputeHessianF, CholeskyDecompositionF,
+//   SolveLinearSystemF, LogisticRegressionF (IRLS logistic, float precision),
+//   FirthComputeHdiagWeightsF, FirthComputeSecondWeightsF, FirthRegressionF (penalized IRLS).
+// Why extracted (not linkable): the home TU is 7106 lines with ~77 g_bigstack/
+//   ThreadGroup/CLI references and ~15 file-local statics; it cannot be linked
+//   wholesale. Dense linear algebra is delegated to the linked plink2_matrix.cc.
+// Drift canary:       scripts/check_vendored_drift.sh (run it in CI / before release;
+//                     it compares these function bodies to the pinned upstream).
+// Re-sync procedure:  when the plink-ng submodule pin is bumped and the canary fails,
+//   re-copy the named functions from the same upstream range (adjusting for line
+//   shifts), reapply the reorder/omission above, then update this pin block's commit
+//   hash and line numbers.
+// Copyright (C) 2005-2026 Shaun Purcell, Christopher Chang.  Licensed under GPL v3+.
+// ===========================================================================
 
 #include "plink2_glm_logistic_math.hpp"
 

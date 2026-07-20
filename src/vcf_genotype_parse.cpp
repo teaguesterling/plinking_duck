@@ -1,12 +1,34 @@
 // vcf_genotype_parse.cpp — VCF GT field parsing for biallelic variants
 //
-// Core parsing logic extracted from plink-ng/2.0/plink2_import.cc (GPLv3)
-// Copyright (C) 2005-2026 Shaun Purcell, Christopher Chang
-//
-// This file extracts VcfConvertUnphasedBiallelicLine, VcfConvertPhasedBiallelicLine,
-// and VcfCheckQuals into a standalone compilation unit for use in the PlinkingDuck
-// DuckDB extension. The original functions depend only on header-inline utilities
-// from plink2_base.h and plink2_string.h.
+// ============================ VENDORED-CODE PIN =============================
+// Upstream file:      third_party/plink-ng/2.0/plink2_import.cc
+// plink-ng submodule: pinned commit 4ce97faa08bc370bedb30dcc82b4eeeef1c7c1f4
+//                     (verify: git -C third_party/plink-ng rev-parse HEAD)
+// Extracted pieces + upstream line ranges (at the pinned commit):
+//   VcfImportBaseContext struct           L869-881
+//   VcfCheckQuals                         L898-920
+//   VcfParseErr enum                      L1109-1116
+//   VcfConvertUnphasedBiallelicLine       L1480-1579
+//   VcfConvertPhasedBiallelicLine         L1962-2091
+// Extract type:       function BODIES are identical to upstream MODULO two documented
+//   renamings applied here (a local enum in src/include/vcf_genotype_parse.hpp is used):
+//     VcfHalfCall (type)  -> uint32_t
+//     kVcfHalfCall* (enum constants) -> kHalfCall*
+//   Reformatted by clang-format; wrapped in namespace duckdb. The other functions in
+//   this file (FillBaseContext, TranslateResult, ParseUnphasedBiallelicGT,
+//   ParsePhasedBiallelicGT) are PlinkingDuck glue, NOT upstream copies.
+// Why extracted (not linkable): plink2_import.cc is an 18k-line CLI/import-pipeline TU
+//   and cannot be linked wholesale; the copied functions depend only on header-inline
+//   utilities from plink2_base.h / plink2_string.h.
+// Drift canary:       scripts/check_vendored_drift.sh (run it in CI / before release;
+//                     it compares these function bodies to the pinned upstream, applying
+//                     the two renamings above so the comparison stays an exact match).
+// Re-sync procedure:  when the plink-ng submodule pin is bumped and the canary fails,
+//   re-copy the named functions from the ranges above (adjusting for line shifts),
+//   reapply the VcfHalfCall/kVcfHalfCall renamings, then update this pin block's commit
+//   hash and line numbers.
+// Copyright (C) 2005-2026 Shaun Purcell, Christopher Chang.  Licensed under GPL v3+.
+// ===========================================================================
 
 #include "vcf_genotype_parse.hpp"
 

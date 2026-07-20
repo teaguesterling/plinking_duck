@@ -1,3 +1,15 @@
+// plink_ld.cpp — pairwise linkage disequilibrium (r2, D, D').
+//
+// FORCED-REIMPLEMENTATION CAVEAT (see docs/planning/plink2-wrapping-audit.md, YELLOW #4):
+// This is a hand-rolled genotype-covariance estimator, NOT plink2's phased-haplotype r2.
+// plink2's LD code (plink2_ld.cc: IndepPairwise/LdConsole) is g_bigstack/ThreadGroup/CLI-
+// entangled and pruning/console-oriented, so no per-pair r2/D' function is linkable. r2 here
+// is a genotype-level Pearson correlation (cov^2 / (varA*varB)) and D' uses the Weir-1979
+// composite estimator; these are numerically DIFFERENT from plink2's haplotype-based values.
+// Consequence, by design and noted at the D' computation below: D' can exceed 1.0 when the
+// samples deviate from Hardy-Weinberg equilibrium. This is a conscious estimator choice, not
+// a bug. Cross-check against `plink2 --r2` before relying on exact-match semantics.
+
 #include "plink_ld.hpp"
 #include "duckdb_compat.hpp"
 #include "plink_common.hpp"

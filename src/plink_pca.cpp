@@ -1,3 +1,15 @@
+// plink_pca.cpp — top-n_pcs eigenvectors/eigenvalues of the sample GRM via multi-pass
+// randomized subspace iteration; per-sample PC output.
+//
+// FORCED-REIMPLEMENTATION CAVEAT (see docs/planning/plink2-wrapping-audit.md, YELLOW #5):
+// This is a hand-rolled randomized SVD (Eigen BDCSVD) plus a bespoke DuckDB-threaded
+// subspace accumulator, NOT a wrap of plink2. plink2's CalcPca (plink2_matrix_calc.cc) is
+// saturated with g_bigstack_* / PgenMtLoadInit / SetThreadFuncAndData and is not compiled,
+// so no callable equivalent exists — reimplementation is forced, not a smell. The approach
+// mirrors `plink2 --pca approx` (randomized subspace iteration) but the numerics are
+// independent and carry drift risk: cross-check eigenvalues/vectors against
+// `plink2 --pca approx` on a fixture before relying on exact agreement.
+
 #include "plink_pca.hpp"
 #include "duckdb_compat.hpp"
 #include "plink_common.hpp"
