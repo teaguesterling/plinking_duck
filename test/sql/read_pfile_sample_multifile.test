@@ -1,0 +1,94 @@
+# name: test/sql/read_pfile_sample_multifile.test
+# description: orient := 'sample' across multiple variant-sharded files; genotypes concatenate along the variant axis in shard order. combine_samples controls sample-set handling (implicit/identical implemented).
+# group: [sql]
+
+require plinking_duck
+
+# shard1/2/3: 1000 variants x 8 samples each, identical .psam (SAMP1..SAMP8),
+# distinct variant IDs interleaved shard1={var1,var4,..}, shard2={var2,..}, shard3={var3,..}.
+
+# --- Basic shape: one row per sample; genotypes span all 3000 variants ---
+query II
+SELECT count(*) AS samples, DISTINCT_len FROM (
+  SELECT len(genotypes) AS DISTINCT_len FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample')
+) GROUP BY DISTINCT_len;
+----
+8	3000
+
+# --- Value-level concatenation: SAMP1's array = shard1 || shard2 || shard3, in
+#     that order. Each 1000-wide slice must equal that shard's single-file array. ---
+query III
+WITH mf AS (SELECT genotypes g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', genotypes := 'list') WHERE IID = 'SAMP1'),
+     s1 AS (SELECT genotypes g FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'list') WHERE IID = 'SAMP1'),
+     s2 AS (SELECT genotypes g FROM read_pfile('test/data/shard2', orient := 'sample', genotypes := 'list') WHERE IID = 'SAMP1'),
+     s3 AS (SELECT genotypes g FROM read_pfile('test/data/shard3', orient := 'sample', genotypes := 'list') WHERE IID = 'SAMP1')
+SELECT mf.g[1:1000] = s1.g, mf.g[1001:2000] = s2.g, mf.g[2001:3000] = s3.g FROM mf, s1, s2, s3;
+----
+true	true	true
+
+# --- Sample axis alignment: a different sample's middle slice also matches ---
+query I
+WITH mf AS (SELECT genotypes g FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', genotypes := 'list') WHERE IID = 'SAMP5'),
+     s2 AS (SELECT genotypes g FROM read_pfile('test/data/shard2', orient := 'sample', genotypes := 'list') WHERE IID = 'SAMP5')
+SELECT mf.g[1001:2000] = s2.g FROM mf, s2;
+----
+true
+
+# --- combine_samples := 'identical' (matching IIDs) behaves like the default ---
+query I
+SELECT DISTINCT len(genotypes) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', combine_samples := 'identical');
+----
+2000
+
+# --- combine_samples := 'implicit' is the explicit default ---
+query I
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', combine_samples := 'implicit');
+----
+8
+
+# --- Sample subset applies uniformly across shards ---
+query II
+SELECT count(*) AS rows, DISTINCT_len FROM (
+  SELECT len(genotypes) AS DISTINCT_len FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', samples := ['SAMP1','SAMP2'])
+) GROUP BY DISTINCT_len;
+----
+2	3000
+
+# --- Per-source count filter + variant_offsets rebuild: subset(3)+ac[2,4] gives
+#     partial per-shard reduction; sample-orient dimension == variant-orient total ---
+query I
+SELECT DISTINCT len(genotypes) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', samples := ['SAMP1','SAMP2','SAMP3'], ac_range := {min: 2, max: 4});
+----
+2250
+
+query I
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], samples := ['SAMP1','SAMP2','SAMP3'], ac_range := {min: 2, max: 4});
+----
+2250
+
+# --- genotypes := 'columns': one column per variant, IDs span all shards ---
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', genotypes := 'columns')) WHERE column_name IN ('var1','var2','var3','var3000');
+----
+4
+
+# --- Unimplemented combine_samples modes are a clear error, not a crash ---
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', combine_samples := 'union');
+----
+not yet implemented
+
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', combine_samples := 'intersect');
+----
+not yet implemented
+
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', combine_samples := 'concatenate');
+----
+not yet implemented
+
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1'], orient := 'sample', combine_samples := 'nonsense');
+----
+unknown combine_samples

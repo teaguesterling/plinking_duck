@@ -96,11 +96,17 @@ SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/large_exam
 ----
 sample count mismatch across files
 
-# --- Negative: sample orient with multiple files is not yet supported (Phase 2) ---
-statement error
+# --- Positive: sample orient across multiple files (variants concatenated;
+#     genotypes span both files' variants) — same file twice = 4 samples x 8 variants ---
+query I
 SELECT count(*) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], orient := 'sample');
 ----
-orient := 'sample' with multiple files is not yet supported
+4
+
+query I
+SELECT DISTINCT len(genotypes) FROM read_pfile(['test/data/pgen_example', 'test/data/pgen_example'], orient := 'sample');
+----
+8
 
 # --- Negative: single-file sample orient still works ---
 query I
