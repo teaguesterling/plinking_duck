@@ -740,8 +740,11 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 	}
 	src.has_effective_variant_list = true;
 
-	// Case A: sparse pvar index (parquet region pushdown).
-	if (!src.variants.vidx_map.empty()) {
+	// Case A: sparse/subset pvar index (parquet region pushdown). Use IsDense()
+	// (not vidx_map.empty()) so a zero-match region — an empty subset — takes this
+	// path and yields an empty effective list, instead of falling through to the
+	// dense Case C, which would index the empty metadata vectors out of bounds.
+	if (!src.variants.IsDense()) {
 		src.effective_variant_indices.reserve(src.variants.vidx_map.size());
 		for (auto &kv : src.variants.vidx_map) {
 			if (use_variant_set && variant_set.find(kv.first) == variant_set.end()) {

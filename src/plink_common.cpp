@@ -909,6 +909,10 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 
 	VariantMetadataIndex idx;
 	idx.is_bim = false;
+	// The vectors hold only the region-matching rows, indexed by local position
+	// (file-row vidx via vidx_map). Mark it a subset so a zero-match region (empty
+	// vidx_map) is not misclassified as dense — see VariantMetadataIndex::is_subset.
+	idx.is_subset = true;
 	string label = "parquet companion '" + path + "' (region pushdown)";
 	IngestVariantResult(*result, label, func_name, idx);
 	// variant_ct = caller's hint (typically pgen's raw_variant_ct). The post-load

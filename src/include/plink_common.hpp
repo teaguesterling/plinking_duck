@@ -161,6 +161,14 @@ struct VariantMetadataIndex {
 	//! Whether the source was .bim format (affects column-name defaults only).
 	bool is_bim = false;
 
+	//! True iff the vectors hold a pre-filtered SUBSET indexed by local position
+	//! (e.g. parquet region pushdown), so vidx must be routed through vidx_map —
+	//! NEVER indexed directly. This is distinct from `vidx_map.empty()`: a region
+	//! that matches ZERO rows yields an empty vidx_map but is still a subset (its
+	//! vectors are empty, not raw_variant_ct-sized). Treating that empty subset as
+	//! dense makes Local(vidx) return vidx and index empty vectors out of bounds.
+	bool is_subset = false;
+
 	//! Whether ID/REF/ALT are loaded. Dense text load always sets both true.
 	//! Parquet lazy paths may skip loading these if the query doesn't need them.
 	bool has_ids = true;
@@ -168,7 +176,7 @@ struct VariantMetadataIndex {
 
 	//! Local index for a file-row vidx.
 	inline idx_t Local(idx_t vidx) const {
-		if (vidx_map.empty()) {
+		if (IsDense()) {
 			return vidx;
 		}
 		auto it = vidx_map.find(static_cast<uint32_t>(vidx));
@@ -179,9 +187,11 @@ struct VariantMetadataIndex {
 		return it->second;
 	}
 
-	//! True iff this index is dense (fully loaded, indexed by vidx directly).
+	//! True iff this index is dense (fully loaded, indexed by vidx directly). A
+	//! subset index is never dense — even when it loaded zero rows (vidx_map
+	//! empty), its vectors are a subset, not raw_variant_ct-sized.
 	inline bool IsDense() const {
-		return vidx_map.empty();
+		return vidx_map.empty() && !is_subset;
 	}
 
 	//! Returns [first_local_idx, past_end_local_idx) for a chromosome; {0,0} if absent.

@@ -1,0 +1,49 @@
+# name: test/sql/read_pfile_region_parquet_empty.test
+# description: region that matches ZERO variants via parquet region-pushdown must not crash (regression: empty subset index was misclassified as dense -> OOB on empty metadata vectors)
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Build a parquet .pvar companion; overriding pvr:= to it forces the region
+# pushdown path (region.active && IsParquetFile), which returns a SUBSET index.
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/shard1.pvar')) TO '__TEST_DIR__/shard1_region.pvar.parquet' (FORMAT parquet);
+
+# shard1 CHROMs are '1','2','3'. A 'chr16:...' region (or any non-matching chrom)
+# matches zero rows -> empty subset. Before the fix this indexed empty vectors
+# out of bounds (INTERNAL Error / segfault in release). Now: clean empty result.
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1', pvar := '__TEST_DIR__/shard1_region.pvar.parquet', region := 'chr16:123-456');
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1', pvar := '__TEST_DIR__/shard1_region.pvar.parquet', region := 'chr16:123-456', orient := 'genotype');
+----
+0
+
+# sample orient (pre-reads a matrix) must also survive a zero-variant region.
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1', pvar := '__TEST_DIR__/shard1_region.pvar.parquet', region := 'chr16:123-456', orient := 'sample');
+----
+8
+
+# A matching chrom but a POS window with no variants is also an empty subset.
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1', pvar := '__TEST_DIR__/shard1_region.pvar.parquet', region := '1:1-1');
+----
+0
+
+# Regression guard: a VALID region via the same pushdown path still returns the
+# correct subset (proves the fix didn't neuter non-empty pushdown).
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1', pvar := '__TEST_DIR__/shard1_region.pvar.parquet', region := '1:1-100000000');
+----
+334
+
+query T
+SELECT DISTINCT CHROM FROM read_pfile('test/data/shard1', pvar := '__TEST_DIR__/shard1_region.pvar.parquet', region := '2:1-100000000');
+----
+2
