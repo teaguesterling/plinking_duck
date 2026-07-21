@@ -256,6 +256,16 @@ string ReplaceExtension(const string &path, const string &new_ext);
 //! skipped; an empty list throws. A scalar VARCHAR yields a 1-element list.
 vector<string> ResolvePathList(const Value &input, const char *fn_name);
 
+//! Expand glob patterns and protocol URLs (e.g. scalarfs `pathmacro:`) in a
+//! path/prefix list to concrete local paths via the VFS, mirroring how read_csv
+//! resolves its inputs. A single URL/glob may fan out to many entries (a sharded
+//! fileset). Plain prefixes / literal paths with no glob match are kept as-is so
+//! the prefix->.pgen discovery and file_search_path resolution still run. Throws
+//! if an input that IS a glob pattern matches nothing. Uses a context-carrying
+//! opener so protocol filesystems needing the client (pathmacro macro) resolve.
+vector<string> ExpandPathInputs(ClientContext &context, FileSystem &fs, const vector<string> &inputs,
+                                const char *fn_name);
+
 //! Resolve a candidate path against the `file_search_path` setting, mirroring
 //! DuckDB's glob-time resolution (LocalFileSystem::FetchFileWithoutGlob). Our
 //! readers discover files with direct FileExists/OpenFile and never route the

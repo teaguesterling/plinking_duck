@@ -660,8 +660,16 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 
 	// Discover .psam/.fam (only the first source needs it — shared sample metadata)
 	if (need_psam && src.psam_path.empty()) {
-		string psam_base = eff_prefix.empty() ? src.pgen_path : eff_prefix + ".pgen";
-		src.psam_path = FindCompanionFileWithParquet(context, fs, psam_base, {".psam", ".fam"});
+		if (!eff_prefix.empty()) {
+			src.psam_path = FindCompanionFileWithParquet(context, fs, eff_prefix + ".pgen", {".psam", ".fam"});
+		}
+		// Fall back to deriving from the resolved .pgen path. This is required
+		// when eff_prefix is itself a full .pgen path (e.g. from a '*.pgen' glob):
+		// eff_prefix + ".pgen" would double the extension, so ReplaceExtension on
+		// src.pgen_path is what finds the companion. Mirrors the .pvar block.
+		if (src.psam_path.empty()) {
+			src.psam_path = FindCompanionFileWithParquet(context, fs, src.pgen_path, {".psam", ".fam"});
+		}
 		if (src.psam_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .psam or .fam file for '%s' "
 			                            "(use psam := 'path' to specify explicitly)",
@@ -810,15 +818,19 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// --- Resolve file path(s) ---
 	// First positional argument is a prefix (VARCHAR) or a list of prefixes
 	// (LIST(VARCHAR), row-concatenated in order). Empty inputs → only named params.
+	auto &fs = FileSystem::GetFileSystem(context);
+
 	vector<string> prefixes;
 	if (!input.inputs.empty()) {
 		prefixes = ResolvePathList(input.inputs[0], "read_pfile");
+		// Expand glob patterns and protocol URLs (e.g. pathmacro:) to concrete
+		// local prefixes/paths, so a single URL/glob can fan out to a sharded
+		// fileset (mirrors read_csv). Plain prefixes pass through unchanged.
+		prefixes = ExpandPathInputs(context, fs, prefixes, "read_pfile");
 	} else {
 		prefixes.push_back("");
 	}
 	const bool multi_file = prefixes.size() > 1;
-
-	auto &fs = FileSystem::GetFileSystem(context);
 
 	// Named parameters can override individual paths (single-file only)
 	string orient_str;

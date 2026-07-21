@@ -17,6 +17,8 @@ namespace duckdb {
 bool IsNativePlinkFormat(const string &path);
 vector<string> ResolvePathList(const Value &input, const char *fn_name);
 string ResolveExistingPath(ClientContext &context, FileSystem &fs, const string &path);
+vector<string> ExpandPathInputs(ClientContext &context, FileSystem &fs, const vector<string> &inputs,
+                                const char *fn_name);
 } // namespace duckdb
 
 namespace duckdb {
@@ -241,13 +243,16 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 	auto bind_data = make_uniq<PvarBindData>();
 	bind_data->file_paths = ResolvePathList(input.inputs[0], "read_pvar");
 
-	// Resolve each path against file_search_path (like read_csv), so relative
-	// paths work when a search dir is set. Keep the literal if not found — a
-	// non-native source (parquet/glob) is passed to a stock reader that does its
-	// own file_search_path resolution, and a missing native file falls through
-	// to the natural open error.
 	{
 		auto &fs = FileSystem::GetFileSystem(context);
+		// Expand glob patterns and protocol URLs (e.g. pathmacro:) to concrete
+		// paths, so a single URL/glob can fan out to multiple files (mirrors
+		// read_csv). Plain paths pass through unchanged.
+		bind_data->file_paths = ExpandPathInputs(context, fs, bind_data->file_paths, "read_pvar");
+		// Resolve each remaining relative path against file_search_path. Keep the
+		// literal if not found — a non-native source (parquet) is passed to a
+		// stock reader that resolves itself, and a missing native file falls
+		// through to the natural open error.
 		for (auto &p : bind_data->file_paths) {
 			auto resolved = ResolveExistingPath(context, fs, p);
 			if (!resolved.empty()) {

@@ -141,6 +141,19 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 
 	auto &fs = FileSystem::GetFileSystem(context);
 
+	// Expand a glob/URL (e.g. pathmacro:) to a concrete .pgen path. read_pgen is
+	// single-file; a pattern resolving to multiple files is an error (use
+	// read_pfile for a sharded fileset).
+	{
+		auto expanded = ExpandPathInputs(context, fs, {bind_data->pgen_path}, "read_pgen");
+		if (expanded.size() > 1) {
+			throw InvalidInputException("read_pgen: input '%s' resolved to %llu files; read_pgen reads a single .pgen "
+			                            "(use read_pfile for a sharded fileset)",
+			                            bind_data->pgen_path, (unsigned long long)expanded.size());
+		}
+		bind_data->pgen_path = expanded[0];
+	}
+
 	// --- Named parameters ---
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "pvar") {

@@ -1,0 +1,101 @@
+# name: test/sql/read_pfile_glob.test
+# description: readers expand glob patterns (and protocol URLs) in inputs via the VFS, like read_csv (v0.7.2). pathmacro: URLs ride this same fs.Glob dispatch (verified separately with scalarfs loaded).
+# group: [sql]
+
+require plinking_duck
+
+# Fixtures: shard1/2/3 each have 1000 variants x 8 samples; variant IDs are
+# interleaved so shard1={var1,var4,...}, shard2={var2,var5,...}, shard3={var3,...}.
+
+# ============================================================================
+# read_pfile: a '*.pgen' glob fans out to a sharded fileset
+# ============================================================================
+
+query I
+SELECT count(*) FROM read_pfile('test/data/shard*.pgen');
+----
+3000
+
+# genotype orient: 3000 variants x 8 samples
+query I
+SELECT count(*) FROM read_pfile('test/data/shard*.pgen', orient := 'genotype');
+----
+24000
+
+# Deterministic order: glob matches are SORTED (filesystem readdir order is not
+# stable across platforms), so shard1 comes first regardless of readdir order.
+query T
+SELECT ID FROM read_pfile('test/data/shard*.pgen') LIMIT 3;
+----
+var1
+var4
+var7
+
+# Explicit list order is preserved (only matches WITHIN one pattern are sorted).
+query T
+SELECT ID FROM read_pfile(['test/data/shard3', 'test/data/shard1']) LIMIT 3;
+----
+var3
+var6
+var9
+
+# ============================================================================
+# .psam discovery from a bare .pgen path (regression: eff_prefix + ".pgen" would
+# double the extension; the src.pgen_path fallback is what finds the companion).
+# The count=3000 assertion above already exercises this for source 0 of a glob;
+# these cover a single-file glob (sample orient loads .psam) and an explicit list
+# of bare .pgen paths, so the fallback can't silently regress in either form.
+# ============================================================================
+
+# Form 1: a single-shard glob expands to one bare .pgen path; sample orient
+# reads the .psam (8 samples) — proving bare-.pgen .psam discovery.
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1*.pgen', orient := 'sample');
+----
+8
+
+# Form 2: explicit list of bare .pgen paths
+query I
+SELECT count(*) FROM read_pfile(['test/data/shard1.pgen', 'test/data/shard2.pgen']);
+----
+2000
+
+# ============================================================================
+# Error cases
+# ============================================================================
+
+# A glob that matches nothing is a clear error (not a silent empty result).
+statement error
+SELECT count(*) FROM read_pfile('test/data/nope*.pgen');
+----
+no files matched pattern
+
+# read_pgen is single-file: a pattern that fans out to >1 file is an error.
+statement error
+SELECT count(*) FROM read_pgen('test/data/shard*.pgen');
+----
+resolved to 3 files
+
+# read_psam is single-file too.
+statement error
+SELECT count(*) FROM read_psam('test/data/shard*.psam');
+----
+resolved to 3 files
+
+# ============================================================================
+# read_pvar / read_psam globs (single-file readers still expand)
+# ============================================================================
+
+query I
+SELECT count(*) FROM read_pvar('test/data/shard*.pvar');
+----
+3000
+
+# ============================================================================
+# No regression: a plain prefix with no glob chars is untouched
+# ============================================================================
+
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_example');
+----
+4

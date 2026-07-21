@@ -16,6 +16,8 @@
 namespace duckdb {
 bool IsNativePlinkFormat(const string &path);
 string ResolveExistingPath(ClientContext &context, FileSystem &fs, const string &path);
+vector<string> ExpandPathInputs(ClientContext &context, FileSystem &fs, const vector<string> &inputs,
+                                const char *fn_name);
 } // namespace duckdb
 
 namespace duckdb {
@@ -384,11 +386,20 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 	auto result = make_uniq<PsamBindData>();
 	result->file_path = input.inputs[0].GetValue<string>();
 
-	// Resolve against file_search_path (like read_csv). Keep the literal if not
-	// found — a non-native source is passed to a stock reader that resolves
-	// itself, and a missing native file falls through to the natural error.
 	{
 		auto &fs = FileSystem::GetFileSystem(context);
+		// Expand a glob/URL (e.g. pathmacro:) to a concrete path. read_psam is
+		// single-file; a pattern resolving to multiple files is an error.
+		auto expanded = ExpandPathInputs(context, fs, {result->file_path}, "read_psam");
+		if (expanded.size() > 1) {
+			throw InvalidInputException("read_psam: input '%s' resolved to %llu files; read_psam reads a single "
+			                            ".psam/.fam",
+			                            result->file_path, (unsigned long long)expanded.size());
+		}
+		result->file_path = expanded[0];
+		// Resolve against file_search_path. Keep the literal if not found — a
+		// non-native source is passed to a stock reader that resolves itself, and
+		// a missing native file falls through to the natural error.
 		auto resolved = ResolveExistingPath(context, fs, result->file_path);
 		if (!resolved.empty()) {
 			result->file_path = resolved;

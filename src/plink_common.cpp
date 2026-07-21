@@ -6,6 +6,8 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 // ---------------------------------------------------------------------------
@@ -497,6 +499,49 @@ string ResolveExistingPath(ClientContext &context, FileSystem &fs, const string 
 		}
 	}
 	return "";
+}
+
+vector<string> ExpandPathInputs(ClientContext &context, FileSystem &fs, const vector<string> &inputs,
+                                const char *fn_name) {
+	// NB: FileSystem::GetFileSystem(context) returns an OpenerFileSystem that
+	// pushes the context-bound opener into Glob automatically — passing our own
+	// opener is an error ("cannot take an opener"). So call Glob with no opener;
+	// protocol filesystems that need the client (e.g. scalarfs `pathmacro:`,
+	// which runs a catalog macro) still receive it via that pushed opener.
+	(void)context;
+	vector<string> expanded;
+	for (auto &input : inputs) {
+		if (input.empty()) {
+			expanded.push_back(input); // named-params-only / empty positional
+			continue;
+		}
+		const bool is_glob = FileSystem::HasGlob(input);
+		// Route through the VFS so glob patterns and protocol URLs (e.g.
+		// pathmacro:) resolve to concrete local paths, mirroring read_csv. Local
+		// .pgen I/O then opens those concrete paths via pgenlib's raw FILE*.
+		auto matches = fs.Glob(input);
+		if (!matches.empty()) {
+			// Glob order is filesystem-dependent (LocalFileSystem does not sort),
+			// so sort each pattern's matches for a deterministic, reproducible
+			// shard order. This matters for row order and especially by-index
+			// variant selection, whose global offsets depend on shard order.
+			// read_csv sorts its glob expansion for the same reason. Explicit
+			// list order (across separate inputs) is preserved — only the
+			// matches WITHIN one pattern are sorted.
+			std::sort(matches.begin(), matches.end(),
+			          [](const OpenFileInfo &a, const OpenFileInfo &b) { return a.path < b.path; });
+			for (auto &m : matches) {
+				expanded.push_back(m.path);
+			}
+		} else if (is_glob) {
+			throw InvalidInputException("%s: no files matched pattern '%s'", fn_name, input);
+		} else {
+			// Plain prefix / literal path with no glob match: keep as-is so the
+			// prefix->.pgen discovery and file_search_path resolution still run.
+			expanded.push_back(input);
+		}
+	}
+	return expanded;
 }
 
 string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions) {
