@@ -474,6 +474,31 @@ vector<string> ResolvePathList(const Value &input, const char *fn_name) {
 	return paths;
 }
 
+string ResolveExistingPath(ClientContext &context, FileSystem &fs, const string &path) {
+	// Literal / cwd-relative / absolute path wins, matching DuckDB's precedence
+	// in LocalFileSystem::FetchFileWithoutGlob.
+	if (fs.FileExists(path)) {
+		return path;
+	}
+	// Only relative paths get file_search_path expansion (matches DuckDB).
+	if (fs.IsPathAbsolute(path)) {
+		return "";
+	}
+	Value value;
+	if (context.TryGetCurrentSetting("file_search_path", value)) {
+		auto search_paths_str = value.ToString();
+		if (!search_paths_str.empty()) {
+			for (auto &search_path : StringUtil::Split(search_paths_str, ',')) {
+				auto joined = fs.JoinPath(search_path, path);
+				if (fs.FileExists(joined)) {
+					return joined;
+				}
+			}
+		}
+	}
+	return "";
+}
+
 string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions) {
 	for (auto &ext : extensions) {
 		auto candidate = ReplaceExtension(pgen_path, ext);

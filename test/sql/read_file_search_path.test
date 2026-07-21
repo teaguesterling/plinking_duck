@@ -1,0 +1,91 @@
+# name: test/sql/read_file_search_path.test
+# description: plinking readers honor the file_search_path setting for relative paths, like read_csv/read_parquet (v0.7.2 fix)
+# group: [sql]
+
+require plinking_duck
+
+# The fixtures live under test/data/, NOT the test cwd (repo root). Each reader
+# resolves its (relative) input through file_search_path, mirroring how DuckDB's
+# stock readers glob. Every positive case below has a negative control proving
+# the search-path join is what made it succeed.
+
+# ============================================================================
+# NEGATIVE CONTROLS — bare names, no file_search_path set => not found
+# ============================================================================
+
+statement error
+SELECT count(*) FROM read_pfile('pgen_example');
+----
+cannot find .pgen file for prefix 'pgen_example'
+
+statement error
+SELECT count(*) FROM read_pgen('pgen_example.pgen');
+----
+cannot find .pvar or .bim companion
+
+statement error
+SELECT count(*) FROM read_pvar('pgen_example.pvar');
+----
+pgen_example.pvar
+
+statement error
+SELECT count(*) FROM read_psam('pgen_example.psam');
+----
+pgen_example.psam
+
+# ============================================================================
+# POSITIVE — same bare names resolve once file_search_path points at test/data
+# ============================================================================
+
+statement ok
+SET file_search_path='test/data';
+
+query I
+SELECT count(*) FROM read_pfile('pgen_example');
+----
+4
+
+query I
+SELECT count(*) FROM read_pgen('pgen_example.pgen');
+----
+4
+
+query I
+SELECT count(*) FROM read_pvar('pgen_example.pvar');
+----
+4
+
+query I
+SELECT count(*) FROM read_psam('pgen_example.psam');
+----
+4
+
+# Genotypes decode identically whether resolved via file_search_path or an
+# explicit relative path (the search-path join yields a concrete path pgenlib
+# opens the same way).
+query IT
+SELECT ID, genotypes FROM read_pfile('pgen_example') ORDER BY ID LIMIT 2;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+
+# Multi-file list: every element is resolved against file_search_path.
+query I
+SELECT count(*) FROM read_pfile(['pgen_example', 'pgen_example']);
+----
+8
+
+# cwd/explicit path still wins over the search path (precedence unchanged).
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_example');
+----
+4
+
+# Named companion overrides are resolved against file_search_path too.
+query I
+SELECT count(*) FROM read_pgen('pgen_example.pgen', pvar='pgen_example.pvar', psam='pgen_example.psam');
+----
+4
+
+statement ok
+RESET file_search_path;

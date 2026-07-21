@@ -594,20 +594,40 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
                                    const string &override_psam, bool need_psam, const RegionFilter &region,
                                    uint32_t &raw_sample_ct_out) {
 	PfileSource src;
+	// Resolve explicit overrides against file_search_path too (keep the literal
+	// if not found, so downstream open produces the natural error message).
 	src.pgen_path = override_pgen;
 	src.pvar_path = override_pvar;
 	src.psam_path = override_psam;
+	for (auto *p : {&src.pgen_path, &src.pvar_path, &src.psam_path}) {
+		if (!p->empty()) {
+			auto resolved = ResolveExistingPath(context, fs, *p);
+			if (!resolved.empty()) {
+				*p = resolved;
+			}
+		}
+	}
 
-	// Discover .pgen from prefix if not explicitly provided
+	// Discover .pgen from prefix if not explicitly provided. Resolve the base
+	// against file_search_path ONCE (mirrors read_csv), then derive all
+	// companions from the resolved concrete base so they share its directory —
+	// never search-resolve each companion independently (that could mix files
+	// from different search dirs).
+	string eff_prefix = prefix;
 	if (src.pgen_path.empty() && !prefix.empty()) {
-		string candidate = prefix + ".pgen";
-		if (fs.FileExists(candidate)) {
-			src.pgen_path = candidate;
-		} else if (fs.FileExists(prefix)) {
-			src.pgen_path = prefix;
+		string resolved = ResolveExistingPath(context, fs, prefix + ".pgen");
+		if (!resolved.empty()) {
+			src.pgen_path = resolved;
+			eff_prefix = resolved.substr(0, resolved.size() - 5); // strip ".pgen"
 		} else {
-			throw InvalidInputException("read_pfile: cannot find .pgen file for prefix '%s' (tried '%s')", prefix,
-			                            candidate);
+			resolved = ResolveExistingPath(context, fs, prefix);
+			if (!resolved.empty()) {
+				src.pgen_path = resolved;
+				eff_prefix = resolved;
+			} else {
+				throw InvalidInputException("read_pfile: cannot find .pgen file for prefix '%s' (tried '%s')", prefix,
+				                            prefix + ".pgen");
+			}
 		}
 	}
 	if (src.pgen_path.empty()) {
@@ -616,11 +636,11 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 
 	// Discover .pvar/.bim
 	if (src.pvar_path.empty()) {
-		if (!prefix.empty()) {
-			src.pvar_path = FindCompanionFileWithParquet(context, fs, prefix + ".pgen", {".pvar", ".bim"});
+		if (!eff_prefix.empty()) {
+			src.pvar_path = FindCompanionFileWithParquet(context, fs, eff_prefix + ".pgen", {".pvar", ".bim"});
 			if (src.pvar_path.empty()) {
 				for (auto &ext : {".pvar", ".bim"}) {
-					auto candidate = prefix + ext;
+					auto candidate = eff_prefix + ext;
 					if (fs.FileExists(candidate)) {
 						src.pvar_path = candidate;
 						break;
@@ -640,7 +660,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 
 	// Discover .psam/.fam (only the first source needs it — shared sample metadata)
 	if (need_psam && src.psam_path.empty()) {
-		string psam_base = prefix.empty() ? src.pgen_path : prefix + ".pgen";
+		string psam_base = eff_prefix.empty() ? src.pgen_path : eff_prefix + ".pgen";
 		src.psam_path = FindCompanionFileWithParquet(context, fs, psam_base, {".psam", ".fam"});
 		if (src.psam_path.empty()) {
 			throw InvalidInputException("read_pfile: cannot find .psam or .fam file for '%s' "

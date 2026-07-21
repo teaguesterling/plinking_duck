@@ -256,6 +256,16 @@ string ReplaceExtension(const string &path, const string &new_ext);
 //! skipped; an empty list throws. A scalar VARCHAR yields a 1-element list.
 vector<string> ResolvePathList(const Value &input, const char *fn_name);
 
+//! Resolve a candidate path against the `file_search_path` setting, mirroring
+//! DuckDB's glob-time resolution (LocalFileSystem::FetchFileWithoutGlob). Our
+//! readers discover files with direct FileExists/OpenFile and never route the
+//! path through Glob(), so without this they silently ignore file_search_path —
+//! unlike read_csv/read_parquet/read_json. Returns the concrete path: the
+//! literal path if it already exists (cwd/absolute wins, matching DuckDB
+//! precedence), else the first `file_search_path` entry joined with it that
+//! exists, else "" if none is found. Absolute paths are never search-expanded.
+string ResolveExistingPath(ClientContext &context, FileSystem &fs, const string &path);
+
 //! Try to find a companion file by replacing the .pgen extension.
 //! Returns the first existing path from candidates, or empty string.
 string FindCompanionFile(FileSystem &fs, const string &pgen_path, const vector<string> &extensions);

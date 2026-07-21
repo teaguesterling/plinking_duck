@@ -15,6 +15,7 @@
 // to prevent name conflicts with local static SplitTabLine/SplitWhitespaceLine/ReadFileLines.
 namespace duckdb {
 bool IsNativePlinkFormat(const string &path);
+string ResolveExistingPath(ClientContext &context, FileSystem &fs, const string &path);
 } // namespace duckdb
 
 namespace duckdb {
@@ -382,6 +383,17 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<PsamBindData>();
 	result->file_path = input.inputs[0].GetValue<string>();
+
+	// Resolve against file_search_path (like read_csv). Keep the literal if not
+	// found — a non-native source is passed to a stock reader that resolves
+	// itself, and a missing native file falls through to the natural error.
+	{
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto resolved = ResolveExistingPath(context, fs, result->file_path);
+		if (!resolved.empty()) {
+			result->file_path = resolved;
+		}
+	}
 
 	if (IsNativePlinkFormat(result->file_path)) {
 		// Existing path: parse native text file

@@ -16,6 +16,7 @@
 namespace duckdb {
 bool IsNativePlinkFormat(const string &path);
 vector<string> ResolvePathList(const Value &input, const char *fn_name);
+string ResolveExistingPath(ClientContext &context, FileSystem &fs, const string &path);
 } // namespace duckdb
 
 namespace duckdb {
@@ -239,6 +240,21 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
                                          vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<PvarBindData>();
 	bind_data->file_paths = ResolvePathList(input.inputs[0], "read_pvar");
+
+	// Resolve each path against file_search_path (like read_csv), so relative
+	// paths work when a search dir is set. Keep the literal if not found — a
+	// non-native source (parquet/glob) is passed to a stock reader that does its
+	// own file_search_path resolution, and a missing native file falls through
+	// to the natural open error.
+	{
+		auto &fs = FileSystem::GetFileSystem(context);
+		for (auto &p : bind_data->file_paths) {
+			auto resolved = ResolveExistingPath(context, fs, p);
+			if (!resolved.empty()) {
+				p = resolved;
+			}
+		}
+	}
 
 	// Schema comes from the first file; all files are assumed to share it (row-concat).
 	if (IsNativePlinkFormat(bind_data->file_paths[0])) {

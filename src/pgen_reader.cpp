@@ -173,6 +173,19 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 		throw InvalidInputException("read_pgen: dosages and phased cannot both be true");
 	}
 
+	// Resolve the .pgen path (and explicit companion overrides) against
+	// file_search_path, like read_csv. Companions are then derived from the
+	// resolved .pgen base so they share its directory. Keep the literal if not
+	// found so pgenlib/open produces the natural error.
+	for (auto *p : {&bind_data->pgen_path, &bind_data->pvar_path, &bind_data->psam_path}) {
+		if (!p->empty()) {
+			auto resolved = ResolveExistingPath(context, fs, *p);
+			if (!resolved.empty()) {
+				*p = resolved;
+			}
+		}
+	}
+
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
 		bind_data->pvar_path = FindCompanionFileWithParquet(context, fs, bind_data->pgen_path, {".pvar", ".bim"});
