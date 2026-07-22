@@ -21,7 +21,8 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | `pvar` | `VARCHAR` | `prefix.pvar` | Explicit `.pvar` or `.bim` path |
 | `psam` | `VARCHAR` | `prefix.psam` | Explicit `.psam` or `.fam` path |
 | `orient` | `VARCHAR` | `'variant'` | Output orientation: `'variant'`, `'genotype'`, or `'sample'` |
-| `genotypes` | `VARCHAR` | `'array'` | Genotype output format: `'array'`, `'list'`, or `'columns'` |
+| `combine_samples` | `VARCHAR` | `'implicit'` | Multi-file only: how shards' samples combine — `'implicit'` (positional trust) or `'identical'` (verify IIDs). See [Multi-File Input](#multi-file-input) |
+| `genotypes` | `VARCHAR` | `'array'` | Genotype output: `'array'`, `'list'`, `'columns'`, `'struct'`, or the aggregate modes `'counts'` / `'stats'` (per-sample summaries in sample orient) |
 | `phased` | `BOOLEAN` | `false` | Output phased haplotype pairs instead of dosage counts |
 | `dosages` | `BOOLEAN` | `false` | Output dosage values instead of hard calls |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific samples |
@@ -83,7 +84,11 @@ In genotype orient mode, each row represents one variant-sample combination. The
 | *additional* | varies | Any extra `.psam` columns |
 | `genotypes` | `ARRAY(TINYINT, M)` | Genotype calls, one per variant |
 
-In sample orient mode, each row represents one sample. The genotypes array contains one value per variant (M = effective variant count after filtering). All genotypes are pre-read at bind time.
+In sample orient mode, each row represents one sample. The genotypes array contains one value per variant (M = effective variant count after filtering). A multi-file list concatenates every shard's variants along this axis (M = total across shards).
+
+**Aggregate output** (`genotypes := 'counts'` or `'stats'`) replaces the array with a per-sample summary STRUCT — how many `hom_ref` / `het` / `hom_alt` / `missing` genotypes that sample has across the variant range (`stats` adds `n`, `af`, `maf`, `missing_rate`, `carrier_count`, `het_rate`). These modes **stream** (they do not materialize the variants × samples matrix), so they are not bounded by `plinking_max_matrix_elements` and are the fast path for per-individual **carrier counting** over large variant ranges. See [Performance](../guides/performance.md#per-sample-counts--carrier-finding).
+
+The array/list/struct/columns modes pre-read the genotype matrix at bind time (bounded by `plinking_max_matrix_elements`, default 16 G elements).
 
 ## Description
 
@@ -92,6 +97,8 @@ In sample orient mode, each row represents one sample. The genotypes array conta
 ### File Discovery
 
 By default, `read_pfile` constructs file paths by appending extensions to the prefix: `prefix.pgen`, `prefix.pvar`, `prefix.psam`. Each can be overridden individually.
+
+Relative prefixes honor DuckDB's **`file_search_path`** setting (like `read_csv`): `SET file_search_path='/data/cohort'; SELECT * FROM read_pfile('chr22')` resolves `chr22.*` under that directory. Inputs containing a **glob** (`chr*.pgen`) or a registered **protocol** (`pathmacro:...`) are expanded via the VFS to concrete local paths before opening — a single glob/URL can fan out to a whole sharded fileset.
 
 ### Multi-File Input
 
@@ -103,17 +110,21 @@ SELECT * FROM read_pfile(['/data/chr1', '/data/chr2', '/data/chr3']);
 
 This targets the biobank-scale layout where a fileset is **sharded by variant** — many `.pgen`/`.pvar` files that all share one identical `.psam`. All files in a list must carry the **same sample set: the same IIDs in the same order**. Alignment is **positional** and trust-the-caller — there is no per-file sample-identity check by design (adding one would reintroduce the `.psam`-parse cost on the real workload). The only guard is a free one: each `.pgen` header reports its sample count, and a file whose sample count differs from the first is rejected as a hard error. Sample order is *not* verified; that remains the caller's contract.
 
-Sample and variant metadata are taken from the first file only (identical by contract). Row order across files is not guaranteed (same as today's single-file parallel scan) — add `ORDER BY` if you need a stable order.
+Metadata is taken from the first file only (identical by contract). Row order across files is not guaranteed (same as single-file parallel scan) — add `ORDER BY` if you need a stable order.
 
-Current scope and limitations:
+**All orient modes** accept a multi-file list. `variant` and `genotype` orient row-concatenate variants at scan time; `orient := 'sample'` concatenates every shard's variants into one genotypes array per sample (array dimension = total variants across all shards).
 
-- `variant` and `genotype` orient support multi-file input.
-- `orient := 'sample'` with **multiple** files is **not yet supported** (a single file still works).
-- `region :=` works across a list (each shard is filtered to the range; the union is returned).
-- `variants := [...]` is **not yet supported** with a multi-file list (variant IDs/indices don't resolve globally across shards yet) — use `region :=` for selection across files. It still works on a single file.
-- Explicit `pgen` / `pvar` / `psam` overrides are single-file only; combining them with a multi-element list is an error (they cannot disambiguate per shard).
+**`combine_samples`** controls how the shards' sample sets are combined:
 
-The list of prefixes can come from anywhere, including a catalog macro that returns a `VARCHAR[]` of shard prefixes (e.g. via the scalarfs `pathmacro:` protocol) fed directly to `read_pfile([...])`.
+- `'implicit'` *(default)* — trust positional alignment; no per-shard IID check, no extra I/O. This is the contract above.
+- `'identical'` — verify every shard carries the **same IIDs in the same order** (one `.psam` parse per shard); a mismatch is a hard error naming the differing sample. Use it when you aren't certain the shards are aligned.
+- `'union'` / `'intersect'` / `'concatenate'` — reserved for real sample-set joins; **not yet implemented** (they error).
+
+A **`psam` override is allowed** with a multi-file list — it names the single shared `.psam` used for every shard (the common layout of per-shard `.pgen`/`.pvar` with one `.psam` kept elsewhere). `pgen`/`pvar` overrides remain single-file only (they can't disambiguate per shard). The `.psam` sample count must still match every shard's `.pgen`.
+
+`region :=` works across a list (each shard is filtered to the range; the union is returned). `variants := [...]` is **not yet supported** with a multi-file list (IDs/indices don't resolve globally across shards yet) — use `region :=`.
+
+The list of prefixes can come from anywhere: a literal list, a **glob** (`read_pfile('data/chr*.pgen')`), or a **catalog macro** returning a `VARCHAR[]` of shard prefixes — e.g. the scalarfs `pathmacro:` protocol, which `read_pfile` resolves to local shard paths and reads directly: `read_pfile('pathmacro:cohort?gene=BRCA1')`.
 
 ### Genotype Output Formats
 
@@ -208,6 +219,61 @@ SELECT * FROM read_pfile('data/example',
 -- Columns pivot mode
 SELECT * FROM read_pfile('data/example',
     genotypes := 'columns');
+```
+
+### Multi-file, sharded filesets
+
+```sql
+-- Sample orient across a variant-sharded fileset: each sample's genotypes
+-- array spans every shard's variants (one row per sample).
+SELECT IID, genotypes
+FROM read_pfile(['data/chr1', 'data/chr2', 'data/chr3'], orient := 'sample');
+```
+
+```sql
+-- A glob fans out to every matching shard.
+SELECT count(*) FROM read_pfile('data/chr*.pgen');
+```
+
+```sql
+-- Verify the shards really share the same samples (else hard error).
+SELECT count(*) FROM read_pfile(['data/chr1', 'data/chr2'],
+    orient := 'sample', combine_samples := 'identical');
+```
+
+```sql
+-- Per-shard .pgen/.pvar with one shared .psam kept elsewhere.
+SELECT count(*) FROM read_pfile(['data/chr1', 'data/chr2'],
+    psam := 'data/cohort.psam');
+```
+
+```sql
+-- Resolve relative prefixes via file_search_path (like read_csv).
+SET file_search_path = '/data/cohort';
+SELECT count(*) FROM read_pfile(['chr1', 'chr2', 'chr3']);
+```
+
+### Per-individual carrier counting
+
+```sql
+-- How many rare-variant carriers does each subject have in a region?
+-- Streams per-sample counts (no genotype matrix), scales to millions of samples.
+SELECT IID, genotypes.het + genotypes.hom_alt AS n_carrier_variants
+FROM read_pfile('data/cohort', orient := 'sample',
+    region := '17:43000000-43125000',      -- e.g. BRCA1
+    genotypes := 'counts')
+WHERE genotypes.het + genotypes.hom_alt > 0
+ORDER BY n_carrier_variants DESC;
+```
+
+```sql
+-- Same, but let the row filter drop non-carriers for you.
+SELECT IID FROM read_pfile('data/cohort', orient := 'sample',
+    genotypes := 'counts',
+    include_genotypes := ['het', 'hom_alt']);   -- keeps only carriers
+
+-- For biobank-scale rare-variant ranges, enable the sparse (difflist) path:
+SET plinking_sample_counts_sparse = true;       -- 4-6x faster on rare variants
 ```
 
 ## See Also

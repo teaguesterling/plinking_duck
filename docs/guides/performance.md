@@ -102,6 +102,57 @@ are computed inside the table function. The same works in `genotype` orient
 (one row per matching variant × subject), and the filter applies whether or not
 the genotype column itself is selected.
 
+## Per-sample counts & carrier finding
+
+`orient := 'sample'` with `genotypes := 'counts'` or `'stats'` produces a per-sample
+summary across a variant range — for counting how many variants each subject carries.
+Both modes take a **streaming** path: a variant-parallel pass accumulates per-sample
+category counts (`hom_ref`/`het`/`hom_alt`/`missing`) directly, **without materializing
+the variants × samples genotype matrix**. So:
+
+- Memory is `O(samples)`, not `O(variants × samples)` — a 5 000-variant × 7 M-sample
+  range is tens of MB, not a ~35 GB matrix. These modes are **not** bounded by
+  `plinking_max_matrix_elements` (the array/list/struct/columns modes still are).
+- It scales over threads (the accumulation is parallel over the variant range).
+- `stats` uses the **same** accumulation as `counts` — its `n`/`af`/`maf`/
+  `missing_rate`/`carrier_count`/`het_rate` fields are derived from the same
+  per-sample counters at no extra decode cost.
+
+```sql
+-- Per-subject carrier burden over a gene, streamed:
+SELECT IID, genotypes.het + genotypes.hom_alt AS n_carrier_variants
+FROM read_pfile('biobank', orient := 'sample',
+    region := '17:43000000-43125000', genotypes := 'counts')
+WHERE genotypes.het + genotypes.hom_alt > 0;
+```
+
+### Sparse (difflist) path for rare variants
+
+For rare-variant carrier finding, most subjects are `hom_ref` at any given variant.
+The `.pgen` difflist stores only the non-`hom_ref` genotypes of a sparse variant, so
+the counts can be accumulated by touching only the carriers — skipping the `hom_ref`
+majority entirely. Enable it with:
+
+```sql
+SET plinking_sample_counts_sparse = true;   -- default false
+```
+
+Measured **~4× (moderate-rare, MAF < 1%)** to **~6× (ultra-rare, MAF < 0.05%)** faster
+on 100 K samples × 30 K variants; the win grows with both rarity and sample count.
+The path auto-falls-back to the dense loop for common variants, so it is never worse
+on common data, and it produces **identical** results either way. It applies to
+`counts` and `stats` (the streaming aggregate modes) in sample orient. Left off by
+default pending broad validation — A/B it on your data and enable per session.
+
+## Configuration
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `plinking_max_threads` | `0` (cap 16) | Cap threads for all parallel scans |
+| `plinking_max_matrix_elements` | `16 G` | Ceiling for the `orient := 'sample'` genotype-matrix pre-read (array/list/struct/columns; **not** counts/stats, which stream) |
+| `plinking_sample_counts_sparse` | `false` | Use the sparse difflist path for sample-orient `counts`/`stats` (see above) |
+| `plinking_use_parquet_companions` | `true` | Prefer `.pvar.parquet` / `.psam.parquet` companions |
+
 ## Sample Subsetting
 
 When using the `samples` parameter, only the specified samples are processed:
