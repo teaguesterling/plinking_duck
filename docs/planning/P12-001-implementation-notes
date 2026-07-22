@@ -60,17 +60,40 @@ in-memory block buffer, not the file). So the shim needs exactly:
 `PgenFile { FILE* ff; void* rhandle; uint64_t roff; }`; local branch = the libc
 call unchanged (zero hot-path diff), remote branch = a positioned read.
 
-### Design wrinkle found while tabulating (important — would bite a naive patch)
+### Seam design — resolved via DuckDB's VFS + a local fastpath
 
-**Remote open needs the query's `ClientContext`** (httpfs credentials/secrets,
-`file_search_path`, settings live there). pgenlib's `PgfiInitPhase1(fname, …)`
-opens the file itself, context-free — a global `open(fname)` callback could not get
-credentials. Resolution: **do the remote open extension-side** (bind/init has the
-context), and pass the already-open handle into pgenlib. So the C-ABI seam pgenlib
-needs is only **`pread(handle, buf, n, off)` / `fsize(handle)` / `close(handle)`** —
-*not* `open`. The `.pgen` open flow (L2067 etc.) becomes: if a caller-supplied
-remote handle is present, use it; else `fopen` locally. This keeps DuckDB types out
-of pgenlib and puts credential handling where the context is.
+The context problem (remote open needs the query `ClientContext` for httpfs
+credentials/secrets, `file_search_path`, settings) is solved by **opening the
+`.pgen` through DuckDB's VFS extension-side**, and keeping raw `fopen` as a
+local fastpath. Confirmed API: `FileSystem::OpenFile(path, READ, opener)`
+(file_system.hpp:149) + `ClientContextFileOpener(context)` whose opener carries
+`SecretManager` (file_opener.hpp:45) → httpfs credentials/settings. Once open, the
+`FileHandle` is **self-contained** — positioned `Read(buf, n, location)` needs no
+further context.
+
+**So the seam pgenlib needs is only `pread / fsize / close`** — *no `open`
+callback, no context, no DuckDB types in pgenlib.* The extension opens the handle
+(it has the context) and hands it in.
+
+**Local default fastpath (necessary, not just nice):** `FileHandle::Read(...,
+location)` does one `pread` **syscall per call, no stdio readahead**, while pgenlib
+does ~1 read per variant record → a local sequential scan would regress to
+syscall-per-record vs stdio `fread`'s buffered reads. So:
+
+- **plain-local** (`FileSystem::IsRemoteFile` false / `FileHandle::OnDiskFile`) →
+  keep raw `fopen` / `fread_unlocked` (buffered, zero change to today's hot path).
+- **remote / VFS-resolved** → `FileHandle` positioned reads, buffering from
+  `cache_httpfs` (or our block layer).
+
+`PgenFile { FILE* ff; void* vfs_handle; uint64_t vfs_off; }`; the 5 op wrappers
+branch on `vfs_handle != nullptr`. The extension picks the branch at open with
+`IsRemoteFile`/`OnDiskFile`.
+
+**Bonus folded in (bigger than S3):** routing `.pgen` through the VFS makes
+`file_search_path`, `pathmacro:`, glob, and every DuckDB protocol work for `.pgen`
+**uniformly** — closing the long-standing "`.pgen` bypasses the VFS" gap
+([[pathmacro-readpfile-integration]]) for free, not just enabling S3. A previously
+separate limitation becomes a side effect of this work.
 
 ## Known surface (superseded by the milestone-1 result above)
 
