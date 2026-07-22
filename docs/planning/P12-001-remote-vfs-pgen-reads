@@ -88,6 +88,22 @@ parquet; verify for our access sizes). If so, the remote backing is "wire 7 ops 
 `FileHandle`" and range-read + caching is already solved upstream — we build no
 HTTP client and no cache.
 
+### §0a. `.pgi` split index — a pre-existing gap to close alongside
+
+`PgfiInitPhase1(fname, pgi_fname, …)` takes a second argument: the **split `.pgi`
+index** filename. We pass `nullptr` at **every** call site (all readers +
+plink_freq/hardy/missing/glm/pca), which tells pgenlib "the variant offset index is
+**embedded in the `.pgen` header**." That is correct and complete for the standard
+`plink2 --make-pgen` output (and all our fixtures), so nothing is broken today — but
+a fileset written in the **split form** (`.pgen` + separate `.pgi`, produced by some
+plink2 modes / other tools) would fail: we neither discover a `.pgi` companion nor
+pass its path. This is orthogonal to remoteness but belongs here because **the index
+is exactly what P12 relies on** for byte-offset range planning (embedded or split, it
+must be loaded — and loaded efficiently, in one range read, when remote). Close it as
+part of this work: add `.pgi` to companion discovery, thread the path through to
+`pgi_fname` (nullptr when absent → embedded), and let `pgi_ff` ride the same
+`PgenFile` shim. Small, and it removes a real compatibility gap.
+
 ### §1. `PgenFile`: a tagged byte source (not a vtable)
 
 Replace the raw `FILE*` with a tiny tagged struct so the **local hot path keeps
@@ -177,15 +193,30 @@ and cached:
   and any mild non-monotonic access within a region.
 
 The parameters are read at bind (like the other `plinking_*` options) and cached on
-the `PgenFile` so the hot `pread` path does no setting lookups. Sizing is a real
-tuning question — too small = too many requests, too large = over-fetch on sparse
-regions — hence config knobs plus a measured default from the spike. Note httpfs
-already does *its own* range caching; the block layer here is about **matching fetch
-size to pgenlib's tiny record reads** so we don't depend on httpfs's granularity
-being right for genotype records. The spike should measure whether an explicit
-block layer beats raw positioned reads on httpfs, or whether httpfs's caching is
-enough (in which case the shim stays thin and we only add the block layer if the
-numbers demand it).
+the `PgenFile` so the hot `pread` path does no setting lookups.
+
+**Prefer delegating the block cache to `cache_httpfs`, don't build our own.** The
+community extension `cache_httpfs` (github.com/dentiny/duck-read-cache-fs, v0.14.1,
+"drop-in replacement for httpfs") already provides exactly this layer: on-disk **and**
+in-memory data-block cache with **tunable block size**, LRU/timestamp eviction with
+disk reservation, **parallel IO with tunable request size + parallelism**, and
+hit/miss + latency profiling. Since our shim opens the `.pgen` through DuckDB's
+`FileSystem`, a `cache_httpfs`-wrapped filesystem caches our range reads transparently
+— we get the entire §3a block/cache/parallel layer for free by having the user
+`LOAD cache_httpfs`. So the division of labor is:
+
+- **`cache_httpfs` (optional dependency)** owns raw block caching, eviction, parallel
+  range IO, and disk spill. We do **not** reimplement it.
+- **Our shim** owns only what is pgen-format-specific and `cache_httpfs` cannot know:
+  using the in-memory **offset index** to plan *which* record ranges a region query
+  needs and coalescing them (§3), and fetching the header+index span up front.
+
+Net: the shim stays thin (route 7 ops to `FileHandle` + region range-planning), and
+the caching/parallelism/eviction that P12 first sketched as custom work is an
+existing, maintained extension. The only `plinking_*` knob we may still want is the
+region-coalescing granularity; the rest is `cache_httpfs`'s config surface. The spike
+should compare: raw positioned reads on httpfs vs. the same with `cache_httpfs`
+loaded — and only add any custom block logic if those numbers demand it.
 
 ### §4. Fork management (own the decision)
 
