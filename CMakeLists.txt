@@ -72,6 +72,31 @@ if(NOT EXISTS ${PGENLIB_DIR}/pgenlib_read.cc)
         "  git submodule update --init third_party/plink-ng")
 endif()
 
+# --- Apply our vendored plink-ng patches (idempotent) ---
+# We keep pgenlib pristine except for a minimal, re-appliable set of patches under
+# patches/plink-ng/ (the VFS fopen hook; upstreamable). Each is applied at configure
+# time if not already applied — `git apply --reverse --check` succeeds only when the
+# patch is already present, so re-running (or a fresh submodule) is safe. The drift
+# canary (scripts/check_vendored_drift.sh) treats these as the intended delta.
+set(PLINK_NG_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/plink-ng)
+file(GLOB PLINK_NG_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/patches/plink-ng/*.patch)
+list(SORT PLINK_NG_PATCHES)
+find_package(Git QUIET)
+foreach(_patch ${PLINK_NG_PATCHES})
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${PLINK_NG_SUBMODULE} apply --reverse --check ${_patch}
+        RESULT_VARIABLE _already_applied OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _already_applied EQUAL 0)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} -C ${PLINK_NG_SUBMODULE} apply ${_patch}
+            RESULT_VARIABLE _apply_rc)
+        if(NOT _apply_rc EQUAL 0)
+            message(FATAL_ERROR "Failed to apply plink-ng patch: ${_patch}")
+        endif()
+        message(STATUS "Applied plink-ng patch: ${_patch}")
+    endif()
+endforeach()
+
 # --- libdeflate (C library) ---
 add_library(plink_libdeflate STATIC
     ${LIBDEFLATE_DIR}/lib/adler32.c
@@ -147,6 +172,10 @@ add_library(pgenlib STATIC
     ${PGENLIB_DIR}/pgenlib_read.cc
     ${PGENLIB_DIR}/pgenlib_ffi_support.cc
     ${PGENLIB_DIR}/pvar_ffi_support.cc
+    # plinking_duck VFS shim: pgenlib_read.cc's fopen sites call plinking_pgen_fopen
+    # (defined here). No DuckDB dependency — pure libc + a runtime-registered opener —
+    # so it lives in pgenlib itself and resolves for every target that links pgenlib.
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/plinking_pgen_vfs.cpp
 )
 target_include_directories(pgenlib PUBLIC
     ${PGENLIB_DIR}

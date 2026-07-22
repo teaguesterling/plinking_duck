@@ -1,0 +1,43 @@
+diff --git a/2.0/include/pgenlib_read.cc b/2.0/include/pgenlib_read.cc
+index 39b2a1c2..e06a8de6 100644
+--- a/2.0/include/pgenlib_read.cc
++++ b/2.0/include/pgenlib_read.cc
+@@ -25,6 +25,11 @@
+ // #include <stdexcept>
+ 
+ #ifdef __cplusplus
++// plinking_duck: route pgen file opens through the VFS shim (local fopen by
++// default; a cookie FILE* over a DuckDB FileHandle when a per-thread VFS opener is
++// registered). See src/plinking_pgen_vfs.{hpp,cpp}.
++extern "C" FILE* plinking_pgen_fopen(const char* fname);
++
+ namespace plink2 {
+ #endif
+ 
+@@ -705,7 +710,7 @@ PglErr PgfiInitPhase1(const char* fname, const char* pgi_fname, uint32_t raw_var
+   uint64_t fsize;
+   const unsigned char* fread_ptr;
+   unsigned char small_readbuf[3];
+-  FILE* shared_ff = fopen(fname, FOPEN_RB);
++  FILE* shared_ff = plinking_pgen_fopen(fname);
+   pgfip->shared_ff = shared_ff;
+   if (unlikely(!shared_ff)) {
+     snprintf(errstr_buf, kPglErrstrBufBlen, "Error: Failed to open %s : %s.\n", fname, strerror(errno));
+@@ -821,7 +826,7 @@ PglErr PgfiInitPhase1(const char* fname, const char* pgi_fname, uint32_t raw_var
+       strcpy_k(fname_iter, ".pgi");
+       header_fname = pgi_fname_buf;
+     }
+-    header_ff = fopen(header_fname, FOPEN_RB);
++    header_ff = plinking_pgen_fopen(header_fname);
+     pgfip->pgi_ff = header_ff;
+     if (unlikely(!header_ff)) {
+       snprintf(errstr_buf, kPglErrstrBufBlen, "Error: Failed to open %s : %s.\n", header_fname, strerror(errno));
+@@ -2064,7 +2069,7 @@ PglErr PgrInit(const char* fname, uint32_t max_vrec_width, PgenFileInfo* pgfip,
+       pgrp->ff = pgfip->shared_ff;
+       pgfip->shared_ff = nullptr;
+     } else {
+-      pgrp->ff = fopen(fname, FOPEN_RB);
++      pgrp->ff = plinking_pgen_fopen(fname);
+       if (unlikely(!pgrp->ff)) {
+         return kPglRetOpenFail;
+       }

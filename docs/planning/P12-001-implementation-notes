@@ -37,20 +37,37 @@ only in whether the front-end had to resolve the path. The two *paths* are L and
 `localize` is what we ship if the spike says range-reads don't win; `vfs` is the
 measurement/edge mode.
 
-### The seam (context solved by the VFS)
+### The seam — `fopencookie` (CHOSEN), not a struct/wrapper conversion
 
-Path V's `FileHandle` is opened **extension-side** via
-`fs.OpenFile(path, READ, ClientContextFileOpener(context))` — the opener carries
-`SecretManager` → httpfs credentials + settings (confirmed: file_system.hpp:149,
-file_opener.hpp:45). The handle is self-contained after open, so pgenlib's C-ABI
-seam is only **`pread(handle, buf, n, off)` / `fsize(handle)` / `close(handle)`** —
-no `open` callback, no context, **no DuckDB types in pgenlib**. The extension picks
-L vs V at open with `IsRemoteFile` / `OnDiskFile`.
+The milestone-1 enumeration proved the op set touching the file is **pure stdio**
+(`fopen`/`fseeko`/`ftello`/`fread_unlocked`/`rewind`/`fclose`). That means a real
+`FILE*` backed by custom callbacks — glibc/musl **`fopencookie`** (macOS/BSD
+**`funopen`**) — is transparent to pgenlib: all reads/seeks/tells/closes work
+**unchanged**. Verified: a cookie stream over positioned reads passes every one of
+pgenlib's ops (SEEK_END/SET, `ftello`, `rewind`, `fread_unlocked`).
 
-Why L must exist (not just use a local `FileHandle`): `FileHandle::Read(…,
-location)` is one `pread` **syscall per call, no stdio readahead**, while pgenlib
-issues ~1 read per variant record → a local sequential scan would regress to
-syscall-per-record. L keeps stdio buffering; V relies on `cache_httpfs`.
+So the pgenlib patch is **just the 3 `fopen` sites** (L708 `shared_ff`, L824
+`pgi_ff`, L2067 reader `ff`) redirected to `plinking_pgen_fopen(fname)`:
+
+- **Path L (local/native):** `plinking_pgen_fopen` → real `fopen(fname, "rb")`.
+  Byte-identical to unpatched plink2, stdio-buffered. The default.
+- **Path V (VFS):** the extension (which has the `ClientContext`) opens a DuckDB
+  `FileHandle` via `fs.OpenFile(path, READ, ClientContextFileOpener(context))` —
+  opener carries `SecretManager` → httpfs credentials + settings (file_system.hpp:149,
+  file_opener.hpp:45) — and registers a per-thread VFS opener. `plinking_pgen_fopen`
+  then returns a **`fopencookie` `FILE*`** whose read/seek/close callbacks drive that
+  `FileHandle` (positioned `Read(buf, n, location)`). glibc stdio **buffers the
+  cookie stream**, so Path V gets readahead for free on top of the handle (and
+  `cache_httpfs` under that).
+
+pgenlib sees only `FILE*` on both paths → **no DuckDB types, no context, no struct
+conversion, no fixpoint.** The 34 field-touch sites and their local `FILE*` copies
+are all untouched. This is why the poison enumeration still mattered: it *proved*
+the op set is stdio-only, which is exactly what makes the cookie transparent.
+
+The two I/O paths are now: **real-`fopen` `FILE*`** (L) vs **cookie `FILE*`** (V) —
+pgenlib is agnostic. Extension picks L vs V at open via `IsRemoteFile`/`OnDiskFile`
+and the `plinking_pgen_io` policy.
 
 ## Milestone 1 RESULT — poison enumeration (done)
 
@@ -73,17 +90,22 @@ wrappers branch on `vfs_handle != nullptr`.
 
 ## Sequenced milestones
 
-1. **Enumerate (done).** 34 sites / 5 ops.
-2. **2a — shim + local-transparent patch.** Add `PgenFile` + the 5 op wrappers
-   (Path L only: `vfs_handle` always null → wrappers call libc, byte-identical).
-   Patch the 34 sites. Build; **full suite must stay green** = the abstraction is a
-   no-op for local. This is the safe first patch to the plink files.
-3. **2b — wire Path V.** Extension opens the `FileHandle` (context), threads it into
-   pgenlib (a small init addition, not an fname-signature change); wrappers' V
-   branch does positioned reads. Add the `plinking_pgen_io` policy + `IsRemoteFile`/
-   `OnDiskFile` selection + the `localize` (download-to-temp) strategy.
+1. **Enumerate (done).** 34 field-touch sites / 5 ops, all pure stdio → cookie is
+   transparent. This is what made the tiny-patch approach possible.
+2. **2a — shim scaffold + fopen redirect (local-transparent).** Add
+   `plinking_pgen_fopen` (declared in a small header included by pgenlib; defined in
+   `src/`, resolved at final `.so` link since pgenlib is a static lib). Default =
+   real `fopen`. Redirect the 3 pgenlib `fopen` sites. Build; **full suite green** =
+   byte-identical local. Tiny, safe first patch to the plink files.
+3. **2b — cookie + Path V (testable locally!).** Implement the `fopencookie` /
+   `funopen` wrapper + a per-thread VFS-opener registration; extension opens the
+   `FileHandle` with context and registers it. Add the `plinking_pgen_io` policy +
+   `IsRemoteFile`/`OnDiskFile` selection + the `localize` strategy. **Test with no
+   network**: back a cookie with a *local* file's positioned reads (or a
+   LocalFileSystem `FileHandle`) and assert genotypes byte-identical to Path L —
+   this validates the entire VFS-read mechanism locally.
 4. **3 — MEASURE (go/no-go).** Contiguous-region query, bytes fetched + wall clock,
-   over a local HTTP server: `auto`/V raw httpfs vs V + `cache_httpfs` vs `localize`
+   over a local HTTP server: V raw httpfs vs V + `cache_httpfs` vs `localize`
    (download-to-temp). If V doesn't **decisively** beat `localize`, ship `localize`
    and keep V behind the flag. Only then invest in range-coalescing/`.pgi`/canary.
 
