@@ -1,0 +1,85 @@
+# name: test/sql/read_pfile_sample_counts_streaming.test
+# description: orient := 'sample' + genotypes := 'counts'|'stats' streams per-sample counts (variant-parallel, O(samples) memory) instead of materializing the variants×samples matrix — so it is NOT bounded by plinking_max_matrix_elements. Covers carrier-finding (include_genotypes row-skip).
+# group: [sql]
+
+require plinking_duck
+
+# shard1: 1000 variants x 8 samples, per sample 250 hom_ref / 250 het / 250 hom_alt
+# / 250 missing (deterministic fixture).
+
+# --- counts are correct (deterministic per-sample values) ---
+query IIII
+SELECT genotypes.hom_ref, genotypes.het, genotypes.hom_alt, genotypes.missing
+FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP1';
+----
+250	250	250	250
+
+query II
+SELECT sum(genotypes.het), sum(genotypes.missing)
+FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'counts');
+----
+2000	2000
+
+# --- NOT bounded by the matrix guard: a tiny limit that blocks array/list mode
+#     still lets counts through (the whole point — 50K×10M carrier queries) ---
+statement ok
+SET plinking_max_matrix_elements = 1;
+
+query II
+SELECT count(*), sum(genotypes.het) FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'counts');
+----
+8	2000
+
+# array/list mode is still guarded (inherently matrix-bound)
+statement error
+SELECT count(*) FROM read_pfile('test/data/shard1', orient := 'sample');
+----
+plinking_max_matrix_elements
+
+statement ok
+RESET plinking_max_matrix_elements;
+
+# --- stats derived correctly from the streamed counts ---
+query IIIII
+SELECT genotypes.n, genotypes.af, genotypes.maf, genotypes.carrier_count, round(genotypes.het_rate, 6)
+FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'stats') WHERE IID = 'SAMP1';
+----
+750	0.5	0.5	500	0.333333
+
+# --- multi-file: counts concatenate across shards (3000 variants) ---
+query III
+SELECT sum(genotypes.het), sum(genotypes.missing), sum(genotypes.hom_ref)
+FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', genotypes := 'counts');
+----
+6000	6000	6000
+
+# --- empty region (0 effective variants): all-zero counts, every sample, no hang ---
+query III
+SELECT count(*), sum(genotypes.het), sum(genotypes.hom_ref)
+FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'counts', region := 'chr16:1-2');
+----
+8	0	0
+
+# --- carrier finding: include_genotypes row-skip + counts (true counts reported) ---
+# all 8 shard1 samples carry het/hom_alt on AF=0.5 data
+query I
+SELECT count(*) FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'counts', include_genotypes := ['het','hom_alt']);
+----
+8
+
+# all_missing (2 samples, all missing): no het carriers → 0 rows; missing carriers → 2 rows
+query I
+SELECT count(*) FROM read_pfile('test/data/all_missing', orient := 'sample', genotypes := 'counts', include_genotypes := ['het']);
+----
+0
+
+query II
+SELECT count(*), sum(genotypes.missing) FROM read_pfile('test/data/all_missing', orient := 'sample', genotypes := 'counts', include_genotypes := ['missing']);
+----
+2	4
+
+# --- sample subset streams only the subset ---
+query II
+SELECT count(*), sum(genotypes.het) FROM read_pfile('test/data/shard1', orient := 'sample', genotypes := 'counts', samples := ['SAMP1','SAMP2']);
+----
+2	500

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -532,6 +533,22 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	OrientMode orient_mode = OrientMode::VARIANT;
 	uint32_t max_threads_config = 0;
 
+	// --- Sample-orient AGGREGATE streaming (genotypes := 'counts'|'stats') ---
+	// Instead of materializing the variants×samples matrix, a variant-parallel
+	// Phase 1 accumulates per-sample category counts, then Phase 2 emits per-sample
+	// rows. Memory is O(samples), not O(variants×samples) — this is what makes
+	// per-sample carrier/counts queries over huge variant ranges feasible. Modeled
+	// on plink_missing's two-phase pattern.
+	bool smp_streaming = false;                         // aggregate sample orient?
+	std::atomic<uint32_t> smp_next_batch {0};           // Phase 1: claims into `batches`
+	std::atomic<uint32_t> smp_phase1_active {0};        // threads currently in Phase 1
+	std::atomic<bool> smp_phase1_done {false};          // accumulation complete → Phase 2
+	std::mutex smp_merge_mutex;                         // guards the global-accumulator merge
+	vector<uint32_t> smp_het, smp_hom_alt, smp_missing; // per output-sample (hom_ref derived)
+	vector<uint8_t> smp_in_range, smp_has_missing;      // per output-sample (row filter)
+	vector<uint32_t> smp_sample_keep;                   // built by last Phase-1 thread (row filter)
+	uint32_t smp_total_eff_variants = 0;                // for hom_ref = total − het − hom_alt − missing
+
 	// Projection-aware psam column data (parquet source only). Built once here with
 	// ONLY the psam columns the query projects, so a wide biobank psam never
 	// materializes/reads unused covariate columns. Read at scan via a per-thread
@@ -546,8 +563,12 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 			// for better load balancing when filters skip variants unevenly
 			return ApplyMaxThreadsCap(total_count / 64 + 1, max_threads_config);
 		}
+		// Aggregate sample-orient streaming: the heavy phase (Phase 1) is parallel
+		// over the VARIANT range, so size threads by variants when that dominates
+		// the sample count (few samples × huge range would otherwise under-thread).
+		uint32_t work = smp_streaming ? std::max(total_count, smp_total_eff_variants) : total_count;
 		// Variant and sample modes support parallel scan
-		return ApplyMaxThreadsCap(total_count / 1000 + 1, max_threads_config);
+		return ApplyMaxThreadsCap(work / 1000 + 1, max_threads_config);
 	}
 };
 
@@ -602,6 +623,12 @@ struct PfileLocalState : public LocalTableFunctionState {
 	bool batch_variant_loaded = false;      // genotypes decoded for current variant in batch
 	bool geno_range_all_pass = true;        // per-variant flag for genotype_range optimization
 	bool batch_exhausted = true;            // true initially to trigger first batch claim
+
+	// Sample-orient aggregate streaming: thread-local accumulators (merged into the
+	// global state at the end of Phase 1). Sized to OutputSampleCt in PfileInitLocal.
+	vector<uint32_t> smp_local_het, smp_local_hom_alt, smp_local_missing;
+	vector<uint8_t> smp_local_in_range, smp_local_has_missing;
+	bool smp_phase1_contributed = false;
 
 	// Per-thread cache of one chunk of the projected psam CDC (PfileGlobalState::psam_cdc),
 	// for reading psam column values at scan time. Populated lazily via FetchChunk.
@@ -1482,280 +1509,292 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			bind_data->sample_orient_total_cols = names.size();
 		}
 
-		// --- Pre-read all genotypes into matrix ---
-		uint32_t output_sample_ct = bind_data->OutputSampleCt();
-		uint64_t matrix_size = static_cast<uint64_t>(effective_variant_ct) * static_cast<uint64_t>(output_sample_ct);
+		// --- Pre-read all genotypes into matrix (per-element output modes only) ---
+		// Aggregate modes (counts/stats) skip this entirely: they stream per-sample
+		// counts in a variant-parallel scan phase (O(samples) memory), so they do NOT
+		// materialize the variants×samples matrix and are NOT bound by
+		// plinking_max_matrix_elements. The per-sample keep list (genotype filter) is
+		// likewise built during that streaming phase, not here.
+		if (!IsAggregateGenotypeMode(bind_data->genotype_mode)) {
+			uint32_t output_sample_ct = bind_data->OutputSampleCt();
+			uint64_t matrix_size =
+			    static_cast<uint64_t>(effective_variant_ct) * static_cast<uint64_t>(output_sample_ct);
 
-		// Check configurable matrix size limit
-		int64_t max_elements = 16LL * 1024 * 1024 * 1024; // default 16G
-		Value max_elements_val;
-		if (context.TryGetCurrentSetting("plinking_max_matrix_elements", max_elements_val)) {
-			max_elements = max_elements_val.GetValue<int64_t>();
-		}
-		if (matrix_size > static_cast<uint64_t>(max_elements)) {
-			throw InvalidInputException("read_pfile: orient := 'sample' would require %llu genotype values "
-			                            "(%u variants x %u samples, limit: %lld). "
-			                            "Use variants := [...] or samples := [...] to reduce, "
-			                            "or SET plinking_max_matrix_elements = <higher value>.",
-			                            static_cast<unsigned long long>(matrix_size), effective_variant_ct,
-			                            output_sample_ct, static_cast<long long>(max_elements));
-		}
-
-		// Shared decode buffers below depend only on the (shared) sample counts;
-		// each source opens its own PgenReader inside the pre-read loop further down.
-
-		// Allocate genovec buffer
-		uintptr_t genovec_wc = plink2::NypCtToAlignedWordCt(bind_data->raw_sample_ct);
-		AlignedBuffer genovec_buf2;
-		genovec_buf2.Allocate(genovec_wc * sizeof(uintptr_t));
-		std::memset(genovec_buf2.ptr, 0, genovec_wc * sizeof(uintptr_t));
-
-		vector<int8_t> tmp_bytes(bind_data->raw_sample_ct);
-
-		// Sample subsetting: a SINGLE subset (from the shared samples) applied to
-		// every source. pssi is per-reader, so it is (re)set inside the source loop.
-		SampleSubset preread_subset;
-		if (bind_data->has_sample_subset) {
-			preread_subset = BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices);
-		}
-
-		// Allocate phase buffers if needed
-		AlignedBuffer preread_phasepresent;
-		AlignedBuffer preread_phaseinfo;
-		vector<int8_t> preread_phased_pairs;
-		if (bind_data->include_phased) {
-			uintptr_t phase_wc = plink2::BitCtToAlignedWordCt(output_sample_ct);
-			preread_phasepresent.Allocate(phase_wc * sizeof(uintptr_t));
-			preread_phaseinfo.Allocate(phase_wc * sizeof(uintptr_t));
-			preread_phased_pairs.resize(static_cast<size_t>(output_sample_ct) * 2);
-		}
-
-		// Allocate dosage buffers if needed
-		AlignedBuffer preread_dosage_present;
-		AlignedBuffer preread_dosage_main;
-		vector<double> preread_dosage_doubles;
-		if (bind_data->include_dosages) {
-			uintptr_t dosage_present_wc = plink2::BitCtToAlignedWordCt(bind_data->raw_sample_ct);
-			preread_dosage_present.Allocate(dosage_present_wc * sizeof(uintptr_t));
-			std::memset(preread_dosage_present.ptr, 0, dosage_present_wc * sizeof(uintptr_t));
-			preread_dosage_main.Allocate(bind_data->raw_sample_ct * sizeof(uint16_t));
-			std::memset(preread_dosage_main.ptr, 0, bind_data->raw_sample_ct * sizeof(uint16_t));
-			preread_dosage_doubles.resize(output_sample_ct, 0.0);
-		}
-
-		// Pre-read genotypes for each effective variant
-		if (bind_data->include_dosages) {
-			bind_data->dosage_matrix.resize(effective_variant_ct);
-		} else {
-			bind_data->genotype_matrix.resize(effective_variant_ct);
-		}
-
-		// Row-level genotype_range accumulators (sample orient): track, per output
-		// sample, whether it has any in-range genotype and any missing genotype
-		// across the effective variants. Computed from TRUE genotype values, before
-		// any per-element null-out, so aggregate counts and the keep decision are
-		// not confused by the -9 sentinel. dosages are incompatible with
-		// genotype_range (rejected at parse time), so only the non-dosage paths
-		// populate these.
-		const bool row_filter_active = bind_data->genotype_filter.active && !bind_data->include_dosages;
-		vector<uint8_t> sample_in_range;
-		vector<uint8_t> sample_has_missing;
-		if (row_filter_active) {
-			sample_in_range.assign(output_sample_ct, 0);
-			sample_has_missing.assign(output_sample_ct, 0);
-		}
-
-		// Pre-read every source into its slice of the global matrix. Source src_idx
-		// occupies matrix rows [variant_offsets[src_idx], variant_offsets[src_idx+1]).
-		for (idx_t src_idx = 0; src_idx < bind_data->sources.size(); src_idx++) {
-			PfileSource &src = bind_data->sources[src_idx];
-			uint32_t global_offset = bind_data->variant_offsets[src_idx];
-
-			// Temporary PgenReader for THIS source.
-			plink2::PgenFileInfo tmp_pgfi;
-			plink2::PreinitPgfi(&tmp_pgfi);
-			char errstr_buf2[plink2::kPglErrstrBufBlen];
-			plink2::PgenHeaderCtrl header_ctrl2;
-			uintptr_t pgfi_alloc_ct2 = 0;
-			err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data->raw_sample_ct,
-			                             &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read: %s", errstr_buf2);
+			// Check configurable matrix size limit
+			int64_t max_elements = 16LL * 1024 * 1024 * 1024; // default 16G
+			Value max_elements_val;
+			if (context.TryGetCurrentSetting("plinking_max_matrix_elements", max_elements_val)) {
+				max_elements = max_elements_val.GetValue<int64_t>();
 			}
-			AlignedBuffer pgfi_alloc2;
-			if (pgfi_alloc_ct2 > 0) {
-				pgfi_alloc2.Allocate(pgfi_alloc_ct2 * plink2::kCacheline);
+			if (matrix_size > static_cast<uint64_t>(max_elements)) {
+				throw InvalidInputException("read_pfile: orient := 'sample' would require %llu genotype values "
+				                            "(%u variants x %u samples, limit: %lld). "
+				                            "Use variants := [...] or samples := [...] to reduce, "
+				                            "or SET plinking_max_matrix_elements = <higher value>.",
+				                            static_cast<unsigned long long>(matrix_size), effective_variant_ct,
+				                            output_sample_ct, static_cast<long long>(max_elements));
 			}
-			uint32_t max_vrec2 = 0;
-			uintptr_t pgr_alloc_ct2 = 0;
-			err = plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
-			                             pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
-				                  errstr_buf2);
-			}
-			plink2::PgenReader tmp_pgr;
-			plink2::PreinitPgr(&tmp_pgr);
-			AlignedBuffer pgr_alloc2;
-			if (pgr_alloc_ct2 > 0) {
-				pgr_alloc2.Allocate(pgr_alloc_ct2 * plink2::kCacheline);
-			}
-			err =
-			    plink2::PgrInit(src.pgen_path.c_str(), max_vrec2, &tmp_pgfi, &tmp_pgr, pgr_alloc2.As<unsigned char>());
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgr(&tmp_pgr, &ce);
-				ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: PgrInit failed for sample-orient pre-read");
-			}
-			plink2::PgrSampleSubsetIndex pssi2;
+
+			// Shared decode buffers below depend only on the (shared) sample counts;
+			// each source opens its own PgenReader inside the pre-read loop further down.
+
+			// Allocate genovec buffer
+			uintptr_t genovec_wc = plink2::NypCtToAlignedWordCt(bind_data->raw_sample_ct);
+			AlignedBuffer genovec_buf2;
+			genovec_buf2.Allocate(genovec_wc * sizeof(uintptr_t));
+			std::memset(genovec_buf2.ptr, 0, genovec_wc * sizeof(uintptr_t));
+
+			vector<int8_t> tmp_bytes(bind_data->raw_sample_ct);
+
+			// Sample subsetting: a SINGLE subset (from the shared samples) applied to
+			// every source. pssi is per-reader, so it is (re)set inside the source loop.
+			SampleSubset preread_subset;
 			if (bind_data->has_sample_subset) {
-				plink2::PgrSetSampleSubsetIndex(preread_subset.CumulativePopcounts(), &tmp_pgr, &pssi2);
+				preread_subset = BuildSampleSubset(bind_data->raw_sample_ct, bind_data->sample_indices);
+			}
+
+			// Allocate phase buffers if needed
+			AlignedBuffer preread_phasepresent;
+			AlignedBuffer preread_phaseinfo;
+			vector<int8_t> preread_phased_pairs;
+			if (bind_data->include_phased) {
+				uintptr_t phase_wc = plink2::BitCtToAlignedWordCt(output_sample_ct);
+				preread_phasepresent.Allocate(phase_wc * sizeof(uintptr_t));
+				preread_phaseinfo.Allocate(phase_wc * sizeof(uintptr_t));
+				preread_phased_pairs.resize(static_cast<size_t>(output_sample_ct) * 2);
+			}
+
+			// Allocate dosage buffers if needed
+			AlignedBuffer preread_dosage_present;
+			AlignedBuffer preread_dosage_main;
+			vector<double> preread_dosage_doubles;
+			if (bind_data->include_dosages) {
+				uintptr_t dosage_present_wc = plink2::BitCtToAlignedWordCt(bind_data->raw_sample_ct);
+				preread_dosage_present.Allocate(dosage_present_wc * sizeof(uintptr_t));
+				std::memset(preread_dosage_present.ptr, 0, dosage_present_wc * sizeof(uintptr_t));
+				preread_dosage_main.Allocate(bind_data->raw_sample_ct * sizeof(uint16_t));
+				std::memset(preread_dosage_main.ptr, 0, bind_data->raw_sample_ct * sizeof(uint16_t));
+				preread_dosage_doubles.resize(output_sample_ct, 0.0);
+			}
+
+			// Pre-read genotypes for each effective variant
+			if (bind_data->include_dosages) {
+				bind_data->dosage_matrix.resize(effective_variant_ct);
 			} else {
-				plink2::PgrClearSampleSubsetIndex(&tmp_pgr, &pssi2);
+				bind_data->genotype_matrix.resize(effective_variant_ct);
 			}
 
-			uint32_t src_effective_ct = src.EffectiveVariantCt();
-			for (uint32_t local_ev = 0; local_ev < src_effective_ct; local_ev++) {
-				uint32_t ev = global_offset + local_ev; // global matrix row
-				uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[local_ev] : local_ev;
+			// Row-level genotype_range accumulators (sample orient): track, per output
+			// sample, whether it has any in-range genotype and any missing genotype
+			// across the effective variants. Computed from TRUE genotype values, before
+			// any per-element null-out, so aggregate counts and the keep decision are
+			// not confused by the -9 sentinel. dosages are incompatible with
+			// genotype_range (rejected at parse time), so only the non-dosage paths
+			// populate these.
+			const bool row_filter_active = bind_data->genotype_filter.active && !bind_data->include_dosages;
+			vector<uint8_t> sample_in_range;
+			vector<uint8_t> sample_has_missing;
+			if (row_filter_active) {
+				sample_in_range.assign(output_sample_ct, 0);
+				sample_has_missing.assign(output_sample_ct, 0);
+			}
 
-				const uintptr_t *si_ptr = bind_data->has_sample_subset ? preread_subset.SampleInclude() : nullptr;
+			// Pre-read every source into its slice of the global matrix. Source src_idx
+			// occupies matrix rows [variant_offsets[src_idx], variant_offsets[src_idx+1]).
+			for (idx_t src_idx = 0; src_idx < bind_data->sources.size(); src_idx++) {
+				PfileSource &src = bind_data->sources[src_idx];
+				uint32_t global_offset = bind_data->variant_offsets[src_idx];
 
-				if (bind_data->include_dosages) {
-					uint32_t dosage_ct = 0;
-					err = plink2::PgrGetD(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr, genovec_buf2.As<uintptr_t>(),
-					                      preread_dosage_present.As<uintptr_t>(), preread_dosage_main.As<uint16_t>(),
-					                      &dosage_ct);
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgr(&tmp_pgr, &ce);
-						ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&tmp_pgfi, &ce);
-						throw IOException("read_pfile: PgrGetD failed for variant %u during sample-orient pre-read",
-						                  vidx);
-					}
-					plink2::Dosage16ToDoublesMinus9(
-					    genovec_buf2.As<uintptr_t>(), preread_dosage_present.As<uintptr_t>(),
-					    preread_dosage_main.As<uint16_t>(), output_sample_ct, dosage_ct, preread_dosage_doubles.data());
-					bind_data->dosage_matrix[ev].assign(preread_dosage_doubles.begin(),
-					                                    preread_dosage_doubles.begin() + output_sample_ct);
-				} else if (bind_data->include_phased) {
-					uint32_t phasepresent_ct = 0;
-					// PgrGetP leaves the phase buffers untouched for variants without an
-					// hphase track; zero per-call so unphased hets decode deterministically
-					// as REF|ALT [0,1] and never inherit stale phase bits. cachealigned_malloc
-					// does not zero, so a one-time memset at allocation is insufficient.
-					uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
-					std::memset(preread_phasepresent.ptr, 0, phase_byte_ct);
-					std::memset(preread_phaseinfo.ptr, 0, phase_byte_ct);
-					err = plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr, genovec_buf2.As<uintptr_t>(),
-					                      preread_phasepresent.As<uintptr_t>(), preread_phaseinfo.As<uintptr_t>(),
-					                      &phasepresent_ct);
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgr(&tmp_pgr, &ce);
-						ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&tmp_pgfi, &ce);
-						throw IOException("read_pfile: PgrGetP failed for variant %u during sample-orient pre-read",
-						                  vidx);
-					}
-					plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
-					UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
-					                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct,
-					                      preread_phased_pairs.data());
-					// Row-level keep accumulation (phased: diploid sum) from true values.
-					if (row_filter_active) {
-						for (uint32_t s = 0; s < output_sample_ct; s++) {
-							int8_t a1 = preread_phased_pairs[s * 2];
-							if (a1 == -9) {
-								sample_has_missing[s] = 1;
-							} else if (bind_data->genotype_filter.AllowsCall(
-							               static_cast<double>(a1 + preread_phased_pairs[s * 2 + 1]))) {
-								sample_in_range[s] = 1;
-							}
-						}
-					}
-					// Apply genotype_range per-element filtering (phased: check diploid sum)
-					if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
-					    !genotype_range_all_pass[ev]) {
-						for (uint32_t s = 0; s < output_sample_ct; s++) {
-							int8_t a1 = preread_phased_pairs[s * 2];
-							int8_t a2 = preread_phased_pairs[s * 2 + 1];
-							if (a1 != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(a1 + a2))) {
-								preread_phased_pairs[s * 2] = -9;
-								preread_phased_pairs[s * 2 + 1] = -9;
-							}
-						}
-					}
-					bind_data->genotype_matrix[ev].assign(preread_phased_pairs.begin(),
-					                                      preread_phased_pairs.begin() + output_sample_ct * 2);
+				// Temporary PgenReader for THIS source.
+				plink2::PgenFileInfo tmp_pgfi;
+				plink2::PreinitPgfi(&tmp_pgfi);
+				char errstr_buf2[plink2::kPglErrstrBufBlen];
+				plink2::PgenHeaderCtrl header_ctrl2;
+				uintptr_t pgfi_alloc_ct2 = 0;
+				err =
+				    plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data->raw_sample_ct,
+				                           &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
+				if (err != plink2::kPglRetSuccess) {
+					plink2::PglErr ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgfi(&tmp_pgfi, &ce);
+					throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read: %s",
+					                  errstr_buf2);
+				}
+				AlignedBuffer pgfi_alloc2;
+				if (pgfi_alloc_ct2 > 0) {
+					pgfi_alloc2.Allocate(pgfi_alloc_ct2 * plink2::kCacheline);
+				}
+				uint32_t max_vrec2 = 0;
+				uintptr_t pgr_alloc_ct2 = 0;
+				err = plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
+				                             pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
+				if (err != plink2::kPglRetSuccess) {
+					plink2::PglErr ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgfi(&tmp_pgfi, &ce);
+					throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
+					                  errstr_buf2);
+				}
+				plink2::PgenReader tmp_pgr;
+				plink2::PreinitPgr(&tmp_pgr);
+				AlignedBuffer pgr_alloc2;
+				if (pgr_alloc_ct2 > 0) {
+					pgr_alloc2.Allocate(pgr_alloc_ct2 * plink2::kCacheline);
+				}
+				err = plink2::PgrInit(src.pgen_path.c_str(), max_vrec2, &tmp_pgfi, &tmp_pgr,
+				                      pgr_alloc2.As<unsigned char>());
+				if (err != plink2::kPglRetSuccess) {
+					plink2::PglErr ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgr(&tmp_pgr, &ce);
+					ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgfi(&tmp_pgfi, &ce);
+					throw IOException("read_pfile: PgrInit failed for sample-orient pre-read");
+				}
+				plink2::PgrSampleSubsetIndex pssi2;
+				if (bind_data->has_sample_subset) {
+					plink2::PgrSetSampleSubsetIndex(preread_subset.CumulativePopcounts(), &tmp_pgr, &pssi2);
 				} else {
-					err = plink2::PgrGet(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr, genovec_buf2.As<uintptr_t>());
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgr(&tmp_pgr, &ce);
-						ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&tmp_pgfi, &ce);
-						throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read",
-						                  vidx);
-					}
-					plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
-					// Row-level keep accumulation from true values, before any null-out.
-					if (row_filter_active) {
-						for (uint32_t s = 0; s < output_sample_ct; s++) {
-							int8_t geno = tmp_bytes[s];
-							if (geno == -9) {
-								sample_has_missing[s] = 1;
-							} else if (bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
-								sample_in_range[s] = 1;
+					plink2::PgrClearSampleSubsetIndex(&tmp_pgr, &pssi2);
+				}
+
+				uint32_t src_effective_ct = src.EffectiveVariantCt();
+				for (uint32_t local_ev = 0; local_ev < src_effective_ct; local_ev++) {
+					uint32_t ev = global_offset + local_ev; // global matrix row
+					uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[local_ev] : local_ev;
+
+					const uintptr_t *si_ptr = bind_data->has_sample_subset ? preread_subset.SampleInclude() : nullptr;
+
+					if (bind_data->include_dosages) {
+						uint32_t dosage_ct = 0;
+						err = plink2::PgrGetD(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
+						                      genovec_buf2.As<uintptr_t>(), preread_dosage_present.As<uintptr_t>(),
+						                      preread_dosage_main.As<uint16_t>(), &dosage_ct);
+						if (err != plink2::kPglRetSuccess) {
+							plink2::PglErr ce = plink2::kPglRetSuccess;
+							plink2::CleanupPgr(&tmp_pgr, &ce);
+							ce = plink2::kPglRetSuccess;
+							plink2::CleanupPgfi(&tmp_pgfi, &ce);
+							throw IOException("read_pfile: PgrGetD failed for variant %u during sample-orient pre-read",
+							                  vidx);
+						}
+						plink2::Dosage16ToDoublesMinus9(genovec_buf2.As<uintptr_t>(),
+						                                preread_dosage_present.As<uintptr_t>(),
+						                                preread_dosage_main.As<uint16_t>(), output_sample_ct, dosage_ct,
+						                                preread_dosage_doubles.data());
+						bind_data->dosage_matrix[ev].assign(preread_dosage_doubles.begin(),
+						                                    preread_dosage_doubles.begin() + output_sample_ct);
+					} else if (bind_data->include_phased) {
+						uint32_t phasepresent_ct = 0;
+						// PgrGetP leaves the phase buffers untouched for variants without an
+						// hphase track; zero per-call so unphased hets decode deterministically
+						// as REF|ALT [0,1] and never inherit stale phase bits. cachealigned_malloc
+						// does not zero, so a one-time memset at allocation is insufficient.
+						uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
+						std::memset(preread_phasepresent.ptr, 0, phase_byte_ct);
+						std::memset(preread_phaseinfo.ptr, 0, phase_byte_ct);
+						err = plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
+						                      genovec_buf2.As<uintptr_t>(), preread_phasepresent.As<uintptr_t>(),
+						                      preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct);
+						if (err != plink2::kPglRetSuccess) {
+							plink2::PglErr ce = plink2::kPglRetSuccess;
+							plink2::CleanupPgr(&tmp_pgr, &ce);
+							ce = plink2::kPglRetSuccess;
+							plink2::CleanupPgfi(&tmp_pgfi, &ce);
+							throw IOException("read_pfile: PgrGetP failed for variant %u during sample-orient pre-read",
+							                  vidx);
+						}
+						plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
+						UnpackPhasedGenotypes(tmp_bytes.data(), preread_phasepresent.As<uintptr_t>(),
+						                      preread_phaseinfo.As<uintptr_t>(), output_sample_ct,
+						                      preread_phased_pairs.data());
+						// Row-level keep accumulation (phased: diploid sum) from true values.
+						if (row_filter_active) {
+							for (uint32_t s = 0; s < output_sample_ct; s++) {
+								int8_t a1 = preread_phased_pairs[s * 2];
+								if (a1 == -9) {
+									sample_has_missing[s] = 1;
+								} else if (bind_data->genotype_filter.AllowsCall(
+								               static_cast<double>(a1 + preread_phased_pairs[s * 2 + 1]))) {
+									sample_in_range[s] = 1;
+								}
 							}
 						}
-					}
-					// Apply genotype_range per-element null-out for per-element output modes only.
-					// Aggregate modes (counts/stats) must keep true genotype values so that
-					// out-of-range calls are not miscounted as missing (-9) in the counts struct;
-					// genotype_range acts purely as a row filter there.
-					if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
-					    !genotype_range_all_pass[ev] && !IsAggregateGenotypeMode(bind_data->genotype_mode)) {
-						for (uint32_t s = 0; s < output_sample_ct; s++) {
-							int8_t geno = tmp_bytes[s];
-							if (geno != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
-								tmp_bytes[s] = -9;
+						// Apply genotype_range per-element filtering (phased: check diploid sum)
+						if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
+						    !genotype_range_all_pass[ev]) {
+							for (uint32_t s = 0; s < output_sample_ct; s++) {
+								int8_t a1 = preread_phased_pairs[s * 2];
+								int8_t a2 = preread_phased_pairs[s * 2 + 1];
+								if (a1 != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(a1 + a2))) {
+									preread_phased_pairs[s * 2] = -9;
+									preread_phased_pairs[s * 2 + 1] = -9;
+								}
 							}
 						}
+						bind_data->genotype_matrix[ev].assign(preread_phased_pairs.begin(),
+						                                      preread_phased_pairs.begin() + output_sample_ct * 2);
+					} else {
+						err = plink2::PgrGet(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
+						                     genovec_buf2.As<uintptr_t>());
+						if (err != plink2::kPglRetSuccess) {
+							plink2::PglErr ce = plink2::kPglRetSuccess;
+							plink2::CleanupPgr(&tmp_pgr, &ce);
+							ce = plink2::kPglRetSuccess;
+							plink2::CleanupPgfi(&tmp_pgfi, &ce);
+							throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient pre-read",
+							                  vidx);
+						}
+						plink2::GenoarrToBytesMinus9(genovec_buf2.As<uintptr_t>(), output_sample_ct, tmp_bytes.data());
+						// Row-level keep accumulation from true values, before any null-out.
+						if (row_filter_active) {
+							for (uint32_t s = 0; s < output_sample_ct; s++) {
+								int8_t geno = tmp_bytes[s];
+								if (geno == -9) {
+									sample_has_missing[s] = 1;
+								} else if (bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
+									sample_in_range[s] = 1;
+								}
+							}
+						}
+						// Apply genotype_range per-element null-out for per-element output modes only.
+						// Aggregate modes (counts/stats) must keep true genotype values so that
+						// out-of-range calls are not miscounted as missing (-9) in the counts struct;
+						// genotype_range acts purely as a row filter there.
+						if (bind_data->genotype_filter.active && !genotype_range_all_pass.empty() &&
+						    !genotype_range_all_pass[ev] && !IsAggregateGenotypeMode(bind_data->genotype_mode)) {
+							for (uint32_t s = 0; s < output_sample_ct; s++) {
+								int8_t geno = tmp_bytes[s];
+								if (geno != -9 && !bind_data->genotype_filter.AllowsCall(static_cast<double>(geno))) {
+									tmp_bytes[s] = -9;
+								}
+							}
+						}
+						bind_data->genotype_matrix[ev].assign(tmp_bytes.begin(), tmp_bytes.begin() + output_sample_ct);
 					}
-					bind_data->genotype_matrix[ev].assign(tmp_bytes.begin(), tmp_bytes.begin() + output_sample_ct);
+				}
+
+				// Cleanup this source's temporary pgenlib state
+				{
+					plink2::PglErr ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgr(&tmp_pgr, &ce);
+					ce = plink2::kPglRetSuccess;
+					plink2::CleanupPgfi(&tmp_pgfi, &ce);
 				}
 			}
 
-			// Cleanup this source's temporary pgenlib state
-			{
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgr(&tmp_pgr, &ce);
-				ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-			}
-		}
-
-		// Build the row-level keep list: a sample is emitted iff it has at least
-		// one genotype in range (or a missing genotype when include_missing is set).
-		// The scan iterates this list instead of all samples, so only surviving
-		// rows materialize.
-		if (row_filter_active) {
-			bind_data->sample_keep.reserve(output_sample_ct);
-			for (uint32_t s = 0; s < output_sample_ct; s++) {
-				if (sample_in_range[s] || (bind_data->genotype_filter.include_missing && sample_has_missing[s])) {
-					bind_data->sample_keep.push_back(s);
+			// Build the row-level keep list: a sample is emitted iff it has at least
+			// one genotype in range (or a missing genotype when include_missing is set).
+			// The scan iterates this list instead of all samples, so only surviving
+			// rows materialize.
+			if (row_filter_active) {
+				bind_data->sample_keep.reserve(output_sample_ct);
+				for (uint32_t s = 0; s < output_sample_ct; s++) {
+					if (sample_in_range[s] || (bind_data->genotype_filter.include_missing && sample_has_missing[s])) {
+						bind_data->sample_keep.push_back(s);
+					}
 				}
+				bind_data->has_sample_keep = true;
 			}
-			bind_data->has_sample_keep = true;
-		}
+		} // end !IsAggregateGenotypeMode (matrix pre-read)
 	} else {
 		// Variant mode: same as read_pgen
 		uint32_t output_sample_ct = bind_data->OutputSampleCt();
@@ -1987,6 +2026,23 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 				break;
 			}
 		}
+		// Aggregate streaming (counts/stats): allocate per-sample accumulators and
+		// arm Phase 1. We accumulate only when the counts are actually produced —
+		// i.e. the genotypes column is projected, or a genotype filter drives the
+		// per-sample keep decision. Otherwise Phase 1 is skipped entirely.
+		if (IsAggregateGenotypeMode(bind_data.genotype_mode) &&
+		    (state->need_genotypes || bind_data.genotype_filter.active)) {
+			state->smp_streaming = true;
+			state->smp_total_eff_variants = bind_data.EffectiveVariantCt();
+			uint32_t osc = bind_data.OutputSampleCt();
+			state->smp_het.assign(osc, 0);
+			state->smp_hom_alt.assign(osc, 0);
+			state->smp_missing.assign(osc, 0);
+			if (bind_data.genotype_filter.active) {
+				state->smp_in_range.assign(osc, 0);
+				state->smp_has_missing.assign(osc, 0);
+			}
+		}
 	} else {
 		state->total_count = bind_data.EffectiveVariantCt();
 		state->need_genotypes = false;
@@ -2025,11 +2081,15 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	state->need_pgen_reader = state->need_genotypes || bind_data.count_filter.HasFilter() ||
 	                          bind_data.genotype_filter.active || need_aggregate_pgen;
 
-	// Multi-file variant/genotype orient: precompute scan batches, each bounded to a
-	// single source and sub-batched so no batch spans a file boundary. Threads claim
-	// batches atomically (next_idx as a batch index); a thread reopens its reader at
-	// most once per claimed batch. Sample orient is single-file only (guarded in bind).
-	if (bind_data.sources.size() > 1 && bind_data.orient_mode != OrientMode::SAMPLE) {
+	// Precompute source-bounded scan batches (a batch never spans a file boundary,
+	// so a thread reopens its reader at most once per claimed batch). Used by:
+	//  - multi-file variant/genotype orient (claimed via next_idx), and
+	//  - sample-orient AGGREGATE streaming Phase 1 (claimed via smp_next_batch),
+	//    for single- AND multi-file (the whole point is to parallelize the per-sample
+	//    accumulation over the variant range).
+	bool build_batches =
+	    (bind_data.sources.size() > 1 && bind_data.orient_mode != OrientMode::SAMPLE) || state->smp_streaming;
+	if (build_batches) {
 		// Genotype orient fans each variant out to N sample rows → smaller sub-batches.
 		const uint32_t sub =
 		    (bind_data.orient_mode == OrientMode::GENOTYPE) ? MULTI_GENOTYPE_SUBBATCH : MULTI_VARIANT_SUBBATCH;
@@ -2138,9 +2198,23 @@ static unique_ptr<LocalTableFunctionState> PfileInitLocal(ExecutionContext &cont
 	auto &gstate = global_state->Cast<PfileGlobalState>();
 	auto state = make_uniq<PfileLocalState>();
 
-	if (!gstate.need_pgen_reader || bind_data.orient_mode == OrientMode::SAMPLE) {
-		// Sample-orient mode uses pre-read genotype matrix — no per-thread PgenReader needed
+	if (!gstate.need_pgen_reader || (bind_data.orient_mode == OrientMode::SAMPLE && !gstate.smp_streaming)) {
+		// Per-element sample orient uses the pre-read genotype matrix — no per-thread
+		// PgenReader needed. Aggregate STREAMING sample orient DOES decode per thread
+		// (Phase 1), so it falls through to allocate buffers + accumulators below.
 		return std::move(state);
+	}
+
+	// Sample-orient aggregate streaming: thread-local per-sample accumulators.
+	if (gstate.smp_streaming) {
+		uint32_t osc = bind_data.OutputSampleCt();
+		state->smp_local_het.assign(osc, 0);
+		state->smp_local_hom_alt.assign(osc, 0);
+		state->smp_local_missing.assign(osc, 0);
+		if (bind_data.genotype_filter.active) {
+			state->smp_local_in_range.assign(osc, 0);
+			state->smp_local_has_missing.assign(osc, 0);
+		}
 	}
 
 	// --- Allocate one-time per-thread buffers (sized off shared raw_sample_ct) ---
@@ -3162,6 +3236,116 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 	// bind_data.EffectiveVariantCt() (= variant_offsets.back()) is the correct
 	// post-filter total matrix width across every shard.
 	uint32_t effective_variant_ct = bind_data.EffectiveVariantCt();
+	uint32_t output_sample_ct = bind_data.OutputSampleCt();
+
+	// --- Phase 1 (aggregate streaming): variant-parallel per-sample accumulation ---
+	// All scan threads claim variant batches, decode each variant once, and increment
+	// THREAD-LOCAL per-sample category counts (hom_ref derived). The last thread out
+	// merges nothing new, builds the keep list (row filter), and opens Phase 2. This
+	// is O(samples) memory instead of the O(variants×samples) matrix. Each thread
+	// contributes exactly once (guarded by lstate.smp_phase1_contributed). Mirrors
+	// plink_missing's two-phase pattern.
+	if (gstate.smp_streaming && !gstate.smp_phase1_done.load(std::memory_order_acquire) &&
+	    !lstate.smp_phase1_contributed) {
+		gstate.smp_phase1_active.fetch_add(1, std::memory_order_acq_rel);
+
+		const bool filter_active = bind_data.genotype_filter.active;
+		auto &gf = bind_data.genotype_filter;
+		uint32_t *l_het = lstate.smp_local_het.data();
+		uint32_t *l_homalt = lstate.smp_local_hom_alt.data();
+		uint32_t *l_miss = lstate.smp_local_missing.data();
+		uint8_t *l_inr = filter_active ? lstate.smp_local_in_range.data() : nullptr;
+		uint8_t *l_hasm = filter_active ? lstate.smp_local_has_missing.data() : nullptr;
+
+		while (true) {
+			uint32_t bidx = gstate.smp_next_batch.fetch_add(1);
+			if (bidx >= gstate.batches.size()) {
+				break;
+			}
+			auto &batch = gstate.batches[bidx];
+			OpenSourceReader(lstate, bind_data, batch.source_idx);
+			auto &src = bind_data.sources[batch.source_idx];
+			const uintptr_t *si_ptr = bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
+
+			for (uint32_t lev = batch.local_start; lev < batch.local_end; lev++) {
+				uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[lev] : lev;
+				plink2::PglErr perr = plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                                     lstate.genovec_buf.As<uintptr_t>());
+				if (perr != plink2::kPglRetSuccess) {
+					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient aggregation",
+					                  vidx);
+				}
+				plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
+				                             lstate.genotype_bytes.data());
+				const int8_t *b = lstate.genotype_bytes.data();
+				for (uint32_t s = 0; s < output_sample_ct; s++) {
+					int8_t g = b[s];
+					switch (g) {
+					case 1:
+						l_het[s]++;
+						break;
+					case 2:
+						l_homalt[s]++;
+						break;
+					case 0:
+						break; // hom_ref derived at emit time
+					default:
+						l_miss[s]++;
+						break;
+					}
+					if (filter_active) {
+						if (g == -9) {
+							l_hasm[s] = 1;
+						} else if (gf.AllowsCall(static_cast<double>(g))) {
+							l_inr[s] = 1;
+						}
+					}
+				}
+			}
+		}
+
+		// Merge thread-local accumulators into the global state.
+		{
+			std::lock_guard<std::mutex> lock(gstate.smp_merge_mutex);
+			for (uint32_t s = 0; s < output_sample_ct; s++) {
+				gstate.smp_het[s] += lstate.smp_local_het[s];
+				gstate.smp_hom_alt[s] += lstate.smp_local_hom_alt[s];
+				gstate.smp_missing[s] += lstate.smp_local_missing[s];
+			}
+			if (filter_active) {
+				for (uint32_t s = 0; s < output_sample_ct; s++) {
+					gstate.smp_in_range[s] |= lstate.smp_local_in_range[s];
+					gstate.smp_has_missing[s] |= lstate.smp_local_has_missing[s];
+				}
+			}
+		}
+		lstate.smp_phase1_contributed = true;
+
+		// Last thread out of Phase 1 finalizes and opens Phase 2. Non-last threads
+		// emit nothing this call. The keep-list build is guarded (mutex + empty check)
+		// so a thread that enters during the finalize window can't double-append.
+		if (gstate.smp_phase1_active.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+			CompatSetOutputCardinality(output, 0);
+			return;
+		}
+		if (filter_active) {
+			std::lock_guard<std::mutex> lock(gstate.smp_merge_mutex);
+			if (gstate.smp_sample_keep.empty()) {
+				gstate.smp_sample_keep.reserve(output_sample_ct);
+				for (uint32_t s = 0; s < output_sample_ct; s++) {
+					if (gstate.smp_in_range[s] || (gf.include_missing && gstate.smp_has_missing[s])) {
+						gstate.smp_sample_keep.push_back(s);
+					}
+				}
+			}
+		}
+		gstate.smp_phase1_done.store(true, std::memory_order_release);
+	}
+
+	// Phase 2 emits per output-sample row. With a genotype filter, streaming builds
+	// the keep list during Phase 1 (gstate.smp_sample_keep); otherwise all samples emit.
+	const bool streaming_keep = gstate.smp_streaming && bind_data.genotype_filter.active;
+	uint32_t phase2_total = streaming_keep ? static_cast<uint32_t>(gstate.smp_sample_keep.size()) : total_samples;
 
 	idx_t rows_emitted = 0;
 
@@ -3169,15 +3353,17 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		uint32_t remaining_capacity = static_cast<uint32_t>(STANDARD_VECTOR_SIZE - rows_emitted);
 		uint32_t claim_size = std::min(PFILE_BATCH_SIZE, remaining_capacity);
 		uint32_t batch_start = gstate.next_idx.fetch_add(claim_size);
-		if (batch_start >= total_samples) {
+		if (batch_start >= phase2_total) {
 			break;
 		}
-		uint32_t batch_end = std::min(batch_start + claim_size, total_samples);
+		uint32_t batch_end = std::min(batch_start + claim_size, phase2_total);
 
 		for (uint32_t claim_idx = batch_start; claim_idx < batch_end; claim_idx++) {
 			// When a genotype_range row filter is active, the claimed index addresses
 			// the surviving-sample list; otherwise it is the output sample position directly.
-			uint32_t sample_pos = bind_data.has_sample_keep ? bind_data.sample_keep[claim_idx] : claim_idx;
+			uint32_t sample_pos = streaming_keep              ? gstate.smp_sample_keep[claim_idx]
+			                      : bind_data.has_sample_keep ? bind_data.sample_keep[claim_idx]
+			                                                  : claim_idx;
 			// Map output sample position to file-order sample index
 			uint32_t sample_file_idx = bind_data.has_sample_subset ? bind_data.sample_indices[sample_pos] : sample_pos;
 
@@ -3254,25 +3440,14 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							}
 						}
 					} else if (IsAggregateGenotypeMode(bind_data.genotype_mode)) {
-						// COUNTS/STATS: accumulate from genotype_matrix across variants
-						uint32_t hom_ref = 0, het = 0, hom_alt = 0, missing = 0;
-						for (idx_t v = 0; v < effective_variant_ct; v++) {
-							int8_t geno = bind_data.genotype_matrix[v][sample_pos];
-							switch (geno) {
-							case 0:
-								hom_ref++;
-								break;
-							case 1:
-								het++;
-								break;
-							case 2:
-								hom_alt++;
-								break;
-							default:
-								missing++;
-								break;
-							}
-						}
+						// COUNTS/STATS: read the per-sample counts accumulated in Phase 1
+						// (streaming — no genotype_matrix). hom_ref is derived: every kept
+						// sample sees every effective variant, so
+						// hom_ref = total_eff_variants − het − hom_alt − missing.
+						uint32_t het = gstate.smp_het[sample_pos];
+						uint32_t hom_alt = gstate.smp_hom_alt[sample_pos];
+						uint32_t missing = gstate.smp_missing[sample_pos];
+						uint32_t hom_ref = gstate.smp_total_eff_variants - het - hom_alt - missing;
 						auto &entries = StructVector::GetEntries(vec);
 						FlatVector::GetData<uint32_t>(*entries[0])[rows_emitted] = hom_ref;
 						FlatVector::GetData<uint32_t>(*entries[1])[rows_emitted] = het;
