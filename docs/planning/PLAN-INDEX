@@ -185,6 +185,7 @@ P4-004 (arbitrary sources, tables/views) deferred to later.
 | P9 pfile writer | Write `.pgen`/`.pvar`/`.psam` via `COPY ... TO` | `P9-001`/`P9-002` (on `feature/reader-completion`) | Design + spikes done, build not started |
 | P10-001 filter pushdown | `WHERE` drives region/af/sample/genotype filters | `P10-001-filter-pushdown` | Design only |
 | P11-001 ATTACH pfile catalog | Attach a fileset as a schema of views; enabled by P10 | `P11-001-attach-pfile-catalog` | Design only (spike-gated) |
+| P12-001 remote/VFS `.pgen` reads | Read `.pgen` over s3://…/http via a pgenlib FILE*→FileHandle shim (range reads); ahead of plink2 | `P12-001-remote-vfs-pgen-reads` | Design only (spike-gated; ship download-to-temp first) |
 
 ### Future — Deferred Candidates
 

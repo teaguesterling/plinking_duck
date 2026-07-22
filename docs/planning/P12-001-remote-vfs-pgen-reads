@@ -1,0 +1,270 @@
+# P12-001: Remote / VFS `.pgen` reads (S3, HTTP, any DuckDB filesystem)
+
+Let `read_pfile` / `read_pgen` open a `.pgen` over a DuckDB filesystem (`s3://`,
+`https://`, `hf://`, gcs, azure, …), not just local disk — with **targeted region
+queries reading only the bytes they need** over the network. That last part is an
+architectural edge plink2 does **not** have (see P-context below): this is
+ahead-of-upstream work, not parity work. The bar is therefore "does a spike prove
+the edge is real," not "does it work at all."
+
+## Status
+
+- [ ] **Confirm** `FileHandle` positioned-read + httpfs range semantics (mostly done, see Design §0)
+- [ ] **Spike**: contiguous-region query over a local HTTP server via a `FileHandle`-backed
+      byte source vs. download-to-temp — measure bytes fetched + wall clock. **Go/no-go.**
+- [ ] Poison-type pass: make the compiler enumerate the complete `.pgen` I/O surface
+- [ ] `PgenFile` tagged byte source; wire the ~7 primitives (local = zero diff)
+- [ ] Coalesced/parallel range reads for a region (use the in-memory offset index)
+- [ ] Network-free correctness test (FILE* backing vs FileHandle backing, same local file)
+- [ ] Fork management: re-appliable patch + drift canary + upstream offer
+
+## Prerequisites
+
+- Independent of P10/P11. Pairs with the writer (P9) only thematically (both concern
+  the `.pgen` I/O boundary; the writer stays local-only for now).
+- **Gated on the spike + API confirmation, not on this doc.** Write the doc now; do
+  not start the build until §0 is confirmed and the spike shows the edge is real.
+
+## Branch
+
+`feature/P12-001-remote-vfs-pgen-reads`
+
+---
+
+## Background
+
+### The constraint
+
+`.pvar` / `.psam` companions already read through DuckDB's VFS (`fs.OpenFile`,
+`read_parquet` via a `Connection`), so those work remotely today with `httpfs`.
+The `.pgen` does **not**: it is opened by vendored pgenlib via raw
+`fopen(fname, "rb")` + `fseeko`, which only understand local paths. Hand it
+`s3://…` and it fails at open. So resolution (glob / `file_search_path` /
+`pathmacro:`) succeeds and the read then dies — the fileset is unreadable remotely.
+
+This is inherited from plink2: plink-ng has **zero** networking (grepped: no
+libcurl / S3 / GCS / azure anywhere; the I/O surface is `fopen` + zstd), and the
+`plink2` CLI takes local paths only. Upstream even left the seam marked:
+`plink2_text.h:137` — `FILE* ff;  // could use e.g. htslib for some network
+support later`.
+
+### Why a DuckDB-native reader can beat the CLI here
+
+pgenlib's `.pgen` access is **coarse-grained random access**: `PgfiInitPhase2`
+loads the full variant→byte-offset index into memory, then each variant read is
+`fseeko(record_offset)` + `fread_unlocked(record_bytes)` (≈1:1 seek:read; all
+difflist/decompress after that is in-memory pointer work). Because we know every
+record's exact byte range after init, a region query can fetch **only those
+records' bytes** — coalesced into few HTTP Range requests — instead of downloading
+the whole file. plink2 can't do this at all. That is the entire value proposition,
+and it lives or dies on range-read economics (see §3).
+
+### Surface map (from sitting_duck `read_ast` over the compiled read path)
+
+The `.pgen` read path is small and concentrated (write path excluded from our
+build; text/VCF/bgzf paths already go through our own VFS parsing):
+
+- **State — 3 `FILE*` fields**: `PgenFileInfo.shared_ff`, `PgenFileInfo.pgi_ff`
+  (the split `.pgi` index), `PgenReaderMain.ff` (`pgenlib_read.h:102/107/124`).
+- **Operations (~7)**: `fopen`, `fseeko`, `ftello`, `fread_unlocked` (the byte
+  pull — a macro for `fread`), `getc_unlocked`, `rewind`, `fclose`. Concentrated
+  in `pgenlib_read.cc` (6 `fopen`, 38 `fseeko`, 38 `fread_unlocked`).
+- **Access pattern**: seek-to-record + read-record; not streaming (so download-to-
+  stdin is a non-starter, and range reads map perfectly).
+
+## Design
+
+### §0. Foundation (confirm first — mostly done)
+
+`duckdb/common/file_system.hpp` exposes exactly what a shim needs:
+
+- `FileHandle::Read(void *buffer, idx_t nr_bytes, idx_t location)` — a **positioned
+  read** = one seek+read call (line 86). This is what httpfs turns into an HTTP
+  `Range:` request (the same mechanism DuckDB reads remote parquet with).
+- `CanSeek()`, `GetFileSize()`, `OpenFile()` — the rest of the surface.
+
+Confirm httpfs implements positioned `Read` as a cached range request (it does for
+parquet; verify for our access sizes). If so, the remote backing is "wire 7 ops to
+`FileHandle`" and range-read + caching is already solved upstream — we build no
+HTTP client and no cache.
+
+### §1. `PgenFile`: a tagged byte source (not a vtable)
+
+Replace the raw `FILE*` with a tiny tagged struct so the **local hot path keeps
+raw `fread_unlocked` with zero indirection** (we just spent real effort on local
+counts/streaming perf; an indirect call per read × 38/variant × millions of
+variants would tax it). The `is_remote` branch is constant per open file →
+perfectly predicted → effectively free.
+
+```c
+typedef struct PgenFile {
+  bool is_remote;
+  FILE* ff;             // local: raw stdio, unchanged hot path
+  void* handle;         // remote: DuckDB FileHandle (opaque to pgenlib)
+  uint64_t offset;      // remote: current position (pgenlib expects a seek model)
+} PgenFile;
+```
+
+The ~7 primitives become thin inline wrappers that branch on `is_remote`:
+
+| pgenlib call | local | remote (via a C-ABI callback into the extension) |
+|---|---|---|
+| `fopen` | `fopen` | `plinking_vfs_open(path)` → FileHandle |
+| `fseeko` | `fseeko` | set `offset` (no I/O; positioned read carries it) |
+| `ftello` | `ftello` | return `offset` |
+| `fread_unlocked` | `fread` | `plinking_vfs_pread(handle, buf, n, offset)`; `offset += n` |
+| `getc_unlocked` | `getc_unlocked` | 1-byte `pread` |
+| `rewind` | `rewind` | `offset = 0` |
+| `fclose` | `fclose` | `plinking_vfs_close(handle)` |
+
+pgenlib stays C and framework-free: the remote callbacks are a small **C ABI**
+(function pointers registered by the extension, which owns the C++ `FileHandle`
+and `ClientContext`). pgenlib never sees DuckDB types. The `.pgi` split index
+(`pgi_ff`) rides the identical `PgenFile`.
+
+### §2. Proving the surface is complete — the poison-type pass
+
+Search *finds* call sites; it can't *prove* none were missed (a read routed through
+`plink2_common.cc`'s `fread`, an inline helper, an un-enumerated macro). Make
+completeness a compile, not a search: temporarily change the 3 `FILE*` fields to an
+**incomplete/poison type** and let the compiler emit an error at every site that
+touches `.pgen` file I/O. That error list **is** the exact, exhaustive patch
+surface. This is the step that de-risks "did I miss a read path," and it is how
+this refactor stays manageable.
+
+### §3. Range-read economics — the go/no-go (make this the core)
+
+The edge is real only when a query's records are **contiguous** in the file → one
+coalesced range read. Characterize honestly:
+
+- **Contiguous region** (`region := '17:43e6-43.1e6'`; records adjacent in
+  `(CHROM,POS)` order): the win. After `PgfiInitPhase2`, compute the byte span of
+  the region's records from the in-memory offset index, issue **one coalesced range
+  read** (or a few parallel ones), decode in memory. Fetches ~region bytes, not the
+  file. This beats download-to-temp and plink2.
+- **Scattered access** (by-ID selection across the file, `variants := [...]`): N
+  latency-bound round-trips. Coalesce adjacent offsets; beyond a density threshold,
+  fall back to download-to-temp.
+- **Full scan**: download-first always wins (you read every byte anyway, once, with
+  no per-record latency). Detect and switch.
+
+So the design is **not** "route every `fread` to the network." It is: use the
+offset index to plan the minimal set of coalesced, parallelizable range reads for
+the actual query, and fall back to download-to-temp when access is scattered/dense.
+The **spike** measures a contiguous-region query over a local HTTP server (bytes
+fetched + wall clock) vs. download-to-temp; that number is the go/no-go.
+
+### §3a. Parameterized fetch granularity + block cache
+
+pgenlib issues **one `fread` per variant record** (a difflist record for a rare
+variant is tiny — tens to hundreds of bytes). One HTTP range request per record is
+latency-death: 5 000 records × ~30–100 ms RTT ≫ any decode saving. So the shim must
+decouple *pgenlib's read granularity* (one record) from *the network fetch
+granularity* (a block of many contiguous records). Two knobs, both parameterized
+and cached:
+
+- **Fetch block size** — how much contiguous file span to pull per range request.
+  Config `plinking_remote_pgen_block_bytes` (e.g. default 1–4 MB) **or** the
+  variant-count equivalent `plinking_remote_pgen_block_variants` (records per
+  fetch; converted to a byte span via the offset index). A record read that lands
+  outside the cached block triggers one range request for the next block-aligned
+  span. This turns 5 000 per-record reads into `region_bytes / block_bytes` range
+  requests.
+- **Block cache** — an LRU of fetched blocks (`plinking_remote_pgen_cache_blocks` /
+  `_cache_bytes`), keyed by (file identity, block index). pgenlib's per-record
+  `fread` becomes a `memcpy` out of the resident block when it hits. This also
+  absorbs pgenlib's small **header + index** reads at open (fetch that span once)
+  and any mild non-monotonic access within a region.
+
+The parameters are read at bind (like the other `plinking_*` options) and cached on
+the `PgenFile` so the hot `pread` path does no setting lookups. Sizing is a real
+tuning question — too small = too many requests, too large = over-fetch on sparse
+regions — hence config knobs plus a measured default from the spike. Note httpfs
+already does *its own* range caching; the block layer here is about **matching fetch
+size to pgenlib's tiny record reads** so we don't depend on httpfs's granularity
+being right for genotype records. The spike should measure whether an explicit
+block layer beats raw positioned reads on httpfs, or whether httpfs's caching is
+enough (in which case the shim stays thin and we only add the block layer if the
+numbers demand it).
+
+### §4. Fork management (own the decision)
+
+This **is** a fork of vendored pgenlib — against the "wrap, don't reimplement"
+discipline ([[plink2-wrapping-audit-and-fixes]]). Resolve it concretely rather than
+leave it open:
+
+- A **surgical patch** to `pgenlib_read.{cc,h}` (3 field types + ~7 primitive sites),
+  kept as a **re-appliable patch file** applied at build time. Precedent: the musl
+  `rawmemchr` shim is force-included via CMake (`src/musl_compat.h`).
+- Guarded by the existing **drift canary** (`scripts/check_vendored_drift.sh`): the
+  patch is the intentional delta; the canary verifies everything else is unchanged
+  and flags when a submodule bump needs the patch re-checked.
+- **Offer it upstream** — the `plink2_text.h:137` comment is an open door; an
+  optional VFS-callback seam benefits pgenlib generally and would retire the fork.
+
+### §5. Wiring in the extension
+
+`read_pfile` / `read_pgen` already resolve paths via the VFS. When a resolved
+`.pgen` is a remote/VFS URL (not `IsPathAbsolute` local), open a `FileHandle`,
+register the C callbacks, and pass a remote `PgenFile` into pgenlib. `.pvar` /
+`.psam` already read remotely. Companion discovery must also VFS-resolve (it
+partially does post-P8/P10). Config gate (e.g. `plinking_remote_pgen`) defaulting
+off until proven, mirroring `plinking_sample_counts_sparse`.
+
+## Cheaper alternative (recommend shipping first)
+
+**Download-to-temp with a local cache**: on a remote `.pgen`, fetch it once via the
+VFS to a local temp (or a user cache dir keyed by URL+etag), open that with the
+unchanged local path. **Zero pgenlib changes, no fork**, and it genuinely serves
+the common cases — repeated queries on the same fileset, and any full scan. Its
+only loss vs. the shim is one-shot *targeted-region-over-remote-without-a-full-
+fetch*. Given the round-trip cost of releases and the fork tension, the defensible
+sequencing is:
+
+1. **Ship download-to-temp + cache first** (small, no fork, immediate remote support).
+2. **Spike** the range-read shim on a real contiguous-region workload.
+3. Build the shim **only if** the spike shows range reads decisively beat
+   download-to-temp on that workload.
+
+## Deferred
+
+- Remote **writes** (the writer is local-only; same boundary).
+- A shared cross-query block cache beyond what httpfs already caches.
+- Credential handling beyond what DuckDB secrets / httpfs already provide.
+- Multi-file/sharded remote filesets as one logical scan over the network (pairs
+  with the shipped multi-file reader + `pathmacro:` resolution).
+
+## Testing
+
+- **Network-free shim correctness (the must-have):** read the same local `.pgen`
+  via the `FILE*` backing and via the `FileHandle` backing pointed at that same
+  local file → assert **byte-identical genotypes** (reuse the wes_chr10 /
+  rare_small fixtures + the streaming counts as an equality oracle). This isolates
+  shim correctness from S3 entirely; "remote" is then just "the FileHandle happens
+  to be httpfs."
+- **Range accounting (spike + regression):** a contiguous-region query fetches
+  ≈region bytes, not the whole file (assert an upper bound on bytes read via a
+  counting local HTTP server).
+- **Fallback:** scattered/full-scan access switches to download-to-temp and still
+  returns identical results.
+- **Drift canary** stays green with the patch applied.
+
+## Open questions
+
+- Positioned-read granularity: does httpfs coalesce our per-record reads, or should
+  we coalesce region ranges ourselves before calling `Read`? (Likely both — we plan
+  ranges, httpfs caches.)
+- Latency threshold for scattered access → download-to-temp switch (measure).
+- Patch vs. a maintained pgenlib fork branch vs. upstreaming — pick per the canary
+  burden across submodule bumps.
+- Does `PgfiInitPhase1/2` itself do scattered small reads at open that would be slow
+  over the network (header + index load)? If so, fetch the header+index region in
+  one range read up front.
+
+## Context — where this sits
+
+Distinct from the local-only constraints of the writer (P9) and the earlier
+`pathmacro:`-can't-feed-`read_pfile` finding — all three trace to the same vendored
+`FILE*` boundary, and this doc is the one that removes it for the read path. See
+[[pathmacro-readpfile-integration]], [[roadmap-0-8-0-pfile-writer]],
+[[plink2-wrapping-audit-and-fixes]].
