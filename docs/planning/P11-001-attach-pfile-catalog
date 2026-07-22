@@ -1,0 +1,108 @@
+# P11-001: ATTACH a pfile as a catalog of views
+
+Expose a PLINK fileset as an attachable "database" so a fileset reads like a
+schema of tables — matching the mental model genomics users already have (a plink
+fileset / Hail MatrixTable is one unit): `ATTACH 'cohort' AS c (TYPE plink)` →
+`SELECT * FROM c.variants`, `c.samples`, `c.genotypes`, `c.freq`, ...
+
+## Status
+
+- [ ] Feasibility spike on DuckDB's storage/catalog extension API (biggest unknown)
+- [ ] `plink_attach()` macro/view helper (cheap interim — validates demand)
+- [ ] `ATTACH ... (TYPE plink)` catalog exposing per-orient + analysis views
+- [ ] Read path; (later) write path once the writer exists
+- [ ] Tests + docs
+
+## Prerequisites
+
+- **Benefits strongly from P10-001 (filter pushdown)** — without it the exposed
+  views are rigid (a view can't take named params, so its flexibility comes from
+  `WHERE` pushing down into region/sample/af filters). Do P10 first.
+- **Write support depends on P9 (the pfile writer)** — a pfile is not a mutable
+  catalog until then; attach is read-only initially.
+
+## Branch
+
+`feature/P11-001-attach-pfile-catalog`
+
+---
+
+## Background
+
+`read_pfile('cohort', orient := ...)` is powerful but verbose, and the options
+aren't discoverable. Genomics users think of a fileset as a single object with
+variant/sample/genotype "tables". An ATTACH catalog gives that model plus
+`SHOW TABLES` discoverability and schema introspection.
+
+This is primarily an **ergonomics** feature — it adds no capability the table
+functions lack. That is the main reason to be cautious about the cost (see
+Skepticism), and to validate demand with the cheap helper before the real build.
+
+## Design
+
+### The catalog (target)
+
+`ATTACH 'cohort' AS c (TYPE plink)` registers a read-only catalog whose tables map
+to reader/analysis calls on the `cohort` prefix:
+
+| Table | Backing call |
+|---|---|
+| `c.variants` | `read_pfile('cohort', orient := 'variant')` |
+| `c.samples` | `read_psam('cohort.psam')` |
+| `c.genotypes` | `read_pfile('cohort', orient := 'genotype')` |
+| `c.matrix` | `read_pfile('cohort', orient := 'sample')` |
+| `c.freq` / `c.hardy` / `c.missing` / `c.ld` / `c.score` / `c.glm` | the analysis functions |
+
+Backed by DuckDB's `StorageExtension` / custom `Catalog` / `TableCatalogEntry`.
+This is a different, heavier API than table functions and the main implementation
+risk — hence the feasibility spike first.
+
+`WHERE` predicates on these tables push into the reader via P10-001, so
+`SELECT * FROM c.variants WHERE CHROM='17' AND POS BETWEEN a AND b` is a targeted
+scan, not a full read.
+
+### Cheap interim: a view/macro helper (do this first)
+
+Ship a `plink_attach('cohort'[, schema])` (or SQL/table macros) that simply
+`CREATE VIEW`s the above over the existing functions. Captures ~80% of the
+discoverability/UX with **none** of the storage-extension complexity, and lets us
+validate that "attach a fileset" is a workflow people actually reach for before
+committing to the real catalog. If demand is thin, we stop here.
+
+### Unification with the writer (later)
+
+Once the writer (P9) lands, the same attached catalog could support
+`COPY (SELECT …) TO c` / `CREATE TABLE c.new AS …` writing a pfile through the
+catalog — read and write a fileset as one object. Design the catalog with that
+seam in mind, but ship read-only first.
+
+## Deferred
+
+- Write support (blocked on the writer).
+- Attaching a **multi-file / sharded** fileset as one catalog (pairs with the
+  multi-file reader + `pathmacro:` resolution already shipped).
+- Configurable schema (which views, custom names), attach-time default filters.
+
+## Testing
+
+- `ATTACH ... (TYPE plink)` then `SELECT` from each view returns the same rows as
+  the equivalent `read_pfile(...)` call.
+- `WHERE` on a view is pushed (P10) — same rows + fewer scanned than a full read.
+- `SHOW TABLES` / `DESCRIBE` list the expected views with correct schemas.
+- Read-only: writes error clearly (until the writer lands).
+
+## Open questions
+
+- **Is the storage-extension API worth it** vs. the macro helper? Decide after the
+  helper ships and demand is observed — don't build the heavy path on spec.
+- Catalog surface: which analysis functions become views (fixed defaults) vs.
+  table macros that still take arguments (e.g. `c.ld(window := ...)`)?
+- How attach options map (a default `region`/`samples` scoping the whole catalog?).
+- Stability/maintenance burden of the `StorageExtension` API across DuckDB versions.
+
+## Skepticism (recorded deliberately)
+
+ATTACH is a lot of machinery for an ergonomic win. Gate the real build on (a) the
+feasibility spike and (b) evidence — from the macro helper or users — that the
+"attach a fileset" workflow is genuinely wanted. Filter pushdown (P10) stands on
+its own merits regardless; ATTACH does not.

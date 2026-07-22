@@ -1,0 +1,107 @@
+# P10-001: Filter pushdown (WHERE → reader filters)
+
+Let a `WHERE` clause drive the reader's existing region/frequency/sample/genotype
+filters, so `... WHERE CHROM='17' AND POS BETWEEN 43e6 AND 43.1e6` runs the same
+targeted scan as `region := '17:43000000-43100000'` — idiomatic SQL instead of
+named parameters, and the enabler for efficient ATTACH views (P11-001).
+
+## Status
+
+- [ ] Declare `filter_pushdown = true` on `read_pfile` (and `read_pvar`/`read_pgen` where applicable)
+- [ ] Map the pushed `TableFilterSet` to the existing filter backend at bind/init
+- [ ] Report consumed vs. residual filters correctly
+- [ ] Compose with the named-param filters (intersection, not conflict)
+- [ ] Tests: WHERE-vs-param equivalence; pushed-vs-unpushed identical results
+
+## Prerequisites
+
+None (independent). Complements P11-001 (ATTACH) — makes attached views efficient.
+
+## Branch
+
+`feature/P10-001-filter-pushdown`
+
+---
+
+## Background
+
+`read_pfile` already declares `projection_pushdown = true` and carries a rich
+internal filter backend:
+
+- `RegionFilter` / `VariantRange` with a chrom-offset binary search (`region :=`)
+- af/ac count pre-filter via `PgrGetCounts` (`af_range :=` / `ac_range :=`)
+- `GenotypeRangeFilter` (`include_genotypes :=` / `genotype_range :=`)
+- sample subsetting (`samples :=`)
+
+Today a `WHERE` clause is applied by DuckDB **after** the scan: correct, but the
+reader still materializes everything (e.g. all variants when the user wanted one
+region). Filter pushdown is a new **front-end** on machinery that already exists —
+route `WHERE` predicates into those filters. No new backend.
+
+## Design
+
+Set `filter_pushdown = true`. DuckDB then hands the scan a `TableFilterSet` keyed
+by output-column index. At bind/init, translate recognized filters:
+
+| Output-column predicate | Existing internal filter |
+|---|---|
+| `CHROM = c` (or `IN`) **and** `POS BETWEEN a AND b` (or `>=`/`<=`) | `RegionFilter` (chrom_offsets binary search) |
+| `ALT_FREQ`/`MAF` range | `af_range` |
+| `AC` / allele-count range | `ac_range` |
+| `IID = x` / `IID IN (...)` | sample subset |
+| `genotype` `=`/`IN` (genotype orient) | `include_genotypes` |
+
+Everything else stays a **residual** filter for DuckDB to apply post-scan.
+
+### Consumed vs. residual (the part that must be correct)
+
+DuckDB re-applies any filter the function does not report as fully handled. The
+reader must:
+
+- Consume a predicate only when it exactly implements it (e.g. `POS >= a AND POS <= b`
+  maps cleanly to a region; a bare `POS >= a` maps to a half-open region).
+- Leave anything it cannot fully honor as residual (DuckDB re-checks it) — never
+  silently drop it (wrong results) and never both push and rely on DuckDB (double
+  work, still correct but slow).
+- A `CHROM`+`POS` conjunction must be recognized **together** to form one region;
+  a lone `CHROM=` with no `POS` is a whole-chromosome region.
+
+### Composition with named params
+
+`WHERE` filters and named params intersect (both must hold), matching how
+`region :=` + `variants :=` already compose. Named params remain supported; the
+`WHERE` form is sugar over the same code paths.
+
+### Orient-dependent coverage (document explicitly)
+
+- **variant** orient: `CHROM`/`POS`/`ALT_FREQ` are output columns → pushable.
+- **genotype** orient: `chrom`/`pos`/`iid`/`genotype` are output columns → pushable.
+- **sample** orient: variants are array *elements*, not columns, so variant-level
+  `WHERE` predicates cannot push here — `region :=` / `variants :=` are still the
+  way to restrict variants in sample orient. Only `IID` (a column) is pushable.
+
+## Deferred
+
+- Arbitrary/complex expressions (DuckDB applies them post-scan; only the mappable
+  shapes above are consumed).
+- `IN`-lists over CHROM producing multiple disjoint regions (start with single
+  region; multi-region is a follow-up if demand appears).
+
+## Testing
+
+- **Equivalence**: `... WHERE CHROM='1' AND POS BETWEEN a AND b` returns exactly
+  the same rows as `region := '1:a-b'`; `WHERE ALT_FREQ > x` == `af_range`.
+- **Pushed vs. unpushed identical**: run each query with and without pushdown
+  (e.g. wrap the predicate so it can't push) — results must match byte-for-byte.
+  This is the guard against the consumed/residual bug.
+- `EXPLAIN` shows the filter reached the scan (fewer rows scanned).
+- Genotype-orient carrier `WHERE genotype IN (1,2)` == `include_genotypes`.
+
+## Open questions
+
+- `TableFilterSet` (simple per-column constant/range filters) vs. the
+  `pushdown_complex_filter` callback (arbitrary expression tree) — the CHROM+POS
+  conjunction likely needs the complex-filter path to fuse two columns into one
+  region.
+- Float precision when mapping `ALT_FREQ` comparisons to `af_range` bounds.
+- Whether to also wire `read_pvar` (variant-only) and `read_pgen`.
