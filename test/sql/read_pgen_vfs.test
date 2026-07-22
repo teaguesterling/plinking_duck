@@ -1,0 +1,65 @@
+# name: test/sql/read_pgen_vfs.test
+# description: plinking_pgen_io routes read_pgen's .pgen byte I/O through DuckDB's VFS (Path V, a fopencookie/funopen FILE* over a FileHandle) or native fopen (Path L). On a local file both paths MUST produce identical results — this validates the whole VFS-read mechanism with no network.
+# group: [sql]
+
+require plinking_duck
+
+# --- default (auto) on a local path = native fopen (Path L) ---
+query IT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# --- native forced: same ---
+statement ok
+SET plinking_pgen_io = 'native';
+
+query IT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# --- vfs forced: bytes read through a cookie FILE* over a DuckDB FileHandle
+#     (positioned reads). Byte-identical to native — proves the whole Path V. ---
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+query IT
+SELECT ID, genotypes FROM read_pgen('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# --- vfs at scale + parallel: same aggregate as native (30000 variants) ---
+query II
+SELECT count(*), sum(list_sum(list_transform(genotypes, x -> CASE WHEN x < 0 THEN 0 ELSE x END)))
+FROM read_pgen('test/data/wes_chr10.pgen');
+----
+30000	14328698
+
+statement ok
+RESET plinking_pgen_io;
+
+# --- policy validation ---
+statement error
+SET plinking_pgen_io = 'localize';
+SELECT count(*) FROM read_pgen('test/data/pgen_example.pgen');
+----
+not yet implemented
+
+statement error
+SET plinking_pgen_io = 'bogus';
+SELECT count(*) FROM read_pgen('test/data/pgen_example.pgen');
+----
+unknown plinking_pgen_io
+
+statement ok
+RESET plinking_pgen_io;

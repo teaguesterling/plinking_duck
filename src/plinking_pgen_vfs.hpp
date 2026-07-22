@@ -25,10 +25,10 @@ extern "C" {
 // the extension owns it (typically a DuckDB FileHandle) and its closures capture
 // the ClientContext, so credentials/secrets/settings are handled extension-side.
 struct PlinkingPgenVfsOpener {
-	void *user;                                                    // opaque extension state
-	void *(*open)(const char *fname, void *user);                  // -> handle, or nullptr
+	void *user;                                                            // opaque extension state
+	void *(*open)(const char *fname, void *user);                          // -> handle, or nullptr
 	int64_t (*pread)(void *handle, void *buf, int64_t n, uint64_t offset); // bytes, <0 on error
-	int64_t (*size)(void *handle);                                 // file size, <0 on error
+	int64_t (*size)(void *handle);                                         // file size, <0 on error
 	void (*close)(void *handle);
 };
 

@@ -33,9 +33,12 @@ namespace {
 thread_local const PlinkingPgenVfsOpener *t_opener = nullptr;
 
 #if defined(PLINKING_PGEN_VFS_COOKIE) || defined(PLINKING_PGEN_VFS_FUNOPEN)
-// Cookie state: the opener's ops + the opaque handle + our tracked offset.
+// Cookie state — SELF-CONTAINED: it COPIES the read/close callbacks (it must
+// outlive the PlinkingPgenVfsOpener, which the extension may destroy right after
+// the open, while the FILE* lives for the whole scan).
 struct PgenCookie {
-	const PlinkingPgenVfsOpener *ops;
+	int64_t (*pread)(void *handle, void *buf, int64_t n, uint64_t offset);
+	void (*close)(void *handle);
 	void *handle;
 	uint64_t offset;
 	uint64_t size;
@@ -46,7 +49,8 @@ PgenCookie *MakeCookie(const PlinkingPgenVfsOpener *ops, void *handle) {
 	if (!c) {
 		return nullptr;
 	}
-	c->ops = ops;
+	c->pread = ops->pread;
+	c->close = ops->close;
 	c->handle = handle;
 	c->offset = 0;
 	int64_t sz = ops->size(handle);
@@ -58,7 +62,15 @@ PgenCookie *MakeCookie(const PlinkingPgenVfsOpener *ops, void *handle) {
 #if defined(PLINKING_PGEN_VFS_COOKIE)
 ssize_t CookieRead(void *cookie, char *buf, size_t n) {
 	auto *c = static_cast<PgenCookie *>(cookie);
-	int64_t got = c->ops->pread(c->handle, buf, static_cast<int64_t>(n), c->offset);
+	// Clamp to available (short read at EOF — pgenlib/stdio may request past end).
+	uint64_t avail = (c->offset < c->size) ? (c->size - c->offset) : 0;
+	if (static_cast<uint64_t>(n) > avail) {
+		n = static_cast<size_t>(avail);
+	}
+	if (n == 0) {
+		return 0;
+	}
+	int64_t got = c->pread(c->handle, buf, static_cast<int64_t>(n), c->offset);
 	if (got < 0) {
 		return -1;
 	}
@@ -68,8 +80,9 @@ ssize_t CookieRead(void *cookie, char *buf, size_t n) {
 
 int CookieSeek(void *cookie, off64_t *offset, int whence) {
 	auto *c = static_cast<PgenCookie *>(cookie);
-	int64_t base = (whence == SEEK_SET) ? 0 : (whence == SEEK_CUR) ? static_cast<int64_t>(c->offset)
-	                                                               : static_cast<int64_t>(c->size);
+	int64_t base = (whence == SEEK_SET)   ? 0
+	               : (whence == SEEK_CUR) ? static_cast<int64_t>(c->offset)
+	                                      : static_cast<int64_t>(c->size);
 	int64_t target = base + *offset;
 	if (target < 0) {
 		return -1;
@@ -81,7 +94,7 @@ int CookieSeek(void *cookie, off64_t *offset, int whence) {
 
 int CookieClose(void *cookie) {
 	auto *c = static_cast<PgenCookie *>(cookie);
-	c->ops->close(c->handle);
+	c->close(c->handle);
 	std::free(c);
 	return 0;
 }
@@ -103,7 +116,17 @@ FILE *OpenCookieFile(const PlinkingPgenVfsOpener *ops, void *handle) {
 #elif defined(PLINKING_PGEN_VFS_FUNOPEN)
 int FunReadFn(void *cookie, char *buf, int n) {
 	auto *c = static_cast<PgenCookie *>(cookie);
-	int64_t got = c->ops->pread(c->handle, buf, n, c->offset);
+	uint64_t avail = (c->offset < c->size) ? (c->size - c->offset) : 0;
+	if (n < 0) {
+		return -1;
+	}
+	if (static_cast<uint64_t>(n) > avail) {
+		n = static_cast<int>(avail);
+	}
+	if (n == 0) {
+		return 0;
+	}
+	int64_t got = c->pread(c->handle, buf, n, c->offset);
 	if (got < 0) {
 		return -1;
 	}
@@ -113,8 +136,9 @@ int FunReadFn(void *cookie, char *buf, int n) {
 
 fpos_t FunSeekFn(void *cookie, fpos_t offset, int whence) {
 	auto *c = static_cast<PgenCookie *>(cookie);
-	int64_t base = (whence == SEEK_SET) ? 0 : (whence == SEEK_CUR) ? static_cast<int64_t>(c->offset)
-	                                                               : static_cast<int64_t>(c->size);
+	int64_t base = (whence == SEEK_SET)   ? 0
+	               : (whence == SEEK_CUR) ? static_cast<int64_t>(c->offset)
+	                                      : static_cast<int64_t>(c->size);
 	int64_t target = base + static_cast<int64_t>(offset);
 	if (target < 0) {
 		return -1;
@@ -125,7 +149,7 @@ fpos_t FunSeekFn(void *cookie, fpos_t offset, int whence) {
 
 int FunCloseFn(void *cookie) {
 	auto *c = static_cast<PgenCookie *>(cookie);
-	c->ops->close(c->handle);
+	c->close(c->handle);
 	std::free(c);
 	return 0;
 }

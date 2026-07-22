@@ -62,6 +62,13 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	                          "When true, parquet companions are preferred over text formats.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
+	config.AddExtensionOption(
+	    "plinking_pgen_io",
+	    "How .pgen bytes are read: 'auto' (default — remote/VFS paths via DuckDB's VFS, local via native "
+	    "fopen), 'native' (always native fopen; errors on remote), 'vfs' (always via DuckDB's VFS, even "
+	    "local), 'localize' (download remote to a temp then native — not yet implemented).",
+	    LogicalType::VARCHAR, Value("auto"));
+
 	config.AddExtensionOption("plinking_sample_counts_sparse",
 	                          "orient := 'sample' + genotypes := 'counts'|'stats': when true, use the "
 	                          "sparse (pgen difflist) accumulation path — reads only the non-hom_ref "
