@@ -2,6 +2,7 @@
 #include "duckdb_compat.hpp"
 #include "plink_common.hpp"
 #include "plink_profile.hpp"
+#include "pgen_vfs_opener.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
@@ -410,6 +411,9 @@ struct PfileBindData : public TableFunctionData {
 	// Mode
 	OrientMode orient_mode = OrientMode::VARIANT;
 
+	// Route .pgen opens through DuckDB's VFS (Path V) — plinking_pgen_io / remote path.
+	bool use_vfs = false;
+
 	// How multiple sources' sample sets combine (multi-file only).
 	CombineSamplesMode combine_samples = CombineSamplesMode::IMPLICIT;
 
@@ -748,6 +752,8 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	}
 
 	// --- Read the .pgen header (counts) ---
+	// Route the header open through the VFS for a remote/VFS path (Path V).
+	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, src.pgen_path));
 	plink2::PgenFileInfo pgfi;
 	plink2::PreinitPgfi(&pgfi);
 	char errstr_buf[plink2::kPglErrstrBufBlen];
@@ -1024,6 +1030,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_timer.Note("sources built (raw_sample_ct=%u, total effective variants=%u)", bind_data->raw_sample_ct,
 	                bind_data->EffectiveVariantCt());
 
+	// Decide once how .pgen bytes are read (native fopen vs DuckDB VFS). All sources
+	// share the protocol in practice; use the first. Scan/init opens read this.
+	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->Primary().pgen_path);
+
 	// --- Load sample info (from sources[0] only — identical psam by contract) ---
 	const string &psam_path = bind_data->Primary().psam_path;
 	// Determine whether the query actually needs IID strings. If not, we only
@@ -1278,6 +1288,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// globally across sources in file order, staying aligned with the matrix.
 		vector<bool> genotype_range_all_pass;
 		if (bind_data->count_filter.HasFilter() || bind_data->genotype_filter.active) {
+			// Count-filter readers open .pgen — route through the VFS while active.
+			PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
 			for (auto &src : bind_data->sources) {
 				// Init temporary PgenReader for count filtering
 				plink2::PgenFileInfo cf_pgfi;
@@ -1607,6 +1619,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 			// Pre-read every source into its slice of the global matrix. Source src_idx
 			// occupies matrix rows [variant_offsets[src_idx], variant_offsets[src_idx+1]).
+			// The per-source readers open .pgen — route through the VFS while active.
+			PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
 			for (idx_t src_idx = 0; src_idx < bind_data->sources.size(); src_idx++) {
 				PfileSource &src = bind_data->sources[src_idx];
 				uint32_t global_offset = bind_data->variant_offsets[src_idx];
@@ -2136,7 +2150,8 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 //! here — they are built once in PfileInitLocal and reused across source swaps
 //! (identical samples by contract). Only pgfi/pgr are torn down and rebuilt, and
 //! pssi is re-bound to the new pgr. No-op if already open on source_idx.
-static void OpenSourceReader(PfileLocalState &state, const PfileBindData &bind_data, idx_t source_idx) {
+static void OpenSourceReader(ClientContext &context, PfileLocalState &state, const PfileBindData &bind_data,
+                             idx_t source_idx) {
 	if (state.initialized && state.current_source_idx == source_idx) {
 		return;
 	}
@@ -2147,6 +2162,9 @@ static void OpenSourceReader(PfileLocalState &state, const PfileBindData &bind_d
 		plink2::CleanupPgfi(&state.pgfi, &ce);
 		state.initialized = false;
 	}
+
+	// Route this reader's .pgen opens through the VFS while active (Path V).
+	PgenVfsScope pgen_vfs_scope(context, bind_data.use_vfs);
 
 	const PfileSource &src = bind_data.sources[source_idx];
 
@@ -2292,7 +2310,7 @@ static unique_ptr<LocalTableFunctionState> PfileInitLocal(ExecutionContext &cont
 
 	// Open the first source (single-file: the only one). Multi-file scans reopen on a
 	// source boundary via OpenSourceReader.
-	OpenSourceReader(*state, bind_data, 0);
+	OpenSourceReader(context.client, *state, bind_data, 0);
 
 	return std::move(state);
 }
@@ -2785,7 +2803,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			const ScanBatch &batch = gstate.batches[lstate.mf_batch];
 			const PfileSource &source = bind_data.sources[batch.source_idx];
 			if (gstate.need_pgen_reader) {
-				OpenSourceReader(lstate, bind_data, batch.source_idx);
+				OpenSourceReader(context, lstate, bind_data, batch.source_idx);
 			}
 			while (lstate.mf_local < batch.local_end && rows_emitted < STANDARD_VECTOR_SIZE) {
 				if (emit_variant_row(source, lstate.mf_local)) {
@@ -3207,7 +3225,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			const ScanBatch &batch = gstate.batches[lstate.mf_batch];
 			const PfileSource &source = bind_data.sources[batch.source_idx];
 			if (gstate.need_pgen_reader) {
-				OpenSourceReader(lstate, bind_data, batch.source_idx);
+				OpenSourceReader(context, lstate, bind_data, batch.source_idx);
 			}
 
 			while (lstate.mf_local < batch.local_end && rows_emitted < STANDARD_VECTOR_SIZE) {
@@ -3318,7 +3336,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 				break;
 			}
 			auto &batch = gstate.batches[bidx];
-			OpenSourceReader(lstate, bind_data, batch.source_idx);
+			OpenSourceReader(context, lstate, bind_data, batch.source_idx);
 			auto &src = bind_data.sources[batch.source_idx];
 			const uintptr_t *si_ptr = bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
