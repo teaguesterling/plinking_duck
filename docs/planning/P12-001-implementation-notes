@@ -1,0 +1,74 @@
+# P12-001 implementation notes (branch `feature/P12-001-remote-vfs-pgen-reads`)
+
+Working notes for building the remote/VFS `.pgen` read shim. Design is in
+`P12-001-remote-vfs-pgen-reads`; this is the build sequencing. **Milestone 1 is a
+number, not a finished fork** — the range-read spike gates the whole fork
+investment. Do not polish the patch set before that number exists.
+
+## Sequenced milestones
+
+1. **Enumerate the surface (poison-to-fixpoint).** Change the 3 read-path `FILE*`
+   fields in `pgenlib_read.h` (`PgenFileInfo.shared_ff` L102, `.pgi_ff` L107,
+   `PgenReaderMain.ff` L123) to a pointer-to-incomplete poison type; rebuild;
+   **iterate**: the first error list is the field *use* sites, but pgenlib threads
+   `FILE*` through helper *parameters* too (`fread_checked(void*, uintptr_t, FILE*)`
+   in `plink2_base.h`; the `fread_unlocked` macro). Convert helper signatures →
+   rebuild → repeat until clean. The fixpoint set IS the complete patch surface.
+   `pgenlib_read.cc` is C++ so incompatible-pointer is a hard error (good); never
+   run this on a `.c` file (there it's only a warning). *(Started this session:
+   confirmed the 3 fields poison cleanly and force a pgenlib recompile; the full
+   fixpoint capture is task 1 of the real build.)*
+
+2. **Thinnest possible shim, one hot path.** Tagged `PgenFile { bool is_remote;
+   FILE* ff; void* handle; uint64_t offset; }`. Local = unchanged raw
+   `fread_unlocked` (zero hot-path diff). Remote = wire just the open + positioned
+   read (`FileHandle::Read(buf, n, location)`, confirmed `file_system.hpp:86`) for
+   the one path a region query exercises. Enough to run one real query over a URL.
+
+3. **MEASURE — the go/no-go.** Contiguous-region query, **bytes fetched + wall
+   clock**, over a local HTTP server, three ways:
+   - raw httpfs (positioned reads, no cache)
+   - httpfs **+ `cache_httpfs` loaded** (block cache + parallel range IO)
+   - download-to-temp (fetch whole `.pgen` once, open local)
+   If range reads don't **decisively** beat download-to-temp, **stop** and ship
+   download-to-temp instead — having spent a minimal shim, not a finished fork.
+
+4. **Only if green:** complete the fixpoint patch set, region range-coalescing via
+   the in-memory offset index, `.pgi` on the shim, config gate, drift-canary +
+   patch mechanism, upstream offer.
+
+## Known surface (from sitting_duck `read_ast` + grep — confirm with the poison fixpoint)
+
+- **State**: 3 `FILE*` fields (above).
+- **Ops**: `fopen`, `fseeko`, `ftello`, `fread_unlocked` (macro→`fread`),
+  `getc_unlocked`, `rewind`, `fclose` — concentrated in `pgenlib_read.cc`.
+- **Helpers that take `FILE*`**: `fread_checked` (and friends) in `plink2_base.h` —
+  these are part of the fixpoint, not just the 3 fields.
+- **Access pattern**: coarse seek+read per variant record (≈1:1 `fseeko`:`fread`).
+
+## Patch mechanism (defer heavy wiring until milestone 3 is green)
+
+- Edits live as **re-appliable patches** to the `third_party/plink-ng` submodule
+  (git-format-patch under `patches/plink-ng/`), applied idempotently at build time.
+  Precedent for build-time injection: `src/musl_compat.h` force-included via CMake.
+- Must be idempotent (re-apply = no-op; a `git submodule update` after a bump
+  doesn't fight it) and CI-reproducible from a clean checkout.
+- Structured minimal + one-logical-change-per-patch so they are **upstreamable**
+  (the `plink2_text.h:137` "network support later" comment is the open door).
+- The drift canary (`scripts/check_vendored_drift.sh`) treats the patch as the
+  intended delta and verifies the rest is unchanged.
+
+## Split off now, independent of the spike
+
+- **`.pgi` split-index support** — non-fork compatibility fix (companion discovery
+  + thread `pgi_fname`, nullptr = embedded). Land it on `main`/a small branch,
+  **not** gated on the remote-read spike. See design §0a.
+
+## cache_httpfs
+
+Delegate the block cache / parallel range IO / eviction to `cache_httpfs`
+(community, "drop-in replacement for httpfs"). It only helps reads that go through
+DuckDB's VFS — which `.pgen` does **not** today — so it is unlocked *by* the shim,
+not a substitute for it. Our shim keeps only the pgen-format-specific
+offset-index range planning. Load it in the milestone-3 spike or the cached case
+is under-measured.
