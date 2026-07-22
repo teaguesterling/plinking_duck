@@ -104,10 +104,36 @@ wrappers branch on `vfs_handle != nullptr`.
    network**: back a cookie with a *local* file's positioned reads (or a
    LocalFileSystem `FileHandle`) and assert genotypes byte-identical to Path L —
    this validates the entire VFS-read mechanism locally.
-4. **3 — MEASURE (go/no-go).** Contiguous-region query, bytes fetched + wall clock,
-   over a local HTTP server: V raw httpfs vs V + `cache_httpfs` vs `localize`
-   (download-to-temp). If V doesn't **decisively** beat `localize`, ship `localize`
-   and keep V behind the flag. Only then invest in range-coalescing/`.pgi`/canary.
+4. **3 — MEASURE (go/no-go). DONE — verdict: GO for the targeted path.** Bundled
+   httpfs into the build, served wes_chr10.pgen over a Range-capable local HTTP
+   server, measured **bytes fetched** per query (read_pgen over `http://`).
+   Correctness exact over real http (14328698 == local). Results (11 MB .pgen):
+
+   | query | fetched | ×file |
+   |---|---|---|
+   | metadata (count) | 1.8 MB | 0.2× |
+   | targeted 1 variant | 2.9 MB | 0.3× |
+   | targeted 10 variants | 1.8 MB | 0.2× |
+   | full scan (30k, genotypes) | 97.6 MB | **8.9×** |
+
+   - **Targeted/carrier queries fetch ~0.2× the file** → Path V **decisively beats
+     download-to-temp** (1×) for selective reads on a large remote file. This is the
+     P12 use case (carrier/range queries), and it works.
+   - **Full scan over-fetches 8.9×** — raw httpfs re-fetches per positioned read
+     (its per-read window has no multi-block cache; a 1 MB `setvbuf` on the cookie
+     barely helped → 8.3×, so it's httpfs, not glibc buffering). For full scans
+     `localize` (download once, 1×) wins; **`cache_httpfs`** (multi-block LRU) is
+     what removes the re-fetch. Matches the design: `auto` for targeted, `localize`
+     for full scans, `cache_httpfs` for the block layer.
+   - **Index-cost caveat:** even a 1-variant query fetches ~1.8 MB — the variant
+     offset index pgenlib loads (PgfiInitPhase2) for the *whole* file (~1.8 MB for
+     30k variants). At biobank scale (millions of variants) the index is larger and
+     is paid per query → `.pgi` split index / index range-planning is a real future
+     optimization.
+
+   **Verdict:** GO for the targeted/carrier remote path (the point of the feature).
+   Next investment is worthwhile: wire read_pfile + analysis fns, and add
+   `cache_httpfs` guidance + `localize` for the full-scan case.
 
 ## Patch mechanism
 
