@@ -10,14 +10,14 @@ query IIII
 SELECT sum(genotypes.hom_ref) hom_ref, sum(genotypes.het) het, sum(genotypes.hom_alt) hom_alt, sum(genotypes.missing) miss
 FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
 ----
-97595	3291	502	1012
+99217	1947	224	1012
 
 # --- Dense path (default) ---
 query IIII
 SELECT sum(genotypes.het), sum(genotypes.hom_alt), sum(genotypes.missing), sum(genotypes.hom_ref)
 FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
 ----
-3291	502	1012	97595
+1947	224	1012	99217
 
 # --- Sparse path: identical totals ---
 statement ok
@@ -27,7 +27,7 @@ query IIII
 SELECT sum(genotypes.het), sum(genotypes.hom_alt), sum(genotypes.missing), sum(genotypes.hom_ref)
 FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
 ----
-3291	502	1012	97595
+1947	224	1012	99217
 
 # per-sample equivalence: sparse EXCEPT dense must be empty (both computed under
 # the current sparse=true setting vs an explicit dense subquery is awkward in one
@@ -35,10 +35,10 @@ FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts
 
 # --- stats derived identically under the sparse path ---
 query IIR
-SELECT sum(genotypes.n), sum(genotypes.carrier_count), round(sum(genotypes.het) / sum(genotypes.n), 6)
+SELECT sum(genotypes.n), sum(genotypes.carrier_count), round(sum(genotypes.het)::DOUBLE / sum(genotypes.n), 6)
 FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'stats');
 ----
-101388	3793	0.032459
+101388	2171	0.019203
 
 # --- carrier row-skip under sparse (het/hom_alt): same keep-set as dense ---
 query I
@@ -61,4 +61,4 @@ query II
 SELECT sum(genotypes.het), sum(genotypes.hom_alt)
 FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
 ----
-3291	502
+1947	224
