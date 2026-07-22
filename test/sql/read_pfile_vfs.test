@@ -1,0 +1,60 @@
+# name: test/sql/read_pfile_vfs.test
+# description: plinking_pgen_io='vfs' routes read_pfile and the analysis functions' .pgen byte I/O through DuckDB's VFS (Path V — a fopencookie/funopen FILE* over a FileHandle). On a local file it MUST equal native fopen (Path L). Locks the vfs==native equivalence for the whole reader/analysis surface so a wiring regression is caught.
+# group: [sql]
+
+require plinking_duck
+
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+# --- read_pfile: variant orient genotypes (the core reader) ---
+query IT
+SELECT ID, genotypes FROM read_pfile('test/data/pgen_example') ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# --- read_pfile: sample-orient carrier counts (the biobank use case) ---
+query IIII
+SELECT IID, genotypes.het, genotypes.hom_alt, genotypes.missing
+FROM read_pfile('test/data/pgen_example', orient := 'sample', genotypes := 'counts') ORDER BY IID;
+----
+SAMPLE1	1	1	0
+SAMPLE2	2	0	1
+SAMPLE3	2	1	0
+SAMPLE4	0	2	1
+
+# --- multi-file sample orient over the VFS ---
+query I
+SELECT sum(genotypes.het) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', genotypes := 'counts');
+----
+6000
+
+# --- analysis functions over the VFS ---
+query IRI
+SELECT ID, round(ALT_FREQ, 4), OBS_CT FROM plink_freq('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	0.5	6
+rs2	0.5	8
+rs3	0.5	6
+rs4	0.375	8
+
+query IR
+SELECT ID, F_MISS FROM plink_missing('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	0.25
+rs2	0.0
+rs3	0.25
+rs4	0.0
+
+# --- scale + parallel over the VFS: same aggregate as native ---
+query II
+SELECT count(*), sum(genotypes.het)
+FROM read_pfile('test/data/wes_chr10', orient := 'sample', genotypes := 'counts');
+----
+10000	11582052
+
+statement ok
+RESET plinking_pgen_io;
