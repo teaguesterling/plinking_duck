@@ -100,6 +100,38 @@ By default, `read_pfile` constructs file paths by appending extensions to the pr
 
 Relative prefixes honor DuckDB's **`file_search_path`** setting (like `read_csv`): `SET file_search_path='/data/cohort'; SELECT * FROM read_pfile('chr22')` resolves `chr22.*` under that directory. Inputs containing a **glob** (`chr*.pgen`) or a registered **protocol** (`pathmacro:...`) are expanded via the VFS to concrete local paths before opening — a single glob/URL can fan out to a whole sharded fileset.
 
+### Remote / cloud reads (`s3://`, `http`, …)
+
+`read_pfile` (and `read_pgen` and every `plink_*` analysis function) can read a
+`.pgen` **directly from any DuckDB filesystem** — `s3://`, `https://`, plus the
+`.pvar`/`.psam` companions — with the `httpfs` extension loaded:
+
+```sql
+LOAD httpfs;
+SELECT IID FROM read_pfile('s3://bucket/cohort', orient := 'sample',
+    genotypes := 'counts', region := '17:43000000-43125000',
+    include_genotypes := ['het','hom_alt']);   -- carriers in BRCA1, over S3
+```
+
+Credentials/secrets and settings are taken from the query context automatically.
+A **targeted query fetches only the bytes it needs** (the variant index + the
+region's records, via HTTP range reads) — not the whole file — so carrier/range
+queries over a large remote `.pgen` are efficient. `.pgen` I/O is governed by
+`plinking_pgen_io`:
+
+| `plinking_pgen_io` | behavior |
+|---|---|
+| `'auto'` *(default)* | remote/VFS paths read through the VFS; local paths use native `fopen` (zero overhead) |
+| `'native'` | always native `fopen` — errors on a remote path |
+| `'vfs'` | always through the VFS (even local) — for testing |
+| `'localize'` | *reserved* — download remote to a temp then read locally (not yet implemented) |
+
+**Caveats:** a **full scan** of a remote `.pgen` re-reads more than a targeted
+query (and each parallel thread reads the index + its range independently) —
+load the community `cache_httpfs` extension (a block cache over `httpfs`) or
+reduce threads for full-scan-over-remote workloads. Split-index (`.pgi`) filesets
+are not yet supported (embedded-index `.pgen` only).
+
 ### Multi-File Input
 
 The first argument may be a single prefix or a `LIST(VARCHAR)` of prefixes, mirroring the way `read_csv` and `read_json` accept a list. A list **row-concatenates** the variants from each file, in file order, into one logical table:

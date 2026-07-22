@@ -152,6 +152,21 @@ default pending broad validation — A/B it on your data and enable per session.
 | `plinking_max_matrix_elements` | `16 G` | Ceiling for the `orient := 'sample'` genotype-matrix pre-read (array/list/struct/columns; **not** counts/stats, which stream) |
 | `plinking_sample_counts_sparse` | `false` | Use the sparse difflist path for sample-orient `counts`/`stats` (see above) |
 | `plinking_use_parquet_companions` | `true` | Prefer `.pvar.parquet` / `.psam.parquet` companions |
+| `plinking_pgen_io` | `'auto'` | How `.pgen` bytes are read: `auto` (remote→VFS, local→native `fopen`), `native`, `vfs`, `localize` (reserved). See below |
+
+### Remote / cloud `.pgen` reads
+
+With `httpfs` loaded, every reader and analysis function can read a `.pgen` from
+`s3://` / `https://` (companions too). A **targeted query fetches only the variant
+index plus the region's records** via HTTP range reads — not the whole file — so a
+carrier/range query over a large remote `.pgen` is efficient (a shim's read-ahead
+block cache collapses the per-read over-fetch to ~1×). `plinking_pgen_io` controls
+this (`auto` by default; local paths keep native `fopen`, zero overhead).
+
+For a **full scan** of a remote `.pgen`, prefer loading the community `cache_httpfs`
+extension (a block cache over `httpfs`) or reducing threads — a full scan re-reads
+more than a targeted query, and parallel threads each read the index + their range
+independently. Split-index (`.pgi`) filesets are not yet supported.
 
 ## Sample Subsetting
 
