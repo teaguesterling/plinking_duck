@@ -37,7 +37,42 @@ investment. Do not polish the patch set before that number exists.
    the in-memory offset index, `.pgi` on the shim, config gate, drift-canary +
    patch mechanism, upstream offer.
 
-## Known surface (from sitting_duck `read_ast` + grep — confirm with the poison fixpoint)
+## Milestone 1 RESULT — poison enumeration complete (definitive surface)
+
+Poisoned the 3 read-path `FILE*` fields (`PoisonPgenFile*`) and compiled
+`pgenlib_read.cc` in isolation with the CMake pgenlib flags. **34 error sites, all
+in `pgenlib_read.cc`** (nothing else in the compiled read path touches these
+fields — completeness confirmed by the compiler, not just search). The full op
+vocabulary is just **5 operations**:
+
+| op | sites | notes |
+|---|---|---|
+| open (`fopen` + assign an open `FILE*` into the field) | 3 | L2067 `pgrp->ff = fopen(...)`, L709/825 assign a local into `shared_ff`/`pgi_ff` |
+| `fseeko` | 9 | seek to a variant record offset |
+| `ftello` | 2 | position query |
+| `fread_unlocked` | 2 | the byte pull (macro → `fread`) |
+| `fclose_null(&field)` | 5 | pgenlib helper, takes `FILE**` (close + null) |
+| *(read field into a local `FILE*`)* | 3 | e.g. `FILE* header_ff = pgfip->pgi_ff;` — the local + its uses convert too |
+
+`getc_unlocked` / `rewind` do **not** touch these fields (they operate on the
+in-memory block buffer, not the file). So the shim needs exactly:
+`open / seek / tell / read / close_null` — five thin wrappers over a tagged
+`PgenFile { FILE* ff; void* rhandle; uint64_t roff; }`; local branch = the libc
+call unchanged (zero hot-path diff), remote branch = a positioned read.
+
+### Design wrinkle found while tabulating (important — would bite a naive patch)
+
+**Remote open needs the query's `ClientContext`** (httpfs credentials/secrets,
+`file_search_path`, settings live there). pgenlib's `PgfiInitPhase1(fname, …)`
+opens the file itself, context-free — a global `open(fname)` callback could not get
+credentials. Resolution: **do the remote open extension-side** (bind/init has the
+context), and pass the already-open handle into pgenlib. So the C-ABI seam pgenlib
+needs is only **`pread(handle, buf, n, off)` / `fsize(handle)` / `close(handle)`** —
+*not* `open`. The `.pgen` open flow (L2067 etc.) becomes: if a caller-supplied
+remote handle is present, use it; else `fopen` locally. This keeps DuckDB types out
+of pgenlib and puts credential handling where the context is.
+
+## Known surface (superseded by the milestone-1 result above)
 
 - **State**: 3 `FILE*` fields (above).
 - **Ops**: `fopen`, `fseeko`, `ftello`, `fread_unlocked` (macro→`fread`),
