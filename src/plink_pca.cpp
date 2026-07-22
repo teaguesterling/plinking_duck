@@ -13,6 +13,7 @@
 #include "plink_pca.hpp"
 #include "duckdb_compat.hpp"
 #include "plink_common.hpp"
+#include "pgen_vfs_opener.hpp"
 
 #include "duckdb/parallel/task_scheduler.hpp"
 
@@ -84,6 +85,7 @@ struct EffectiveVariant {
 
 struct PlinkPcaBindData : public TableFunctionData {
 	string pgen_path;
+	bool use_vfs = false; // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
 	string pvar_path;
 	string psam_path;
 
@@ -260,6 +262,9 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 	}
 
 	// --- Initialize pgenlib (temporary, for header + allele freq counting) ---
+	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
+	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
+
 	plink2::PgenFileInfo pgfi;
 	plink2::PreinitPgfi(&pgfi);
 
@@ -549,6 +554,7 @@ static unique_ptr<LocalTableFunctionState> PlinkPcaInitLocal(ExecutionContext &c
 	state->thread_id = gstate.next_thread_id.fetch_add(1);
 
 	// --- Initialize per-thread PgenFileInfo + PgenReader ---
+	PgenVfsScope pgen_vfs_scope(context.client, bind_data.use_vfs);
 	plink2::PreinitPgfi(&state->pgfi);
 	plink2::PreinitPgr(&state->pgr);
 
