@@ -62,6 +62,14 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	                          "When true, parquet companions are preferred over text formats.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
+	config.AddExtensionOption("plinking_sample_counts_sparse",
+	                          "orient := 'sample' + genotypes := 'counts'|'stats': when true, use the "
+	                          "sparse (pgen difflist) accumulation path — reads only the non-hom_ref "
+	                          "carriers of rare variants (auto-falls-back to the dense full-decode path "
+	                          "per variant). When false, always use the dense path. Toggle to A/B time "
+	                          "both; both paths produce identical counts.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	// Register table functions
 	RegisterPvarReader(loader);
 	RegisterPsamReader(loader);

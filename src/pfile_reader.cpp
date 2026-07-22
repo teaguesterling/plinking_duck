@@ -540,6 +540,8 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	// per-sample carrier/counts queries over huge variant ranges feasible. Modeled
 	// on plink_missing's two-phase pattern.
 	bool smp_streaming = false;                         // aggregate sample orient?
+	bool smp_use_sparse = false;                        // Phase 1: use pgen difflist path
+	uint32_t smp_max_difflist_len = 0;                  // difflist cutoff (output_sample_ct/8)
 	std::atomic<uint32_t> smp_next_batch {0};           // Phase 1: claims into `batches`
 	std::atomic<uint32_t> smp_phase1_active {0};        // threads currently in Phase 1
 	std::atomic<bool> smp_phase1_done {false};          // accumulation complete → Phase 2
@@ -629,6 +631,10 @@ struct PfileLocalState : public LocalTableFunctionState {
 	vector<uint32_t> smp_local_het, smp_local_hom_alt, smp_local_missing;
 	vector<uint8_t> smp_local_in_range, smp_local_has_missing;
 	bool smp_phase1_contributed = false;
+
+	// Sparse (difflist) Phase 1 workspace (when plinking_sample_counts_sparse).
+	AlignedBuffer smp_raregeno_buf;           // packed 2-bit genotypes of the difflist samples
+	vector<uint32_t> smp_difflist_sample_ids; // subset-relative indices of the difflist samples
 
 	// Per-thread cache of one chunk of the projected psam CDC (PfileGlobalState::psam_cdc),
 	// for reading psam column values at scan time. Populated lazily via FetchChunk.
@@ -2042,6 +2048,18 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 				state->smp_in_range.assign(osc, 0);
 				state->smp_has_missing.assign(osc, 0);
 			}
+			// Sparse (difflist) path: opt-in via plinking_sample_counts_sparse. It skips
+			// the hom_ref majority of rare variants. A hom_ref-INCLUSIVE filter would
+			// need every non-carrier sample marked (O(samples), defeating the point), so
+			// force dense in that case — carrier filters (het/hom_alt/missing) don't hit it.
+			Value sparse_val;
+			bool want_sparse = context.TryGetCurrentSetting("plinking_sample_counts_sparse", sparse_val) &&
+			                   sparse_val.GetValue<bool>();
+			bool filter_allows_hom_ref = bind_data.genotype_filter.active && bind_data.genotype_filter.AllowsCall(0.0);
+			if (want_sparse && !filter_allows_hom_ref) {
+				state->smp_use_sparse = true;
+				state->smp_max_difflist_len = std::max<uint32_t>(1, osc / 8);
+			}
 		}
 	} else {
 		state->total_count = bind_data.EffectiveVariantCt();
@@ -2214,6 +2232,13 @@ static unique_ptr<LocalTableFunctionState> PfileInitLocal(ExecutionContext &cont
 		if (bind_data.genotype_filter.active) {
 			state->smp_local_in_range.assign(osc, 0);
 			state->smp_local_has_missing.assign(osc, 0);
+		}
+		// Sparse (difflist) workspace: raregeno holds up to max_difflist_len packed
+		// 2-bit genotypes; sample_ids needs one extra slot (pgenlib appends sample_ct).
+		if (gstate.smp_use_sparse) {
+			uint32_t mdl = gstate.smp_max_difflist_len;
+			state->smp_raregeno_buf.Allocate(plink2::NypCtToAlignedWordCt(mdl) * sizeof(uintptr_t));
+			state->smp_difflist_sample_ids.resize(mdl + 2);
 		}
 	}
 
@@ -3257,6 +3282,36 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		uint8_t *l_inr = filter_active ? lstate.smp_local_in_range.data() : nullptr;
 		uint8_t *l_hasm = filter_active ? lstate.smp_local_has_missing.data() : nullptr;
 
+		// Dense accumulation: decode the whole genovec and touch every sample. Used
+		// by the non-sparse path and as the sparse path's per-variant fallback.
+		auto accumulate_dense = [&](const uintptr_t *genovec) {
+			plink2::GenoarrToBytesMinus9(genovec, output_sample_ct, lstate.genotype_bytes.data());
+			const int8_t *b = lstate.genotype_bytes.data();
+			for (uint32_t s = 0; s < output_sample_ct; s++) {
+				int8_t g = b[s];
+				switch (g) {
+				case 1:
+					l_het[s]++;
+					break;
+				case 2:
+					l_homalt[s]++;
+					break;
+				case 0:
+					break; // hom_ref derived at emit time
+				default:
+					l_miss[s]++;
+					break;
+				}
+				if (filter_active) {
+					if (g == -9) {
+						l_hasm[s] = 1;
+					} else if (gf.AllowsCall(static_cast<double>(g))) {
+						l_inr[s] = 1;
+					}
+				}
+			}
+		};
+
 		while (true) {
 			uint32_t bidx = gstate.smp_next_batch.fetch_add(1);
 			if (bidx >= gstate.batches.size()) {
@@ -3267,19 +3322,53 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 			auto &src = bind_data.sources[batch.source_idx];
 			const uintptr_t *si_ptr = bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
 
+			auto *genovec = lstate.genovec_buf.As<uintptr_t>();
 			for (uint32_t lev = batch.local_start; lev < batch.local_end; lev++) {
 				uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[lev] : lev;
-				plink2::PglErr perr = plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                                     lstate.genovec_buf.As<uintptr_t>());
-				if (perr != plink2::kPglRetSuccess) {
-					throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient aggregation",
-					                  vidx);
+
+				if (!gstate.smp_use_sparse) {
+					plink2::PglErr perr =
+					    plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx, &lstate.pgr, genovec);
+					if (perr != plink2::kPglRetSuccess) {
+						throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient aggregation",
+						                  vidx);
+					}
+					accumulate_dense(genovec);
+					continue;
 				}
-				plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
-				                             lstate.genotype_bytes.data());
-				const int8_t *b = lstate.genotype_bytes.data();
-				for (uint32_t s = 0; s < output_sample_ct; s++) {
-					int8_t g = b[s];
+
+				// Sparse path: pgen hands back the difflist for rare variants (only the
+				// non-common samples) or a genovec for common ones. For the common case
+				// (majority hom_ref) we touch only the carriers; everything else falls
+				// back to the dense loop (correct, never worse).
+				uint32_t common_geno = 0;
+				uint32_t difflist_len = 0;
+				auto *raregeno = lstate.smp_raregeno_buf.As<uintptr_t>();
+				uint32_t *difflist_ids = lstate.smp_difflist_sample_ids.data();
+				plink2::PglErr perr = plink2::PgrGetDifflistOrGenovec(
+				    si_ptr, lstate.pssi, output_sample_ct, gstate.smp_max_difflist_len, vidx, &lstate.pgr, genovec,
+				    &common_geno, raregeno, difflist_ids, &difflist_len);
+				if (perr != plink2::kPglRetSuccess) {
+					throw IOException("read_pfile: PgrGetDifflistOrGenovec failed for variant %u", vidx);
+				}
+				if (common_geno == UINT32_MAX || common_geno != 0) {
+					// Dense genovec returned, OR a difflist whose majority is not hom_ref
+					// (rare — ALT/missing-major): decode densely. The latter re-reads the
+					// variant, but such variants are uncommon so it's negligible.
+					if (common_geno != 0 && common_geno != UINT32_MAX) {
+						perr = plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx, &lstate.pgr, genovec);
+						if (perr != plink2::kPglRetSuccess) {
+							throw IOException("read_pfile: PgrGet (sparse fallback) failed for variant %u", vidx);
+						}
+					}
+					accumulate_dense(genovec);
+					continue;
+				}
+				// Fast path: majority hom_ref. Non-difflist samples are hom_ref (handled
+				// by derivation); only the difflist carriers touch the counters.
+				for (uint32_t j = 0; j < difflist_len; j++) {
+					uint32_t s = difflist_ids[j];
+					uint32_t g = (raregeno[j / plink2::kBitsPerWordD2] >> (2 * (j % plink2::kBitsPerWordD2))) & 3;
 					switch (g) {
 					case 1:
 						l_het[s]++;
@@ -3287,14 +3376,14 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					case 2:
 						l_homalt[s]++;
 						break;
-					case 0:
-						break; // hom_ref derived at emit time
-					default:
+					case 3:
 						l_miss[s]++;
 						break;
+					default:
+						break; // g==0 is the common genotype and never appears in the difflist
 					}
 					if (filter_active) {
-						if (g == -9) {
+						if (g == 3) {
 							l_hasm[s] = 1;
 						} else if (gf.AllowsCall(static_cast<double>(g))) {
 							l_inr[s] = 1;

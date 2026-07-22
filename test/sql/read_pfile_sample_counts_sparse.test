@@ -1,0 +1,64 @@
+# name: test/sql/read_pfile_sample_counts_sparse.test
+# description: plinking_sample_counts_sparse toggles the pgen difflist accumulation path for orient='sample' counts/stats. It must produce IDENTICAL results to the dense path. rare_small is a REF-major, difflist-encoded fixture (256 samples x 400 ultra-rare variants) so the sparse fast path (common_geno==hom_ref) is actually exercised.
+# group: [sql]
+
+require plinking_duck
+
+# The fixture must be REF-major (hom_ref the majority) or the sparse fast path
+# would never trigger — guard that assumption explicitly.
+query IIII
+SELECT sum(genotypes.hom_ref) hom_ref, sum(genotypes.het) het, sum(genotypes.hom_alt) hom_alt, sum(genotypes.missing) miss
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
+----
+97595	3291	502	1012
+
+# --- Dense path (default) ---
+query IIII
+SELECT sum(genotypes.het), sum(genotypes.hom_alt), sum(genotypes.missing), sum(genotypes.hom_ref)
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
+----
+3291	502	1012	97595
+
+# --- Sparse path: identical totals ---
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query IIII
+SELECT sum(genotypes.het), sum(genotypes.hom_alt), sum(genotypes.missing), sum(genotypes.hom_ref)
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
+----
+3291	502	1012	97595
+
+# per-sample equivalence: sparse EXCEPT dense must be empty (both computed under
+# the current sparse=true setting vs an explicit dense subquery is awkward in one
+# statement, so assert the aggregate identity above plus stats below).
+
+# --- stats derived identically under the sparse path ---
+query IIR
+SELECT sum(genotypes.n), sum(genotypes.carrier_count), round(sum(genotypes.het) / sum(genotypes.n), 6)
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'stats');
+----
+101388	3793	0.032459
+
+# --- carrier row-skip under sparse (het/hom_alt): same keep-set as dense ---
+query I
+SELECT count(*) FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts', include_genotypes := ['het','hom_alt']);
+----
+256
+
+# --- empty region under sparse: all-zero counts, no hang ---
+query III
+SELECT count(*), sum(genotypes.het), sum(genotypes.hom_ref)
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts', region := 'chrZ:1-2');
+----
+256	0	0
+
+statement ok
+RESET plinking_sample_counts_sparse;
+
+# --- back on the dense path, totals still match (sanity) ---
+query II
+SELECT sum(genotypes.het), sum(genotypes.hom_alt)
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts');
+----
+3291	502
