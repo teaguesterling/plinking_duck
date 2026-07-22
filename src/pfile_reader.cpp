@@ -913,9 +913,15 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 	// --- Multi-file guards (throw before loading anything) ---
 	if (multi_file) {
-		if (!override_pgen.empty() || !override_pvar.empty() || !override_psam.empty()) {
-			throw InvalidInputException("read_pfile: pgen/pvar/psam overrides cannot be combined with a multi-file "
-			                            "list (they can't disambiguate per shard)");
+		// pgen/pvar overrides can't disambiguate across shards: the list elements
+		// ARE the per-shard pgens, and each shard has its own (different) variants.
+		// A psam override IS allowed — all shards share one sample set by contract,
+		// so a single .psam legitimately applies to every shard ("use this psam for
+		// all pgens"); it becomes the shared sample metadata (see below).
+		if (!override_pgen.empty() || !override_pvar.empty()) {
+			throw InvalidInputException(
+			    "read_pfile: pgen/pvar overrides cannot be combined with a multi-file list (pgen is the per-shard "
+			    "input and pvar differs per shard). A psam override is allowed — it applies to every shard.");
 		}
 		// `variants` resolves against a single file's variant index; across a
 		// multi-file list neither by-ID (an ID lives in only one shard) nor by-index
@@ -938,8 +944,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	for (idx_t si = 0; si < prefixes.size(); si++) {
 		uint32_t src_sample_ct = 0;
 		// combine_samples := 'identical' needs each shard's .psam discovered so we
-		// can compare IIDs below; otherwise only source 0's psam is needed.
-		bool need_psam = (si == 0) || (bind_data->combine_samples == CombineSamplesMode::IDENTICAL);
+		// can compare IIDs below; otherwise only source 0's psam is needed. A psam
+		// override supplies one shared .psam for all shards, so there is nothing to
+		// discover or compare per shard.
+		bool need_psam =
+		    (si == 0) || (bind_data->combine_samples == CombineSamplesMode::IDENTICAL && override_psam.empty());
 		PfileSource src = LoadPfileSource(context, fs, prefixes[si], si == 0 ? override_pgen : string(),
 		                                  si == 0 ? override_pvar : string(), si == 0 ? override_psam : string(),
 		                                  need_psam, bind_data->region, src_sample_ct);
@@ -1038,7 +1047,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// silently fuse different individuals into one row (esp. in sample orient).
 	// Cost: one .psam parse per shard — the price of validation; 'implicit' (the
 	// default) skips it and trusts the caller.
-	if (multi_file && bind_data->combine_samples == CombineSamplesMode::IDENTICAL) {
+	if (multi_file && bind_data->combine_samples == CombineSamplesMode::IDENTICAL && override_psam.empty()) {
 		vector<string> ref_iids_owned;
 		const vector<string> *ref_iids = &bind_data->sample_info.iids;
 		if (ref_iids->empty()) { // variant orient loads count-only — fetch IIDs for the check

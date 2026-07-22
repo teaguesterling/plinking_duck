@@ -92,3 +92,43 @@ statement error
 SELECT count(*) FROM read_pfile(['test/data/shard1'], orient := 'sample', combine_samples := 'nonsense');
 ----
 unknown combine_samples
+
+# --- psam override applies to ALL shards (biobank layout: per-shard pgen+pvar,
+#     one shared .psam). Result is identical to auto-discovery. ---
+query II
+SELECT count(*) AS rows, DISTINCT_len FROM (
+  SELECT len(genotypes) AS DISTINCT_len FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', psam := 'test/data/shard1.psam')
+) GROUP BY DISTINCT_len;
+----
+8	2000
+
+query I
+WITH ov AS (SELECT genotypes g FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', genotypes := 'list', psam := 'test/data/shard1.psam') WHERE IID = 'SAMP1'),
+     au AS (SELECT genotypes g FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', genotypes := 'list') WHERE IID = 'SAMP1')
+SELECT ov.g = au.g FROM ov, au;
+----
+true
+
+# psam override composes with combine_samples := 'identical' (one shared psam is
+# trivially identical, so the per-shard IID check is skipped).
+query I
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', psam := 'test/data/shard1.psam', combine_samples := 'identical');
+----
+8
+
+# A psam whose sample_ct disagrees with the pgens is still a hard error.
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], psam := 'test/data/pgen_example.psam');
+----
+sample count mismatch
+
+# pgen/pvar overrides remain rejected for a multi-file list (per-shard ambiguous).
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], pgen := 'test/data/shard1.pgen');
+----
+pgen/pvar overrides cannot be combined with a multi-file list
+
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], pvar := 'test/data/shard1.pvar');
+----
+pgen/pvar overrides cannot be combined with a multi-file list
