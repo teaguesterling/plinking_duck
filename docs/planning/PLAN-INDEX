@@ -177,15 +177,17 @@ P4-004 (arbitrary sources, tables/views) deferred to later.
 
 ### Future — Planned Features
 
-| Feature | Description | Design Doc | Status |
+**See `ROADMAP` for the sequenced next-few-releases plan.** Status table:
+
+| Feature | Description | Design Doc | Status / target |
 |---------|------------|------------|--------|
-| P2-007 plink_phenotype | Scalar helper for loading phenotype/covariate data | `P2-007-plink-phenotype` | Design only |
-| plink_glm psam column refs | `phenotype := 'height'` reads column from psam | (part of P2-007) | Planned |
+| P12-001 remote/VFS `.pgen` reads | Read `.pgen` over s3://…/http (fopencookie shim + block cache); ahead of plink2 | `P12-001-*` | **SHIPPED v0.8.0** |
+| P12 follow-ups | `localize` (download-to-temp), `.pgi` split-index, macOS `funopen` CI | `P12-001-implementation-notes` | v0.8.1 |
+| P10-001 filter pushdown | `WHERE` drives region/af/sample/genotype filters | `P10-001-filter-pushdown` | Design only → v0.9.0 |
+| P2-007 plink_phenotype + GLM psam refs | `phenotype := 'height'` reads from a psam column | `P2-007-plink-phenotype` | Design only → v0.9.0 |
+| P9 pfile writer | Write `.pgen`/`.pvar`/`.psam` via `COPY ... TO` | `P9-001`/`P9-002` (on archived `feature/reader-completion`) | Design + spikes done → v0.10.0 |
+| P11-001 ATTACH pfile catalog | Attach a fileset as a schema of views; needs P10 | `P11-001-attach-pfile-catalog` | Design only (spike-gated) → v0.11.0+ |
 | plink_glm multi-phenotype | Run multiple phenotypes in one scan | — | Future |
-| P9 pfile writer | Write `.pgen`/`.pvar`/`.psam` via `COPY ... TO` | `P9-001`/`P9-002` (on `feature/reader-completion`) | Design + spikes done, build not started |
-| P10-001 filter pushdown | `WHERE` drives region/af/sample/genotype filters | `P10-001-filter-pushdown` | Design only |
-| P11-001 ATTACH pfile catalog | Attach a fileset as a schema of views; enabled by P10 | `P11-001-attach-pfile-catalog` | Design only (spike-gated) |
-| P12-001 remote/VFS `.pgen` reads | Read `.pgen` over s3://…/http via a pgenlib FILE*→FileHandle shim (range reads); ahead of plink2 | `P12-001-remote-vfs-pgen-reads` | Design only (spike-gated; ship download-to-temp first) |
 
 ### Future — Deferred Candidates
 

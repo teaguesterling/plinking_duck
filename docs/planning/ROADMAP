@@ -1,0 +1,90 @@
+# plinking_duck roadmap
+
+Sequenced plan for the next few releases. Shipped features are in the git history
+and `PLAN-INDEX`; this file is the forward view. Ordering is a recommendation —
+the writer-vs-ergonomics timing (v0.9 ↔ v0.10) is the main open call.
+
+## Shipped
+
+- **v0.7.x** — multi-file/sharded reads, `combine_samples`, shared `psam`;
+  `file_search_path`/glob/`pathmacro:` resolution; region-zero-match crash fix;
+  streaming per-sample counts/stats + optional sparse (difflist) carrier path;
+  plink2-wrapping audit (chrX HWE fix, vendored-extract pinning + drift canary).
+- **v0.8.0** — **remote / VFS `.pgen` reads** (s3://, http, pathmacro:,
+  file_search_path) across every reader + analysis function, via a `fopencookie`
+  shim on pgenlib + a read-ahead block cache; `plinking_pgen_io` policy. Ahead of
+  the plink2 CLI (local-only). Design: `P12-001-*`.
+
+## v0.8.1 — complete the remote story (patch)
+
+Small, no-fork follow-ups that round out P12. Good first release after v0.8.0.
+
+- **macOS CI** — validate/fix the `funopen` branch (first compiled on the
+  community-CI macOS job for #2298). Likely trivial; blocks a clean cross-platform
+  publish.
+- **`localize`** — implement the reserved `plinking_pgen_io := 'localize'`: fetch a
+  remote `.pgen` to a temp via the VFS, read it natively. The good answer for
+  remote *full scans* (where range-reads over-fetch). Needs temp-file lifecycle +
+  a URL→temp cache. Design notes in `P12-001-implementation-notes`.
+- **`.pgi` split-index** — companion-discover a `.pgi` and thread `pgi_fname`
+  (currently always `nullptr` = embedded-index only). Non-fork compat fix; the
+  `.pgi` rides the existing VFS shim. See `P12-001-remote-vfs-pgen-reads` §0a.
+- *(stretch)* shared cross-reader block cache — only if a real multi-thread
+  remote-scan workload shows the per-thread index re-read hurting (localize +
+  `cache_httpfs` cover most of it first).
+
+## v0.9.0 — query ergonomics + GWAS convenience (feature)
+
+Cohesive "nicer queries, easier GWAS" release. Moderate effort, no vendored fork.
+
+- **P10 filter pushdown** — a `WHERE` clause drives the reader's existing
+  region/af/ac/sample/genotype filters (`WHERE CHROM='17' AND POS BETWEEN …` runs
+  the region pushdown). Idiomatic SQL, and the enabler for efficient ATTACH views.
+  Design: `P10-001-filter-pushdown`. Risk: consumed-vs-residual filter reporting.
+- **P2-007 `plink_phenotype` + GLM psam column refs** — `plink_glm(…, phenotype :=
+  'height')` reads the phenotype/covariates from a `.psam` column instead of a
+  separate join. Removes the most common GWAS friction. Design: `P2-007-*`.
+
+## v0.10.0 — the pfile WRITER (headline feature)
+
+The biggest earmarked capability: make plinking_duck **read *and* write**.
+`COPY (SELECT … ORDER BY chrom,pos) TO 'prefix' (FORMAT pfile, variant_fields:={…},
+sample_fields:={…}, genotype_fields:=…)` writing `.pgen`/`.pvar`/`.psam` (and a
+plink-VCF). Design + both feasibility spikes are **green**
+(`P9-001-writers-design` + `P9-002-writers-implementation-plan`, on the archived
+`feature/reader-completion` branch); build not started. Brings in pgenlib's write
+path (currently excluded), same `FILE*`-local-only constraint as the reader (so a
+remote writer waits, like `localize`). Build order A→E: CopyFunction scaffold +
+text writers → `.pgen` → pfile bundle → shard wrapper → plink_vcf. Its own release
+given the size. *(Could move to v0.9.0 if the writer is the priority over
+ergonomics — the main open sequencing call.)*
+
+## v0.11.0+ — catalog + population genetics (later)
+
+- **P11 ATTACH pfile catalog** — `ATTACH 'cohort' AS c (TYPE plink)` exposing
+  `c.variants` / `c.samples` / `c.genotypes` / `c.freq` / … as a schema of views.
+  Spike-gated; **depends on P10** (views need WHERE-pushdown to be flexible) and
+  reads best **after the writer** (so it can unify read + write of a fileset as one
+  attachable database). Cheap interim: a `plink_attach()` view/macro helper to
+  validate demand first. Design: `P11-001-attach-pfile-catalog`.
+- **Deferred analysis functions** (demand-driven): `plink_king_table` (kinship,
+  O(N²)), `plink_het`, `plink_fst`. See PLAN-INDEX "Deferred Candidates".
+
+## Cross-cutting / opportunistic
+
+- **P4-004 flexible companion sources** — parquet + table/view/query companions
+  already ship; full arbitrary-source generalization is the remaining piece.
+- **Global `variants := [...]` across a multi-file list** and **`read_pgen` LIST
+  input** — designed on the archived `feature/reader-completion` branch (its
+  sample-orient-multifile approach was superseded by v0.7.2's variant-axis
+  concatenation; the read_pgen-list + global-variants bits remain unshipped).
+- **`filter pushdown` for the analysis functions** once P10 lands for the readers.
+
+## Notes
+
+- Stale unmerged branches (`fix/sex-chromosome-ploidy`, `feature/sample-orient-
+  genotype-filter`, `feat/duckdb-v1.5.3-and-main-compat`, etc.) are superseded
+  reimplementations already in `main` (verified: the phase-buffer-corruption fix is
+  present) — safe to delete after a spot-check.
+- The `.pgen` `FILE*`-local-only boundary gates two things (remote writes, remote
+  full-scan efficiency); `localize` and the (someday) pgenlib VFS-shim close it.
