@@ -83,6 +83,9 @@ set(PLINK_NG_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/plink-ng)
 file(GLOB PLINK_NG_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/patches/plink-ng/*.patch)
 list(SORT PLINK_NG_PATCHES)
 find_package(Git QUIET)
+if(PLINK_NG_PATCHES AND NOT Git_FOUND)
+    message(FATAL_ERROR "git is required to apply patches/plink-ng/*.patch but was not found")
+endif()
 foreach(_patch ${PLINK_NG_PATCHES})
     execute_process(
         COMMAND ${GIT_EXECUTABLE} -C ${PLINK_NG_SUBMODULE} apply --reverse --check ${_patch}
@@ -97,6 +100,18 @@ foreach(_patch ${PLINK_NG_PATCHES})
         message(STATUS "Applied plink-ng patch: ${_patch}")
     endif()
 endforeach()
+
+# Assert the patch's EFFECT is present in the source we compile — the definitive
+# guard that the shipped binary actually has the VFS hook. A runtime test can't
+# prove this (on a local path Path L and Path V produce identical output), so if
+# `git apply` ever silently no-ops in a CI checkout, THIS fails the build loudly
+# instead of shipping a feature-less binary that still passes every test.
+file(READ ${PGENLIB_DIR}/pgenlib_read.cc _pgenlib_read_src)
+if(NOT _pgenlib_read_src MATCHES "plinking_pgen_fopen")
+    message(FATAL_ERROR
+        "plink-ng patch did not take effect: pgenlib_read.cc has no 'plinking_pgen_fopen' hook. "
+        "The patches/plink-ng/*.patch apply step failed silently.")
+endif()
 
 # --- libdeflate (C library) ---
 add_library(plink_libdeflate STATIC

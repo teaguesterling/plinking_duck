@@ -10,9 +10,12 @@
 // cookie primitive: plinking_pgen_vfs_supported() returns 0 and Path V opens fall
 // back to fopen (remote simply fails to open, as today), so nothing regresses.
 
-// fopencookie / off64_t / cookie_io_functions_t are GNU extensions.
+// fopencookie / off64_t / cookie_io_functions_t are GNU extensions (glibc/musl).
+// Not needed — and potentially header-affecting — on macOS/BSD, which use funopen.
+#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #endif
 #include <cstdio>
 
