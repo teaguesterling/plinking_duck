@@ -1,4 +1,4 @@
-# Performance
+# Optimizations
 
 PlinkingDuck is designed for efficient access to large PLINK datasets. This guide explains the performance features and how to take advantage of them.
 

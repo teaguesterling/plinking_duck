@@ -55,6 +55,7 @@ nav:
       - plink_ld: functions/plink_ld.md
       - plink_score: functions/plink_score.md
   - Guides:
+      - File Handling: guides/file-handling.md
       - Quality Control: guides/quality-control.md
-      - Performance: guides/performance.md
+      - Optimizations: guides/optimizations.md
   - Development: development.md

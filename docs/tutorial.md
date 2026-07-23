@@ -590,10 +590,10 @@ FROM plink_freq('test/data/large_example.pgen',
 
 !!! tip "Performance tips"
     - Use `region` instead of `WHERE CHROM = ...` — it avoids reading genotype data outside the region
-    - Select only the columns you need — [projection pushdown](guides/performance.md) skips unused computation
+    - Select only the columns you need — [projection pushdown](guides/optimizations.md) skips unused computation
     - Use dedicated analysis functions (`plink_freq`, `plink_hardy`) instead of computing from raw genotypes — they use optimized pgenlib paths
 
-    See the [Performance Guide](guides/performance.md) for the full set of optimization strategies.
+    See the [Performance Guide](guides/optimizations.md) for the full set of optimization strategies.
 
 ---
 
@@ -603,6 +603,6 @@ You've now seen the complete PlinkingDuck workflow: loading data, exploring geno
 
 - **[Function Reference](functions/index.md)** — full parameter and output documentation for every function
 - **[Quality Control Guide](guides/quality-control.md)** — detailed QC workflows with recommended thresholds
-- **[Performance Guide](guides/performance.md)** — optimization strategies for large datasets
+- **[Performance Guide](guides/optimizations.md)** — optimization strategies for large datasets
 - **[Common Parameters](common-parameters.md)** — sample subsetting, region filtering, and companion file options
 - **[Genotype Encoding](genotype-encoding.md)** — how genotype values map to allele counts

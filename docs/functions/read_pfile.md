@@ -86,7 +86,7 @@ In genotype orient mode, each row represents one variant-sample combination. The
 
 In sample orient mode, each row represents one sample. The genotypes array contains one value per variant (M = effective variant count after filtering). A multi-file list concatenates every shard's variants along this axis (M = total across shards).
 
-**Aggregate output** (`genotypes := 'counts'` or `'stats'`) replaces the array with a per-sample summary STRUCT — how many `hom_ref` / `het` / `hom_alt` / `missing` genotypes that sample has across the variant range (`stats` adds `n`, `af`, `maf`, `missing_rate`, `carrier_count`, `het_rate`). These modes **stream** (they do not materialize the variants × samples matrix), so they are not bounded by `plinking_max_matrix_elements` and are the fast path for per-individual **carrier counting** over large variant ranges. See [Performance](../guides/performance.md#per-sample-counts--carrier-finding).
+**Aggregate output** (`genotypes := 'counts'` or `'stats'`) replaces the array with a per-sample summary STRUCT — how many `hom_ref` / `het` / `hom_alt` / `missing` genotypes that sample has across the variant range (`stats` adds `n`, `af`, `maf`, `missing_rate`, `carrier_count`, `het_rate`). These modes **stream** (they do not materialize the variants × samples matrix), so they are not bounded by `plinking_max_matrix_elements` and are the fast path for per-individual **carrier counting** over large variant ranges. See [Performance](../guides/optimizations.md#per-sample-counts-carrier-finding).
 
 The array/list/struct/columns modes pre-read the genotype matrix at bind time (bounded by `plinking_max_matrix_elements`, default 16 G elements).
 
@@ -131,6 +131,9 @@ query (and each parallel thread reads the index + its range independently) —
 load the community `cache_httpfs` extension (a block cache over `httpfs`) or
 reduce threads for full-scan-over-remote workloads. Split-index (`.pgi`) filesets
 are not yet supported (embedded-index `.pgen` only).
+
+See the [File Handling](../guides/file-handling.md) guide for the full treatment of
+discovery, companions, multi-file/sharded reads, path resolution, and remote reads.
 
 ### Multi-File Input
 
