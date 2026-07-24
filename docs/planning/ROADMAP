@@ -22,10 +22,15 @@ Small, no-fork follow-ups that round out P12. Good first release after v0.8.0.
 - **macOS CI** — validate/fix the `funopen` branch (first compiled on the
   community-CI macOS job for #2298). Likely trivial; blocks a clean cross-platform
   publish.
-- **`localize`** — implement the reserved `plinking_pgen_io := 'localize'`: fetch a
-  remote `.pgen` to a temp via the VFS, read it natively. The good answer for
-  remote *full scans* (where range-reads over-fetch). Needs temp-file lifecycle +
-  a URL→temp cache. Design notes in `P12-001-implementation-notes`.
+- **`localize` (opt-in, configurable)** — implement the reserved
+  `plinking_pgen_io := 'localize'`: fetch a remote `.pgen` to a temp via the VFS,
+  read it natively. The good answer for remote *full scans* (where range-reads
+  over-fetch) — but **not always wanted** (disk-constrained hosts, scan-once
+  workloads, or when streaming range-reads is preferable). So it stays **explicit
+  opt-in**: `auto` never auto-localizes (remote → range reads), and `localize`
+  adds a configurable temp directory (`plinking_localize_dir`?) + an optional
+  size/threshold and a URL→temp cache (skip re-download of the same file). Needs
+  temp-file lifecycle. Design notes in `P12-001-implementation-notes`.
 - **`.pgi` split-index** — companion-discover a `.pgi` and thread `pgi_fname`
   (currently always `nullptr` = embedded-index only). Non-fork compat fix; the
   `.pgi` rides the existing VFS shim. See `P12-001-remote-vfs-pgen-reads` §0a.
@@ -41,6 +46,14 @@ Cohesive "nicer queries, easier GWAS" release. Moderate effort, no vendored fork
   region/af/ac/sample/genotype filters (`WHERE CHROM='17' AND POS BETWEEN …` runs
   the region pushdown). Idiomatic SQL, and the enabler for efficient ATTACH views.
   Design: `P10-001-filter-pushdown`. Risk: consumed-vs-residual filter reporting.
+  Gated by a new **`plinking_pushdown_mode`** setting:
+  - `'none'` — no pushdown (post-scan filtering only; the pre-P10 behavior).
+  - `'standard'` *(default, v0.9.0)* — `WHERE` → region/af/ac/sample/genotype filters.
+  - `'smart'` — *(v0.11.0+)* also **infer read config from column references**: a
+    query touching `variants.<ID>` / `samples.<IID>` / `genotype.<field>` auto-
+    configures the corresponding `variants :=` / `samples :=` / genotype selection
+    on `read_pfile`, so column access drives what's read. More speculative
+    (projection→config inference); deferred past `'standard'`.
 - **P2-007 `plink_phenotype` + GLM psam column refs** — `plink_glm(…, phenotype :=
   'height')` reads the phenotype/covariates from a `.psam` column instead of a
   separate join. Removes the most common GWAS friction. Design: `P2-007-*`.
@@ -49,15 +62,25 @@ Cohesive "nicer queries, easier GWAS" release. Moderate effort, no vendored fork
 
 The biggest earmarked capability: make plinking_duck **read *and* write**.
 `COPY (SELECT … ORDER BY chrom,pos) TO 'prefix' (FORMAT pfile, variant_fields:={…},
-sample_fields:={…}, genotype_fields:=…)` writing `.pgen`/`.pvar`/`.psam` (and a
-plink-VCF). Design + both feasibility spikes are **green**
-(`P9-001-writers-design` + `P9-002-writers-implementation-plan`, on the archived
-`feature/reader-completion` branch); build not started. Brings in pgenlib's write
-path (currently excluded), same `FILE*`-local-only constraint as the reader (so a
-remote writer waits, like `localize`). Build order A→E: CopyFunction scaffold +
-text writers → `.pgen` → pfile bundle → shard wrapper → plink_vcf. Its own release
-given the size. *(Could move to v0.9.0 if the writer is the priority over
-ergonomics — the main open sequencing call.)*
+sample_fields:={…}, genotype_fields:=…)`. Design + both feasibility spikes are
+**green** (`P9-001-writers-design` + `P9-002-writers-implementation-plan`, on the
+archived `feature/reader-completion` branch); build not started. Brings in
+pgenlib's write path (currently excluded), same `FILE*`-local-only constraint as
+the reader (so a remote writer waits, like `localize`).
+
+**Modular — write any subset, not just the bundle:**
+- Individual `.pvar` / `.psam` / `.pgen` writers (e.g. `FORMAT pvar`/`psam`/`pgen`,
+  or `write_pvar`/`write_psam`/`write_pgen`) AND the bundled `FORMAT pfile`.
+- Options to **also emit companions**: `.pgi` (split index) and/or
+  `.pvar.parquet` / `.psam.parquet` (parquet companions), so the output is
+  round-trippable by the reader's fast paths.
+
+Build order A→E: CopyFunction scaffold + text `.pvar`/`.psam` writers → `.pgen`
+(+ optional `.pgi`) → pfile bundle (+ optional parquet companions) → shard wrapper
+→ plink-VCF. A full **VCF/BCF writer** is a distinct effort → v0.11.0+ (below);
+plink-VCF (biallelic, plink-flavored) is in scope here. Its own release given the
+size. *(Could move to v0.9.0 if the writer is the priority over ergonomics — the
+main open sequencing call.)*
 
 ## v0.11.0+ — catalog + population genetics (later)
 
