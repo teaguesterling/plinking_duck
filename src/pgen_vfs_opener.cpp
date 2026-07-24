@@ -248,6 +248,17 @@ void LocalizePgenIfRequested(ClientContext &context, string &pgen_path, PgenLoca
 	// Track BEFORE the copy so a partial/failed download is still unlinked.
 	guard.Track(fs, temp);
 	LocalizeCopy(fs, pgen_path, temp);
+	// Split-index fileset: if the source uses an external index, pgenlib will look
+	// for the localized .pgen's derived companion ("<temp>.pgi"). We only copied the
+	// .pgen, so also copy the source's ".pgi" companion (standard name is
+	// "<pgen>.pgi") to that derived name — otherwise the split-index read fails on
+	// the missing index. Embedded-index filesets have no .pgi (skipped).
+	string src_pgi = pgen_path + ".pgi";
+	if (fs.FileExists(src_pgi)) {
+		string temp_pgi = temp + ".pgi";
+		guard.Track(fs, temp_pgi);
+		LocalizeCopy(fs, src_pgi, temp_pgi);
+	}
 	pgen_path = temp; // downstream opens read the native local temp
 }
 

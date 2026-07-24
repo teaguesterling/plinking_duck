@@ -102,6 +102,21 @@ EOF
 "$PLINK2" --vcf dosage_example.vcf dosage=HDS --make-pgen --out dosage_example --allow-extra-chr
 rm -f dosage_example.vcf
 
+# Split-index fixture: pgen_split.* is pgen_example recoded with an EXTERNAL index
+# (a separate .pgen.pgi companion; header type 0x2x) instead of the embedded index
+# plink2 --make-pgen writes (0x1x). plink2's CLI only writes embedded indexes, so we
+# use plink-ng's `pgen_compress -i` tool. Genotypes/variants/samples are identical to
+# pgen_example, so its .pvar/.psam are reused verbatim and pgen_example is the read
+# oracle (see test/sql/read_pfile_pgi.test).
+#   Build pgen_compress from the pinned submodule (needs pgenlib_write.cc, which the
+#   extension build excludes — build it standalone against the submodule sources):
+#     cd ../../third_party/plink-ng/2.0 && make pgen_compress   # -> bin/pgen_compress
+#   Then:
+#     ../../third_party/plink-ng/2.0/bin/pgen_compress -i pgen_example.pgen pgen_split.pgen
+#     cp pgen_example.pvar pgen_split.pvar
+#     cp pgen_example.psam pgen_split.psam
+# (pgen_compress writes pgen_split.pgen + the derived pgen_split.pgen.pgi.)
+
 echo "Test data generated successfully."
 echo "Generated files:"
 ls -la pgen_example.pgen pgen_example.pvar pgen_example.psam \

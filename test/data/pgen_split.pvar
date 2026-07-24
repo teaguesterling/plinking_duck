@@ -1,0 +1,7 @@
+##contig=<ID=1,length=100000>
+##contig=<ID=2,length=100000>
+#CHROM	POS	ID	REF	ALT
+1	10000	rs1	A	G
+1	20000	rs2	C	T
+1	30000	rs3	G	A
+2	15000	rs4	T	C

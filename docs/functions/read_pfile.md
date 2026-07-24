@@ -131,8 +131,10 @@ targeted query (each parallel thread reads the index + its range independently) 
 use `plinking_pgen_io := 'localize'` (download once), load the community
 `cache_httpfs` extension (a block cache over `httpfs`), or reduce threads for
 full-scan-over-remote workloads. `'localize'` currently has no size guard, so it
-will download an arbitrarily large remote `.pgen` in full at bind. Split-index
-(`.pgi`) filesets are not yet supported (embedded-index `.pgen` only).
+will download an arbitrarily large remote `.pgen` in full at bind. **Split-index
+filesets** (a separate `.pgen.pgi` index instead of an embedded one) are supported
+transparently — pgenlib derives the `<pgen>.pgi` companion and it rides the same
+path as the `.pgen` (local, remote, and `localize`).
 
 See the [File Handling](../guides/file-handling.md) guide for the full treatment of
 discovery, companions, multi-file/sharded reads, path resolution, and remote reads.

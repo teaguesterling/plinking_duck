@@ -1,0 +1,95 @@
+# name: test/sql/read_pfile_pgi.test
+# description: split-index filesets (.pgen with an EXTERNAL index in a companion .pgen.pgi, header type 0x2x) read identically to the embedded-index form. pgenlib auto-derives "<pgen>.pgi" when pgi_fname is null, and the .pgi open rides the same VFS shim as the .pgen — so auto/native/vfs and (with the .pgi-copy fix) localize all work. Fixture pgen_split.* is pgen_example recoded with a separate index (pgen_compress -i); genotypes/variants/samples are identical, so pgen_example is the oracle. See test/data/generate_test_data.sh.
+# group: [sql]
+
+require plinking_duck
+
+# --- sanity: the fixture really is split-index (companion .pgi exists) ---
+# (pgen_split.pgen header byte is 0x20 = external index; pgen_split.pgen.pgi holds it)
+
+# --- variant orient: split genotypes == embedded, variant for variant ---
+query I
+SELECT bool_and(e.genotypes = s.genotypes)
+FROM read_pfile('test/data/pgen_example') e JOIN read_pfile('test/data/pgen_split') s USING (ID);
+----
+true
+
+query IT
+SELECT ID, genotypes FROM read_pfile('test/data/pgen_split') ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# --- sample orient (carrier counts) over a split-index fileset ---
+query IIII
+SELECT IID, genotypes.het, genotypes.hom_alt, genotypes.missing
+FROM read_pfile('test/data/pgen_split', orient := 'sample', genotypes := 'counts') ORDER BY IID;
+----
+SAMPLE1	1	1	0
+SAMPLE2	2	0	1
+SAMPLE3	2	1	0
+SAMPLE4	0	2	1
+
+# --- analysis functions (their own PgfiInitPhase1 sites) read the split index ---
+query IR
+SELECT ID, round(ALT_FREQ, 4) FROM plink_freq('test/data/pgen_split.pgen') ORDER BY ID;
+----
+rs1	0.5
+rs2	0.5
+rs3	0.5
+rs4	0.375
+
+query IR
+SELECT ID, F_MISS FROM plink_missing('test/data/pgen_split.pgen') ORDER BY ID;
+----
+rs1	0.25
+rs2	0.0
+rs3	0.25
+rs4	0.0
+
+# --- plinking_pgen_io = 'vfs' routes BOTH the .pgen and the .pgi open through the
+#     fopencookie/funopen shim; must still equal the embedded original ---
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+query I
+SELECT bool_and(e.genotypes = s.genotypes)
+FROM read_pfile('test/data/pgen_example') e JOIN read_pfile('test/data/pgen_split') s USING (ID);
+----
+true
+
+statement ok
+RESET plinking_pgen_io;
+
+# --- plinking_pgen_io = 'localize' copies the .pgen to a temp; pgenlib then derives
+#     "<temp>.pgi", so localize MUST also copy the .pgi companion. Regression guard
+#     for that fix — without it this errors on the missing derived .pgi. ---
+statement ok
+SET plinking_localize_dir = '__TEST_DIR__';
+
+statement ok
+SET plinking_pgen_io = 'localize';
+
+query IT
+SELECT ID, genotypes FROM read_pfile('test/data/pgen_split') ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+query IR
+SELECT ID, round(ALT_FREQ, 4) FROM plink_freq('test/data/pgen_split.pgen') ORDER BY ID;
+----
+rs1	0.5
+rs2	0.5
+rs3	0.5
+rs4	0.375
+
+statement ok
+RESET plinking_pgen_io;
+
+statement ok
+RESET plinking_localize_dir;
