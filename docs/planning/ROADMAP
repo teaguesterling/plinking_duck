@@ -41,9 +41,19 @@ Small, no-fork follow-ups that round out P12. Good first release after v0.8.0.
   deliberately); no persistent URL→temp cache (per-query only; `cache_httpfs`
   covers repeat-query at the block layer). Design notes:
   `P12-001-implementation-notes`.
-- **`.pgi` split-index** — companion-discover a `.pgi` and thread `pgi_fname`
-  (currently always `nullptr` = embedded-index only). Non-fork compat fix; the
-  `.pgi` rides the existing VFS shim. See `P12-001-remote-vfs-pgen-reads` §0a.
+- **`.pgi` split-index** — ✅ **DONE.** Premise was wrong: passing `pgi_fname =
+  nullptr` does **not** mean embedded-only — for an external-index `.pgen` (header
+  type `0x2x`), pgenlib **auto-derives `<pgen>.pgi`** and opens it via our
+  `plinking_pgen_fopen` shim (pgenlib_read.cc:817-828). So `auto`/`native` (local),
+  `vfs`, remote **Path V**, and every analysis function already read split-index
+  filesets — verified byte-identical to the embedded twin (local, `vfs`, and over
+  real httpfs). **One real bug found + fixed:** `localize` copied only the `.pgen`,
+  so pgenlib's derived `<temp>.pgi` was missing → split-index failed under
+  `localize`; now it also copies the `.pgi` companion. Fixture `pgen_split.*`
+  (`pgen_compress -i`, see `generate_test_data.sh`) + `test/sql/read_pfile_pgi.test`.
+  *(Deferred, YAGNI: a `pgi :=` path override / non-standard-name discovery — the
+  standard `<pgen>.pgi` layout auto-works; plink2's `--pgi` shows non-derived names
+  exist, so revisit only on demand.)*
 - *(stretch)* shared cross-reader block cache — only if a real multi-thread
   remote-scan workload shows the per-thread index re-read hurting (localize +
   `cache_httpfs` cover most of it first).

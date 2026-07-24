@@ -116,8 +116,16 @@ and its variant range independently). For full-scan-over-remote workloads, load 
 community **`cache_httpfs`** extension (a block cache over `httpfs`) or reduce
 threads. See [Optimizations](optimizations.md#remote-cloud-pgen-reads).
 
+### Split-index filesets
+
+Both index layouts are read transparently: the embedded index (`plink2 --make-pgen`
+default) and the **split index** (a separate `<pgen>.pgi` companion, header type
+`0x2x`). pgenlib derives the `<pgen>.pgi` name automatically, and it rides the same
+path as the `.pgen` — so split-index works for local, remote (`s3://`/`http`), the
+`vfs` policy, and `localize` (which copies the `.pgi` alongside the `.pgen`). A
+non-standard `.pgi` name (not `<pgen>.pgi`) is not discovered — rename it to the
+derived form.
+
 ### Limitations
 
-- Split-index filesets (separate `.pgi`) are not yet supported — embedded-index
-  `.pgen` only (the `plink2 --make-pgen` default).
 - Remote **writes** are not supported (there is no writer yet).

@@ -170,7 +170,8 @@ community `cache_httpfs` extension (a block cache over `httpfs`), or reduce thre
 — a full scan re-reads more than a targeted query, and parallel threads each read
 the index + their range independently. `localize` has no size guard, so it fetches
 the whole `.pgen` up front; use it deliberately for scan-heavy remote workloads.
-Split-index (`.pgi`) filesets are not yet supported.
+Split-index filesets (a separate `<pgen>.pgi`) are read transparently on every path
+(`localize` copies the `.pgi` alongside the `.pgen`).
 
 ## Sample Subsetting
 
