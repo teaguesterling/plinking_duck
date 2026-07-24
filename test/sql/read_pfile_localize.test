@@ -1,0 +1,73 @@
+# name: test/sql/read_pfile_localize.test
+# description: plinking_pgen_io='localize' materializes a local temp copy of each .pgen (via the context FileSystem) and reads it natively. It ALWAYS copies — even a local source — so this exercises the real chunked copy path locally and locks localize==native across the reader/analysis surface. plinking_localize_dir controls where temps land; temps are per-query and removed when the query's bind data is destroyed.
+# group: [sql]
+
+require plinking_duck
+
+# Keep temp copies in the test-scoped dir (writable, auto-cleaned).
+statement ok
+SET plinking_localize_dir = '__TEST_DIR__';
+
+statement ok
+SET plinking_pgen_io = 'localize';
+
+# --- read_pfile: variant orient genotypes (bytes must match native exactly) ---
+query IT
+SELECT ID, genotypes FROM read_pfile('test/data/pgen_example') ORDER BY ID;
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# --- sample-orient carrier counts (the biobank full-scan use case localize targets) ---
+query IIII
+SELECT IID, genotypes.het, genotypes.hom_alt, genotypes.missing
+FROM read_pfile('test/data/pgen_example', orient := 'sample', genotypes := 'counts') ORDER BY IID;
+----
+SAMPLE1	1	1	0
+SAMPLE2	2	0	1
+SAMPLE3	2	1	0
+SAMPLE4	0	2	1
+
+# --- multi-file: EACH shard's .pgen is localized independently; row-concat unchanged ---
+query I
+SELECT sum(genotypes.het) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3'], orient := 'sample', genotypes := 'counts');
+----
+6000
+
+# --- analysis functions localize too ---
+query IRI
+SELECT ID, round(ALT_FREQ, 4), OBS_CT FROM plink_freq('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	0.5	6
+rs2	0.5	8
+rs3	0.5	6
+rs4	0.375	8
+
+query IR
+SELECT ID, F_MISS FROM plink_missing('test/data/pgen_example.pgen') ORDER BY ID;
+----
+rs1	0.25
+rs2	0.0
+rs3	0.25
+rs4	0.0
+
+# --- scale + parallel over a localized copy: same aggregate as native ---
+query II
+SELECT count(*), sum(genotypes.het)
+FROM read_pfile('test/data/wes_chr10', orient := 'sample', genotypes := 'counts');
+----
+10000	11582052
+
+# --- default localize_dir (DuckDB temporary_directory) also works ---
+statement ok
+RESET plinking_localize_dir;
+
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_example');
+----
+4
+
+statement ok
+RESET plinking_pgen_io;

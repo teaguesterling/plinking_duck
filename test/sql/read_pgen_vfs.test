@@ -49,11 +49,19 @@ statement ok
 RESET plinking_pgen_io;
 
 # --- policy validation ---
-statement error
+# 'localize' is implemented (materializes a local temp copy, then reads natively);
+# it must return the same counts as native. Full localize coverage lives in
+# read_pfile_localize.test.
+statement ok
 SET plinking_pgen_io = 'localize';
-SELECT count(*) FROM read_pgen('test/data/pgen_example.pgen');
+
+query II
+SELECT count(*), sum(genotypes[1]) FROM read_pgen('test/data/pgen_example.pgen');
 ----
-not yet implemented
+4	3
+
+statement ok
+RESET plinking_pgen_io;
 
 statement error
 SET plinking_pgen_io = 'bogus';

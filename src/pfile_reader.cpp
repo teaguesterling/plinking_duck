@@ -414,6 +414,10 @@ struct PfileBindData : public TableFunctionData {
 	// Route .pgen opens through DuckDB's VFS (Path V) — plinking_pgen_io / remote path.
 	bool use_vfs = false;
 
+	// Owns the downloaded temp .pgen copies for plinking_pgen_io := 'localize'
+	// (one per localized source). Per-query lifecycle: unlinked when bind data dies.
+	PgenLocalizeGuard localize_guard;
+
 	// How multiple sources' sample sets combine (multi-file only).
 	CombineSamplesMode combine_samples = CombineSamplesMode::IMPLICIT;
 
@@ -666,7 +670,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const string &prefix,
                                    const string &override_pgen, const string &override_pvar,
                                    const string &override_psam, bool need_psam, const RegionFilter &region,
-                                   uint32_t &raw_sample_ct_out) {
+                                   uint32_t &raw_sample_ct_out, PgenLocalizeGuard &localize_guard) {
 	PfileSource src;
 	// Resolve explicit overrides against file_search_path too (keep the literal
 	// if not found, so downstream open produces the natural error message).
@@ -752,6 +756,10 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	}
 
 	// --- Read the .pgen header (counts) ---
+	// Under 'localize', materialize a local temp copy of this source's .pgen now
+	// (rewrites src.pgen_path in place) so the header and every later scan open read
+	// the native temp. No-op for other policies.
+	LocalizePgenIfRequested(context, src.pgen_path, localize_guard);
 	// Route the header open through the VFS for a remote/VFS path (Path V).
 	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, src.pgen_path));
 	plink2::PgenFileInfo pgfi;
@@ -990,7 +998,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		    (si == 0) || (bind_data->combine_samples == CombineSamplesMode::IDENTICAL && override_psam.empty());
 		PfileSource src = LoadPfileSource(context, fs, prefixes[si], si == 0 ? override_pgen : string(),
 		                                  si == 0 ? override_pvar : string(), si == 0 ? override_psam : string(),
-		                                  need_psam, bind_data->region, src_sample_ct);
+		                                  need_psam, bind_data->region, src_sample_ct, bind_data->localize_guard);
 
 		// Free safety check: every shard's .pgen header reports its sample_ct. All
 		// shards share an identical .psam by contract; a genuine mismatch would

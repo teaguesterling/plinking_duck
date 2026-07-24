@@ -36,6 +36,7 @@ static constexpr idx_t COL_IMP_R2 = 11;
 struct PlinkFreqBindData : public TableFunctionData {
 	string pgen_path;
 	bool use_vfs = false; // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
+	PgenLocalizeGuard localize_guard; // owns downloaded temp .pgen for 'localize' (per-query)
 	string pvar_path;
 	string psam_path;
 
@@ -160,6 +161,7 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 	}
 
 	// --- Initialize pgenlib (Phase 1) to get counts ---
+	LocalizePgenIfRequested(context, bind_data->pgen_path, bind_data->localize_guard);
 	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
 	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
 

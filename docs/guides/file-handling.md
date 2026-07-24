@@ -91,10 +91,18 @@ DuckDB Secrets). This is genuinely ahead of the `plink2` CLI, which is local-onl
 | `'auto'` *(default)* | remote/VFS paths read through the VFS; local paths use native `fopen` (zero overhead) |
 | `'native'` | always native `fopen` — errors on a remote path |
 | `'vfs'` | always through the VFS (even local) — for testing |
-| `'localize'` | *reserved* — download remote to a temp then read locally (not yet implemented) |
+| `'localize'` | download the `.pgen` to a local temp, then read it natively — best for remote **full scans**. Always copies (even a local source). Temp dir from `plinking_localize_dir` (else DuckDB's `temporary_directory`); per-query, removed when the query finishes. |
 
 Under `'auto'`, **local reads are byte-for-byte the classic path** (no overhead);
 only remote/VFS paths take the VFS route.
+
+**`'localize'` vs `'auto'` for remote:** `'auto'` range-reads (great for
+targeted/carrier queries — fetches ~0.2× the file); a **full scan** re-fetches
+more (each thread reads the index + its range). For a remote full scan,
+`'localize'` downloads once (`1×`) and then reads at native speed. It has **no size
+guard yet** — it will download an arbitrarily large `.pgen` in full at bind — so
+reach for it deliberately, not as a blanket default. `.pvar`/`.psam` are read over
+the VFS as text regardless; only the `.pgen` is localized.
 
 ### What gets fetched
 

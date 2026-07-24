@@ -124,13 +124,15 @@ queries over a large remote `.pgen` are efficient. `.pgen` I/O is governed by
 | `'auto'` *(default)* | remote/VFS paths read through the VFS; local paths use native `fopen` (zero overhead) |
 | `'native'` | always native `fopen` — errors on a remote path |
 | `'vfs'` | always through the VFS (even local) — for testing |
-| `'localize'` | *reserved* — download remote to a temp then read locally (not yet implemented) |
+| `'localize'` | materialize a local temp copy of the `.pgen`, then read it natively — best for remote **full scans** (downloads once, `1×`, instead of range-reads re-fetching). Always copies, even a local source. Temp dir: `plinking_localize_dir` (else DuckDB's `temporary_directory`); per-query, removed when the query finishes. |
 
-**Caveats:** a **full scan** of a remote `.pgen` re-reads more than a targeted
-query (and each parallel thread reads the index + its range independently) —
-load the community `cache_httpfs` extension (a block cache over `httpfs`) or
-reduce threads for full-scan-over-remote workloads. Split-index (`.pgi`) filesets
-are not yet supported (embedded-index `.pgen` only).
+**Caveats:** a **full scan** of a remote `.pgen` under `'auto'` re-reads more than a
+targeted query (each parallel thread reads the index + its range independently) —
+use `plinking_pgen_io := 'localize'` (download once), load the community
+`cache_httpfs` extension (a block cache over `httpfs`), or reduce threads for
+full-scan-over-remote workloads. `'localize'` currently has no size guard, so it
+will download an arbitrarily large remote `.pgen` in full at bind. Split-index
+(`.pgi`) filesets are not yet supported (embedded-index `.pgen` only).
 
 See the [File Handling](../guides/file-handling.md) guide for the full treatment of
 discovery, companions, multi-file/sharded reads, path resolution, and remote reads.
