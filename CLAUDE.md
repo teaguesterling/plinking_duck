@@ -64,7 +64,7 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - `wes_chr10.*`: 30000 variants × 10000 samples, chr10 WES-scale dataset (~11MB .pgen, parallel correctness tests)
 - `example.*`: pvar/psam/bim/fam test data for P1-001/P1-002 — do not overwrite
 - `generate_test_data.sh`: regenerates pgen fixtures (needs plink2)
-- `plink2`: Binary is in `/mnt/aux-data/teague/Dev/spack/opt/spack/linux-zen3/plink2-2.0.0-a.6.9-e2l3wx22vy6tkmdwzhaexlml4rs3okx3`
+- `plink2`: `/srv/physical/longbottom-nvme2/teague/Dev/spack/opt/spack/linux-haswell/plink2-2.0.0-a.6.9-7p3r57u7ynsbctzz7zqspoavti4vllrp/bin/plink2` (spack; the old `/mnt/aux-data/...` path is gone). Or `spack location -i plink2`. NOTE: plink2's CLI only writes **embedded**-index `.pgen`; split-index (`.pgen.pgi`) fixtures need plink-ng's `pgen_compress -i` (build via `make pgen_compress` in the submodule, or compile `pgen_compress.cc`+`pgenlib_write.cc` against the extension's prebuilt pgenlib objects).
 
 ## CI / Platform Support
 
