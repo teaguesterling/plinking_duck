@@ -66,8 +66,16 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	    "plinking_pgen_io",
 	    "How .pgen bytes are read: 'auto' (default — remote/VFS paths via DuckDB's VFS, local via native "
 	    "fopen), 'native' (always native fopen; errors on remote), 'vfs' (always via DuckDB's VFS, even "
-	    "local), 'localize' (download remote to a temp then native — not yet implemented).",
+	    "local), 'localize' (materialize a local temp copy then read natively — best for remote full scans; "
+	    "always copies, even a local source).",
 	    LogicalType::VARCHAR, Value("auto"));
+
+	config.AddExtensionOption("plinking_localize_dir",
+	                          "Directory (local) for temp copies made by plinking_pgen_io := 'localize'. Empty "
+	                          "(default) uses DuckDB's temporary_directory, else the current directory. Created if "
+	                          "absent (one level only — parent dirs must already exist). Temps are per-query and "
+	                          "removed when the query's bind data is destroyed.",
+	                          LogicalType::VARCHAR, Value(""));
 
 	config.AddExtensionOption("plinking_sample_counts_sparse",
 	                          "orient := 'sample' + genotypes := 'counts'|'stats': when true, use the "

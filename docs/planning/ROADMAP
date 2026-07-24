@@ -19,18 +19,28 @@ the writer-vs-ergonomics timing (v0.9 ↔ v0.10) is the main open call.
 
 Small, no-fork follow-ups that round out P12. Good first release after v0.8.0.
 
-- **macOS CI** — validate/fix the `funopen` branch (first compiled on the
-  community-CI macOS job for #2298). Likely trivial; blocks a clean cross-platform
-  publish.
-- **`localize` (opt-in, configurable)** — implement the reserved
-  `plinking_pgen_io := 'localize'`: fetch a remote `.pgen` to a temp via the VFS,
-  read it natively. The good answer for remote *full scans* (where range-reads
-  over-fetch) — but **not always wanted** (disk-constrained hosts, scan-once
-  workloads, or when streaming range-reads is preferable). So it stays **explicit
-  opt-in**: `auto` never auto-localizes (remote → range reads), and `localize`
-  adds a configurable temp directory (`plinking_localize_dir`?) + an optional
-  size/threshold and a URL→temp cache (skip re-download of the same file). Needs
-  temp-file lifecycle. Design notes in `P12-001-implementation-notes`.
+- **macOS CI** — ✅ **DONE.** Both macOS arches (`osx_amd64`, `osx_arm64`) built
+  green on the community-CI job for #2298 — the `funopen` branch's first real
+  compile passed, no fix needed.
+- **`localize` (opt-in, configurable)** — ✅ **DONE** (branch
+  `feature/v0.8.1-localize`). `plinking_pgen_io := 'localize'` materializes a local
+  temp copy of the `.pgen` at bind (via the context FS → httpfs secrets apply),
+  rewrites the path, reads natively — the good answer for remote *full scans*.
+  Explicit opt-in: `auto` never localizes. Configurable temp dir
+  (`plinking_localize_dir`, defaults to DuckDB's `temporary_directory`, created if
+  missing); per-query temp lifecycle via a move-only `PgenLocalizeGuard` in each
+  reader's bind data (unlinked when the query ends). Design decision: `localize`
+  **always copies, even a local source** — so the chunked-copy path is testable
+  without a network (`test/sql/read_pfile_localize.test`, localize==native across
+  the reader/analysis surface, incl. a no-op guard: an uncreatable temp dir MUST
+  error, proving the copy actually runs). **Remote path validated end-to-end**: a
+  local Range-capable HTTP server + the bundled httpfs → `localize` over
+  `http://…/wes_chr10.pgen` (10.5 MB, 3 copy chunks) is byte-identical to native,
+  temp unlinked after the query. **Deferred (known cuts):** no size/threshold guard
+  (downloads an arbitrarily large remote `.pgen` in full — reach for it
+  deliberately); no persistent URL→temp cache (per-query only; `cache_httpfs`
+  covers repeat-query at the block layer). Design notes:
+  `P12-001-implementation-notes`.
 - **`.pgi` split-index** — companion-discover a `.pgi` and thread `pgi_fname`
   (currently always `nullptr` = embedded-index only). Non-fork compat fix; the
   `.pgi` rides the existing VFS shim. See `P12-001-remote-vfs-pgen-reads` §0a.

@@ -86,6 +86,7 @@ struct EffectiveVariant {
 struct PlinkPcaBindData : public TableFunctionData {
 	string pgen_path;
 	bool use_vfs = false; // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
+	PgenLocalizeGuard localize_guard; // owns downloaded temp .pgen for 'localize' (per-query)
 	string pvar_path;
 	string psam_path;
 
@@ -262,6 +263,7 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 	}
 
 	// --- Initialize pgenlib (temporary, for header + allele freq counting) ---
+	LocalizePgenIfRequested(context, bind_data->pgen_path, bind_data->localize_guard);
 	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
 	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
 
