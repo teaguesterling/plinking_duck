@@ -152,7 +152,8 @@ default pending broad validation — A/B it on your data and enable per session.
 | `plinking_max_matrix_elements` | `16 G` | Ceiling for the `orient := 'sample'` genotype-matrix pre-read (array/list/struct/columns; **not** counts/stats, which stream) |
 | `plinking_sample_counts_sparse` | `false` | Use the sparse difflist path for sample-orient `counts`/`stats` (see above) |
 | `plinking_use_parquet_companions` | `true` | Prefer `.pvar.parquet` / `.psam.parquet` companions |
-| `plinking_pgen_io` | `'auto'` | How `.pgen` bytes are read: `auto` (remote→VFS, local→native `fopen`), `native`, `vfs`, `localize` (reserved). See below |
+| `plinking_pgen_io` | `'auto'` | How `.pgen` bytes are read: `auto` (remote→VFS, local→native `fopen`), `native`, `vfs`, `localize` (download to a local temp, then native — best for remote full scans). See below |
+| `plinking_localize_dir` | `''` | Temp dir for `plinking_pgen_io := 'localize'` (empty → DuckDB's `temporary_directory`) |
 
 ### Remote / cloud `.pgen` reads
 
@@ -163,10 +164,13 @@ carrier/range query over a large remote `.pgen` is efficient (a shim's read-ahea
 block cache collapses the per-read over-fetch to ~1×). `plinking_pgen_io` controls
 this (`auto` by default; local paths keep native `fopen`, zero overhead).
 
-For a **full scan** of a remote `.pgen`, prefer loading the community `cache_httpfs`
-extension (a block cache over `httpfs`) or reducing threads — a full scan re-reads
-more than a targeted query, and parallel threads each read the index + their range
-independently. Split-index (`.pgi`) filesets are not yet supported.
+For a **full scan** of a remote `.pgen`, set `plinking_pgen_io := 'localize'`
+(downloads the `.pgen` once to a local temp, then reads at native speed), load the
+community `cache_httpfs` extension (a block cache over `httpfs`), or reduce threads
+— a full scan re-reads more than a targeted query, and parallel threads each read
+the index + their range independently. `localize` has no size guard, so it fetches
+the whole `.pgen` up front; use it deliberately for scan-heavy remote workloads.
+Split-index (`.pgi`) filesets are not yet supported.
 
 ## Sample Subsetting
 
