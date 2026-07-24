@@ -32,7 +32,11 @@ Small, no-fork follow-ups that round out P12. Good first release after v0.8.0.
   reader's bind data (unlinked when the query ends). Design decision: `localize`
   **always copies, even a local source** — so the chunked-copy path is testable
   without a network (`test/sql/read_pfile_localize.test`, localize==native across
-  the reader/analysis surface). **Deferred (known cuts):** no size/threshold guard
+  the reader/analysis surface, incl. a no-op guard: an uncreatable temp dir MUST
+  error, proving the copy actually runs). **Remote path validated end-to-end**: a
+  local Range-capable HTTP server + the bundled httpfs → `localize` over
+  `http://…/wes_chr10.pgen` (10.5 MB, 3 copy chunks) is byte-identical to native,
+  temp unlinked after the query. **Deferred (known cuts):** no size/threshold guard
   (downloads an arbitrarily large remote `.pgen` in full — reach for it
   deliberately); no persistent URL→temp cache (per-query only; `cache_httpfs`
   covers repeat-query at the block layer). Design notes:

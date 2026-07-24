@@ -69,5 +69,20 @@ SELECT count(*) FROM read_pfile('test/data/pgen_example');
 ----
 4
 
+# --- PROOF localize is not a silent no-op: an uncreatable temp dir MUST error.
+#     If localize ever regressed to "do nothing", this would wrongly succeed —
+#     so this is the guard that the copy actually runs (every equivalence check
+#     above passes whether or not the copy happens, since native==localized bytes).
+statement ok
+SET plinking_localize_dir = '/dev/null/nope';
+
+statement error
+SELECT count(*) FROM read_pfile('test/data/pgen_example');
+----
+Failed to create directory
+
+statement ok
+RESET plinking_localize_dir;
+
 statement ok
 RESET plinking_pgen_io;
