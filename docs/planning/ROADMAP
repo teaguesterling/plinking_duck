@@ -77,10 +77,36 @@ the reader (so a remote writer waits, like `localize`).
 
 Build order A→E: CopyFunction scaffold + text `.pvar`/`.psam` writers → `.pgen`
 (+ optional `.pgi`) → pfile bundle (+ optional parquet companions) → shard wrapper
-→ plink-VCF. A full **VCF/BCF writer** is a distinct effort → v0.11.0+ (below);
-plink-VCF (biallelic, plink-flavored) is in scope here. Its own release given the
-size. *(Could move to v0.9.0 if the writer is the priority over ergonomics — the
-main open sequencing call.)*
+→ plink-VCF. Only a **plink-flavored** text VCF (biallelic, GT-only, zero-dep) is
+in scope here; **spec-grade VCF/BCF is delegated to duckhts** (below). Its own
+release given the size. *(Could move to v0.9.0 if the writer is the priority over
+ergonomics — the main open sequencing call.)*
+
+## Deferred — VCF/BCF export via duckhts (BLOCKED on their write path)
+
+**Not a plinking_duck writer.** Real (multiallelic, INFO, bgzf, csi/tbi-indexed)
+VCF/BCF is delegated to **duckhts** (htslib-backed; *not* our repo — friendly
+maintainer). duckhts is **read-only today** (all `read_*`); this item is **blocked
+until duckhts adds a `COPY … TO (FORMAT vcf/bcf)` write path**. Revisit then.
+
+Interop, when unblocked (SQL-level only — two extensions can't link each other's
+C++; they compose through SQL, both must be `LOAD`ed):
+- duckhts's `tidy_format := true` schema (`CHROM,POS,ID,REF,ALT,QUAL,FILTER,INFO_*,
+  SAMPLE_ID,FORMAT_GT,…`) == our `orient := 'genotype'` grain. Bridge is
+  column-rename + one transform.
+- **Our side (cheap, could ship independently as a helper even now):**
+  - `plink_gt(genotype)` — vectorized scalar: unphased `0/1/2/-9→'0/0'/'0/1'/'1/1'/'./.'`,
+    phased `[a,b]→'a|b'`. The only real logic; runs per genotype cell → C++ scalar,
+    not a SQL CASE macro.
+  - `read_pfile_vcf(prefix,…)` / `to_vcf_rows` table macro — wraps `read_pfile(…,
+    orient:='genotype')`, projects to duckhts's tidy schema (`IID→SAMPLE_ID`,
+    `plink_gt(genotype)→FORMAT_GT`). Then `COPY (SELECT * FROM read_pfile_vcf(…))
+    TO 'out.vcf.gz' (FORMAT vcf)`.
+- **Coordinate before building:** confirm duckhts's write contract — does it consume
+  `FORMAT_GT` as the same **string** form (vs. ints / wide layout)? And **header
+  construction** (`##contig`/INFO/FORMAT defs) lives on *their* side (htslib
+  `bcf_hdr_*`, inferred or templated) — our helpers only shape the tidy body.
+- Draft a write-path-contract note to the maintainer once we pick this back up.
 
 ## v0.11.0+ — catalog + population genetics (later)
 
