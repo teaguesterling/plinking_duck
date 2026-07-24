@@ -71,9 +71,10 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	    LogicalType::VARCHAR, Value("auto"));
 
 	config.AddExtensionOption("plinking_localize_dir",
-	                          "Directory for temp copies made by plinking_pgen_io := 'localize'. Empty "
-	                          "(default) uses DuckDB's temporary_directory, else the current directory. "
-	                          "Temps are per-query and removed when the query's bind data is destroyed.",
+	                          "Directory (local) for temp copies made by plinking_pgen_io := 'localize'. Empty "
+	                          "(default) uses DuckDB's temporary_directory, else the current directory. Created if "
+	                          "absent (one level only — parent dirs must already exist). Temps are per-query and "
+	                          "removed when the query's bind data is destroyed.",
 	                          LogicalType::VARCHAR, Value(""));
 
 	config.AddExtensionOption("plinking_sample_counts_sparse",

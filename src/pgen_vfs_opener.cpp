@@ -184,16 +184,28 @@ string LocalizeDir(ClientContext &context) {
 }
 
 //! Process-unique temp name (PID + monotonic counter) so concurrent queries
-//! localizing the same URL never collide.
+//! localizing the same URL never collide. Skips any name that already exists on
+//! disk — defends against a stale temp leaked by a crashed same-PID process (whose
+//! counter would also restart at 0), which would otherwise make FILE_CREATE_NEW
+//! fail with a confusing error instead of just picking the next name.
 string UniqueTempName(FileSystem &fs, const string &dir) {
 	static std::atomic<uint64_t> counter {0};
-	uint64_t n = counter.fetch_add(1);
-	string name = "plinking_localize_" + std::to_string(static_cast<long>(getpid())) + "_" + std::to_string(n) + ".pgen";
-	return fs.JoinPath(dir, name);
+	string path;
+	for (int attempt = 0; attempt < 1024; attempt++) {
+		uint64_t n = counter.fetch_add(1);
+		string name =
+		    "plinking_localize_" + std::to_string(static_cast<long>(getpid())) + "_" + std::to_string(n) + ".pgen";
+		path = fs.JoinPath(dir, name);
+		if (!fs.FileExists(path)) {
+			break;
+		}
+	}
+	return path; // if all 1024 existed (absurd), FILE_CREATE_NEW still errors clearly
 }
 
-//! Stream-copy src -> dst through `fs` in chunks (no full-file buffer). Positioned
-//! reads keep this correct over any FileHandle (local or httpfs).
+//! Stream-copy src -> dst through `fs` in chunks (no full-file buffer). Sequential
+//! reads over the FileHandle (position advances) work over any backing (local or
+//! httpfs); the temp is a fresh local file created with FILE_CREATE_NEW.
 void LocalizeCopy(FileSystem &fs, const string &src, const string &dst) {
 	auto in = fs.OpenFile(src, FileFlags::FILE_FLAGS_READ);
 	if (!in) {
