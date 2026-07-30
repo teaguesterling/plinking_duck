@@ -514,6 +514,11 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		}
 	};
 
+	// NULL value (bare, or a LIST-typed NULL from list(x) over zero rows) has no
+	// children — guard before the LIST branch reaches ListValue::GetChildren.
+	if (pheno_val.IsNull()) {
+		throw InvalidInputException("plink_glm: phenotype must not be NULL");
+	}
 	// Type dispatch: VARCHAR → psam column name, LIST → direct values
 	if (pheno_val.type().id() == LogicalTypeId::VARCHAR) {
 		// --- Phenotype from psam column ---
@@ -604,6 +609,11 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	auto covar_it = input.named_parameters.find("covariates");
 	if (covar_it != input.named_parameters.end()) {
 		auto &covar_val = covar_it->second;
+		// NULL value (bare, or a LIST/STRUCT-typed NULL) has no child type/children —
+		// guard before the branches touch ListType/ListValue/StructValue.
+		if (covar_val.IsNull()) {
+			throw InvalidInputException("plink_glm: covariates must not be NULL");
+		}
 		auto &covar_type = covar_val.type();
 
 		if (covar_type.id() == LogicalTypeId::LIST &&
@@ -659,8 +669,10 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				auto &name = struct_children[ci].first;
 				auto &val = struct_vals[ci];
 
-				if (val.type().id() != LogicalTypeId::LIST) {
-					throw InvalidInputException("plink_glm: covariate '%s' must be a LIST, got %s", name,
+				if (val.IsNull() || val.type().id() != LogicalTypeId::LIST) {
+					// A NULL field list (e.g. {age: list(x) over zero rows}) has a LIST
+					// type but no children — reject before ListValue::GetChildren.
+					throw InvalidInputException("plink_glm: covariate '%s' must be a non-null LIST, got %s", name,
 					                            val.type().ToString());
 				}
 

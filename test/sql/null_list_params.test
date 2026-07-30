@@ -1,0 +1,122 @@
+# name: test/sql/null_list_params.test
+# description: A NULL LIST value passed to a list-typed parameter must not crash. This
+# happens in the wild when a session variable / expression holds `list(x)` over zero
+# rows (returns a LIST-typed NULL), or a bare NULL. Previously these reached
+# ListValue::GetChildren()/ListType::GetChildType() on a NULL value -> INTERNAL Error
+# (assertion). Now every list param guards IsNull() before the accessor and treats a
+# null list like an empty/absent one (error for samples/variants/file-list/phenotype/
+# covariates; no-op = no filter for include_genotypes). Covers both trigger forms
+# (a LIST-typed NULL via `NULL::T[]` and a bare NULL) across all 9 sites.
+# group: [sql]
+
+require plinking_duck
+
+# --- The real-world trigger: list(x) over zero rows is a LIST-typed NULL ---
+# (proves NULL::T[] below is a faithful proxy for the reported scenario)
+statement ok
+SET VARIABLE empty_samples = (SELECT list(iid) FROM (SELECT 'SAMPLE1' AS iid WHERE false) t);
+
+query TT
+SELECT typeof(getvariable('empty_samples')), getvariable('empty_samples') IS NULL;
+----
+VARCHAR[]	true
+
+statement error
+SELECT count(*) FROM read_pfile('test/data/pgen_example', samples := getvariable('empty_samples'));
+----
+samples list must not be empty
+
+# --- file-list argument (plink_common ResolvePathList) ---
+statement error
+SELECT count(*) FROM read_pfile(NULL::VARCHAR[]);
+----
+empty file list
+
+# --- samples: read_pfile (pfile_reader), LIST-typed NULL + bare NULL ---
+statement error
+SELECT count(*) FROM read_pfile('test/data/pgen_example', samples := NULL::VARCHAR[]);
+----
+samples list must not be empty
+
+statement error
+SELECT count(*) FROM read_pfile('test/data/pgen_example', samples := NULL::INTEGER[]);
+----
+samples list must not be empty
+
+statement error
+SELECT count(*) FROM read_pfile('test/data/pgen_example', samples := NULL);
+----
+samples list must not be empty
+
+# --- samples: an analysis function goes through the SHARED plink_common path
+#     (ResolveSampleIndices) — same guard must protect it ---
+statement error
+SELECT count(*) FROM plink_freq('test/data/pgen_example.pgen', samples := NULL::VARCHAR[]);
+----
+samples list must not be empty
+
+# --- variants (plink_common ResolveVariantsParameter): LIST-typed NULL + bare NULL ---
+statement error
+SELECT count(*) FROM read_pfile('test/data/pgen_example', variants := NULL::VARCHAR[]);
+----
+variants must not be NULL
+
+statement error
+SELECT count(*) FROM read_pfile('test/data/pgen_example', variants := NULL);
+----
+variants must not be NULL
+
+# --- include_genotypes (plink_common ParseIncludeGenotypes): NULL = no filter ---
+# (all 4 variants returned, not a crash and not an empty result)
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_example', include_genotypes := NULL::VARCHAR[]);
+----
+4
+
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_example', include_genotypes := NULL);
+----
+4
+
+# --- plink_glm phenotype: LIST-typed NULL + bare NULL ---
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example', phenotype := NULL::DOUBLE[]);
+----
+phenotype must not be NULL
+
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example', phenotype := NULL);
+----
+phenotype must not be NULL
+
+# --- plink_glm covariates: whole-value NULL (LIST) ---
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example', phenotype := [1.0, 2.0, 3.0, 4.0], covariates := NULL::VARCHAR[]);
+----
+covariates must not be NULL
+
+# --- plink_glm covariates: a NULL LIST *field* inside a non-null struct ---
+statement error
+SELECT * FROM plink_glm('test/data/pgen_example', phenotype := [1.5, 2.3, 3.7, 0.8], covariates := {age: NULL::DOUBLE[]});
+----
+covariate 'age' must be a non-null LIST
+
+# --- plink_score weights: its own inline list access (not the shared helpers) ---
+statement error
+SELECT * FROM plink_score('test/data/pgen_example.pgen', weights := NULL::DOUBLE[]);
+----
+weights must not be NULL
+
+statement error
+SELECT * FROM plink_score('test/data/pgen_example.pgen', weights := NULL);
+----
+weights must not be NULL
+
+# --- sanity: a valid (non-null) list still works after the guards (variant orient:
+#     the samples subset narrows the genotype width to 2, row count stays 4) ---
+query II
+SELECT count(*), DISTINCT_len FROM (
+  SELECT len(genotypes) AS DISTINCT_len FROM read_pfile('test/data/pgen_example', samples := ['SAMPLE1', 'SAMPLE2'])
+) GROUP BY DISTINCT_len;
+----
+4	2

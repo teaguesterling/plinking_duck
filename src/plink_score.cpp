@@ -313,6 +313,11 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 	}
 
 	auto &weights_val = weights_it->second;
+	// NULL value (bare, or a LIST-typed NULL from list(x) over zero rows) has no
+	// children/child-type — guard before the branches touch ListValue/ListType.
+	if (weights_val.IsNull()) {
+		throw InvalidInputException("plink_score: weights must not be NULL");
+	}
 	auto &weights_type = weights_val.type();
 
 	// Determine variant range for positional mode

@@ -1056,7 +1056,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 	{
 		auto it = input.named_parameters.find("samples");
-		if (it != input.named_parameters.end()) {
+		// Only probe the child type for a real LIST value. A NULL (bare, or a
+		// LIST-typed NULL) has no child type — GetChildType would crash; the samples
+		// block below raises the proper "must not be empty" error.
+		if (it != input.named_parameters.end() && !it->second.IsNull() &&
+		    it->second.type().id() == LogicalTypeId::LIST) {
 			auto &child_type = ListType::GetChildType(it->second.type());
 			if (child_type.id() == LogicalTypeId::VARCHAR) {
 				needs_iids = true;
@@ -1130,6 +1134,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	auto samples_it = input.named_parameters.find("samples");
 	if (samples_it != input.named_parameters.end()) {
 		auto &samples_val = samples_it->second;
+		// NULL value (bare, or a LIST-typed NULL from list(x) over zero rows) has no
+		// child type/children — guard before ListType/ListValue access.
+		if (samples_val.IsNull()) {
+			throw InvalidInputException("read_pfile: samples list must not be empty");
+		}
 		auto &child_type = ListType::GetChildType(samples_val.type());
 
 		auto &children_check = ListValue::GetChildren(samples_val);

@@ -461,6 +461,12 @@ string ReplaceExtension(const string &path, const string &new_ext) {
 
 vector<string> ResolvePathList(const Value &input, const char *fn_name) {
 	vector<string> paths;
+	// A NULL list value (e.g. list(x) over zero rows, or NULL::VARCHAR[]) has a LIST
+	// type but no children — guard before GetChildren, which asserts on a NULL value.
+	// (The child.IsNull() skip below only handles NULL *elements* of a non-null list.)
+	if (input.IsNull()) {
+		throw InvalidInputException("%s: empty file list provided", fn_name);
+	}
 	if (input.type().id() == LogicalTypeId::LIST) {
 		for (auto &child : ListValue::GetChildren(input)) {
 			if (!child.IsNull()) {
@@ -1154,6 +1160,11 @@ SampleInfo LoadSampleCount(ClientContext &context, const string &path) {
 
 vector<uint32_t> ResolveSampleIndices(const Value &samples_val, uint32_t raw_sample_ct, const SampleInfo *sample_info,
                                       const string &func_name) {
+	// NULL value (bare NULL, or a LIST-typed NULL from list(x) over zero rows) has no
+	// children/child-type to read — guard before ListValue/ListType access.
+	if (samples_val.IsNull()) {
+		throw InvalidInputException("%s: samples list must not be empty", func_name);
+	}
 	auto &child_type = ListType::GetChildType(samples_val.type());
 	auto &children = ListValue::GetChildren(samples_val);
 
@@ -1385,6 +1396,10 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double 
 }
 
 void ParseIncludeGenotypes(const Value &val, GenotypeRangeFilter &out, const string &func_name) {
+	// NULL (bare, or a LIST-typed NULL) = no filter, matching the empty-list case below.
+	if (val.IsNull()) {
+		return;
+	}
 	if (val.type().id() != LogicalTypeId::LIST) {
 		throw InvalidInputException("%s: include_genotypes must be a LIST of category names "
 		                            "(e.g. ['het', 'hom_alt'])",
@@ -1772,6 +1787,11 @@ static vector<uint32_t> ResolveRangeStruct(const Value &val, const VariantMetada
 vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadataIndex &variants,
                                           uint32_t raw_variant_ct, const string &func_name) {
 	vector<uint32_t> indices;
+	// NULL value (bare NULL, or a LIST-typed NULL from list(x) over zero rows) has no
+	// children/child-type — guard before the type dispatch touches ListValue/ListType.
+	if (val.IsNull()) {
+		throw InvalidInputException("%s: variants must not be NULL", func_name);
+	}
 	auto &type = val.type();
 
 	// Lazily build ID index only when needed
