@@ -101,6 +101,17 @@ SELECT * FROM plink_glm('test/data/pgen_example', phenotype := [1.5, 2.3, 3.7, 0
 ----
 covariate 'age' must be a non-null LIST
 
+# --- plink_score weights: its own inline list access (not the shared helpers) ---
+statement error
+SELECT * FROM plink_score('test/data/pgen_example.pgen', weights := NULL::DOUBLE[]);
+----
+weights must not be NULL
+
+statement error
+SELECT * FROM plink_score('test/data/pgen_example.pgen', weights := NULL);
+----
+weights must not be NULL
+
 # --- sanity: a valid (non-null) list still works after the guards (variant orient:
 #     the samples subset narrows the genotype width to 2, row count stays 4) ---
 query II
