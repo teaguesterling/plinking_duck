@@ -35,7 +35,7 @@ static constexpr idx_t COL_IMP_R2 = 11;
 
 struct PlinkFreqBindData : public TableFunctionData {
 	string pgen_path;
-	bool use_vfs = false; // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
+	bool use_vfs = false;             // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
 	PgenLocalizeGuard localize_guard; // owns downloaded temp .pgen for 'localize' (per-query)
 	string pvar_path;
 	string psam_path;

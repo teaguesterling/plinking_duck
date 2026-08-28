@@ -1,12 +1,5 @@
 # name: test/sql/null_list_params.test
-# description: A NULL LIST value passed to a list-typed parameter must not crash. This
-# happens in the wild when a session variable / expression holds `list(x)` over zero
-# rows (returns a LIST-typed NULL), or a bare NULL. Previously these reached
-# ListValue::GetChildren()/ListType::GetChildType() on a NULL value -> INTERNAL Error
-# (assertion). Now every list param guards IsNull() before the accessor and treats a
-# null list like an empty/absent one (error for samples/variants/file-list/phenotype/
-# covariates; no-op = no filter for include_genotypes). Covers both trigger forms
-# (a LIST-typed NULL via `NULL::T[]` and a bare NULL) across all 9 sites.
+# description: A NULL LIST value passed to a list-typed parameter must not crash. This happens in the wild when a session variable / expression holds `list(x)` over zero rows (returns a LIST-typed NULL), or a bare NULL. Previously these reached ListValue::GetChildren()/ListType::GetChildType() on a NULL value -> INTERNAL Error (assertion). Now every list param guards IsNull() before the accessor and treats a null list like an empty/absent one (error for samples/variants/file-list/phenotype/covariates; no-op = no filter for include_genotypes). Covers both trigger forms (a LIST-typed NULL via `NULL::T[]` and a bare NULL) across all 9 sites.
 # group: [sql]
 
 require plinking_duck

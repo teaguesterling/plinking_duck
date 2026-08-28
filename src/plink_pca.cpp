@@ -85,7 +85,7 @@ struct EffectiveVariant {
 
 struct PlinkPcaBindData : public TableFunctionData {
 	string pgen_path;
-	bool use_vfs = false; // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
+	bool use_vfs = false;             // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
 	PgenLocalizeGuard localize_guard; // owns downloaded temp .pgen for 'localize' (per-query)
 	string pvar_path;
 	string psam_path;
