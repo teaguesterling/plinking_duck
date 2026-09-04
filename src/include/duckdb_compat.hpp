@@ -143,31 +143,51 @@ struct CompatHasWithAlias : std::false_type {};
 template <class T>
 struct CompatHasWithAlias<T, decltype(void(std::declval<const T &>().WithAlias(string())))> : std::true_type {};
 
-template <class TYPE = LogicalType>
-inline LogicalType CompatWithAlias(TYPE type, string alias) {
-	if constexpr (CompatHasWithAlias<TYPE>::value) {
-		return type.WithAlias(std::move(alias));
-	} else {
-		type.SetAlias(std::move(alias));
-		return type;
-	}
+// Tag dispatch rather than `if constexpr`, and a CONCRETE entry point.
+//
+// `template <class TYPE = LogicalType>` looks equivalent but is not: a default
+// template argument is inert when deduction succeeds, and LogicalType::VARCHAR
+// is a `static constexpr LogicalTypeId` (types.hpp), NOT a LogicalType. So
+// CompatWithAlias(LogicalType::VARCHAR, "x") would deduce TYPE = LogicalTypeId
+// and hard-error inside the shim -- on the PINNED v1.5 build, not on v2.0.
+// Taking LogicalType by value forces the implicit LogicalTypeId -> LogicalType
+// conversion at the call site instead.
+template <class TYPE>
+inline LogicalType CompatWithAliasImpl(TYPE type, string alias, std::true_type) {
+	return type.WithAlias(std::move(alias)); // v2.0: returns a copy
+}
+template <class TYPE>
+inline LogicalType CompatWithAliasImpl(TYPE type, string alias, std::false_type) {
+	type.SetAlias(std::move(alias)); // v1.5: mutates in place
+	return type;
+}
+inline LogicalType CompatWithAlias(LogicalType type, string alias) {
+	return CompatWithAliasImpl(std::move(type), std::move(alias), CompatHasWithAlias<LogicalType>());
 }
 
 // --- Vector::ToUnifiedFormat ---------------------------------------------------
-// v2.0 dropped the count parameter (the vector now tracks its own size). Probed
-// the same way.
+// v1.5: void ToUnifiedFormat(idx_t count, UnifiedVectorFormat &)   -- only form
+// v2.0: void ToUnifiedFormat(UnifiedVectorFormat &)                -- the vector
+//       tracks its own size; the count form SURVIVES as [[deprecated]].
+//
+// Probe for the NEW (no-count) overload, never the old one. Probing for the
+// count form would be true on BOTH versions -- because v2.0 kept it deprecated
+// rather than removing it -- so the shim would compile, look correct, and
+// silently keep every call site on the deprecated path forever. When an API is
+// deprecated rather than removed, the probe has to look for what was ADDED.
 template <class T, class = void>
-struct CompatToUnifiedTakesCount : std::false_type {};
+struct CompatToUnifiedWithoutCount : std::false_type {};
 template <class T>
-struct CompatToUnifiedTakesCount<T, decltype(void(std::declval<T &>().ToUnifiedFormat(
-                                        idx_t(0), std::declval<UnifiedVectorFormat &>())))> : std::true_type {};
+struct CompatToUnifiedWithoutCount<T, decltype(void(std::declval<T &>().ToUnifiedFormat(
+                                          std::declval<UnifiedVectorFormat &>())))> : std::true_type {};
 
 template <class VEC = Vector>
 inline void CompatToUnifiedFormat(VEC &vec, idx_t count, UnifiedVectorFormat &data) {
-	if constexpr (CompatToUnifiedTakesCount<VEC>::value) {
-		vec.ToUnifiedFormat(count, data);
-	} else {
+	if constexpr (CompatToUnifiedWithoutCount<VEC>::value) {
+		(void)count;
 		vec.ToUnifiedFormat(data);
+	} else {
+		vec.ToUnifiedFormat(count, data);
 	}
 }
 
