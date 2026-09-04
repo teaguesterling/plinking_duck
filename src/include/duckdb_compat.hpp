@@ -136,8 +136,9 @@ inline Vector &CompatStructEntry(unique_ptr<Vector> &entry) {
 //       type whose type-info may be shared. SetAlias is REMOVED, not deprecated.
 //
 // Detected by PROBING for the member rather than by the Identifier macro above,
-// because these are independent changes. `if constexpr` discards the untaken
-// branch only inside a template, hence the template parameter.
+// because these are independent changes. The untaken branch must not be
+// instantiated (SetAlias does not exist on v2.0, WithAlias does not exist on
+// v1.5), which is what the tag-dispatched Impl overloads below achieve.
 template <class T, class = void>
 struct CompatHasWithAlias : std::false_type {};
 template <class T>
