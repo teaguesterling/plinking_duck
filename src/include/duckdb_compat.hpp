@@ -15,7 +15,23 @@
 //
 // Cross-version coverage:
 //   - duckdb v1.4.x / v1.5.x: old API everywhere
-//   - duckdb main / v1.6.x:   new API everywhere
+//   - duckdb main / v2.0.x:   new API everywhere
+//
+// DETECT THE NARROWEST THING THAT ACTUALLY CHANGED, and give each change its
+// OWN detector, because they do not move together:
+//
+//   - a type that changed shape -> ask DuckDB for it (see CompatName). A header
+//     probe is a proxy, and identifier.hpp has already been backported to
+//     stable WITHOUT the signature change that motivated it, so the proxy is
+//     now wrong on that branch.
+//   - a method that was ADDED -> probe for the new member. Never probe for the
+//     old one: DuckDB frequently keeps it as [[deprecated]], so an "old exists"
+//     probe is true on both lines and the shim silently never switches (this
+//     bit CompatToUnifiedFormat).
+//   - a whole header that appeared -> __has_include is fine.
+//
+// Tying several changes to one macro picks the wrong branch the moment they
+// land in different releases.
 //
 // See teaguesterling/duckdb_markdown's docs/DUCKDB_API_MIGRATION.md for the
 // long-form rationale + upgrade checklist for other extensions.
