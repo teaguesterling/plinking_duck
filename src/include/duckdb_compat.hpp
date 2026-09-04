@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/function/table_function.hpp"
 #include <type_traits>
 #include <utility>
 
@@ -32,9 +33,18 @@
 // deliberate act at the call site -- so a boundary helper is needed rather than
 // an implicit conversion.
 //
-// PROBED SEPARATELY from the vector-header change above. Each API change gets
-// its own probe: tying several to one macro silently picks the wrong branch if
-// they ever land in different releases (backport, revert, unexpected branch).
+// This __has_include gates only whether the Identifier TYPE is available (and
+// therefore whether an Identifier overload can be declared below). It must NOT
+// decide the bind-signature name type -- see CompatName. Verified:
+//
+//   v1.5-variegata @ our pin    no identifier.hpp   bind takes vector<string>
+//   v1.5-variegata @ branch tip HAS identifier.hpp  bind takes vector<string>
+//   main (v2.0)                 HAS identifier.hpp  bind takes vector<Identifier>
+//
+// identifier.hpp was BACKPORTED to the stable branch without changing
+// table_function_bind_t, so header presence and signature shape have already
+// come apart. A __has_include-driven CompatName is correct only by accident of
+// where the submodule happens to be pinned.
 #if __has_include("duckdb/common/identifier.hpp")
 #define DUCKDB_HAS_IDENTIFIER 1
 #include "duckdb/common/identifier.hpp"
@@ -73,29 +83,48 @@ inline void CompatSetOutputCardinality(DataChunk &chunk, idx_t count) {
 // signatures plus the few RUNTIME-string boundaries need the helpers below.
 //
 // CompatNameStr/CompatMakeName are overloaded on both string and Identifier
-// where both types exist, so a call site stays correct whichever type the
+// wherever both types exist, so a call site stays correct whichever type the
 // surrounding DuckDB API hands it (e.g. QueryResult::names).
+//
+// CompatName is ASKED OF DUCKDB rather than inferred from a header probe.
+// TableFunctionBindInput::input_table_names has the same element type as the
+// bind out-parameter on both lines (table_function.hpp: :110/:288 on the pin
+// and on the v1.5 branch tip, :123/:319 on main), so this cannot drift the way
+// __has_include("duckdb/common/identifier.hpp") already has -- that header was
+// backported to stable while the bind signature stayed vector<string>, which
+// would flip CompatName to Identifier on a DuckDB that still wants strings and
+// break all 12 bind signatures at once on the next submodule bump.
+//
+// The invariant this expresses is exactly the one that matters: "whatever type
+// this DuckDB's bind callback fills, that is CompatName."
+using CompatName = typename std::remove_reference<decltype(
+    std::declval<TableFunctionBindInput &>().input_table_names)>::type::value_type;
+
+// Self-check, on BOTH lines: if a future DuckDB moves the bind name type again
+// (or moves it on one branch but not another, as already happened with the
+// identifier.hpp backport), this fails at COMPILE time with a clear message
+// instead of producing 12 confusing "no matching function" errors at the
+// registration sites.
+static_assert(std::is_same<table_function_bind_t,
+                           unique_ptr<FunctionData> (*)(ClientContext &, TableFunctionBindInput &,
+                                                        vector<LogicalType> &, vector<CompatName> &)>::value,
+              "CompatName must be exactly the name type this DuckDB's table_function_bind_t fills");
+
+inline string CompatNameStr(const string &name) {
+	return name;
+}
+inline CompatName CompatMakeName(string name) {
+	return CompatName(std::move(name));
+}
 #ifdef DUCKDB_HAS_IDENTIFIER
-using CompatName = Identifier;
 inline string CompatNameStr(const Identifier &id) {
 	return id.GetIdentifierName();
 }
-inline string CompatNameStr(const string &name) {
-	return name;
-}
-inline Identifier CompatMakeName(string name) {
-	return Identifier(std::move(name));
-}
-inline Identifier CompatMakeName(const Identifier &name) {
-	return name;
-}
-#else
-using CompatName = string;
-inline string CompatNameStr(const string &name) {
-	return name;
-}
-inline string CompatMakeName(string name) {
-	return name;
+// Reached when a DuckDB API hands back Identifiers (QueryResult::names on
+// v2.0). Goes via the raw name so this stays correct even in the backported
+// state, where Identifier exists but CompatName is still string.
+inline CompatName CompatMakeName(const Identifier &name) {
+	return CompatName(name.GetIdentifierName());
 }
 #endif
 
