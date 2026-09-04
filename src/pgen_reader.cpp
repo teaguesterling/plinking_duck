@@ -138,7 +138,7 @@ struct PgenLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PgenBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -407,7 +407,9 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
 			string col_name = bind_data->sample_info.iids[file_idx];
 			bind_data->genotype_column_names.push_back(col_name);
-			names.push_back(col_name);
+			// Runtime string crossing into the bind names vector: on DuckDB v2.0 that
+			// vector holds Identifier, whose string constructor is explicit by design.
+			names.push_back(CompatMakeName(col_name));
 			return_types.push_back(col_type);
 		}
 	} else if (bind_data->genotype_mode == GenotypeMode::STRUCT) {
@@ -747,11 +749,11 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				switch (file_col) {
 				case 0: { // CHROM
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case 1: { // POS
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case 2: { // ID
@@ -759,13 +761,13 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case 3: { // REF
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case 4: { // ALT
@@ -773,7 +775,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -787,7 +789,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								if (dosage == -9.0) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+									CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
@@ -795,7 +797,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+									CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
 								}
 							}
 						} else {
@@ -810,10 +812,10 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 						}
 						auto &entries = StructVector::GetEntries(vec);
 						for (idx_t s = 0; s < output_sample_ct; s++) {
-							auto &child_vec = *entries[s];
+							auto &child_vec = CompatStructEntry(entries[s]);
 							if (bind_data.include_phased) {
 								auto &allele_vec = ArrayVector::GetEntry(child_vec);
-								auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+								auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
 								auto &pair_validity = FlatVector::Validity(child_vec);
 								idx_t allele_base = rows_emitted * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
@@ -831,7 +833,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								if (dosage == -9.0) {
 									FlatVector::SetNull(child_vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<double>(child_vec)[rows_emitted] = dosage;
+									CompatFlatDataMutable<double>(child_vec)[rows_emitted] = dosage;
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[s];
@@ -839,7 +841,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(child_vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<int8_t>(child_vec)[rows_emitted] = geno;
+									CompatFlatDataMutable<int8_t>(child_vec)[rows_emitted] = geno;
 								}
 							}
 						}
@@ -867,43 +869,45 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 						}
 
 						auto &entries = StructVector::GetEntries(vec);
-						FlatVector::GetData<uint32_t>(*entries[0])[rows_emitted] = genocounts[0];
-						FlatVector::GetData<uint32_t>(*entries[1])[rows_emitted] = genocounts[1];
-						FlatVector::GetData<uint32_t>(*entries[2])[rows_emitted] = genocounts[2];
-						FlatVector::GetData<uint32_t>(*entries[3])[rows_emitted] = genocounts[3];
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[0]))[rows_emitted] = genocounts[0];
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[1]))[rows_emitted] = genocounts[1];
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[2]))[rows_emitted] = genocounts[2];
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[3]))[rows_emitted] = genocounts[3];
 
 						if (bind_data.genotype_mode == GenotypeMode::STATS) {
 							uint32_t n = genocounts[0] + genocounts[1] + genocounts[2];
 							uint32_t total = n + genocounts[3];
-							FlatVector::GetData<uint32_t>(*entries[4])[rows_emitted] = n;
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[4]))[rows_emitted] = n;
 							if (n == 0) {
-								FlatVector::GetData<double>(*entries[5])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
-								FlatVector::GetData<double>(*entries[6])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
-								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
 							} else {
 								double af = (static_cast<double>(genocounts[1]) + 2.0 * genocounts[2]) / (2.0 * n);
-								FlatVector::GetData<double>(*entries[5])[rows_emitted] = af;
-								FlatVector::GetData<double>(*entries[6])[rows_emitted] = std::min(af, 1.0 - af);
-								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] = af;
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
+								    std::min(af, 1.0 - af);
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
 								    static_cast<double>(genocounts[1]) / static_cast<double>(n);
 							}
 							if (total == 0) {
-								FlatVector::GetData<double>(*entries[7])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
 							} else {
-								FlatVector::GetData<double>(*entries[7])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
 								    static_cast<double>(genocounts[3]) / static_cast<double>(total);
 							}
-							FlatVector::GetData<uint32_t>(*entries[8])[rows_emitted] = genocounts[1] + genocounts[2];
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[8]))[rows_emitted] =
+							    genocounts[1] + genocounts[2];
 						}
 						break;
 					}
 					if (!genotypes_read) {
 						if (bind_data.genotype_mode == GenotypeMode::LIST) {
-							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 							list_data[rows_emitted].offset = ListVector::GetListSize(vec);
 							list_data[rows_emitted].length = 0;
 						}
@@ -916,7 +920,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 							auto &pair_vec = ArrayVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
 							auto &pair_validity = FlatVector::Validity(pair_vec);
 
 							idx_t pair_base = rows_emitted * static_cast<idx_t>(output_sample_ct);
@@ -941,7 +945,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							ListVector::Reserve(vec, list_offset + output_sample_ct);
 							auto &pair_vec = ListVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
 							auto &pair_validity = FlatVector::Validity(pair_vec);
 
 							for (idx_t s = 0; s < output_sample_ct; s++) {
@@ -960,7 +964,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								}
 							}
 
-							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 							list_data[rows_emitted].offset = list_offset;
 							list_data[rows_emitted].length = output_sample_ct;
 							ListVector::SetListSize(vec, list_offset + output_sample_ct);
@@ -970,7 +974,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 							auto array_size = static_cast<idx_t>(output_sample_ct);
 							auto &child = ArrayVector::GetEntry(vec);
-							auto *child_data = FlatVector::GetData<double>(child);
+							auto *child_data = CompatFlatDataMutable<double>(child);
 							auto &child_validity = FlatVector::Validity(child);
 
 							idx_t base = rows_emitted * array_size;
@@ -988,7 +992,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto list_offset = ListVector::GetListSize(vec);
 							ListVector::Reserve(vec, list_offset + output_sample_ct);
 							auto &child = ListVector::GetEntry(vec);
-							auto *child_data = FlatVector::GetData<double>(child);
+							auto *child_data = CompatFlatDataMutable<double>(child);
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								double dosage = lstate.dosage_doubles[s];
@@ -999,7 +1003,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 									child_data[list_offset + s] = dosage;
 								}
 							}
-							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 							list_data[rows_emitted].offset = list_offset;
 							list_data[rows_emitted].length = output_sample_ct;
 							ListVector::SetListSize(vec, list_offset + output_sample_ct);
@@ -1009,7 +1013,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 							auto array_size = static_cast<idx_t>(output_sample_ct);
 							auto &child = ArrayVector::GetEntry(vec);
-							auto *child_data = FlatVector::GetData<int8_t>(child);
+							auto *child_data = CompatFlatDataMutable<int8_t>(child);
 							auto &child_validity = FlatVector::Validity(child);
 
 							idx_t base = rows_emitted * array_size;
@@ -1028,7 +1032,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto list_offset = ListVector::GetListSize(vec);
 							ListVector::Reserve(vec, list_offset + output_sample_ct);
 							auto &child = ListVector::GetEntry(vec);
-							auto *child_data = FlatVector::GetData<int8_t>(child);
+							auto *child_data = CompatFlatDataMutable<int8_t>(child);
 							auto &child_validity = FlatVector::Validity(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
@@ -1040,7 +1044,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 									child_data[list_offset + s] = geno;
 								}
 							}
-							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 							list_data[rows_emitted].offset = list_offset;
 							list_data[rows_emitted].length = output_sample_ct;
 							ListVector::SetListSize(vec, list_offset + output_sample_ct);
@@ -1060,7 +1064,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								if (dosage == -9.0) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+									CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
 								}
 							} else {
 								int8_t geno = lstate.genotype_bytes[sample_pos];
@@ -1068,7 +1072,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 								                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+									CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
 								}
 							}
 						} else {

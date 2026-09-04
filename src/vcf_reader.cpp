@@ -218,7 +218,7 @@ static VcfHalfCallMode ParseHalfCallMode(const string &mode_str) {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> VcfBind(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<VcfBindData>();
 	bind_data->file_path = input.inputs[0].GetValue<string>();
 
@@ -337,7 +337,8 @@ static unique_ptr<FunctionData> VcfBind(ClientContext &context, TableFunctionBin
 		bind_data->columns_mode_geno_col_count = bind_data->sample_ct;
 
 		for (uint32_t i = 0; i < bind_data->sample_ct; i++) {
-			names.push_back(bind_data->sample_names[i]);
+			// Runtime string -> bind names vector (Identifier on v2.0).
+			names.push_back(CompatMakeName(bind_data->sample_names[i]));
 			if (bind_data->include_phased) {
 				return_types.push_back(LogicalType::ARRAY(LogicalType::TINYINT, 2));
 			} else {
@@ -709,26 +710,26 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 			auto &vec = output.data[out_col];
 
 			if (file_col == VcfBindData::CHROM_COL) {
-				FlatVector::GetData<string_t>(vec)[row_count] =
+				CompatFlatDataMutable<string_t>(vec)[row_count] =
 				    StringVector::AddString(vec, GetField(line, tab_positions, 0));
 			} else if (file_col == VcfBindData::POS_COL) {
-				FlatVector::GetData<int32_t>(vec)[row_count] = ParseVcfPos(line, tab_positions);
+				CompatFlatDataMutable<int32_t>(vec)[row_count] = ParseVcfPos(line, tab_positions);
 			} else if (file_col == VcfBindData::ID_COL) {
 				auto id_field = GetField(line, tab_positions, 2);
 				if (id_field == ".") {
 					FlatVector::SetNull(vec, row_count, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, id_field);
+					CompatFlatDataMutable<string_t>(vec)[row_count] = StringVector::AddString(vec, id_field);
 				}
 			} else if (file_col == VcfBindData::REF_COL) {
-				FlatVector::GetData<string_t>(vec)[row_count] =
+				CompatFlatDataMutable<string_t>(vec)[row_count] =
 				    StringVector::AddString(vec, GetField(line, tab_positions, 3));
 			} else if (file_col == VcfBindData::ALT_COL) {
 				auto alt_field = GetField(line, tab_positions, 4);
 				if (alt_field == ".") {
 					FlatVector::SetNull(vec, row_count, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row_count] = StringVector::AddString(vec, alt_field);
+					CompatFlatDataMutable<string_t>(vec)[row_count] = StringVector::AddString(vec, alt_field);
 				}
 			} else if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
 			           file_col >= bind_data.columns_mode_first_geno_col &&
@@ -736,7 +737,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 				auto sample_idx = static_cast<uint32_t>(file_col - bind_data.columns_mode_first_geno_col);
 				if (bind_data.include_phased) {
 					auto &child = ArrayVector::GetEntry(vec);
-					auto *child_data = FlatVector::GetData<int8_t>(child);
+					auto *child_data = CompatFlatDataMutable<int8_t>(child);
 					idx_t base = row_count * 2;
 					int8_t a1 = lstate.phased_pairs[sample_idx * 2];
 					int8_t a2 = lstate.phased_pairs[sample_idx * 2 + 1];
@@ -753,7 +754,7 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 					if (geno == -9) {
 						FlatVector::SetNull(vec, row_count, true);
 					} else {
-						FlatVector::GetData<int8_t>(vec)[row_count] = geno;
+						CompatFlatDataMutable<int8_t>(vec)[row_count] = geno;
 					}
 				}
 			} else if (file_col == VcfBindData::GENOTYPES_COL) {

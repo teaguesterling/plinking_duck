@@ -346,7 +346,7 @@ struct PlinkGlmLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkGlmBindData>();
 	string prefix = input.inputs[0].GetValue<string>();
 
@@ -1293,11 +1293,11 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				switch (file_col) {
 				case COL_CHROM: {
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
@@ -1305,13 +1305,13 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case COL_REF: {
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
@@ -1319,7 +1319,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1329,7 +1329,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1337,23 +1337,23 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (std::isnan(lr.a1_freq)) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.a1_freq;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.a1_freq;
 					}
 					break;
 				}
 				case COL_TEST: {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, "ADD");
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, "ADD");
 					break;
 				}
 				case COL_OBS_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(lr.obs_ct);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(lr.obs_ct);
 					break;
 				}
 				case COL_BETA: {
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.beta;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.beta;
 					}
 					break;
 				}
@@ -1361,7 +1361,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.se;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.se;
 					}
 					break;
 				}
@@ -1369,7 +1369,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.t_stat;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.t_stat;
 					}
 					break;
 				}
@@ -1377,13 +1377,13 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.p_value;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.p_value;
 					}
 					break;
 				}
 				case COL_ERRCODE: {
 					if (lr.errcode != nullptr) {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, lr.errcode);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, lr.errcode);
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					}
@@ -1391,7 +1391,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 				case COL_OR: {
 					if (lr.is_logistic && lr.errcode == nullptr) {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.odds_ratio;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.odds_ratio;
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					}
@@ -1399,7 +1399,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 				case COL_FIRTH_YN: {
 					if (lr.is_logistic && lr.errcode == nullptr) {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 						    StringVector::AddString(vec, lr.firth_applied ? "Y" : "N");
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);

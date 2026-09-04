@@ -239,7 +239,7 @@ static vector<string> NormalizeBimFields(vector<string> &fields) {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PvarBindData>();
 	bind_data->file_paths = ResolvePathList(input.inputs[0], "read_pvar");
 
@@ -265,7 +265,13 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 	if (IsNativePlinkFormat(bind_data->file_paths[0])) {
 		// Existing path: parse native text file
 		bind_data->header_info = ParsePvarHeader(context, bind_data->file_paths[0]);
-		names = bind_data->header_info.column_names;
+		// Element-wise rather than assigned: on v2.0 `names` is vector<Identifier>
+		// and column_names is vector<string>, with no implicit conversion either way.
+		names.clear();
+		names.reserve(bind_data->header_info.column_names.size());
+		for (auto &col_name : bind_data->header_info.column_names) {
+			names.push_back(CompatMakeName(col_name));
+		}
 		return_types = bind_data->header_info.column_types;
 	} else {
 		// Non-native source(s): query via Connection and materialize, concatenating files.
@@ -284,10 +290,15 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 			if (f == 0) {
 				// Use the first result's schema as the output schema
 				for (idx_t i = 0; i < result->names.size(); i++) {
-					names.push_back(result->names[i]);
+					names.push_back(CompatMakeName(result->names[i]));
 					return_types.push_back(result->types[i]);
 				}
-				bind_data->header_info.column_names = names;
+				// Back across the boundary: names is vector<Identifier> on v2.0.
+				bind_data->header_info.column_names.clear();
+				bind_data->header_info.column_names.reserve(names.size());
+				for (auto &col_name : names) {
+					bind_data->header_info.column_names.push_back(CompatNameStr(col_name));
+				}
 				bind_data->header_info.column_types = return_types;
 				bind_data->header_info.is_bim = false;
 				bind_data->header_info.skip_lines = 0;
@@ -352,7 +363,7 @@ static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const 
 
 	switch (type.id()) {
 	case LogicalTypeId::VARCHAR: {
-		FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, field);
+		CompatFlatDataMutable<string_t>(vec)[row_idx] = StringVector::AddString(vec, field);
 		break;
 	}
 	case LogicalTypeId::INTEGER: {
@@ -366,7 +377,7 @@ static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const 
 		    val < static_cast<long>(std::numeric_limits<int32_t>::min())) {
 			throw InvalidInputException("read_pvar: integer value '%s' out of range", field);
 		}
-		FlatVector::GetData<int32_t>(vec)[row_idx] = static_cast<int32_t>(val);
+		CompatFlatDataMutable<int32_t>(vec)[row_idx] = static_cast<int32_t>(val);
 		break;
 	}
 	case LogicalTypeId::FLOAT: {
@@ -376,7 +387,7 @@ static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const 
 		if (end == field.c_str() || *end != '\0' || errno != 0) {
 			throw InvalidInputException("read_pvar: invalid float value '%s'", field);
 		}
-		FlatVector::GetData<float>(vec)[row_idx] = val;
+		CompatFlatDataMutable<float>(vec)[row_idx] = val;
 		break;
 	}
 	case LogicalTypeId::DOUBLE: {
@@ -386,7 +397,7 @@ static void SetPvarValue(Vector &vec, idx_t row_idx, const string &field, const 
 		if (end == field.c_str() || *end != '\0' || errno != 0) {
 			throw InvalidInputException("read_pvar: invalid double value '%s'", field);
 		}
-		FlatVector::GetData<double>(vec)[row_idx] = val;
+		CompatFlatDataMutable<double>(vec)[row_idx] = val;
 		break;
 	}
 	default:

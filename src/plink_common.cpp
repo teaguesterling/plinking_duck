@@ -1,4 +1,5 @@
 #include "plink_common.hpp"
+#include "duckdb_compat.hpp"
 #include "plink_profile.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -605,7 +606,10 @@ string FindCompanionFileWithParquet(ClientContext &context, FileSystem &fs, cons
 //! the index is dense (indexed by emit order).
 static void IngestVariantResult(QueryResult &result, const string &source_label, const string &func_name,
                                 VariantMetadataIndex &idx) {
-	auto &col_names = result.names;
+	// Copied to strings rather than bound by reference: QueryResult::names is
+	// vector<Identifier> on DuckDB v2.0, and the matching below is plain
+	// lowercase string comparison.
+	auto col_names = CompatNameStrings(result.names);
 	auto &col_types = result.types;
 	idx_t chrom_col = DConstants::INVALID_INDEX;
 	idx_t pos_col = DConstants::INVALID_INDEX;
@@ -654,7 +658,7 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 		{
 			auto &vec = chunk->data[chrom_col];
 			UnifiedVectorFormat uvf;
-			vec.ToUnifiedFormat(n, uvf);
+			CompatToUnifiedFormat(vec, n, uvf);
 			if (chrom_is_integer) {
 				// Render numeric chrom as string for consistency with text .pvar
 				for (idx_t i = 0; i < n; i++) {
@@ -692,7 +696,7 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 		{
 			auto &vec = chunk->data[pos_col];
 			UnifiedVectorFormat uvf;
-			vec.ToUnifiedFormat(n, uvf);
+			CompatToUnifiedFormat(vec, n, uvf);
 			for (idx_t i = 0; i < n; i++) {
 				auto si = uvf.sel->get_index(i);
 				int32_t v = 0;
@@ -720,7 +724,7 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 			} else {
 				auto &vec = chunk->data[id_col];
 				UnifiedVectorFormat uvf;
-				vec.ToUnifiedFormat(n, uvf);
+				CompatToUnifiedFormat(vec, n, uvf);
 				auto data = reinterpret_cast<const string_t *>(uvf.data);
 				for (idx_t i = 0; i < n; i++) {
 					auto si = uvf.sel->get_index(i);
@@ -748,7 +752,7 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 			} else {
 				auto &vec = chunk->data[ref_col];
 				UnifiedVectorFormat uvf;
-				vec.ToUnifiedFormat(n, uvf);
+				CompatToUnifiedFormat(vec, n, uvf);
 				auto data = reinterpret_cast<const string_t *>(uvf.data);
 				for (idx_t i = 0; i < n; i++) {
 					auto si = uvf.sel->get_index(i);
@@ -770,7 +774,7 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 			} else {
 				auto &vec = chunk->data[alt_col];
 				UnifiedVectorFormat uvf;
-				vec.ToUnifiedFormat(n, uvf);
+				CompatToUnifiedFormat(vec, n, uvf);
 				auto data = reinterpret_cast<const string_t *>(uvf.data);
 				for (idx_t i = 0; i < n; i++) {
 					auto si = uvf.sel->get_index(i);
@@ -795,7 +799,7 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 		if (rn_col != DConstants::INVALID_INDEX) {
 			auto &vec = chunk->data[rn_col];
 			UnifiedVectorFormat uvf;
-			vec.ToUnifiedFormat(n, uvf);
+			CompatToUnifiedFormat(vec, n, uvf);
 			auto data = reinterpret_cast<const int64_t *>(uvf.data);
 			idx_t local_base = idx.chroms.size() - n;
 			if (idx.local_to_vidx.size() < idx.chroms.size()) {
@@ -850,19 +854,19 @@ static string DetectChromColumn(Connection &conn, const string &path, const stri
 		throw IOException("%s: failed to read parquet schema for '%s': %s", func_name, path, result->GetError());
 	}
 	for (auto &name : result->names) {
-		auto lower = StringUtil::Lower(name);
+		auto lower = StringUtil::Lower(CompatNameStr(name));
 		if (lower == "#chrom") {
 			return "#CHROM";
 		}
 	}
 	for (auto &name : result->names) {
-		auto lower = StringUtil::Lower(name);
+		auto lower = StringUtil::Lower(CompatNameStr(name));
 		if (lower == "chrom") {
 			return "CHROM";
 		}
 	}
 	throw InvalidInputException("%s: parquet companion '%s' has no CHROM or #CHROM column (columns: %s)", func_name,
-	                            path, StringUtil::Join(result->names, ", "));
+	                            path, StringUtil::Join(CompatNameStrings(result->names), ", "));
 }
 
 //! Region-pushdown loader: queries the parquet file with a WHERE clause so
@@ -964,7 +968,8 @@ idx_t GetParquetRowCount(ClientContext &context, const string &path) {
 //! Columnar ingest helper for psam query results.
 static void IngestSampleResult(QueryResult &result, const string &source_label, SampleInfo &info, bool load_iids,
                                bool load_fids) {
-	auto &col_names = result.names;
+	// See IngestVariantResult: QueryResult::names is vector<Identifier> on v2.0.
+	auto col_names = CompatNameStrings(result.names);
 	idx_t iid_col = DConstants::INVALID_INDEX;
 	idx_t fid_col = DConstants::INVALID_INDEX;
 	idx_t sex_col = DConstants::INVALID_INDEX;
@@ -1017,7 +1022,7 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 		if (load_iids) {
 			auto &vec = chunk->data[iid_col];
 			UnifiedVectorFormat uvf;
-			vec.ToUnifiedFormat(n, uvf);
+			CompatToUnifiedFormat(vec, n, uvf);
 			auto data = reinterpret_cast<const string_t *>(uvf.data);
 			for (idx_t i = 0; i < n; i++) {
 				auto si = uvf.sel->get_index(i);
@@ -1031,7 +1036,7 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 		if (load_fids && has_fid_col) {
 			auto &vec = chunk->data[fid_col];
 			UnifiedVectorFormat uvf;
-			vec.ToUnifiedFormat(n, uvf);
+			CompatToUnifiedFormat(vec, n, uvf);
 			auto data = reinterpret_cast<const string_t *>(uvf.data);
 			for (idx_t i = 0; i < n; i++) {
 				auto si = uvf.sel->get_index(i);
@@ -2117,7 +2122,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 		if (mode == GenotypeMode::ARRAY) {
 			auto &pair_vec = ArrayVector::GetEntry(vec);
 			auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-			auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+			auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
 			auto &pair_validity = FlatVector::Validity(pair_vec);
 
 			idx_t pair_base = row_idx * static_cast<idx_t>(output_sample_ct);
@@ -2141,7 +2146,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 			ListVector::Reserve(vec, list_offset + output_sample_ct);
 			auto &pair_vec = ListVector::GetEntry(vec);
 			auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-			auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+			auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
 			auto &pair_validity = FlatVector::Validity(pair_vec);
 
 			for (idx_t s = 0; s < output_sample_ct; s++) {
@@ -2159,7 +2164,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 				}
 			}
 
-			auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+			auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 			list_data[row_idx].offset = list_offset;
 			list_data[row_idx].length = output_sample_ct;
 			ListVector::SetListSize(vec, list_offset + output_sample_ct);
@@ -2169,7 +2174,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 		if (mode == GenotypeMode::ARRAY) {
 			auto array_size = static_cast<idx_t>(output_sample_ct);
 			auto &child = ArrayVector::GetEntry(vec);
-			auto *child_data = FlatVector::GetData<int8_t>(child);
+			auto *child_data = CompatFlatDataMutable<int8_t>(child);
 			auto &child_validity = FlatVector::Validity(child);
 
 			idx_t base = row_idx * array_size;
@@ -2187,7 +2192,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 			auto list_offset = ListVector::GetListSize(vec);
 			ListVector::Reserve(vec, list_offset + output_sample_ct);
 			auto &child = ListVector::GetEntry(vec);
-			auto *child_data = FlatVector::GetData<int8_t>(child);
+			auto *child_data = CompatFlatDataMutable<int8_t>(child);
 			auto &child_validity = FlatVector::Validity(child);
 			for (idx_t s = 0; s < output_sample_ct; s++) {
 				int8_t geno = genotype_bytes[s];
@@ -2198,7 +2203,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 					child_data[list_offset + s] = geno;
 				}
 			}
-			auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+			auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 			list_data[row_idx].offset = list_offset;
 			list_data[row_idx].length = output_sample_ct;
 			ListVector::SetListSize(vec, list_offset + output_sample_ct);

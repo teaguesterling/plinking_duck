@@ -180,7 +180,7 @@ struct PlinkHardyLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkHardyBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -600,11 +600,11 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 				switch (file_col) {
 				case COL_CHROM: {
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
@@ -612,13 +612,13 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case COL_REF: {
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
@@ -626,7 +626,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -636,7 +636,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -644,7 +644,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (counts_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_ref;
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = out_hom_ref;
 					}
 					break;
 				}
@@ -652,7 +652,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (counts_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_het;
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = out_het;
 					}
 					break;
 				}
@@ -660,7 +660,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (counts_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_alt;
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = out_hom_alt;
 					}
 					break;
 				}
@@ -668,7 +668,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (stats_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = o_het;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = o_het;
 					}
 					break;
 				}
@@ -676,7 +676,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (stats_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = e_het;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = e_het;
 					}
 					break;
 				}
@@ -684,7 +684,7 @@ static void PlinkHardyScan(ClientContext &context, TableFunctionInput &data_p, D
 					if (stats_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = p_hwe;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = p_hwe;
 					}
 					break;
 				}

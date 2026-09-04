@@ -120,7 +120,7 @@ struct PlinkFreqLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkFreqBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -564,7 +564,7 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 						// PgrGetDCounts returns a hardcall-derived R² approximation for variants
 						// without dosage entries. Real imputed files typically have dosage for all
 						// variants, so this covers the common cases.
-						FlatVector::GetData<double>(vec)[rows_emitted] = imp_r2;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = imp_r2;
 					} else {
 						// No dosage data in file — IMP_R2 is not meaningful
 						FlatVector::SetNull(vec, rows_emitted, true);
@@ -575,11 +575,11 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 				switch (file_col) {
 				case COL_CHROM: {
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
@@ -587,13 +587,13 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case COL_REF: {
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
@@ -601,7 +601,7 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -609,19 +609,19 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (freq_is_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = alt_freq;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = alt_freq;
 					}
 					break;
 				}
 				case COL_OBS_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
 					break;
 				}
 				case COL_HOM_REF_CT: {
 					if (counts_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_ref;
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = out_hom_ref;
 					}
 					break;
 				}
@@ -629,7 +629,7 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (counts_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_het;
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = out_het;
 					}
 					break;
 				}
@@ -637,7 +637,7 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (counts_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_hom_alt;
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = out_hom_alt;
 					}
 					break;
 				}
@@ -645,7 +645,7 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (counts_are_null) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<int32_t>(vec)[rows_emitted] = out_missing;
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = out_missing;
 					}
 					break;
 				}

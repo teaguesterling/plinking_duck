@@ -144,7 +144,7 @@ struct PlinkMissingLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkMissingBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -501,11 +501,11 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 				switch (file_col) {
 				case VCOL_CHROM: {
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case VCOL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case VCOL_ID: {
@@ -513,13 +513,13 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case VCOL_REF: {
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case VCOL_ALT: {
@@ -527,20 +527,20 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case VCOL_MISSING_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(missing_ct);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(missing_ct);
 					break;
 				}
 				case VCOL_OBS_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
 					break;
 				}
 				case VCOL_F_MISS: {
-					FlatVector::GetData<double>(vec)[rows_emitted] = f_miss;
+					CompatFlatDataMutable<double>(vec)[rows_emitted] = f_miss;
 					break;
 				}
 				default:
@@ -660,7 +660,7 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 			case SCOL_FID: {
 				if (bind_data.has_sample_info && !bind_data.sample_info.fids.empty() &&
 				    orig_idx < bind_data.sample_info.fids.size() && !bind_data.sample_info.fids[orig_idx].empty()) {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 					    StringVector::AddString(vec, bind_data.sample_info.fids[orig_idx]);
 				} else {
 					FlatVector::SetNull(vec, rows_emitted, true);
@@ -668,20 +668,20 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 				break;
 			}
 			case SCOL_IID: {
-				FlatVector::GetData<string_t>(vec)[rows_emitted] =
+				CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 				    StringVector::AddString(vec, bind_data.sample_info.iids[orig_idx]);
 				break;
 			}
 			case SCOL_MISSING_CT: {
-				FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(missing_ct);
+				CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(missing_ct);
 				break;
 			}
 			case SCOL_OBS_CT: {
-				FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
+				CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
 				break;
 			}
 			case SCOL_F_MISS: {
-				FlatVector::GetData<double>(vec)[rows_emitted] = f_miss;
+				CompatFlatDataMutable<double>(vec)[rows_emitted] = f_miss;
 				break;
 			}
 			default:

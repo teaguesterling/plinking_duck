@@ -214,7 +214,7 @@ struct PlinkPcaLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkPcaBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -471,7 +471,9 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 		names = {"FID", "IID"};
 		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
 		for (uint32_t i = 0; i < bind_data->n_pcs; i++) {
-			names.push_back("PC" + std::to_string(i + 1));
+			// Composed at runtime, so this is a std::string rather than a literal:
+			// Identifier's string constructor is explicit on v2.0.
+			names.push_back(CompatMakeName("PC" + std::to_string(i + 1)));
 			return_types.push_back(LogicalType::DOUBLE);
 		}
 	} else {
@@ -750,17 +752,17 @@ static void EmitSamplesMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalSta
 
 			if (file_col == SCOL_FID) {
 				if (has_fid) {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 					    StringVector::AddString(vec, bind_data.sample_info.fids[orig_idx]);
 				} else {
 					FlatVector::SetNull(vec, rows_emitted, true);
 				}
 			} else if (file_col == SCOL_IID) {
-				FlatVector::GetData<string_t>(vec)[rows_emitted] =
+				CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 				    StringVector::AddString(vec, bind_data.sample_info.iids[orig_idx]);
 			} else if (file_col >= SCOL_PC_START && file_col < SCOL_PC_START + bind_data.n_pcs) {
 				uint32_t pc = static_cast<uint32_t>(file_col - SCOL_PC_START);
-				FlatVector::GetData<double>(vec)[rows_emitted] =
+				CompatFlatDataMutable<double>(vec)[rows_emitted] =
 				    gs.eigenvectors[static_cast<size_t>(sidx) * gs.n_pcs + pc];
 			}
 		}
@@ -805,16 +807,16 @@ static void EmitPcsMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &
 
 			switch (file_col) {
 			case PCOL_PC:
-				FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(pc_idx + 1);
+				CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(pc_idx + 1);
 				break;
 			case PCOL_EIGENVALUE:
-				FlatVector::GetData<double>(vec)[rows_emitted] = eigenvalue;
+				CompatFlatDataMutable<double>(vec)[rows_emitted] = eigenvalue;
 				break;
 			case PCOL_VARIANCE_PROPORTION:
-				FlatVector::GetData<double>(vec)[rows_emitted] = var_prop;
+				CompatFlatDataMutable<double>(vec)[rows_emitted] = var_prop;
 				break;
 			case PCOL_CUMULATIVE_VARIANCE:
-				FlatVector::GetData<double>(vec)[rows_emitted] = cum_var;
+				CompatFlatDataMutable<double>(vec)[rows_emitted] = cum_var;
 				break;
 			default:
 				break;
