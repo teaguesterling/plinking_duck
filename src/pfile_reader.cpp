@@ -1513,7 +1513,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 						    col_name);
 					}
 					bind_data->genotype_column_names.push_back(col_name);
-					struct_children.push_back({col_name, field_type});
+					// Runtime string -> child_list_t key (Identifier on v2.0).
+					struct_children.push_back({CompatMakeName(col_name), field_type});
 				}
 			}
 
@@ -1894,7 +1895,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
 				string col_name = bind_data->sample_info.iids[file_idx];
 				bind_data->genotype_column_names.push_back(col_name);
-				struct_children.push_back({col_name, field_type});
+				// Runtime string -> child_list_t key (Identifier on v2.0).
+				struct_children.push_back({CompatMakeName(col_name), field_type});
 			}
 
 			names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
@@ -2516,7 +2518,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						if (bind_data.include_phased) {
 							auto &allele_vec = ArrayVector::GetEntry(child_vec);
 							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(child_vec);
+							auto &pair_validity = CompatFlatValidityMutable(child_vec);
 							idx_t allele_base = rows_emitted * 2;
 							int8_t a1 = lstate.phased_pairs[s * 2];
 							int8_t a2 = lstate.phased_pairs[s * 2 + 1];
@@ -2625,7 +2627,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						auto &pair_vec = ArrayVector::GetEntry(vec);
 						auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 						auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-						auto &pair_validity = FlatVector::Validity(pair_vec);
+						auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 						idx_t pair_base = rows_emitted * static_cast<idx_t>(output_sample_ct);
 						for (idx_t s = 0; s < output_sample_ct; s++) {
@@ -2649,7 +2651,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						auto &pair_vec = ListVector::GetEntry(vec);
 						auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 						auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-						auto &pair_validity = FlatVector::Validity(pair_vec);
+						auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 						for (idx_t s = 0; s < output_sample_ct; s++) {
 							idx_t pair_idx = list_offset + s;
@@ -2678,7 +2680,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						auto array_size = static_cast<idx_t>(output_sample_ct);
 						auto &child = ArrayVector::GetEntry(vec);
 						auto *child_data = CompatFlatDataMutable<double>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 
 						idx_t base = rows_emitted * array_size;
 						for (idx_t s = 0; s < array_size; s++) {
@@ -2696,7 +2698,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						ListVector::Reserve(vec, list_offset + output_sample_ct);
 						auto &child = ListVector::GetEntry(vec);
 						auto *child_data = CompatFlatDataMutable<double>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 						for (idx_t s = 0; s < output_sample_ct; s++) {
 							double dosage = lstate.dosage_doubles[s];
 							if (dosage == -9.0) {
@@ -2720,7 +2722,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						auto array_size = static_cast<idx_t>(output_sample_ct);
 						auto &child = ArrayVector::GetEntry(vec);
 						auto *child_data = CompatFlatDataMutable<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 
 						idx_t base = rows_emitted * array_size;
 						for (idx_t s = 0; s < array_size; s++) {
@@ -2738,7 +2740,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						ListVector::Reserve(vec, list_offset + output_sample_ct);
 						auto &child = ListVector::GetEntry(vec);
 						auto *child_data = CompatFlatDataMutable<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 						for (idx_t s = 0; s < output_sample_ct; s++) {
 							int8_t geno = lstate.genotype_bytes[s];
 							if (geno == -9 || (!geno_range_all_pass &&
@@ -3541,7 +3543,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							if (bind_data.include_phased) {
 								auto &allele_vec = ArrayVector::GetEntry(child_vec);
 								auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-								auto &pair_validity = FlatVector::Validity(child_vec);
+								auto &pair_validity = CompatFlatValidityMutable(child_vec);
 								idx_t allele_base = rows_emitted * 2;
 								int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
 								if (a1 == -9) {
@@ -3618,7 +3620,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							auto &pair_vec = ArrayVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(pair_vec);
+							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 							idx_t pair_base = rows_emitted * static_cast<idx_t>(effective_variant_ct);
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
@@ -3641,7 +3643,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							auto &pair_vec = ListVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(pair_vec);
+							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
 								idx_t pair_idx = list_offset + v;
@@ -3668,7 +3670,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							auto array_size = static_cast<idx_t>(effective_variant_ct);
 							auto &child = ArrayVector::GetEntry(vec);
 							auto *child_data = CompatFlatDataMutable<double>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 
 							idx_t base = rows_emitted * array_size;
 							for (idx_t v = 0; v < array_size; v++) {
@@ -3686,7 +3688,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							ListVector::Reserve(vec, list_offset + effective_variant_ct);
 							auto &child = ListVector::GetEntry(vec);
 							auto *child_data = CompatFlatDataMutable<double>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
 								double dosage = bind_data.dosage_matrix[v][sample_pos];
 								if (dosage == -9.0) {
@@ -3705,7 +3707,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 						auto array_size = static_cast<idx_t>(effective_variant_ct);
 						auto &child = ArrayVector::GetEntry(vec);
 						auto *child_data = CompatFlatDataMutable<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 
 						idx_t base = rows_emitted * array_size;
 						for (idx_t v = 0; v < array_size; v++) {
@@ -3723,7 +3725,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 						ListVector::Reserve(vec, list_offset + effective_variant_ct);
 						auto &child = ListVector::GetEntry(vec);
 						auto *child_data = CompatFlatDataMutable<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 						for (idx_t v = 0; v < effective_variant_ct; v++) {
 							int8_t geno = bind_data.genotype_matrix[v][sample_pos];
 							if (geno == -9) {

@@ -672,15 +672,15 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				if (val.IsNull() || val.type().id() != LogicalTypeId::LIST) {
 					// A NULL field list (e.g. {age: list(x) over zero rows}) has a LIST
 					// type but no children — reject before ListValue::GetChildren.
-					throw InvalidInputException("plink_glm: covariate '%s' must be a non-null LIST, got %s", name,
-					                            val.type().ToString());
+					throw InvalidInputException("plink_glm: covariate '%s' must be a non-null LIST, got %s",
+					                            CompatNameStr(name), val.type().ToString());
 				}
 
 				auto &list_children = ListValue::GetChildren(val);
 				if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
-					throw InvalidInputException("plink_glm: covariate '%s' length (%llu) must match sample count (%u)",
-					                            name, static_cast<unsigned long long>(list_children.size()),
-					                            bind_data->raw_sample_ct);
+					throw InvalidInputException(
+					    "plink_glm: covariate '%s' length (%llu) must match sample count (%u)", CompatNameStr(name),
+					    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
 				}
 
 				// Extract values for effective samples (NULLs not allowed in covariates)
@@ -691,8 +691,8 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 					for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
 						if (plink2::IsSet(si, raw_idx)) {
 							if (list_children[raw_idx].IsNull()) {
-								throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name,
-								                            raw_idx);
+								throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u",
+								                            CompatNameStr(name), raw_idx);
 							}
 							covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
 							out_idx++;

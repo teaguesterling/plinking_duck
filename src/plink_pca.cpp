@@ -484,7 +484,9 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 		eigenvec_fields.push_back({"FID", LogicalType::VARCHAR});
 		eigenvec_fields.push_back({"IID", LogicalType::VARCHAR});
 		for (uint32_t i = 0; i < bind_data->n_pcs; i++) {
-			eigenvec_fields.push_back({"PC" + std::to_string(i + 1), LogicalType::DOUBLE});
+			// child_list_t is vector<pair<Identifier, T>> on v2.0; this key is composed
+			// at runtime, so it needs the explicit promotion.
+			eigenvec_fields.push_back({CompatMakeName("PC" + std::to_string(i + 1)), LogicalType::DOUBLE});
 		}
 		auto eigenvec_struct = LogicalType::STRUCT(std::move(eigenvec_fields));
 		auto eigenvec_list = LogicalType::LIST(std::move(eigenvec_struct));
@@ -846,7 +848,7 @@ static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState 
 		fields.push_back({"FID", has_fid ? Value(bind_data.sample_info.fids[orig_idx]) : Value()});
 		fields.push_back({"IID", Value(bind_data.sample_info.iids[orig_idx])});
 		for (uint32_t pc = 0; pc < gs.n_pcs; pc++) {
-			fields.push_back({"PC" + std::to_string(pc + 1),
+			fields.push_back({CompatMakeName("PC" + std::to_string(pc + 1)),
 			                  Value::DOUBLE(gs.eigenvectors[static_cast<size_t>(sidx) * gs.n_pcs + pc])});
 		}
 		eigenvec_entries.push_back(Value::STRUCT(std::move(fields)));

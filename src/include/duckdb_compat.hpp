@@ -193,4 +193,26 @@ inline VALUE *CompatFlatDataMutable(Vector &vec) {
 	}
 }
 
+// --- FlatVector mutable validity mask -------------------------------------------
+// The same const split applies to the validity mask:
+// v1.5: FlatVector::Validity(vec)          returns ValidityMask&
+// v2.0: FlatVector::Validity(vec)          returns const ValidityMask&
+//       FlatVector::ValidityMutable(vec)   returns ValidityMask&
+// so SetInvalid()/SetValid() through the read accessor stops compiling.
+// Probed independently of GetDataMutable above.
+template <class T, class = void>
+struct CompatHasFlatValidityMutable : std::false_type {};
+template <class T>
+struct CompatHasFlatValidityMutable<T, decltype(void(T::ValidityMutable(std::declval<Vector &>())))> : std::true_type {
+};
+
+template <class FV = FlatVector>
+inline ValidityMask &CompatFlatValidityMutable(Vector &vec) {
+	if constexpr (CompatHasFlatValidityMutable<FV>::value) {
+		return FV::ValidityMutable(vec);
+	} else {
+		return FV::Validity(vec);
+	}
+}
+
 } // namespace duckdb

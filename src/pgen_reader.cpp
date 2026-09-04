@@ -431,7 +431,8 @@ static unique_ptr<FunctionData> PgenBind(ClientContext &context, TableFunctionBi
 			uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
 			string col_name = bind_data->sample_info.iids[file_idx];
 			bind_data->genotype_column_names.push_back(col_name);
-			struct_children.push_back({col_name, field_type});
+			// Runtime string -> child_list_t key (Identifier on v2.0).
+			struct_children.push_back({CompatMakeName(col_name), field_type});
 		}
 
 		names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
@@ -816,7 +817,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							if (bind_data.include_phased) {
 								auto &allele_vec = ArrayVector::GetEntry(child_vec);
 								auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-								auto &pair_validity = FlatVector::Validity(child_vec);
+								auto &pair_validity = CompatFlatValidityMutable(child_vec);
 								idx_t allele_base = rows_emitted * 2;
 								int8_t a1 = lstate.phased_pairs[s * 2];
 								int8_t a2 = lstate.phased_pairs[s * 2 + 1];
@@ -921,7 +922,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto &pair_vec = ArrayVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(pair_vec);
+							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 							idx_t pair_base = rows_emitted * static_cast<idx_t>(output_sample_ct);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
@@ -946,7 +947,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto &pair_vec = ListVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(pair_vec);
+							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								idx_t pair_idx = list_offset + s;
@@ -975,7 +976,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto array_size = static_cast<idx_t>(output_sample_ct);
 							auto &child = ArrayVector::GetEntry(vec);
 							auto *child_data = CompatFlatDataMutable<double>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
@@ -993,7 +994,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							ListVector::Reserve(vec, list_offset + output_sample_ct);
 							auto &child = ListVector::GetEntry(vec);
 							auto *child_data = CompatFlatDataMutable<double>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								double dosage = lstate.dosage_doubles[s];
 								if (dosage == -9.0) {
@@ -1014,7 +1015,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							auto array_size = static_cast<idx_t>(output_sample_ct);
 							auto &child = ArrayVector::GetEntry(vec);
 							auto *child_data = CompatFlatDataMutable<int8_t>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 
 							idx_t base = rows_emitted * array_size;
 							for (idx_t s = 0; s < array_size; s++) {
@@ -1033,7 +1034,7 @@ static void PgenScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 							ListVector::Reserve(vec, list_offset + output_sample_ct);
 							auto &child = ListVector::GetEntry(vec);
 							auto *child_data = CompatFlatDataMutable<int8_t>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 							for (idx_t s = 0; s < output_sample_ct; s++) {
 								int8_t geno = lstate.genotype_bytes[s];
 								if (geno == -9 || (bind_data.genotype_filter.active && !geno_range_all_pass &&

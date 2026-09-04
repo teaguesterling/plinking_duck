@@ -281,7 +281,8 @@ static unique_ptr<FunctionData> VcfBind(ClientContext &context, TableFunctionBin
 	bind_data->include_phased = false;
 
 	for (auto &kv : input.named_parameters) {
-		auto key = StringUtil::Lower(kv.first);
+		// named_parameter_map_t is keyed on Identifier on v2.0.
+		auto key = StringUtil::Lower(CompatNameStr(kv.first));
 		if (key == "genotypes") {
 			genotypes_str = kv.second.GetValue<string>();
 		} else if (key == "phased") {

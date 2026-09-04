@@ -1371,7 +1371,7 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double 
 
 		if (field_name != "min" && field_name != "max") {
 			throw InvalidInputException(
-			    "%s: %s has unknown field '%s' (expected %s)", func_name, param_name, field_name,
+			    "%s: %s has unknown field '%s' (expected %s)", func_name, param_name, CompatNameStr(field_name),
 			    include_missing_out ? "'min', 'max', and/or 'include_missing'" : "'min' and/or 'max'");
 		}
 
@@ -1382,7 +1382,7 @@ RangeFilter ParseRangeFilter(const Value &val, const string &param_name, double 
 		double v = child_val.GetValue<double>();
 		if (v < valid_min || v > valid_max) {
 			throw InvalidInputException("%s: %s.%s value %g is out of range [%g, %g]", func_name, param_name,
-			                            field_name, v, valid_min, valid_max);
+			                            CompatNameStr(field_name), v, valid_min, valid_max);
 		}
 
 		if (field_name == "min") {
@@ -2123,7 +2123,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 			auto &pair_vec = ArrayVector::GetEntry(vec);
 			auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 			auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-			auto &pair_validity = FlatVector::Validity(pair_vec);
+			auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 			idx_t pair_base = row_idx * static_cast<idx_t>(output_sample_ct);
 			for (idx_t s = 0; s < output_sample_ct; s++) {
@@ -2147,7 +2147,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 			auto &pair_vec = ListVector::GetEntry(vec);
 			auto &allele_vec = ArrayVector::GetEntry(pair_vec);
 			auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-			auto &pair_validity = FlatVector::Validity(pair_vec);
+			auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 			for (idx_t s = 0; s < output_sample_ct; s++) {
 				idx_t pair_idx = list_offset + s;
@@ -2175,7 +2175,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 			auto array_size = static_cast<idx_t>(output_sample_ct);
 			auto &child = ArrayVector::GetEntry(vec);
 			auto *child_data = CompatFlatDataMutable<int8_t>(child);
-			auto &child_validity = FlatVector::Validity(child);
+			auto &child_validity = CompatFlatValidityMutable(child);
 
 			idx_t base = row_idx * array_size;
 			for (idx_t s = 0; s < array_size; s++) {
@@ -2193,7 +2193,7 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 			ListVector::Reserve(vec, list_offset + output_sample_ct);
 			auto &child = ListVector::GetEntry(vec);
 			auto *child_data = CompatFlatDataMutable<int8_t>(child);
-			auto &child_validity = FlatVector::Validity(child);
+			auto &child_validity = CompatFlatValidityMutable(child);
 			for (idx_t s = 0; s < output_sample_ct; s++) {
 				int8_t geno = genotype_bytes[s];
 				if (geno == -9) {
