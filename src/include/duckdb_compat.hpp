@@ -36,10 +36,30 @@
 // See teaguesterling/duckdb_markdown's docs/DUCKDB_API_MIGRATION.md for the
 // long-form rationale + upgrade checklist for other extensions.
 
+// v2.0 split the per-vector-type accessor classes out of types/vector.hpp into
+// duckdb/common/vector/. There are SIX of them, and pulling in only some leaves
+// the rest undeclared -- which surfaces as a plain "'ArrayVector' has not been
+// declared" hundreds of lines into an unrelated file, long after the headers
+// you did include stopped erroring. Include all six, each guarded so a header
+// that does not exist on a given line is simply skipped.
 #if __has_include("duckdb/common/vector/list_vector.hpp")
 #define DUCKDB_HAS_NEW_VECTOR_HEADERS 1
 #include "duckdb/common/vector/list_vector.hpp"
+#endif
+#if __has_include("duckdb/common/vector/struct_vector.hpp")
 #include "duckdb/common/vector/struct_vector.hpp"
+#endif
+#if __has_include("duckdb/common/vector/array_vector.hpp")
+#include "duckdb/common/vector/array_vector.hpp"
+#endif
+#if __has_include("duckdb/common/vector/flat_vector.hpp")
+#include "duckdb/common/vector/flat_vector.hpp"
+#endif
+#if __has_include("duckdb/common/vector/constant_vector.hpp")
+#include "duckdb/common/vector/constant_vector.hpp"
+#endif
+#if __has_include("duckdb/common/vector/dictionary_vector.hpp")
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #endif
 
 // duckdb::Identifier replaced std::string as the name type in table-function and
@@ -113,8 +133,8 @@ inline void CompatSetOutputCardinality(DataChunk &chunk, idx_t count) {
 //
 // The invariant this expresses is exactly the one that matters: "whatever type
 // this DuckDB's bind callback fills, that is CompatName."
-using CompatName = typename std::remove_reference<decltype(
-    std::declval<TableFunctionBindInput &>().input_table_names)>::type::value_type;
+using CompatName =
+    std::remove_reference<decltype(std::declval<TableFunctionBindInput &>().input_table_names)>::type::value_type;
 
 // Self-check, on BOTH lines: if a future DuckDB moves the bind name type again
 // (or moves it on one branch but not another, as already happened with the
@@ -159,6 +179,49 @@ inline vector<string> CompatNameStrings(const NAMES &names) {
 		result.push_back(CompatNameStr(name));
 	}
 	return result;
+}
+
+// --- QueryResult schema access ---------------------------------------------------
+// v1.5: BaseQueryResult::names / ::types are PUBLIC members, and there are no
+//       GetNames()/GetTypes() accessors at all.
+// v2.0: both members are PRIVATE, reached via GetNames() / GetTypes().
+//
+// So this is not merely the Identifier retype -- `result.names[i]` fails to
+// compile on v2.0 no matter what you do about the element type. Worth calling
+// out because it is nowhere near a bind signature: it is the extension's own
+// conn.Query() results, used to read schemas for the non-native pvar / psam /
+// pfile source paths.
+template <class T, class = void>
+struct CompatHasGetNames : std::false_type {};
+template <class T>
+struct CompatHasGetNames<T, decltype(void(std::declval<const T &>().GetNames()))> : std::true_type {};
+
+template <class T, class = void>
+struct CompatHasGetTypes : std::false_type {};
+template <class T>
+struct CompatHasGetTypes<T, decltype(void(std::declval<const T &>().GetTypes()))> : std::true_type {};
+
+//! Column names of a query result, as plain strings, on either line.
+//! Returned BY VALUE rather than by reference: the element type differs between
+//! versions, so there is no one reference type to hand back.
+template <class RESULT>
+inline vector<string> CompatResultNames(const RESULT &result) {
+	if constexpr (CompatHasGetNames<RESULT>::value) {
+		return CompatNameStrings(result.GetNames());
+	} else {
+		return CompatNameStrings(result.names);
+	}
+}
+
+//! Column types of a query result. The element type did NOT change, so this one
+//! can stay a reference.
+template <class RESULT>
+inline const vector<LogicalType> &CompatResultTypes(const RESULT &result) {
+	if constexpr (CompatHasGetTypes<RESULT>::value) {
+		return result.GetTypes();
+	} else {
+		return result.types;
+	}
 }
 
 // --- StructVector child entries -------------------------------------------------

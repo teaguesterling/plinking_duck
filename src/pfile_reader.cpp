@@ -149,13 +149,14 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 	meta.from_parquet = true;
 	meta.source_path = source;
 	meta.header.format = PsamFormat::PSAM_IID;
-	// QueryResult::names is vector<Identifier> on v2.0; column_names is strings.
-	meta.header.column_names = CompatNameStrings(schema_res->names);
-	meta.header.column_types = schema_res->types;
+	// BaseQueryResult::names/types are private on v2.0 (and names is
+	// vector<Identifier> there); both go through the shim.
+	meta.header.column_names = CompatResultNames(*schema_res);
+	meta.header.column_types = CompatResultTypes(*schema_res);
 
 	idx_t iid_idx = DConstants::INVALID_INDEX;
-	for (idx_t i = 0; i < schema_res->names.size(); i++) {
-		auto lower = StringUtil::Lower(CompatNameStr(schema_res->names[i]));
+	for (idx_t i = 0; i < meta.header.column_names.size(); i++) {
+		auto lower = StringUtil::Lower(meta.header.column_names[i]);
 		if (lower == "sex") {
 			meta.sex_col_idx = i;
 		} else if (lower == "pat" || lower == "mat") {
@@ -169,7 +170,7 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 	}
 	if (iid_idx == DConstants::INVALID_INDEX) {
 		throw IOException("read_pfile: source '%s' has no IID column (found: %s)", source,
-		                  StringUtil::Join(CompatNameStrings(schema_res->names), ", "));
+		                  StringUtil::Join(meta.header.column_names, ", "));
 	}
 	meta.iid_col_idx = iid_idx;
 
@@ -1279,7 +1280,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// Sample metadata columns from .psam
 		auto &psam_header = bind_data->sample_metadata.header;
 		for (idx_t i = 0; i < psam_header.column_names.size(); i++) {
-			names.push_back(psam_header.column_names[i]);
+			// .psam header columns are runtime strings (Identifier on v2.0).
+			names.push_back(CompatMakeName(psam_header.column_names[i]));
 			return_types.push_back(psam_header.column_types[i]);
 			bind_data->geno_sample_col_to_psam_col.push_back(i);
 		}
@@ -1432,7 +1434,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// Sample-orient mode: sample metadata columns + genotypes array/list
 		auto &psam_header = bind_data->sample_metadata.header;
 		for (idx_t i = 0; i < psam_header.column_names.size(); i++) {
-			names.push_back(psam_header.column_names[i]);
+			// .psam header columns are runtime strings (Identifier on v2.0).
+			names.push_back(CompatMakeName(psam_header.column_names[i]));
 			return_types.push_back(psam_header.column_types[i]);
 			bind_data->sample_orient_col_to_psam_col.push_back(i);
 		}

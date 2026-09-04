@@ -609,8 +609,8 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 	// Copied to strings rather than bound by reference: QueryResult::names is
 	// vector<Identifier> on DuckDB v2.0, and the matching below is plain
 	// lowercase string comparison.
-	auto col_names = CompatNameStrings(result.names);
-	auto &col_types = result.types;
+	auto col_names = CompatResultNames(result);
+	auto &col_types = CompatResultTypes(result);
 	idx_t chrom_col = DConstants::INVALID_INDEX;
 	idx_t pos_col = DConstants::INVALID_INDEX;
 	idx_t id_col = DConstants::INVALID_INDEX;
@@ -853,20 +853,22 @@ static string DetectChromColumn(Connection &conn, const string &path, const stri
 	if (result->HasError()) {
 		throw IOException("%s: failed to read parquet schema for '%s': %s", func_name, path, result->GetError());
 	}
-	for (auto &name : result->names) {
-		auto lower = StringUtil::Lower(CompatNameStr(name));
+	// BaseQueryResult::names is private on v2.0; reach it through the shim.
+	auto schema_names = CompatResultNames(*result);
+	for (auto &name : schema_names) {
+		auto lower = StringUtil::Lower(name);
 		if (lower == "#chrom") {
 			return "#CHROM";
 		}
 	}
-	for (auto &name : result->names) {
-		auto lower = StringUtil::Lower(CompatNameStr(name));
+	for (auto &name : schema_names) {
+		auto lower = StringUtil::Lower(name);
 		if (lower == "chrom") {
 			return "CHROM";
 		}
 	}
 	throw InvalidInputException("%s: parquet companion '%s' has no CHROM or #CHROM column (columns: %s)", func_name,
-	                            path, StringUtil::Join(CompatNameStrings(result->names), ", "));
+	                            path, StringUtil::Join(schema_names, ", "));
 }
 
 //! Region-pushdown loader: queries the parquet file with a WHERE clause so
@@ -969,7 +971,7 @@ idx_t GetParquetRowCount(ClientContext &context, const string &path) {
 static void IngestSampleResult(QueryResult &result, const string &source_label, SampleInfo &info, bool load_iids,
                                bool load_fids) {
 	// See IngestVariantResult: QueryResult::names is vector<Identifier> on v2.0.
-	auto col_names = CompatNameStrings(result.names);
+	auto col_names = CompatResultNames(result);
 	idx_t iid_col = DConstants::INVALID_INDEX;
 	idx_t fid_col = DConstants::INVALID_INDEX;
 	idx_t sex_col = DConstants::INVALID_INDEX;

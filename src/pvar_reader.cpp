@@ -288,17 +288,17 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 			}
 
 			if (f == 0) {
-				// Use the first result's schema as the output schema
-				for (idx_t i = 0; i < result->names.size(); i++) {
-					names.push_back(CompatMakeName(result->names[i]));
-					return_types.push_back(result->types[i]);
+				// Use the first result's schema as the output schema.
+				// BaseQueryResult::names/types are private on v2.0 (and names is
+				// vector<Identifier> there), so both go through the shim, which
+				// hands back plain strings.
+				auto schema_names = CompatResultNames(*result);
+				auto &schema_types = CompatResultTypes(*result);
+				for (idx_t i = 0; i < schema_names.size(); i++) {
+					names.push_back(CompatMakeName(schema_names[i]));
+					return_types.push_back(schema_types[i]);
 				}
-				// Back across the boundary: names is vector<Identifier> on v2.0.
-				bind_data->header_info.column_names.clear();
-				bind_data->header_info.column_names.reserve(names.size());
-				for (auto &col_name : names) {
-					bind_data->header_info.column_names.push_back(CompatNameStr(col_name));
-				}
+				bind_data->header_info.column_names = schema_names;
 				bind_data->header_info.column_types = return_types;
 				bind_data->header_info.is_bim = false;
 				bind_data->header_info.skip_lines = 0;

@@ -442,15 +442,15 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 		}
 
 		// Use the result schema as the output schema
-		// QueryResult::names is vector<Identifier> on v2.0; column_names is strings.
-		result->column_names = CompatNameStrings(query_result->names);
-		result->column_types = query_result->types;
+		// BaseQueryResult::names/types are private on v2.0; both via the shim.
+		result->column_names = CompatResultNames(*query_result);
+		result->column_types = CompatResultTypes(*query_result);
 		result->format = PsamFormat::PSAM_IID; // placeholder
 
-		for (idx_t i = 0; i < query_result->names.size(); i++) {
+		for (idx_t i = 0; i < result->column_names.size(); i++) {
 			// Schema of the queried external source, resolved at runtime.
-			names.push_back(CompatMakeName(query_result->names[i]));
-			return_types.push_back(query_result->types[i]);
+			names.push_back(CompatMakeName(result->column_names[i]));
+			return_types.push_back(result->column_types[i]);
 		}
 
 		// Materialize all rows
