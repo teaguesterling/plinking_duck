@@ -701,13 +701,15 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				} else {
 					for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
 						if (list_children[i].IsNull()) {
-							throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name, i);
+							throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u",
+							                            CompatNameStr(name), i);
 						}
 						covar_vals[i] = list_children[i].GetValue<double>();
 					}
 				}
 
-				bind_data->covariate_names.push_back(name);
+				// covariate_names is vector<string>; `name` is an Identifier on v2.0.
+				bind_data->covariate_names.push_back(CompatNameStr(name));
 				bind_data->covariate_values.push_back(std::move(covar_vals));
 			}
 		} else {
