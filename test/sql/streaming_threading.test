@@ -203,14 +203,14 @@ WHERE OBS_CT + MISSING_CT != 50000;
 # (exercises parallel Phase 1 since scored_variants > 100 threshold)
 query I
 SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
-    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}));
+    weights := list_transform(range(50000), lambda x: {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}));
 ----
 8
 
 # plink_score: all values are non-null and finite
 query I
 SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
-    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
+    weights := list_transform(range(50000), lambda x: {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
 WHERE SCORE_SUM IS NULL OR SCORE_AVG IS NULL;
 ----
 0
@@ -218,7 +218,7 @@ WHERE SCORE_SUM IS NULL OR SCORE_AVG IS NULL;
 # plink_score: ALLELE_CT > 0 for all samples (variants were scored)
 query I
 SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
-    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
+    weights := list_transform(range(50000), lambda x: {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
 WHERE ALLELE_CT <= 0;
 ----
 0
@@ -227,7 +227,7 @@ WHERE ALLELE_CT <= 0;
 # This must hold exactly regardless of threading (same accumulation order per sample)
 query I
 SELECT COUNT(*) FROM plink_score('test/data/streaming_example.pgen',
-    weights := list_transform(range(50000), x -> {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
+    weights := list_transform(range(50000), lambda x: {'id': concat('var', x+1), 'allele': 'G', 'weight': 1.0}))
 WHERE SCORE_SUM != NAMED_ALLELE_DOSAGE_SUM;
 ----
 0
