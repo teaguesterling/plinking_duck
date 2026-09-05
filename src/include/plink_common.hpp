@@ -411,9 +411,9 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 //! until the sorted target interval has been passed and materializes only
 //! matching rows. Returns a sparse VariantMetadataIndex keyed by global
 //! pgenlib-compatible file-row variant indices.
-VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, const string &path,
-                                                       const string &chrom, int64_t pos_start, int64_t pos_end,
-                                                       idx_t variant_ct_hint, const string &func_name);
+VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, const string &path, const string &chrom,
+                                                       int64_t pos_start, int64_t pos_end, idx_t variant_ct_hint,
+                                                       const string &func_name);
 
 //! Row count from a parquet file via row-group metadata aggregation
 //! (DuckDB-optimized `COUNT(*)`). Typically sub-ms but O(num_row_groups),

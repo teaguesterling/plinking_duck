@@ -405,9 +405,9 @@ static void ParseVariantHeaderLine(const string &header_line, VariantMetadataInd
 }
 
 static bool ParseVariantDataLine(const char *buf, size_t content_end, bool whitespace, idx_t chrom_field,
-                                 idx_t pos_field, idx_t id_field, idx_t ref_field, idx_t alt_field,
-                                 const string &path, const string &func_name, uint64_t line_number, string &chrom,
-                                 int32_t &pos_val, string &id, string &ref, string &alt) {
+                                 idx_t pos_field, idx_t id_field, idx_t ref_field, idx_t alt_field, const string &path,
+                                 const string &func_name, uint64_t line_number, string &chrom, int32_t &pos_val,
+                                 string &id, string &ref, string &alt) {
 	const idx_t max_field = std::max({chrom_field, pos_field, id_field, ref_field, alt_field});
 	size_t cursor = 0;
 	size_t fstart = 0, flen = 0;
@@ -461,15 +461,15 @@ static bool ParseVariantDataLine(const char *buf, size_t content_end, bool white
 			missing += " REF";
 		if (!got_alt)
 			missing += " ALT";
-		throw InvalidInputException("%s: .pvar/.bim file '%s' line %llu missing required fields [%s]", func_name,
-		                            path, static_cast<unsigned long long>(line_number), missing.c_str());
+		throw InvalidInputException("%s: .pvar/.bim file '%s' line %llu missing required fields [%s]", func_name, path,
+		                            static_cast<unsigned long long>(line_number), missing.c_str());
 	}
 	return true;
 }
 
-VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, const string &path,
-                                                       const string &chrom, int64_t pos_start, int64_t pos_end,
-                                                       idx_t variant_ct_hint, const string &func_name) {
+VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, const string &path, const string &chrom,
+                                                       int64_t pos_start, int64_t pos_end, idx_t variant_ct_hint,
+                                                       const string &func_name) {
 	BindPhaseTimer timer("LoadVariantMetadataFromTextRegion");
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
@@ -613,7 +613,8 @@ VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, c
 	}
 	if (!idx.chroms.empty()) {
 		idx.chrom_offsets.emplace(idx.chroms.front(), std::make_pair(idx_t {0}, idx.chroms.size()));
-		if (!idx.local_to_vidx.empty() && idx.local_to_vidx.back() - idx.local_to_vidx.front() + 1 == idx.local_to_vidx.size()) {
+		if (!idx.local_to_vidx.empty() &&
+		    idx.local_to_vidx.back() - idx.local_to_vidx.front() + 1 == idx.local_to_vidx.size()) {
 			idx.has_contiguous_vidx_range = true;
 			idx.contiguous_start_vidx = idx.local_to_vidx.front();
 		}
@@ -1184,7 +1185,8 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	// Single chrom in pushdown, single contiguous range of local indices
 	if (!idx.chroms.empty()) {
 		idx.chrom_offsets.emplace(idx.chroms.front(), std::make_pair(idx_t {0}, idx.chroms.size()));
-		if (!idx.local_to_vidx.empty() && idx.local_to_vidx.back() - idx.local_to_vidx.front() + 1 == idx.local_to_vidx.size()) {
+		if (!idx.local_to_vidx.empty() &&
+		    idx.local_to_vidx.back() - idx.local_to_vidx.front() + 1 == idx.local_to_vidx.size()) {
 			idx.has_contiguous_vidx_range = true;
 			idx.contiguous_start_vidx = idx.local_to_vidx.front();
 		}

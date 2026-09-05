@@ -581,7 +581,8 @@ static vector<string> LoadSamplePopulationLabels(ClientContext &context, const s
 		throw InvalidInputException("plink_ld: population_column requires a .psam/.fam file");
 	}
 	if (population_column.empty()) {
-		throw InvalidInputException("plink_ld: population_column must not be empty when population_weights is supplied");
+		throw InvalidInputException(
+		    "plink_ld: population_column must not be empty when population_weights is supplied");
 	}
 
 	auto lines = ReadFileLines(context, psam_path);
@@ -665,8 +666,9 @@ static vector<double> BuildPopulationSampleWeights(const PlinkLdBindData &bind_d
 
 	for (auto &kv : population_weights) {
 		if (kv.second > 0.0 && included_pop_counts[kv.first] == 0) {
-			throw InvalidInputException("plink_ld: population_weights includes '%s', but no included samples have that %s",
-			                            kv.first, bind_data.population_column);
+			throw InvalidInputException(
+			    "plink_ld: population_weights includes '%s', but no included samples have that %s", kv.first,
+			    bind_data.population_column);
 		}
 	}
 
@@ -816,7 +818,8 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 		}
 	}
 
-	bind_data->use_population_weights = !bind_data->population_column.empty() || !bind_data->population_weights_spec.empty();
+	bind_data->use_population_weights =
+	    !bind_data->population_column.empty() || !bind_data->population_weights_spec.empty();
 	if (bind_data->use_population_weights &&
 	    (bind_data->population_column.empty() || bind_data->population_weights_spec.empty())) {
 		throw InvalidInputException("plink_ld: population_column and population_weights must be supplied together");
@@ -863,9 +866,9 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	plink2::PgenHeaderCtrl header_ctrl;
 	uintptr_t pgfi_alloc_cacheline_ct = 0;
 
-	plink2::PglErr err = plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX,
-	                                            &header_ctrl, &bind_data->shared_pgfi,
-	                                            &pgfi_alloc_cacheline_ct, errstr_buf);
+	plink2::PglErr err =
+	    plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX, &header_ctrl,
+	                           &bind_data->shared_pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -907,14 +910,14 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	bool metadata_region_pushed = false;
 	bool can_region_push_metadata = region_spec.has_region && bind_data->mode == LdMode::WINDOWED;
 	if (can_region_push_metadata && IsParquetFile(bind_data->pvar_path)) {
-		bind_data->variants = LoadVariantMetadataFromParquetRegion(context, bind_data->pvar_path, region_spec.chrom,
-		                                                        region_spec.start, region_spec.end,
-		                                                        bind_data->raw_variant_ct, "plink_ld");
+		bind_data->variants =
+		    LoadVariantMetadataFromParquetRegion(context, bind_data->pvar_path, region_spec.chrom, region_spec.start,
+		                                         region_spec.end, bind_data->raw_variant_ct, "plink_ld");
 		metadata_region_pushed = true;
 	} else if (can_region_push_metadata && IsNativePlinkFormat(bind_data->pvar_path)) {
-		bind_data->variants = LoadVariantMetadataFromTextRegion(context, bind_data->pvar_path, region_spec.chrom,
-		                                                     region_spec.start, region_spec.end, bind_data->raw_variant_ct,
-		                                                     "plink_ld");
+		bind_data->variants =
+		    LoadVariantMetadataFromTextRegion(context, bind_data->pvar_path, region_spec.chrom, region_spec.start,
+		                                      region_spec.end, bind_data->raw_variant_ct, "plink_ld");
 		metadata_region_pushed = true;
 	} else {
 		bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_ld");
@@ -957,7 +960,7 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	if (bind_data->use_population_weights) {
 		auto population_weights = ParsePopulationWeightsSpec(bind_data->population_weights_spec);
 		auto labels = LoadSamplePopulationLabels(context, bind_data->psam_path, bind_data->population_column,
-		                                      bind_data->raw_sample_ct);
+		                                         bind_data->raw_sample_ct);
 		bind_data->sample_weights = BuildPopulationSampleWeights(*bind_data, labels, population_weights);
 		if (bind_data->sample_weights.size() != bind_data->effective_sample_ct) {
 			throw InternalException("plink_ld: constructed sample weights do not match effective sample count");
@@ -973,7 +976,8 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 				bind_data->variant_range.end_idx = bind_data->variants.local_to_vidx.back() + 1;
 			}
 		} else {
-			bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_ld");
+			bind_data->variant_range =
+			    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_ld");
 		}
 	}
 
@@ -999,9 +1003,9 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	// R is signed ALT-dosage correlation and is needed by fine-mapping / coloc
 	// methods such as SuSiE and ColocBoost. R2 is retained for compatibility.
 	names = {"CHROM_A", "POS_A", "ID_A", "CHROM_B", "POS_B", "ID_B", "R", "R2", "D_PRIME", "OBS_CT"};
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE, LogicalType::INTEGER};
+	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::INTEGER};
 
 	return std::move(bind_data);
 }
@@ -1049,7 +1053,8 @@ static unique_ptr<GlobalTableFunctionState> PlinkLdInitGlobal(ClientContext &con
 	state->genovec_word_ct = plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
 	state->genovec_bytes = state->genovec_word_ct * sizeof(uintptr_t);
 	uintptr_t cache_bytes = static_cast<uintptr_t>(range) * state->genovec_bytes;
-	idx_t estimated_threads = state->mode == LdMode::PAIRWISE ? 1 : ApplyMaxThreadsCap(range / 50 + 1, state->max_threads_config);
+	idx_t estimated_threads =
+	    state->mode == LdMode::PAIRWISE ? 1 : ApplyMaxThreadsCap(range / 50 + 1, state->max_threads_config);
 	bool cache_fits_per_thread = cache_bytes <= LD_CACHE_MAX_BYTES_PER_THREAD;
 	bool cache_fits_total = estimated_threads > 0 && cache_bytes <= (LD_CACHE_MAX_BYTES_TOTAL / estimated_threads);
 	state->use_genotype_cache = bind_data.cache_genotypes && state->mode == LdMode::WINDOWED && range > 0 &&
@@ -1080,8 +1085,8 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 	}
 
 	plink2::PglErr err = plink2::PgrInit(bind_data.pgen_path.c_str(), bind_data.max_vrec_width,
-	                                    const_cast<plink2::PgenFileInfo *>(&bind_data.shared_pgfi),
-	                                    &state->pgr, state->pgr_alloc_buf.As<unsigned char>());
+	                                     const_cast<plink2::PgenFileInfo *>(&bind_data.shared_pgfi), &state->pgr,
+	                                     state->pgr_alloc_buf.As<unsigned char>());
 
 	if (err != plink2::kPglRetSuccess) {
 		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
@@ -1097,7 +1102,8 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 	}
 
 	// Allocate two genovec buffers (anchor + partner)
-	uintptr_t genovec_word_ct = gstate.genovec_word_ct ? gstate.genovec_word_ct : plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
+	uintptr_t genovec_word_ct =
+	    gstate.genovec_word_ct ? gstate.genovec_word_ct : plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
 	uintptr_t genovec_bytes = gstate.genovec_bytes ? gstate.genovec_bytes : genovec_word_ct * sizeof(uintptr_t);
 	state->genovec_a_buf.Allocate(genovec_bytes);
 	state->genovec_b_buf.Allocate(genovec_bytes);
@@ -1119,8 +1125,8 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 			if (bind_data.has_sample_subset && bind_data.sample_subset) {
 				sample_include = bind_data.sample_subset->SampleInclude();
 			}
-			plink2::PglErr cache_err = plink2::PgrGet(sample_include, state->pssi, bind_data.effective_sample_ct, vidx,
-			                                         &state->pgr, dest);
+			plink2::PglErr cache_err =
+			    plink2::PgrGet(sample_include, state->pssi, bind_data.effective_sample_ct, vidx, &state->pgr, dest);
 			if (cache_err != plink2::kPglRetSuccess) {
 				throw IOException("plink_ld: PgrGet failed while caching variant %u", vidx);
 			}
@@ -1292,13 +1298,13 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 		if (vidx_a == vidx_b) {
 			// Self-LD: use same buffer for both
 			auto result = ComputeLdStatsDispatch(bind_data, genovec_a, genovec_a, sample_ct, stats_a, stats_a,
-			                                    gstate.need_r, gstate.need_d_prime);
+			                                     gstate.need_r, gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		} else {
 			genovec_b = GetGenovec(lstate, bind_data, vidx_b, genovec_b_buf);
 			stats_b = GetCachedGenovecStats(lstate, vidx_b);
 			auto result = ComputeLdStatsDispatch(bind_data, genovec_a, genovec_b, sample_ct, stats_a, stats_b,
-			                                    gstate.need_r, gstate.need_d_prime);
+			                                     gstate.need_r, gstate.need_d_prime);
 			EmitRow(output, 0, bind_data, gstate, vidx_a, vidx_b, result);
 		}
 		CompatSetOutputCardinality(output, 1);
@@ -1354,7 +1360,7 @@ static void PlinkLdScan(ClientContext &context, TableFunctionInput &data_p, Data
 				genovec_b = GetGenovec(lstate, bind_data, j, genovec_b_buf);
 				stats_b = GetCachedGenovecStats(lstate, j);
 				auto result = ComputeLdStatsDispatch(bind_data, genovec_a, genovec_b, sample_ct, stats_a, stats_b,
-				                                    gstate.need_r, gstate.need_d_prime);
+				                                     gstate.need_r, gstate.need_d_prime);
 
 				if (result.is_valid && result.r2 >= bind_data.r2_threshold) {
 					EmitRow(output, rows_emitted, bind_data, gstate, ai, j, result);
