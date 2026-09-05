@@ -232,26 +232,26 @@ struct PlinkGlmGlobalState : public GlobalTableFunctionState {
 // Allocated once per thread in InitLocal based on max sample count and predictor count.
 struct LogisticBuffers {
 	// Core IRLS buffers
-	vector<float> xx;    // p * max_sample_ctav (covariate-major design matrix)
-	vector<float> yy;    // max_sample_ctav (phenotype)
-	vector<float> coef;  // predictor_ctav
-	vector<float> ll;    // p * predictor_ctav (Cholesky output)
-	vector<float> pp;    // max_sample_ctav (predicted probabilities)
-	vector<float> vv;    // max_sample_ctav (variances)
-	vector<float> hh;    // p * predictor_ctav (Hessian / inverted var-cov)
-	vector<float> grad;  // predictor_ctav
-	vector<float> dcoef; // predictor_ctav
+	AlignedVector<float> xx;    // p * max_sample_ctav (covariate-major design matrix)
+	AlignedVector<float> yy;    // max_sample_ctav (phenotype)
+	AlignedVector<float> coef;  // predictor_ctav
+	AlignedVector<float> ll;    // p * predictor_ctav (Cholesky output)
+	AlignedVector<float> pp;    // max_sample_ctav (predicted probabilities)
+	AlignedVector<float> vv;    // max_sample_ctav (variances)
+	AlignedVector<float> hh;    // p * predictor_ctav (Hessian / inverted var-cov)
+	AlignedVector<float> grad;  // predictor_ctav
+	AlignedVector<float> dcoef; // predictor_ctav
 
 	// Firth-specific buffers
-	vector<double> half_inverted_buf;    // p * p
-	vector<MatrixInvertBuf1> inv_1d_buf; // 2 * p
-	vector<double> dbl_2d_buf;           // p * p
-	vector<float> ustar;                 // predictor_ctav
-	vector<float> delta;                 // predictor_ctav
-	vector<float> hdiag;                 // max_sample_ctav
-	vector<float> ww;                    // max_sample_ctav
-	vector<float> hh0;                   // p * predictor_ctav
-	vector<float> tmpnxk_buf;            // p * max_sample_ctav
+	AlignedVector<double> half_inverted_buf;    // p * max(p, 3)
+	AlignedVector<MatrixInvertBuf1> inv_1d_buf; // 2 * p
+	AlignedVector<double> dbl_2d_buf;           // p * max(p, 7)
+	AlignedVector<float> ustar;                 // predictor_ctav
+	AlignedVector<float> delta;                 // predictor_ctav
+	AlignedVector<float> hdiag;                 // max_sample_ctav
+	AlignedVector<float> ww;                    // max_sample_ctav
+	AlignedVector<float> hh0;                   // p * predictor_ctav
+	AlignedVector<float> tmpnxk_buf;            // p * max_sample_ctav
 
 	// Hessian inversion buffers (reused for non-Firth and Firth paths)
 	// half_inverted_buf, inv_1d_buf, dbl_2d_buf are shared above

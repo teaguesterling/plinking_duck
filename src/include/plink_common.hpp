@@ -1,4 +1,7 @@
 #pragma once
+#include <vector>
+#include <new>
+#include <cstdlib>
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -56,6 +59,71 @@ enum class OrientMode : uint8_t {
 //! Resolve orient parameter string to an OrientMode.
 //! Errors if orient value is invalid.
 OrientMode ResolveOrientMode(const string &orient_str, const string &func_name);
+
+// ---------------------------------------------------------------------------
+// Allocator giving std::vector the alignment plink2's SIMD kernels require
+// ---------------------------------------------------------------------------
+
+//! plink2's float kernels use ALIGNED AVX loads. Under FVEC_32,
+//! MultMatrixDxnVectNF (plink2_glm_logistic.cc:212) does:
+//!
+//!     const __m256 vv = _mm256_load_ps(&(vect[col_idx]));
+//!
+//! `_mm256_load_ps` is the aligned load: it FAULTS on a pointer that is not
+//! 32-byte aligned, rather than falling back like `_mm256_loadu_ps`.
+//!
+//! std::vector only guarantees alignof(std::max_align_t), which is 16 on
+//! x86-64. Passing a std::vector<float>::data() straight into these kernels is
+//! therefore a latent SIGSEGV whose occurrence depends on where the allocator
+//! happens to place the block and on whether the AVX2 path was compiled in --
+//! which is why it can crash under one DuckDB build while passing under
+//! another, with no out-of-bounds access for a sanitizer to report.
+//!
+//! 64 covers AVX2 (32) and AVX-512 (64), and matches plink2's own cacheline
+//! alignment for these allocations.
+template <class T, size_t ALIGNMENT = 64>
+struct AlignedAllocator {
+	using value_type = T;
+
+	AlignedAllocator() noexcept = default;
+	template <class U>
+	AlignedAllocator(const AlignedAllocator<U, ALIGNMENT> &) noexcept {
+	}
+
+	template <class U>
+	struct rebind {
+		using other = AlignedAllocator<U, ALIGNMENT>;
+	};
+
+	T *allocate(size_t n) {
+		size_t bytes = n * sizeof(T);
+		if (bytes == 0) {
+			bytes = ALIGNMENT;
+		}
+		// posix_memalign requires a multiple of the alignment.
+		bytes = ((bytes + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+		void *raw = nullptr;
+		if (posix_memalign(&raw, ALIGNMENT, bytes) != 0) {
+			throw std::bad_alloc();
+		}
+		return static_cast<T *>(raw);
+	}
+
+	void deallocate(T *p, size_t) noexcept {
+		free(p);
+	}
+
+	bool operator==(const AlignedAllocator &) const noexcept {
+		return true;
+	}
+	bool operator!=(const AlignedAllocator &) const noexcept {
+		return false;
+	}
+};
+
+//! std::vector with plink2-compatible alignment.
+template <class T>
+using AlignedVector = std::vector<T, AlignedAllocator<T>>;
 
 // ---------------------------------------------------------------------------
 // RAII wrapper for cache-aligned allocations from pgenlib
