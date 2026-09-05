@@ -234,7 +234,7 @@ struct PlinkLdLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkLdBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -519,46 +519,46 @@ static void EmitRow(DataChunk &output, idx_t row_idx, const PlinkLdBindData &bin
 	auto &variants = bind_data.variants;
 
 	// CHROM_A
-	FlatVector::GetData<string_t>(output.data[COL_CHROM_A])[row_idx] =
+	CompatFlatDataMutable<string_t>(output.data[COL_CHROM_A])[row_idx] =
 	    StringVector::AddString(output.data[COL_CHROM_A], variants.GetChrom(vidx_a));
 
 	// POS_A
-	FlatVector::GetData<int32_t>(output.data[COL_POS_A])[row_idx] = variants.GetPos(vidx_a);
+	CompatFlatDataMutable<int32_t>(output.data[COL_POS_A])[row_idx] = variants.GetPos(vidx_a);
 
 	// ID_A
 	auto id_a = variants.GetId(vidx_a);
 	if (id_a.empty()) {
 		FlatVector::SetNull(output.data[COL_ID_A], row_idx, true);
 	} else {
-		FlatVector::GetData<string_t>(output.data[COL_ID_A])[row_idx] =
+		CompatFlatDataMutable<string_t>(output.data[COL_ID_A])[row_idx] =
 		    StringVector::AddString(output.data[COL_ID_A], id_a);
 	}
 
 	// CHROM_B
-	FlatVector::GetData<string_t>(output.data[COL_CHROM_B])[row_idx] =
+	CompatFlatDataMutable<string_t>(output.data[COL_CHROM_B])[row_idx] =
 	    StringVector::AddString(output.data[COL_CHROM_B], variants.GetChrom(vidx_b));
 
 	// POS_B
-	FlatVector::GetData<int32_t>(output.data[COL_POS_B])[row_idx] = variants.GetPos(vidx_b);
+	CompatFlatDataMutable<int32_t>(output.data[COL_POS_B])[row_idx] = variants.GetPos(vidx_b);
 
 	// ID_B
 	auto id_b = variants.GetId(vidx_b);
 	if (id_b.empty()) {
 		FlatVector::SetNull(output.data[COL_ID_B], row_idx, true);
 	} else {
-		FlatVector::GetData<string_t>(output.data[COL_ID_B])[row_idx] =
+		CompatFlatDataMutable<string_t>(output.data[COL_ID_B])[row_idx] =
 		    StringVector::AddString(output.data[COL_ID_B], id_b);
 	}
 
 	// R2, D_PRIME, OBS_CT
 	if (result.is_valid) {
-		FlatVector::GetData<double>(output.data[COL_R2])[row_idx] = result.r2;
-		FlatVector::GetData<double>(output.data[COL_D_PRIME])[row_idx] = result.d_prime;
+		CompatFlatDataMutable<double>(output.data[COL_R2])[row_idx] = result.r2;
+		CompatFlatDataMutable<double>(output.data[COL_D_PRIME])[row_idx] = result.d_prime;
 	} else {
 		FlatVector::SetNull(output.data[COL_R2], row_idx, true);
 		FlatVector::SetNull(output.data[COL_D_PRIME], row_idx, true);
 	}
-	FlatVector::GetData<int32_t>(output.data[COL_OBS_CT])[row_idx] = static_cast<int32_t>(result.obs_ct);
+	CompatFlatDataMutable<int32_t>(output.data[COL_OBS_CT])[row_idx] = static_cast<int32_t>(result.obs_ct);
 }
 
 static void ReadGenovec(PlinkLdLocalState &lstate, const PlinkLdBindData &bind_data, uint32_t vidx,

@@ -382,7 +382,7 @@ struct PsamLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto result = make_uniq<PsamBindData>();
 	result->file_path = input.inputs[0].GetValue<string>();
 
@@ -425,7 +425,8 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 
 		// Populate output schema
 		for (idx_t i = 0; i < header.column_names.size(); i++) {
-			names.push_back(header.column_names[i]);
+			// Column names come from the .psam header at runtime.
+			names.push_back(CompatMakeName(header.column_names[i]));
 			return_types.push_back(header.column_types[i]);
 		}
 	} else {
@@ -441,13 +442,15 @@ static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBi
 		}
 
 		// Use the result schema as the output schema
-		result->column_names = query_result->names;
-		result->column_types = query_result->types;
+		// BaseQueryResult::names/types are private on v2.0; both via the shim.
+		result->column_names = CompatResultNames(*query_result);
+		result->column_types = CompatResultTypes(*query_result);
 		result->format = PsamFormat::PSAM_IID; // placeholder
 
-		for (idx_t i = 0; i < query_result->names.size(); i++) {
-			names.push_back(query_result->names[i]);
-			return_types.push_back(query_result->types[i]);
+		for (idx_t i = 0; i < result->column_names.size(); i++) {
+			// Schema of the queried external source, resolved at runtime.
+			names.push_back(CompatMakeName(result->column_names[i]));
+			return_types.push_back(result->column_types[i]);
 		}
 
 		// Materialize all rows
@@ -608,7 +611,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 						if (sex_val == 0) {
 							FlatVector::SetNull(vec, row, true);
 						} else {
-							FlatVector::GetData<int32_t>(vec)[row] = sex_val;
+							CompatFlatDataMutable<int32_t>(vec)[row] = sex_val;
 						}
 					} catch (const std::invalid_argument &) {
 						FlatVector::SetNull(vec, row, true);
@@ -621,14 +624,14 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 				if (IsParentMissing(val)) {
 					FlatVector::SetNull(vec, row, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[row] = StringVector::AddString(vec, val);
 				}
 			} else {
 				// VARCHAR columns: general missing-value handling
 				if (IsMissingValue(val)) {
 					FlatVector::SetNull(vec, row, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[row] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[row] = StringVector::AddString(vec, val);
 				}
 			}
 		}

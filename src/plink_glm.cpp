@@ -232,26 +232,26 @@ struct PlinkGlmGlobalState : public GlobalTableFunctionState {
 // Allocated once per thread in InitLocal based on max sample count and predictor count.
 struct LogisticBuffers {
 	// Core IRLS buffers
-	vector<float> xx;    // p * max_sample_ctav (covariate-major design matrix)
-	vector<float> yy;    // max_sample_ctav (phenotype)
-	vector<float> coef;  // predictor_ctav
-	vector<float> ll;    // p * predictor_ctav (Cholesky output)
-	vector<float> pp;    // max_sample_ctav (predicted probabilities)
-	vector<float> vv;    // max_sample_ctav (variances)
-	vector<float> hh;    // p * predictor_ctav (Hessian / inverted var-cov)
-	vector<float> grad;  // predictor_ctav
-	vector<float> dcoef; // predictor_ctav
+	AlignedVector<float> xx;    // p * max_sample_ctav (covariate-major design matrix)
+	AlignedVector<float> yy;    // max_sample_ctav (phenotype)
+	AlignedVector<float> coef;  // predictor_ctav
+	AlignedVector<float> ll;    // p * predictor_ctav (Cholesky output)
+	AlignedVector<float> pp;    // max_sample_ctav (predicted probabilities)
+	AlignedVector<float> vv;    // max_sample_ctav (variances)
+	AlignedVector<float> hh;    // p * predictor_ctav (Hessian / inverted var-cov)
+	AlignedVector<float> grad;  // predictor_ctav
+	AlignedVector<float> dcoef; // predictor_ctav
 
 	// Firth-specific buffers
-	vector<double> half_inverted_buf;    // p * p
-	vector<MatrixInvertBuf1> inv_1d_buf; // 2 * p
-	vector<double> dbl_2d_buf;           // p * p
-	vector<float> ustar;                 // predictor_ctav
-	vector<float> delta;                 // predictor_ctav
-	vector<float> hdiag;                 // max_sample_ctav
-	vector<float> ww;                    // max_sample_ctav
-	vector<float> hh0;                   // p * predictor_ctav
-	vector<float> tmpnxk_buf;            // p * max_sample_ctav
+	AlignedVector<double> half_inverted_buf;    // p * max(p, 3)
+	AlignedVector<MatrixInvertBuf1> inv_1d_buf; // 2 * p
+	AlignedVector<double> dbl_2d_buf;           // p * max(p, 7)
+	AlignedVector<float> ustar;                 // predictor_ctav
+	AlignedVector<float> delta;                 // predictor_ctav
+	AlignedVector<float> hdiag;                 // max_sample_ctav
+	AlignedVector<float> ww;                    // max_sample_ctav
+	AlignedVector<float> hh0;                   // p * predictor_ctav
+	AlignedVector<float> tmpnxk_buf;            // p * max_sample_ctav
 
 	// Hessian inversion buffers (reused for non-Firth and Firth paths)
 	// half_inverted_buf, inv_1d_buf, dbl_2d_buf are shared above
@@ -276,10 +276,33 @@ struct LogisticBuffers {
 		grad.resize(predictor_ctav);
 		dcoef.resize(predictor_ctav);
 
-		// Hessian inversion buffers (needed for all logistic paths)
-		half_inverted_buf.resize(p * p);
-		inv_1d_buf.resize(2 * p);
-		dbl_2d_buf.resize(p * p);
+		// Hessian inversion buffers (needed for all logistic paths).
+		//
+		// These are NOT p*p. plink-ng sizes them with a floor, because the VIF and
+		// Firth paths reuse them as scratch wider than the Hessian itself --
+		// plink2_glm_logistic.cc:3271:
+		//
+		//   // dbl_2d_buf = max_predictor_ct * max_predictor_ct doubles, or VIF/Firth
+		//   //              (which can be max_predictor_ct * 7 doubles).
+		//   workspace_size += RoundUpPow2(pred_ct * MAXV(pred_ct, 7) * sizeof(double), ...);
+		//   // half_inverted_buf
+		//   workspace_size += RoundUpPow2(pred_ct * MAXV(pred_ct, 3) * sizeof(double), ...);
+		//
+		// p*p under-allocates whenever p < 7 (dbl_2d_buf) or p < 3
+		// (half_inverted_buf), which is the common case: an intercept plus a
+		// genotype column is p = 2, so dbl_2d_buf got 4 doubles where 14 are
+		// required. plink2 then writes 80 bytes past the end of the block.
+		//
+		// That overrun was latent: harmless under one allocator and layout, fatal
+		// under another. It surfaced as a SIGSEGV in the logistic path on the
+		// DuckDB v2.0 image while passing on v1.5, which looked like a version
+		// incompatibility and was in fact this.
+		//
+		// The linear path already sizes its equivalent correctly with
+		// std::max(up, 7u); this is the same rule, applied to logistic.
+		half_inverted_buf.resize(p * std::max(p, 3u));
+		inv_1d_buf.resize(2 * p); // pred_ct * kMatrixInvertBuf1CheckedAlloc == 2*p elements
+		dbl_2d_buf.resize(p * std::max(p, 7u));
 
 		if (use_firth) {
 			ustar.resize(predictor_ctav);
@@ -346,7 +369,7 @@ struct PlinkGlmLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkGlmBindData>();
 	string prefix = input.inputs[0].GetValue<string>();
 
@@ -672,15 +695,15 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				if (val.IsNull() || val.type().id() != LogicalTypeId::LIST) {
 					// A NULL field list (e.g. {age: list(x) over zero rows}) has a LIST
 					// type but no children — reject before ListValue::GetChildren.
-					throw InvalidInputException("plink_glm: covariate '%s' must be a non-null LIST, got %s", name,
-					                            val.type().ToString());
+					throw InvalidInputException("plink_glm: covariate '%s' must be a non-null LIST, got %s",
+					                            CompatNameStr(name), val.type().ToString());
 				}
 
 				auto &list_children = ListValue::GetChildren(val);
 				if (static_cast<uint32_t>(list_children.size()) != bind_data->raw_sample_ct) {
-					throw InvalidInputException("plink_glm: covariate '%s' length (%llu) must match sample count (%u)",
-					                            name, static_cast<unsigned long long>(list_children.size()),
-					                            bind_data->raw_sample_ct);
+					throw InvalidInputException(
+					    "plink_glm: covariate '%s' length (%llu) must match sample count (%u)", CompatNameStr(name),
+					    static_cast<unsigned long long>(list_children.size()), bind_data->raw_sample_ct);
 				}
 
 				// Extract values for effective samples (NULLs not allowed in covariates)
@@ -691,8 +714,8 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 					for (uint32_t raw_idx = 0; raw_idx < bind_data->raw_sample_ct; raw_idx++) {
 						if (plink2::IsSet(si, raw_idx)) {
 							if (list_children[raw_idx].IsNull()) {
-								throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name,
-								                            raw_idx);
+								throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u",
+								                            CompatNameStr(name), raw_idx);
 							}
 							covar_vals[out_idx] = list_children[raw_idx].GetValue<double>();
 							out_idx++;
@@ -701,13 +724,15 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 				} else {
 					for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
 						if (list_children[i].IsNull()) {
-							throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u", name, i);
+							throw InvalidInputException("plink_glm: covariate '%s' contains NULL at index %u",
+							                            CompatNameStr(name), i);
 						}
 						covar_vals[i] = list_children[i].GetValue<double>();
 					}
 				}
 
-				bind_data->covariate_names.push_back(name);
+				// covariate_names is vector<string>; `name` is an Identifier on v2.0.
+				bind_data->covariate_names.push_back(CompatNameStr(name));
 				bind_data->covariate_values.push_back(std::move(covar_vals));
 			}
 		} else {
@@ -1293,11 +1318,11 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				switch (file_col) {
 				case COL_CHROM: {
 					auto val = bind_data.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
@@ -1305,13 +1330,13 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case COL_REF: {
 					auto val = bind_data.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
@@ -1319,7 +1344,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1329,7 +1354,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -1337,23 +1362,23 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (std::isnan(lr.a1_freq)) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.a1_freq;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.a1_freq;
 					}
 					break;
 				}
 				case COL_TEST: {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, "ADD");
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, "ADD");
 					break;
 				}
 				case COL_OBS_CT: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(lr.obs_ct);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(lr.obs_ct);
 					break;
 				}
 				case COL_BETA: {
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.beta;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.beta;
 					}
 					break;
 				}
@@ -1361,7 +1386,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.se;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.se;
 					}
 					break;
 				}
@@ -1369,7 +1394,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.t_stat;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.t_stat;
 					}
 					break;
 				}
@@ -1377,13 +1402,13 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 					if (lr.errcode != nullptr) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.p_value;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.p_value;
 					}
 					break;
 				}
 				case COL_ERRCODE: {
 					if (lr.errcode != nullptr) {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, lr.errcode);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, lr.errcode);
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					}
@@ -1391,7 +1416,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 				case COL_OR: {
 					if (lr.is_logistic && lr.errcode == nullptr) {
-						FlatVector::GetData<double>(vec)[rows_emitted] = lr.odds_ratio;
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = lr.odds_ratio;
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					}
@@ -1399,7 +1424,7 @@ static void PlinkGlmScan(ClientContext &context, TableFunctionInput &data_p, Dat
 				}
 				case COL_FIRTH_YN: {
 					if (lr.is_logistic && lr.errcode == nullptr) {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] =
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 						    StringVector::AddString(vec, lr.firth_applied ? "Y" : "N");
 					} else {
 						FlatVector::SetNull(vec, rows_emitted, true);

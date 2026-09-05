@@ -149,12 +149,14 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 	meta.from_parquet = true;
 	meta.source_path = source;
 	meta.header.format = PsamFormat::PSAM_IID;
-	meta.header.column_names = schema_res->names;
-	meta.header.column_types = schema_res->types;
+	// BaseQueryResult::names/types are private on v2.0 (and names is
+	// vector<Identifier> there); both go through the shim.
+	meta.header.column_names = CompatResultNames(*schema_res);
+	meta.header.column_types = CompatResultTypes(*schema_res);
 
 	idx_t iid_idx = DConstants::INVALID_INDEX;
-	for (idx_t i = 0; i < schema_res->names.size(); i++) {
-		auto lower = StringUtil::Lower(schema_res->names[i]);
+	for (idx_t i = 0; i < meta.header.column_names.size(); i++) {
+		auto lower = StringUtil::Lower(meta.header.column_names[i]);
 		if (lower == "sex") {
 			meta.sex_col_idx = i;
 		} else if (lower == "pat" || lower == "mat") {
@@ -168,7 +170,7 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 	}
 	if (iid_idx == DConstants::INVALID_INDEX) {
 		throw IOException("read_pfile: source '%s' has no IID column (found: %s)", source,
-		                  StringUtil::Join(schema_res->names, ", "));
+		                  StringUtil::Join(meta.header.column_names, ", "));
 	}
 	meta.iid_col_idx = iid_idx;
 
@@ -193,7 +195,7 @@ static void ExtractStringColumn(ClientContext &context, DataChunk &chunk, idx_t 
 		src = &varchar_vec;
 	}
 	UnifiedVectorFormat fmt;
-	src->ToUnifiedFormat(n, fmt);
+	CompatToUnifiedFormat(*src, n, fmt);
 	auto data = UnifiedVectorFormat::GetData<string_t>(fmt);
 	for (idx_t row = 0; row < n; row++) {
 		idx_t vidx = fmt.sel->get_index(row);
@@ -898,7 +900,7 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<CompatName> &names) {
 	BindPhaseTimer bind_timer("PfileBind(total)");
 	auto bind_data = make_uniq<PfileBindData>();
 
@@ -1278,7 +1280,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// Sample metadata columns from .psam
 		auto &psam_header = bind_data->sample_metadata.header;
 		for (idx_t i = 0; i < psam_header.column_names.size(); i++) {
-			names.push_back(psam_header.column_names[i]);
+			// .psam header columns are runtime strings (Identifier on v2.0).
+			names.push_back(CompatMakeName(psam_header.column_names[i]));
 			return_types.push_back(psam_header.column_types[i]);
 			bind_data->geno_sample_col_to_psam_col.push_back(i);
 		}
@@ -1431,7 +1434,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// Sample-orient mode: sample metadata columns + genotypes array/list
 		auto &psam_header = bind_data->sample_metadata.header;
 		for (idx_t i = 0; i < psam_header.column_names.size(); i++) {
-			names.push_back(psam_header.column_names[i]);
+			// .psam header columns are runtime strings (Identifier on v2.0).
+			names.push_back(CompatMakeName(psam_header.column_names[i]));
 			return_types.push_back(psam_header.column_types[i]);
 			bind_data->sample_orient_col_to_psam_col.push_back(i);
 		}
@@ -1484,7 +1488,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 						    col_name);
 					}
 					bind_data->genotype_column_names.push_back(col_name);
-					names.push_back(col_name);
+					// Runtime string -> bind names vector (Identifier on v2.0).
+					names.push_back(CompatMakeName(col_name));
 					return_types.push_back(bind_data->include_dosages ? LogicalType::DOUBLE : LogicalType::TINYINT);
 				}
 			}
@@ -1511,7 +1516,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 						    col_name);
 					}
 					bind_data->genotype_column_names.push_back(col_name);
-					struct_children.push_back({col_name, field_type});
+					// Runtime string -> child_list_t key (Identifier on v2.0).
+					struct_children.push_back({CompatMakeName(col_name), field_type});
 				}
 			}
 
@@ -1877,7 +1883,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
 				string col_name = bind_data->sample_info.iids[file_idx];
 				bind_data->genotype_column_names.push_back(col_name);
-				names.push_back(col_name);
+				// Runtime string -> bind names vector (Identifier on v2.0).
+				names.push_back(CompatMakeName(col_name));
 				return_types.push_back(col_type);
 			}
 		} else if (bind_data->genotype_mode == GenotypeMode::STRUCT) {
@@ -1891,7 +1898,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				uint32_t file_idx = bind_data->has_sample_subset ? bind_data->sample_indices[s] : s;
 				string col_name = bind_data->sample_info.iids[file_idx];
 				bind_data->genotype_column_names.push_back(col_name);
-				struct_children.push_back({col_name, field_type});
+				// Runtime string -> child_list_t key (Identifier on v2.0).
+				struct_children.push_back({CompatMakeName(col_name), field_type});
 			}
 
 			names = {"CHROM", "POS", "ID", "REF", "ALT", "genotypes"};
@@ -2446,11 +2454,11 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			switch (file_col) {
 			case PfileBindData::CHROM_COL: {
 				auto val = source.variants.GetChrom(vidx);
-				FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+				CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 				break;
 			}
 			case PfileBindData::POS_COL: {
-				FlatVector::GetData<int32_t>(vec)[rows_emitted] = source.variants.GetPos(vidx);
+				CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = source.variants.GetPos(vidx);
 				break;
 			}
 			case PfileBindData::ID_COL: {
@@ -2458,13 +2466,13 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				if (val.empty()) {
 					FlatVector::SetNull(vec, rows_emitted, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 				}
 				break;
 			}
 			case PfileBindData::REF_COL: {
 				auto val = source.variants.GetRef(vidx);
-				FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+				CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 				break;
 			}
 			case PfileBindData::ALT_COL: {
@@ -2472,7 +2480,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				if (val.empty() || val == ".") {
 					FlatVector::SetNull(vec, rows_emitted, true);
 				} else {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 				}
 				break;
 			}
@@ -2486,7 +2494,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							if (dosage == -9.0) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+								CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
 							}
 						} else {
 							int8_t geno = lstate.genotype_bytes[sample_pos];
@@ -2494,7 +2502,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+								CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
 							}
 						}
 					} else {
@@ -2509,11 +2517,11 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					}
 					auto &entries = StructVector::GetEntries(vec);
 					for (idx_t s = 0; s < output_sample_ct; s++) {
-						auto &child_vec = *entries[s];
+						auto &child_vec = CompatStructEntry(entries[s]);
 						if (bind_data.include_phased) {
 							auto &allele_vec = ArrayVector::GetEntry(child_vec);
-							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(child_vec);
+							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+							auto &pair_validity = CompatFlatValidityMutable(child_vec);
 							idx_t allele_base = rows_emitted * 2;
 							int8_t a1 = lstate.phased_pairs[s * 2];
 							int8_t a2 = lstate.phased_pairs[s * 2 + 1];
@@ -2530,7 +2538,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							if (dosage == -9.0) {
 								FlatVector::SetNull(child_vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<double>(child_vec)[rows_emitted] = dosage;
+								CompatFlatDataMutable<double>(child_vec)[rows_emitted] = dosage;
 							}
 						} else {
 							int8_t geno = lstate.genotype_bytes[s];
@@ -2538,7 +2546,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 								FlatVector::SetNull(child_vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<int8_t>(child_vec)[rows_emitted] = geno;
+								CompatFlatDataMutable<int8_t>(child_vec)[rows_emitted] = geno;
 							}
 						}
 					}
@@ -2567,43 +2575,45 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					}
 
 					auto &entries = StructVector::GetEntries(vec);
-					FlatVector::GetData<uint32_t>(*entries[0])[rows_emitted] = genocounts[0];
-					FlatVector::GetData<uint32_t>(*entries[1])[rows_emitted] = genocounts[1];
-					FlatVector::GetData<uint32_t>(*entries[2])[rows_emitted] = genocounts[2];
-					FlatVector::GetData<uint32_t>(*entries[3])[rows_emitted] = genocounts[3];
+					CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[0]))[rows_emitted] = genocounts[0];
+					CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[1]))[rows_emitted] = genocounts[1];
+					CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[2]))[rows_emitted] = genocounts[2];
+					CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[3]))[rows_emitted] = genocounts[3];
 
 					if (bind_data.genotype_mode == GenotypeMode::STATS) {
 						uint32_t n = genocounts[0] + genocounts[1] + genocounts[2];
 						uint32_t total = n + genocounts[3];
-						FlatVector::GetData<uint32_t>(*entries[4])[rows_emitted] = n;
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[4]))[rows_emitted] = n;
 						if (n == 0) {
-							FlatVector::GetData<double>(*entries[5])[rows_emitted] =
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] =
 							    std::numeric_limits<double>::quiet_NaN();
-							FlatVector::GetData<double>(*entries[6])[rows_emitted] =
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
 							    std::numeric_limits<double>::quiet_NaN();
-							FlatVector::GetData<double>(*entries[9])[rows_emitted] =
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
 							    std::numeric_limits<double>::quiet_NaN();
 						} else {
 							double af = (static_cast<double>(genocounts[1]) + 2.0 * genocounts[2]) / (2.0 * n);
-							FlatVector::GetData<double>(*entries[5])[rows_emitted] = af;
-							FlatVector::GetData<double>(*entries[6])[rows_emitted] = std::min(af, 1.0 - af);
-							FlatVector::GetData<double>(*entries[9])[rows_emitted] =
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] = af;
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
+							    std::min(af, 1.0 - af);
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
 							    static_cast<double>(genocounts[1]) / static_cast<double>(n);
 						}
 						if (total == 0) {
-							FlatVector::GetData<double>(*entries[7])[rows_emitted] =
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
 							    std::numeric_limits<double>::quiet_NaN();
 						} else {
-							FlatVector::GetData<double>(*entries[7])[rows_emitted] =
+							CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
 							    static_cast<double>(genocounts[3]) / static_cast<double>(total);
 						}
-						FlatVector::GetData<uint32_t>(*entries[8])[rows_emitted] = genocounts[1] + genocounts[2];
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[8]))[rows_emitted] =
+						    genocounts[1] + genocounts[2];
 					}
 					break;
 				}
 				if (!genotypes_read) {
 					if (bind_data.genotype_mode == GenotypeMode::LIST) {
-						auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+						auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 						list_data[rows_emitted].offset = ListVector::GetListSize(vec);
 						list_data[rows_emitted].length = 0;
 					}
@@ -2619,8 +2629,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					} else if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 						auto &pair_vec = ArrayVector::GetEntry(vec);
 						auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-						auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
-						auto &pair_validity = FlatVector::Validity(pair_vec);
+						auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+						auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 						idx_t pair_base = rows_emitted * static_cast<idx_t>(output_sample_ct);
 						for (idx_t s = 0; s < output_sample_ct; s++) {
@@ -2643,8 +2653,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						ListVector::Reserve(vec, list_offset + output_sample_ct);
 						auto &pair_vec = ListVector::GetEntry(vec);
 						auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-						auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
-						auto &pair_validity = FlatVector::Validity(pair_vec);
+						auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+						auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 						for (idx_t s = 0; s < output_sample_ct; s++) {
 							idx_t pair_idx = list_offset + s;
@@ -2662,7 +2672,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							}
 						}
 
-						auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+						auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 						list_data[rows_emitted].offset = list_offset;
 						list_data[rows_emitted].length = output_sample_ct;
 						ListVector::SetListSize(vec, list_offset + output_sample_ct);
@@ -2672,8 +2682,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 						auto array_size = static_cast<idx_t>(output_sample_ct);
 						auto &child = ArrayVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<double>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto *child_data = CompatFlatDataMutable<double>(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 
 						idx_t base = rows_emitted * array_size;
 						for (idx_t s = 0; s < array_size; s++) {
@@ -2690,8 +2700,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						auto list_offset = ListVector::GetListSize(vec);
 						ListVector::Reserve(vec, list_offset + output_sample_ct);
 						auto &child = ListVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<double>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto *child_data = CompatFlatDataMutable<double>(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 						for (idx_t s = 0; s < output_sample_ct; s++) {
 							double dosage = lstate.dosage_doubles[s];
 							if (dosage == -9.0) {
@@ -2701,7 +2711,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								child_data[list_offset + s] = dosage;
 							}
 						}
-						auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+						auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 						list_data[rows_emitted].offset = list_offset;
 						list_data[rows_emitted].length = output_sample_ct;
 						ListVector::SetListSize(vec, list_offset + output_sample_ct);
@@ -2714,8 +2724,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 						auto array_size = static_cast<idx_t>(output_sample_ct);
 						auto &child = ArrayVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto *child_data = CompatFlatDataMutable<int8_t>(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 
 						idx_t base = rows_emitted * array_size;
 						for (idx_t s = 0; s < array_size; s++) {
@@ -2732,8 +2742,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 						auto list_offset = ListVector::GetListSize(vec);
 						ListVector::Reserve(vec, list_offset + output_sample_ct);
 						auto &child = ListVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto *child_data = CompatFlatDataMutable<int8_t>(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 						for (idx_t s = 0; s < output_sample_ct; s++) {
 							int8_t geno = lstate.genotype_bytes[s];
 							if (geno == -9 || (!geno_range_all_pass &&
@@ -2744,7 +2754,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 								child_data[list_offset + s] = geno;
 							}
 						}
-						auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+						auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 						list_data[rows_emitted].offset = list_offset;
 						list_data[rows_emitted].length = output_sample_ct;
 						ListVector::SetListSize(vec, list_offset + output_sample_ct);
@@ -2764,7 +2774,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							if (dosage == -9.0) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+								CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
 							}
 						} else {
 							int8_t geno = lstate.genotype_bytes[sample_pos];
@@ -2772,7 +2782,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 							                   !bind_data.genotype_filter.AllowsCall(static_cast<double>(geno)))) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+								CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
 							}
 						}
 					} else {
@@ -2855,7 +2865,7 @@ static void FillSampleMetadataValue(Vector &vec, idx_t row_idx, const string &va
 				if (sex_val == 0) {
 					FlatVector::SetNull(vec, row_idx, true);
 				} else {
-					FlatVector::GetData<int32_t>(vec)[row_idx] = sex_val;
+					CompatFlatDataMutable<int32_t>(vec)[row_idx] = sex_val;
 				}
 			} catch (...) {
 				FlatVector::SetNull(vec, row_idx, true);
@@ -2870,7 +2880,7 @@ static void FillSampleMetadataValue(Vector &vec, idx_t row_idx, const string &va
 			if (val == "0" || PfileIsMissingValue(val)) {
 				FlatVector::SetNull(vec, row_idx, true);
 			} else {
-				FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, val);
+				CompatFlatDataMutable<string_t>(vec)[row_idx] = StringVector::AddString(vec, val);
 			}
 			return;
 		}
@@ -2880,7 +2890,7 @@ static void FillSampleMetadataValue(Vector &vec, idx_t row_idx, const string &va
 	if (PfileIsMissingValue(val)) {
 		FlatVector::SetNull(vec, row_idx, true);
 	} else {
-		FlatVector::GetData<string_t>(vec)[row_idx] = StringVector::AddString(vec, val);
+		CompatFlatDataMutable<string_t>(vec)[row_idx] = StringVector::AddString(vec, val);
 	}
 }
 
@@ -3096,11 +3106,11 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				switch (file_col) {
 				case PfileBindData::CHROM_COL: {
 					auto val = source.variants.GetChrom(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case PfileBindData::POS_COL: {
-					FlatVector::GetData<int32_t>(vec)[rows_emitted] = source.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = source.variants.GetPos(vidx);
 					break;
 				}
 				case PfileBindData::ID_COL: {
@@ -3108,13 +3118,13 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
 				case PfileBindData::REF_COL: {
 					auto val = source.variants.GetRef(vidx);
-					FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case PfileBindData::ALT_COL: {
@@ -3122,7 +3132,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
-						FlatVector::GetData<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
+						CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					}
 					break;
 				}
@@ -3133,7 +3143,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					if (bind_data.include_phased) {
 						// ARRAY(TINYINT, 2) per row
 						auto &allele_vec = ArrayVector::GetEntry(vec);
-						auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
+						auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
 						idx_t allele_base = rows_emitted * 2;
 						int8_t a1 = lstate.phased_pairs[sample_in_variant * 2];
 						if (a1 == -9) {
@@ -3150,7 +3160,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 						if (dosage == -9.0) {
 							FlatVector::SetNull(vec, rows_emitted, true);
 						} else {
-							FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+							CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
 						}
 					} else {
 						// Scalar TINYINT
@@ -3158,7 +3168,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 						if (geno == -9) {
 							FlatVector::SetNull(vec, rows_emitted, true);
 						} else {
-							FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+							CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
 						}
 					}
 				} else {
@@ -3510,14 +3520,14 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							if (dosage == -9.0) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<double>(vec)[rows_emitted] = dosage;
+								CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
 							}
 						} else {
 							int8_t geno = bind_data.genotype_matrix[variant_pos][sample_pos];
 							if (geno == -9) {
 								FlatVector::SetNull(vec, rows_emitted, true);
 							} else {
-								FlatVector::GetData<int8_t>(vec)[rows_emitted] = geno;
+								CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
 							}
 						}
 					} else {
@@ -3532,11 +3542,11 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 						// STRUCT mode: one field per variant, values from genotype_matrix
 						auto &entries = StructVector::GetEntries(vec);
 						for (idx_t v = 0; v < effective_variant_ct; v++) {
-							auto &child_vec = *entries[v];
+							auto &child_vec = CompatStructEntry(entries[v]);
 							if (bind_data.include_phased) {
 								auto &allele_vec = ArrayVector::GetEntry(child_vec);
-								auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
-								auto &pair_validity = FlatVector::Validity(child_vec);
+								auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+								auto &pair_validity = CompatFlatValidityMutable(child_vec);
 								idx_t allele_base = rows_emitted * 2;
 								int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
 								if (a1 == -9) {
@@ -3552,14 +3562,14 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 								if (dosage == -9.0) {
 									FlatVector::SetNull(child_vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<double>(child_vec)[rows_emitted] = dosage;
+									CompatFlatDataMutable<double>(child_vec)[rows_emitted] = dosage;
 								}
 							} else {
 								int8_t geno = bind_data.genotype_matrix[v][sample_pos];
 								if (geno == -9) {
 									FlatVector::SetNull(child_vec, rows_emitted, true);
 								} else {
-									FlatVector::GetData<int8_t>(child_vec)[rows_emitted] = geno;
+									CompatFlatDataMutable<int8_t>(child_vec)[rows_emitted] = geno;
 								}
 							}
 						}
@@ -3573,45 +3583,47 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 						uint32_t missing = gstate.smp_missing[sample_pos];
 						uint32_t hom_ref = gstate.smp_total_eff_variants - het - hom_alt - missing;
 						auto &entries = StructVector::GetEntries(vec);
-						FlatVector::GetData<uint32_t>(*entries[0])[rows_emitted] = hom_ref;
-						FlatVector::GetData<uint32_t>(*entries[1])[rows_emitted] = het;
-						FlatVector::GetData<uint32_t>(*entries[2])[rows_emitted] = hom_alt;
-						FlatVector::GetData<uint32_t>(*entries[3])[rows_emitted] = missing;
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[0]))[rows_emitted] = hom_ref;
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[1]))[rows_emitted] = het;
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[2]))[rows_emitted] = hom_alt;
+						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[3]))[rows_emitted] = missing;
 
 						if (bind_data.genotype_mode == GenotypeMode::STATS) {
 							uint32_t n = hom_ref + het + hom_alt;
 							uint32_t total = n + missing;
-							FlatVector::GetData<uint32_t>(*entries[4])[rows_emitted] = n;
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[4]))[rows_emitted] = n;
 							if (n == 0) {
-								FlatVector::GetData<double>(*entries[5])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
-								FlatVector::GetData<double>(*entries[6])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
-								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
 							} else {
 								double af = (static_cast<double>(het) + 2.0 * hom_alt) / (2.0 * n);
-								FlatVector::GetData<double>(*entries[5])[rows_emitted] = af;
-								FlatVector::GetData<double>(*entries[6])[rows_emitted] = std::min(af, 1.0 - af);
-								FlatVector::GetData<double>(*entries[9])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] = af;
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
+								    std::min(af, 1.0 - af);
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
 								    static_cast<double>(het) / static_cast<double>(n);
 							}
 							if (total == 0) {
-								FlatVector::GetData<double>(*entries[7])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
 								    std::numeric_limits<double>::quiet_NaN();
 							} else {
-								FlatVector::GetData<double>(*entries[7])[rows_emitted] =
+								CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
 								    static_cast<double>(missing) / static_cast<double>(total);
 							}
-							FlatVector::GetData<uint32_t>(*entries[8])[rows_emitted] = het + hom_alt;
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[8]))[rows_emitted] =
+							    het + hom_alt;
 						}
 					} else if (bind_data.include_phased) {
 						// Phased sample-orient: each variant has stride-2 layout in genotype_matrix
 						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 							auto &pair_vec = ArrayVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(pair_vec);
+							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 							idx_t pair_base = rows_emitted * static_cast<idx_t>(effective_variant_ct);
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
@@ -3633,8 +3645,8 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							ListVector::Reserve(vec, list_offset + effective_variant_ct);
 							auto &pair_vec = ListVector::GetEntry(vec);
 							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-							auto *allele_data = FlatVector::GetData<int8_t>(allele_vec);
-							auto &pair_validity = FlatVector::Validity(pair_vec);
+							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
 
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
 								idx_t pair_idx = list_offset + v;
@@ -3650,7 +3662,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 								}
 							}
 
-							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 							list_data[rows_emitted].offset = list_offset;
 							list_data[rows_emitted].length = effective_variant_ct;
 							ListVector::SetListSize(vec, list_offset + effective_variant_ct);
@@ -3660,8 +3672,8 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 							auto array_size = static_cast<idx_t>(effective_variant_ct);
 							auto &child = ArrayVector::GetEntry(vec);
-							auto *child_data = FlatVector::GetData<double>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto *child_data = CompatFlatDataMutable<double>(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 
 							idx_t base = rows_emitted * array_size;
 							for (idx_t v = 0; v < array_size; v++) {
@@ -3678,8 +3690,8 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							auto list_offset = ListVector::GetListSize(vec);
 							ListVector::Reserve(vec, list_offset + effective_variant_ct);
 							auto &child = ListVector::GetEntry(vec);
-							auto *child_data = FlatVector::GetData<double>(child);
-							auto &child_validity = FlatVector::Validity(child);
+							auto *child_data = CompatFlatDataMutable<double>(child);
+							auto &child_validity = CompatFlatValidityMutable(child);
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
 								double dosage = bind_data.dosage_matrix[v][sample_pos];
 								if (dosage == -9.0) {
@@ -3689,7 +3701,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 									child_data[list_offset + v] = dosage;
 								}
 							}
-							auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 							list_data[rows_emitted].offset = list_offset;
 							list_data[rows_emitted].length = effective_variant_ct;
 							ListVector::SetListSize(vec, list_offset + effective_variant_ct);
@@ -3697,8 +3709,8 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					} else if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 						auto array_size = static_cast<idx_t>(effective_variant_ct);
 						auto &child = ArrayVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto *child_data = CompatFlatDataMutable<int8_t>(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 
 						idx_t base = rows_emitted * array_size;
 						for (idx_t v = 0; v < array_size; v++) {
@@ -3715,8 +3727,8 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 						auto list_offset = ListVector::GetListSize(vec);
 						ListVector::Reserve(vec, list_offset + effective_variant_ct);
 						auto &child = ListVector::GetEntry(vec);
-						auto *child_data = FlatVector::GetData<int8_t>(child);
-						auto &child_validity = FlatVector::Validity(child);
+						auto *child_data = CompatFlatDataMutable<int8_t>(child);
+						auto &child_validity = CompatFlatValidityMutable(child);
 						for (idx_t v = 0; v < effective_variant_ct; v++) {
 							int8_t geno = bind_data.genotype_matrix[v][sample_pos];
 							if (geno == -9) {
@@ -3726,7 +3738,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 								child_data[list_offset + v] = geno;
 							}
 						}
-						auto *list_data = FlatVector::GetData<list_entry_t>(vec);
+						auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
 						list_data[rows_emitted].offset = list_offset;
 						list_data[rows_emitted].length = effective_variant_ct;
 						ListVector::SetListSize(vec, list_offset + effective_variant_ct);

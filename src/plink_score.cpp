@@ -168,7 +168,7 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
 // ---------------------------------------------------------------------------
 
 static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkScoreBindData>();
 	bind_data->pgen_path = input.inputs[0].GetValue<string>();
 
@@ -708,7 +708,7 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 			switch (file_col) {
 			case COL_FID: {
 				if (has_fid) {
-					FlatVector::GetData<string_t>(vec)[rows_emitted] =
+					CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 					    StringVector::AddString(vec, bind_data.sample_info.fids[orig_idx]);
 				} else {
 					FlatVector::SetNull(vec, rows_emitted, true);
@@ -716,28 +716,28 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 				break;
 			}
 			case COL_IID: {
-				FlatVector::GetData<string_t>(vec)[rows_emitted] =
+				CompatFlatDataMutable<string_t>(vec)[rows_emitted] =
 				    StringVector::AddString(vec, bind_data.sample_info.iids[orig_idx]);
 				break;
 			}
 			case COL_ALLELE_CT: {
-				FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(allele_ct);
+				CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(allele_ct);
 				break;
 			}
 			case COL_DENOM: {
-				FlatVector::GetData<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(allele_ct);
+				CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(allele_ct);
 				break;
 			}
 			case COL_NAMED_ALLELE_DOSAGE_SUM: {
-				FlatVector::GetData<double>(vec)[rows_emitted] = dosage_sum;
+				CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage_sum;
 				break;
 			}
 			case COL_SCORE_SUM: {
-				FlatVector::GetData<double>(vec)[rows_emitted] = score_sum;
+				CompatFlatDataMutable<double>(vec)[rows_emitted] = score_sum;
 				break;
 			}
 			case COL_SCORE_AVG: {
-				FlatVector::GetData<double>(vec)[rows_emitted] = score_avg;
+				CompatFlatDataMutable<double>(vec)[rows_emitted] = score_avg;
 				break;
 			}
 			default:

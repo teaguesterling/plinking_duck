@@ -13,3 +13,4 @@ site/
 # Shared across worktrees via .git-worktree-shared (not tracked in git)
 .lq
 .mcp.json
+.cache/

@@ -8,10 +8,38 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  # github.event_name is part of the key on purpose. Without it a push to a
+  # branch and a workflow_dispatch on that same branch collide: same ref, same
+  # sha, both with empty head_ref/base_ref. cancel-in-progress then kills the
+  # push run every time the canary is dispatched by hand, and a cancelled run
+  # reads as a failed one on the checks dashboard.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
 
 jobs:
+  # Forward-compat canary: intentionally builds against duckdb `main` (the v2.0
+  # line). community-extensions' build_next.yml builds every release PR against
+  # v2.0-cyanoptera with NO per-extension opt-out, so this leg is how we learn
+  # about API drift before a release PR goes red.
+  #
+  # Advisory, NOT a merge blocker -- merge-readiness is judged on the stable
+  # v1.5 build below. Gated with `if:` rather than `continue-on-error:`: a job
+  # calling a REUSABLE workflow accepts only a fixed set of keys, and adding
+  # `continue-on-error` makes the whole workflow fail to PARSE, scheduling zero
+  # jobs. The gate also keeps the canary out of pull_request check rollups,
+  # where an advisory red reads as a real failure.
+  duckdb-next-build:
+    name: Canary — build against DuckDB main (advisory)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: main
+      ci_tools_version: main
+      extension_name: plinking_duck
+      # Same plink-ng portability exclusions as the stable leg below -- they are
+      # plink-ng source issues, independent of the DuckDB version.
+      exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
