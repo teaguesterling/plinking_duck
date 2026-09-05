@@ -276,10 +276,33 @@ struct LogisticBuffers {
 		grad.resize(predictor_ctav);
 		dcoef.resize(predictor_ctav);
 
-		// Hessian inversion buffers (needed for all logistic paths)
-		half_inverted_buf.resize(p * p);
-		inv_1d_buf.resize(2 * p);
-		dbl_2d_buf.resize(p * p);
+		// Hessian inversion buffers (needed for all logistic paths).
+		//
+		// These are NOT p*p. plink-ng sizes them with a floor, because the VIF and
+		// Firth paths reuse them as scratch wider than the Hessian itself --
+		// plink2_glm_logistic.cc:3271:
+		//
+		//   // dbl_2d_buf = max_predictor_ct * max_predictor_ct doubles, or VIF/Firth
+		//   //              (which can be max_predictor_ct * 7 doubles).
+		//   workspace_size += RoundUpPow2(pred_ct * MAXV(pred_ct, 7) * sizeof(double), ...);
+		//   // half_inverted_buf
+		//   workspace_size += RoundUpPow2(pred_ct * MAXV(pred_ct, 3) * sizeof(double), ...);
+		//
+		// p*p under-allocates whenever p < 7 (dbl_2d_buf) or p < 3
+		// (half_inverted_buf), which is the common case: an intercept plus a
+		// genotype column is p = 2, so dbl_2d_buf got 4 doubles where 14 are
+		// required. plink2 then writes 80 bytes past the end of the block.
+		//
+		// That overrun was latent: harmless under one allocator and layout, fatal
+		// under another. It surfaced as a SIGSEGV in the logistic path on the
+		// DuckDB v2.0 image while passing on v1.5, which looked like a version
+		// incompatibility and was in fact this.
+		//
+		// The linear path already sizes its equivalent correctly with
+		// std::max(up, 7u); this is the same rule, applied to logistic.
+		half_inverted_buf.resize(p * std::max(p, 3u));
+		inv_1d_buf.resize(2 * p); // pred_ct * kMatrixInvertBuf1CheckedAlloc == 2*p elements
+		dbl_2d_buf.resize(p * std::max(p, 7u));
 
 		if (use_firth) {
 			ustar.resize(predictor_ctav);
