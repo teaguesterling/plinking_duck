@@ -481,6 +481,12 @@ VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, c
 	}
 
 	VariantMetadataIndex idx;
+	// The vectors hold only the region-matching rows, indexed by local position
+	// (file-row vidx via vidx_map / the contiguous fast path). Mark it a subset so
+	// a zero-match region (empty vidx_map, no contiguous range) is not
+	// misclassified as dense — see VariantMetadataIndex::is_subset. Mirrors
+	// LoadVariantMetadataFromParquetRegion.
+	idx.is_subset = true;
 	idx.variant_ct = variant_ct_hint;
 	idx.has_ids = true;
 	idx.has_alleles = true;
