@@ -222,3 +222,112 @@ ORDER BY R2 DESC;
 ----
 rs3	1.0
 rs2	0.75
+
+# ===========================================================================
+# cache_genotypes (maintainer-added tests for PR #37)
+# ===========================================================================
+#
+# cache_genotypes := true caches the region's packed genotypes per worker and,
+# for variant pairs where NEITHER side has a missing call, switches to a
+# popcount kernel (DotNoMissingGenovec) instead of the scalar per-sample loop.
+# The two must agree exactly; if they ever diverge, the cached fast path is
+# silently returning different LD than the documented estimator.
+
+# pgen_example: 4 samples, mixed missingness. rs2/rs4 is the pair with no
+# missing calls, so this covers both the popcount and the scalar branches.
+query I
+SELECT COUNT(*) FROM (
+    (SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+        window_kb := 1000, r2_threshold := 0.0, inter_chr := true, cache_genotypes := true)
+     EXCEPT
+     SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+        window_kb := 1000, r2_threshold := 0.0, inter_chr := true, cache_genotypes := false))
+    UNION ALL
+    (SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+        window_kb := 1000, r2_threshold := 0.0, inter_chr := true, cache_genotypes := false)
+     EXCEPT
+     SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+        window_kb := 1000, r2_threshold := 0.0, inter_chr := true, cache_genotypes := true))
+);
+----
+0
+
+# pca_example: 250 samples with no missing calls, so EVERY pair takes the
+# popcount path when cached. 250 samples = 7 full 32-genotype words plus a
+# 26-genotype tail, which exercises MaskTrailingGenotypes as well as the
+# full-word branch. Region 1:0-49 bounds this to C(50,2) = 1225 pairs.
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pca_example.pgen',
+    region := '1:0-49', window_kb := 1, r2_threshold := 0.0);
+----
+1225
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pca_example.pgen',
+        region := '1:0-49', window_kb := 1, r2_threshold := 0.0, cache_genotypes := true)
+     EXCEPT
+     SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pca_example.pgen',
+        region := '1:0-49', window_kb := 1, r2_threshold := 0.0, cache_genotypes := false))
+    UNION ALL
+    (SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pca_example.pgen',
+        region := '1:0-49', window_kb := 1, r2_threshold := 0.0, cache_genotypes := false)
+     EXCEPT
+     SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pca_example.pgen',
+        region := '1:0-49', window_kb := 1, r2_threshold := 0.0, cache_genotypes := true))
+);
+----
+0
+
+# large_example: region pushdown through the new native-.pvar region loader
+# (LoadVariantMetadataFromTextRegion), which returns a SUBSET index rather
+# than a dense one. Cached and streaming must still agree.
+query I
+SELECT COUNT(*) FROM (
+    (SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/large_example.pgen',
+        region := '1:100-1000', window_kb := 1, r2_threshold := 0.0, cache_genotypes := true)
+     EXCEPT
+     SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/large_example.pgen',
+        region := '1:100-1000', window_kb := 1, r2_threshold := 0.0, cache_genotypes := false))
+    UNION ALL
+    (SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/large_example.pgen',
+        region := '1:100-1000', window_kb := 1, r2_threshold := 0.0, cache_genotypes := false)
+     EXCEPT
+     SELECT ID_A, ID_B, R, R2, D_PRIME, OBS_CT FROM plink_ld('test/data/large_example.pgen',
+        region := '1:100-1000', window_kb := 1, r2_threshold := 0.0, cache_genotypes := true))
+);
+----
+0
+
+# --- Signed R in windowed mode ---
+# Same hand-derived values as the pairwise tests in plink_ld.test.
+query TTRR
+SELECT ID_A, ID_B, round(R, 6), round(R2, 6)
+FROM plink_ld('test/data/pgen_example.pgen',
+    window_kb := 10000, r2_threshold := 0.0, inter_chr := true)
+ORDER BY ID_A, ID_B;
+----
+rs1	rs2	-0.866025	0.75
+rs1	rs3	-1.0	1.0
+rs1	rs4	0.866025	0.75
+rs2	rs3	-0.5	0.25
+rs2	rs4	0.426401	0.181818
+rs3	rs4	-1.0	1.0
+
+# --- Population-weighted LD in windowed mode ---
+# Sample weights [0.125, 0.125, 0.375, 0.375]; rs1/rs2 reproduces the
+# hand-computed -0.9185587 from the pairwise test.
+query TTR
+SELECT ID_A, ID_B, round(R, 6)
+FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    window_kb := 10000, r2_threshold := 0.0, inter_chr := true,
+    population_column := 'POP', population_weights := 'A=0.25,B=0.75')
+ORDER BY ID_A, ID_B;
+----
+rs1	rs2	-0.918559
+rs1	rs3	-1.0
+rs1	rs4	0.918559
+rs2	rs3	-0.661438
+rs2	rs4	0.5547
+rs3	rs4	-1.0
