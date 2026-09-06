@@ -292,6 +292,10 @@ p-value), while the count columns report haploid carriers with `HET_CT = 0`. See
 
 #### Sex-chromosome handling
 
+Ploidy handling **differs per function**, because the right answer differs. The
+table at the end of this section is the summary; read it before using any of
+these functions on non-autosomal data.
+
 `plink_freq` and `plink_hardy` classify each variant by chromosome and treat
 ploidy accordingly. This requires a `.psam`/`.fam` **SEX** column (1 = male,
 2 = female); samples with unknown/missing sex are excluded from the
@@ -314,6 +318,72 @@ parameter selects the PAR coordinates: `'GRCh38'`/`'hg38'` (default),
 If no sex information is available, sex-dependent stats on chrX/chrY are emitted
 as `NULL` rather than silently assuming diploid; chrMT (sex-independent) is
 unaffected. A heterozygous hardcall on a haploid stratum is treated as missing.
+
+##### `plink_score`
+
+Scores are ploidy-aware on **chrY and chrMT**, where a hemizygous call
+contributes **one** allele rather than two — matching plink2, whose scoring
+halves haploid genotypes regardless of `--xchr-model`. `ALLELE_CT`/`DENOM`
+therefore increase by 1 (not 2) per haploid variant, and `SCORE_AVG` is scaled
+accordingly.
+
+On **chrY**, females and unknown-sex samples are **excluded outright** — they
+contribute to neither `SCORE_SUM` nor `ALLELE_CT` — because their genotype is
+structurally absent rather than missing. They are *not* mean-imputed. Scoring
+chrY without a **SEX** column is an **error**, not a silent approximation.
+
+On **chrX**, scores are **diploid for every sample**, males included (coded
+0..2). This matches plink2's *default* `--xchr-model 2`. plink2's
+`--xchr-model 1` (halve male chrX values) is **not implemented**; if you need it,
+halve the chrX weights yourself. chrX scoring needs no sex information.
+
+##### `plink_missing`
+
+Missingness counts **samples, not alleles**, so chrX and chrMT need no ploidy
+adjustment: a hemizygous sample either has a call or it does not.
+
+**chrY is the exception.** Females have no chrY, so counting them as "missing"
+inflates both numerator and denominator. Matching plink2:
+
+- *Variant mode:* the denominator is the **male count**, and only males'
+  calls are counted — so a fully genotyped chrY variant reports `F_MISS` 0,
+  not 0.5.
+- *Sample mode:* chrY variants are dropped from **both** the numerator and the
+  denominator for females and unknown-sex samples, so their `OBS_CT` is lower
+  than males' by the number of chrY variants in range.
+
+Unknown-sex samples are treated as not carrying chrY (plink2's default, absent
+`--y-nosex-missing-stats`). Without a **SEX** column, chrY rows are `NULL` in
+variant mode, and sample mode spanning chrY is an **error**.
+
+##### `plink_glm` — not ploidy-aware (stated limitation)
+
+`plink_glm` applies an **additive diploid model to every variant**, including
+chrX, chrY and chrMT, and **adds no sex covariate**. This is a known limitation,
+not an oversight:
+
+- On **chrX** the allele coding matches plink2's default `--xchr-model 2`
+  ("code males 0..2"), but plink2 *also* adds **sex as a covariate** for chrX
+  under both `--xchr-model 1` and `2`. `plink_glm` does not, because injecting a
+  covariate would silently rewrite a user-specified model and collide with a sex
+  covariate you may already have supplied.
+- On **chrY/chrMT** plink2 treats calls as haploid (halving the genotype);
+  `plink_glm` does not, so a hemizygous ALT call enters the design matrix as 2.
+
+Consequently **`BETA`/`SE` on non-autosomal variants are not comparable to
+`plink2 --glm`.** A warning naming the affected variant count is printed once per
+query. Restrict to autosomes, or supply sex as a covariate yourself via
+`covariates` and interpret the result accordingly.
+
+##### Summary
+
+| function | chrX non-PAR | chrY | chrMT |
+|---|---|---|---|
+| `plink_freq` | males 1 allele, females 2 | males only, 1 allele | 1 allele/sample |
+| `plink_hardy` | females only (males in p-value via `HweXchrLnP`) | undefined → `NULL` | undefined → `NULL` |
+| `plink_score` | diploid, males 0..2 (plink2 default `--xchr-model 2`) | haploid, males only | haploid, all samples |
+| `plink_missing` | unadjusted (counts samples) | males-only denominator | unadjusted |
+| `plink_glm` | **diploid, no sex covariate** (limitation) | **diploid** (limitation) | **diploid** (limitation) |
 
 ### `plink_missing(path [, pvar, psam, samples, region, mode])`
 

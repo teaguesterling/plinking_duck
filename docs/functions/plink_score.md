@@ -138,6 +138,24 @@ FROM plink_score('data/example.pgen',
     samples := ['SAMPLE1', 'SAMPLE2']);
 ```
 
+## Sex chromosomes and ploidy
+
+Scoring is ploidy-aware on **chrY and chrMT**: a hemizygous call contributes
+**one** allele, not two, so `ALLELE_CT`/`DENOM` rise by 1 per haploid variant.
+This matches plink2, which halves haploid genotypes regardless of `--xchr-model`.
+
+On **chrY**, females and unknown-sex samples are **excluded outright** (they
+contribute to neither `SCORE_SUM` nor `ALLELE_CT`) rather than mean-imputed,
+because their genotype is structurally absent, not missing. Scoring chrY without
+a `.psam`/`.fam` **SEX** column raises an error.
+
+On **chrX**, scoring is **diploid for every sample**, males coded 0..2 — matching
+plink2's default `--xchr-model 2`. `--xchr-model 1` (halve male chrX values) is
+not implemented; halve the chrX weights yourself if you need it. chrX scoring
+requires no sex information.
+
+See [Sex-chromosome handling](https://github.com/teaguesterling/plinking_duck#sex-chromosome-handling).
+
 ## See Also
 
 - [plink_freq](plink_freq.md) -- allele frequencies (useful for QC before scoring)

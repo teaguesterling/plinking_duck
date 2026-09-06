@@ -33,8 +33,35 @@ static constexpr idx_t COL_SCORE_AVG = 6;
 struct ScoredVariant {
 	uint32_t variant_idx; // index into .pgen file
 	double weight;        // scoring weight
-	bool flip;            // true if scored allele is REF (dosage = 2 - alt_dosage)
+	bool flip;            // true if scored allele is REF (dosage = ploidy - alt_dosage)
+	bool haploid;         // chrY / chrMT: one allele per sample, not two
+	bool males_only;      // chrY: females and unknown-sex samples have no chromosome
 };
+
+//! Ploidy flags for a scored variant, derived from the shared ClassifyChromPloidy.
+//!
+//! chrX is deliberately NOT haploid here. plink2's default --xchr-model is 2
+//! ("code males 0..2"), under which chrX scoring is diploid for every sample and
+//! needs no sex information at all; only --xchr-model 1 halves male chrX values.
+//! chrY and chrMT are haploid under every --xchr-model, so they are unconditional.
+//! Because chrX is diploid either way, PAR detection is irrelevant to scoring and
+//! no genome build is consulted.
+struct ScoreVariantPloidy {
+	bool haploid;    // one allele per sample rather than two
+	bool males_only; // only males carry the chromosome (chrY)
+};
+
+static ScoreVariantPloidy ClassifyScorePloidy(const string &chrom, int32_t pos) {
+	const ParBounds no_par; // inactive: chrX PAR and non-PAR are both diploid here
+	switch (ClassifyChromPloidy(chrom, pos, no_par)) {
+	case ChromPloidy::CHR_Y:
+		return {true, true};
+	case ChromPloidy::CHR_MT:
+		return {true, false};
+	default:
+		return {false, false}; // autosomes + chrX (PAR and non-PAR)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Bind data
@@ -70,6 +97,9 @@ struct PlinkScoreBindData : public TableFunctionData {
 
 	// Maps output index → original sample index (for sample metadata lookup)
 	vector<uint32_t> sample_output_order;
+
+	vector<uint8_t> aligned_sex; // sex per sample in effective (post-subset) order
+	bool have_sex = false;       // true iff aligned_sex is populated
 };
 
 // ---------------------------------------------------------------------------
@@ -299,6 +329,12 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 		}
 	}
 
+	// Sex, aligned to effective (post-subset) sample order. Only chrY scoring
+	// consults it; chrX is diploid under plink2's default --xchr-model 2.
+	bind_data->aligned_sex = BuildAlignedSex(bind_data->sample_info,
+	                                         bind_data->has_sample_subset ? &bind_data->sample_output_order : nullptr);
+	bind_data->have_sex = !bind_data->aligned_sex.empty();
+
 	// --- Process region parameter ---
 	auto region_it = input.named_parameters.find("region");
 	if (region_it != input.named_parameters.end()) {
@@ -399,7 +435,8 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 				}
 
 				if (weight != 0.0) {
-					bind_data->scored_variants.push_back({vidx, weight, flip});
+					auto pl = ClassifyScorePloidy(bind_data->variants.GetChrom(vidx), bind_data->variants.GetPos(vidx));
+					bind_data->scored_variants.push_back({vidx, weight, flip, pl.haploid, pl.males_only});
 				}
 			}
 
@@ -417,13 +454,29 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 			for (idx_t i = 0; i < children.size(); i++) {
 				double w = children[i].GetValue<double>();
 				if (w != 0.0) {
-					bind_data->scored_variants.push_back({range_start + static_cast<uint32_t>(i), w, false});
+					uint32_t vidx = range_start + static_cast<uint32_t>(i);
+					auto pl = ClassifyScorePloidy(bind_data->variants.GetChrom(vidx), bind_data->variants.GetPos(vidx));
+					bind_data->scored_variants.push_back({vidx, w, false, pl.haploid, pl.males_only});
 				}
 			}
 		}
 	} else {
 		throw InvalidInputException("plink_score: weights must be a list (LIST(DOUBLE) for positional mode, "
 		                            "or LIST(STRUCT(id, allele, weight)) for ID-keyed mode)");
+	}
+
+	// chrY scoring needs sex to identify the males who actually carry the
+	// chromosome. Without it a chrY score would silently average females in, so
+	// fail loudly rather than emit a plausible wrong number.
+	if (!bind_data->have_sex) {
+		for (const auto &sv : bind_data->scored_variants) {
+			if (sv.males_only) {
+				throw InvalidInputException(
+				    "plink_score: the scored set contains chrY variants but the .psam/.fam has no SEX "
+				    "column. chrY scoring requires sex (1=male, 2=female) to exclude samples that do not "
+				    "carry the chromosome; supply sex or exclude chrY variants.");
+			}
+		}
 	}
 
 	// --- Register output columns ---
@@ -595,10 +648,47 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 					    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
 					    lstate.dosage_main_buf.As<uint16_t>(), sample_ct, dosage_ct, lstate.dosage_doubles.data());
 
+					// --- Ploidy normalization (chrY / chrMT) ---
+					// .pgen stores a haploid hardcall as a homozygote, so a hemizygous
+					// ALT call arrives here as dosage 2.0. plink2 halves it: its
+					// FillDdosageInts shifts the genotype lookup table left by
+					// `is_diploid`, giving a haploid call exactly half the diploid
+					// contribution — one allele, not two — and a per-sample ploidy of 1.
+					// This is unconditional in plink2: --xchr-model governs chrX only.
+					// A heterozygous call is invalid on a haploid stratum and is treated
+					// as missing, matching plink_freq / plink_hardy.
+					const double ploidy_d = sv.haploid ? 1.0 : 2.0;
+					const uint32_t ploidy_i = sv.haploid ? 1u : 2u;
+					const uint8_t *sex_ptr = bind_data.have_sex ? bind_data.aligned_sex.data() : nullptr;
+
+					// On chrY, females and unknown-sex samples have no chromosome at all.
+					// Their genotype is structurally absent, not missing data, so they are
+					// excluded outright — contributing to neither SCORE_SUM nor ALLELE_CT
+					// — rather than being mean-imputed.
+					auto excluded = [&](uint32_t s) {
+						return sv.males_only && (sex_ptr == nullptr || sex_ptr[s] != 1);
+					};
+
+					if (sv.haploid) {
+						for (uint32_t s = 0; s < sample_ct; s++) {
+							double d = lstate.dosage_doubles[s];
+							if (d == 0.0) {
+								continue; // zero ALT alleles under either ploidy
+							}
+							// Hemizygous ALT (stored as a homozygote) is one allele;
+							// anything else is missing or an invalid haploid het.
+							lstate.dosage_doubles[s] = (d == 2.0) ? 1.0 : -9.0;
+						}
+					}
+
 					// Per-variant statistics
 					double sum_alt = 0.0;
 					uint32_t non_missing_ct = 0;
 					for (uint32_t s = 0; s < sample_ct; s++) {
+						if (excluded(s)) {
+							lstate.dosage_doubles[s] = -9.0;
+							continue;
+						}
 						if (lstate.dosage_doubles[s] != -9.0) {
 							sum_alt += lstate.dosage_doubles[s];
 							non_missing_ct++;
@@ -611,22 +701,22 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 
 					if (bind_data.center) {
 						double mean_alt = sum_alt / static_cast<double>(non_missing_ct);
-						double freq = mean_alt / 2.0;
-						double sd = std::sqrt(2.0 * freq * (1.0 - freq));
+						double freq = mean_alt / ploidy_d;
+						double sd = std::sqrt(ploidy_d * freq * (1.0 - freq));
 						if (sd == 0.0) {
 							continue;
 						}
-						double mean_scored = sv.flip ? (2.0 - mean_alt) : mean_alt;
+						double mean_scored = sv.flip ? (ploidy_d - mean_alt) : mean_alt;
 
 						for (uint32_t s = 0; s < sample_ct; s++) {
 							if (lstate.dosage_doubles[s] == -9.0) {
 								continue;
 							}
 							double scored_dosage =
-							    sv.flip ? (2.0 - lstate.dosage_doubles[s]) : lstate.dosage_doubles[s];
+							    sv.flip ? (ploidy_d - lstate.dosage_doubles[s]) : lstate.dosage_doubles[s];
 							double standardized = (scored_dosage - mean_scored) / sd;
 							lstate.local_accum.score_sums[s] += sv.weight * standardized;
-							lstate.local_accum.allele_cts[s] += 2;
+							lstate.local_accum.allele_cts[s] += ploidy_i;
 						}
 					} else if (bind_data.no_mean_imputation) {
 						for (uint32_t s = 0; s < sample_ct; s++) {
@@ -634,20 +724,23 @@ static void PlinkScoreScan(ClientContext &context, TableFunctionInput &data_p, D
 								continue;
 							}
 							double scored_dosage =
-							    sv.flip ? (2.0 - lstate.dosage_doubles[s]) : lstate.dosage_doubles[s];
+							    sv.flip ? (ploidy_d - lstate.dosage_doubles[s]) : lstate.dosage_doubles[s];
 							lstate.local_accum.score_sums[s] += sv.weight * scored_dosage;
 							lstate.local_accum.dosage_sums[s] += scored_dosage;
-							lstate.local_accum.allele_cts[s] += 2;
+							lstate.local_accum.allele_cts[s] += ploidy_i;
 						}
 					} else {
 						double mean_alt = sum_alt / static_cast<double>(non_missing_ct);
 						for (uint32_t s = 0; s < sample_ct; s++) {
+							if (excluded(s)) {
+								continue; // no chrY: excluded, never mean-imputed
+							}
 							double alt_dosage =
 							    (lstate.dosage_doubles[s] == -9.0) ? mean_alt : lstate.dosage_doubles[s];
-							double scored_dosage = sv.flip ? (2.0 - alt_dosage) : alt_dosage;
+							double scored_dosage = sv.flip ? (ploidy_d - alt_dosage) : alt_dosage;
 							lstate.local_accum.score_sums[s] += sv.weight * scored_dosage;
 							lstate.local_accum.dosage_sums[s] += scored_dosage;
-							lstate.local_accum.allele_cts[s] += 2;
+							lstate.local_accum.allele_cts[s] += ploidy_i;
 						}
 					}
 				}

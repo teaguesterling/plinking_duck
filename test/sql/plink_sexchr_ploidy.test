@@ -1,0 +1,282 @@
+# name: test/sql/plink_sexchr_ploidy.test
+# description: Ploidy-aware plink_score and plink_missing on chrX / chrY / chrMT (issue #50)
+# group: [sql]
+
+#
+# Fixture: test/data/sexchr_example.{pgen,pvar,psam} (generate_sexchr_test_data.sh).
+# Cohort: males M1,M2,M3 (SEX=1); females F1,F2,F3 (SEX=2).
+# Variants, in .pvar order: a1 (chr1), par1 (chrX PAR), x1 (chrX non-PAR),
+#                           y1 (chrY), mt1 (chrMT).
+#
+# Genotype matrix (ALT dosage AS STORED — .pgen keeps a haploid hardcall as a
+# homozygote, so a hemizygous ALT call is stored as 2):
+#          M1  M2  M3  F1  F2  F3
+#   a1      1   0   2   0   1   2
+#   par1    1   0   2   0   1   0
+#   x1      2   0   0   1   0   2
+#   y1      2   2   0   .   .   .
+#   mt1     2   2   2   2   0   0
+#
+# Every expected value below is derived BY HAND from that matrix.
+#
+# Reference semantics (plink2):
+#   * chrX  — plink2's DEFAULT --xchr-model is 2, "code males 0..2", i.e. chrX is
+#             DIPLOID for every sample. Only --xchr-model 1 halves male chrX values.
+#             So chrX is deliberately unchanged here; the chrX cases below are
+#             regression guards, not fixes.
+#   * chrY/chrMT — haploid under every --xchr-model. plink2's FillDdosageInts
+#             shifts its genotype lookup table by `is_diploid`, giving a haploid
+#             call exactly half the diploid contribution (one allele, not two).
+#   * missingness counts SAMPLES, not alleles, so chrX and chrMT need no
+#             adjustment at all; chrY does, because females have no chrY.
+
+require plinking_duck
+
+# ===========================================================================
+# plink_score — chrY is haploid AND males-only
+# ===========================================================================
+
+# Score only y1 (weights are positional; zero-weight variants are not scored).
+# Hand-derived: males contribute one allele each — M1 ALT=1, M2 ALT=1, M3 REF=0.
+# Females have no chrY: EXCLUDED outright (ALLELE_CT 0), not mean-imputed.
+#
+# WRONG (pre-fix, all-diploid): M1/M2 SCORE_SUM 2 with ALLELE_CT 2, and each
+# female mean-imputed to 4/3 = 1.333333 with ALLELE_CT 2 — a score for a
+# chromosome she does not have.
+query TIRR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6), ROUND(SCORE_AVG, 6)
+FROM plink_score('test/data/sexchr_example.pgen', weights := [0.0, 0.0, 0.0, 1.0, 0.0])
+ORDER BY IID;
+----
+F1	0	0.0	0.0
+F2	0	0.0	0.0
+F3	0	0.0	0.0
+M1	1	1.0	1.0
+M2	1	1.0	1.0
+M3	1	0.0	0.0
+
+# ===========================================================================
+# plink_score — chrMT is haploid for EVERYONE (sex-independent)
+# ===========================================================================
+
+# Score only mt1. Hand-derived: M1,M2,M3,F1 carry ALT (1 allele each);
+# F2,F3 carry REF. Every sample contributes exactly one allele.
+#
+# WRONG (pre-fix): every ALT carrier scored 2.0 with ALLELE_CT 2.
+query TIRR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6), ROUND(SCORE_AVG, 6)
+FROM plink_score('test/data/sexchr_example.pgen', weights := [0.0, 0.0, 0.0, 0.0, 1.0])
+ORDER BY IID;
+----
+F1	1	1.0	1.0
+F2	1	0.0	0.0
+F3	1	0.0	0.0
+M1	1	1.0	1.0
+M2	1	1.0	1.0
+M3	1	1.0	1.0
+
+# ===========================================================================
+# plink_score — chrX stays DIPLOID (plink2 default --xchr-model 2)
+# ===========================================================================
+
+# Score only x1. M1 is a hemizygous ALT male, stored as a homozygote, and under
+# --xchr-model 2 he is coded 0..2 — so SCORE_SUM 2 with ALLELE_CT 2 is CORRECT,
+# matching plink2's default. This asserts the fix did NOT touch chrX.
+query TIRR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6), ROUND(SCORE_AVG, 6)
+FROM plink_score('test/data/sexchr_example.pgen', weights := [0.0, 0.0, 1.0, 0.0, 0.0])
+ORDER BY IID;
+----
+F1	2	1.0	0.5
+F2	2	0.0	0.0
+F3	2	2.0	1.0
+M1	2	2.0	1.0
+M2	2	0.0	0.0
+M3	2	0.0	0.0
+
+# Autosomal regression guard: a1 is untouched.
+query TIRR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6), ROUND(SCORE_AVG, 6)
+FROM plink_score('test/data/sexchr_example.pgen', weights := [1.0, 0.0, 0.0, 0.0, 0.0])
+ORDER BY IID;
+----
+F1	2	0.0	0.0
+F2	2	1.0	0.5
+F3	2	2.0	1.0
+M1	2	1.0	0.5
+M2	2	0.0	0.0
+M3	2	2.0	1.0
+
+# ===========================================================================
+# plink_score — unknown-sex samples are excluded from chrY
+# ===========================================================================
+
+# sexchr_unknownsex.psam gives M1 SEX=0. He no longer counts as a male, so he
+# drops out of the chrY stratum entirely (ALLELE_CT 0) while M2/M3 stand.
+# Compare with the first case above, where M1 scored 1.0.
+query TIRR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6), ROUND(SCORE_AVG, 6)
+FROM plink_score('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam',
+                 weights := [0.0, 0.0, 0.0, 1.0, 0.0])
+ORDER BY IID;
+----
+F1	0	0.0	0.0
+F2	0	0.0	0.0
+F3	0	0.0	0.0
+M1	0	0.0	0.0
+M2	1	1.0	1.0
+M3	1	0.0	0.0
+
+# chrMT ignores sex entirely, so the unknown-sex sample is unaffected there.
+query TIR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6)
+FROM plink_score('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam',
+                 weights := [0.0, 0.0, 0.0, 0.0, 1.0])
+WHERE IID = 'M1';
+----
+M1	1	1.0
+
+# Scoring chrY with no SEX column fails loudly rather than averaging in females.
+statement error
+SELECT * FROM plink_score('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam',
+                          weights := [0.0, 0.0, 0.0, 1.0, 0.0]);
+----
+chrY scoring requires sex
+
+# A chrX-only score needs no sex at all (diploid under --xchr-model 2).
+query TIR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6)
+FROM plink_score('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam',
+                 weights := [0.0, 0.0, 1.0, 0.0, 0.0])
+WHERE IID = 'M1';
+----
+M1	2	2.0
+
+# ===========================================================================
+# plink_missing — variant mode: only chrY's denominator is sex-dependent
+# ===========================================================================
+
+# Every sample has a call on a1 / par1 / x1 / mt1, so those are 0 missing out of
+# 6. chrX and chrMT are deliberately NOT adjusted: missingness counts samples,
+# and a hemizygous sample still has a call.
+query TIIR
+SELECT ID, MISSING_CT, OBS_CT, ROUND(F_MISS, 6)
+FROM plink_missing('test/data/sexchr_example.pgen')
+WHERE ID IN ('a1', 'par1', 'x1', 'mt1') ORDER BY ID;
+----
+a1	0	6	0.0
+mt1	0	6	0.0
+par1	0	6	0.0
+x1	0	6	0.0
+
+# chrY: the denominator is the 3 males, and all 3 have calls -> 0 missing.
+# The 3 females are not "missing" — they have no chrY at all.
+#
+# WRONG (pre-fix): MISSING_CT 3, F_MISS 0.5 — a perfectly genotyped chrY variant
+# reported as half missing, which would fail any --geno style filter.
+query TIIR
+SELECT ID, MISSING_CT, OBS_CT, ROUND(F_MISS, 6)
+FROM plink_missing('test/data/sexchr_example.pgen') WHERE ID = 'y1';
+----
+y1	0	3	0.0
+
+# With M1 unknown-sex, the chrY denominator drops to the 2 remaining males.
+query TIIR
+SELECT ID, MISSING_CT, OBS_CT, ROUND(F_MISS, 6)
+FROM plink_missing('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam')
+WHERE ID = 'y1';
+----
+y1	0	2	0.0
+
+# Without a SEX column the chrY males cannot be identified -> NULL, not a number.
+query TIII
+SELECT ID, MISSING_CT IS NULL, OBS_CT IS NULL, F_MISS IS NULL
+FROM plink_missing('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID = 'y1';
+----
+y1	1	1	1
+
+# ...while the sex-independent chromosomes still compute without any sex info.
+query TIIR
+SELECT ID, MISSING_CT, OBS_CT, ROUND(F_MISS, 6)
+FROM plink_missing('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID IN ('x1', 'mt1') ORDER BY ID;
+----
+mt1	0	6	0.0
+x1	0	6	0.0
+
+# ===========================================================================
+# plink_missing — sample mode: chrY drops out of non-males' denominator
+# ===========================================================================
+
+# 5 variants total, 1 of them chrY. Males are measured against all 5; females
+# have no chrY, so it leaves BOTH their numerator and their denominator (4).
+#
+# WRONG (pre-fix): each female had MISSING_CT 1 and F_MISS 0.2 — a fully
+# genotyped female reported as 20% missing purely for lacking a Y chromosome.
+query TIIR
+SELECT IID, MISSING_CT, OBS_CT, ROUND(F_MISS, 6)
+FROM plink_missing('test/data/sexchr_example.pgen', mode := 'sample')
+ORDER BY IID;
+----
+F1	0	4	0.0
+F2	0	4	0.0
+F3	0	4	0.0
+M1	0	5	0.0
+M2	0	5	0.0
+M3	0	5	0.0
+
+# Unknown sex is treated like "no chrY" (plink2's default, absent
+# --y-nosex-missing-stats): M1 gets the 4-variant denominator.
+query TIIR
+SELECT IID, MISSING_CT, OBS_CT, ROUND(F_MISS, 6)
+FROM plink_missing('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam',
+                   mode := 'sample')
+ORDER BY IID;
+----
+F1	0	4	0.0
+F2	0	4	0.0
+F3	0	4	0.0
+M1	0	4	0.0
+M2	0	5	0.0
+M3	0	5	0.0
+
+# Sample mode spanning chrY without sex cannot form a denominator at all.
+statement error
+SELECT * FROM plink_missing('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam',
+                            mode := 'sample');
+----
+no SEX column
+
+# ===========================================================================
+# plink_glm — STATED LIMITATION (issue #50): diploid model, no sex covariate
+# ===========================================================================
+#
+# plink_glm is deliberately NOT ploidy-aware. On chrX its allele coding matches
+# plink2's default --xchr-model 2 ("code males 0..2"), but plink2 also adds SEX
+# AS A COVARIATE on chrX, and treats chrY/chrMT as haploid; plink_glm does
+# neither. Injecting a sex covariate would silently rewrite a user-supplied
+# model, so the encoding is left to the caller and the limitation is announced
+# once per query on stdout.
+#
+# The BETA values below are pinned only to guard the warning/classification path
+# from crashing or silently dropping variants. They are NOT plink2-comparable on
+# x1 / y1 / mt1, and SHOULD change if a sex-covariate model is ever adopted.
+
+# All five variants still produce a result; nothing is silently dropped.
+query I
+SELECT COUNT(*) FROM plink_glm('test/data/sexchr_example.pgen',
+    psam := 'test/data/sexchr_pheno.psam', phenotype := 'pheno');
+----
+5
+
+# par1 sits in the pseudo-autosomal region and is diploid in both sexes, so it is
+# NOT one of the non-autosomal variants the warning counts (that count is 3:
+# x1, y1, mt1 — a1 and par1 are excluded).
+query TR
+SELECT ID, ROUND(BETA, 6) FROM plink_glm('test/data/sexchr_example.pgen',
+    psam := 'test/data/sexchr_pheno.psam', phenotype := 'pheno')
+WHERE ID IN ('a1', 'par1') ORDER BY ID;
+----
+a1	0.75
+par1	-0.6

@@ -90,6 +90,13 @@ FROM plink_hardy('data/example.pgen',
     samples := ['CTRL1', 'CTRL2', 'CTRL3']);
 ```
 
+## Sex chromosomes and ploidy
+
+On chrX non-PAR, HWE is computed on the female (diploid) stratum, with male
+hemizygous counts folded into the p-value via plink2's `HweXchrLnP`. On chrY and
+chrMT, HWE is undefined and `P_HWE`/`O_HET`/`E_HET` are `NULL`. See
+[Sex-chromosome handling](https://github.com/teaguesterling/plinking_duck#sex-chromosome-handling).
+
 ## See Also
 
 - [plink_freq](plink_freq.md) -- allele frequencies
