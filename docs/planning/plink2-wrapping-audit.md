@@ -20,6 +20,29 @@ the primary discriminator between RED (should have wrapped) and YELLOW (reimplem
 
 ---
 
+> ## ⚠️ Status update — both 🔴 REDs are RESOLVED
+>
+> This audit is a **point-in-time document** and its two RED findings have since been
+> fixed; it is retained for the reasoning, not as a current description of the code.
+>
+> `plink2_stats.cc` **is now linked** (`CMakeLists.txt`, `pgenlib` target) and both
+> re-derived statistics layers now wrap plink2's own routines:
+>
+> - `plink_hardy.cpp` calls `plink2::HweLnP` (autosomal / chrX-PAR / female stratum) and
+>   `plink2::HweXchrLnP` (chrX non-PAR, males included — Graffelman & Weir 2016). The
+>   "female-only stratum" divergence described below **no longer exists.**
+> - `plink_glm.cpp` calls `plink2::TstatToP2` and `plink2::ChisqToP`.
+>
+> Sex-chromosome ploidy handling (issue #39's HIGH item) also landed: chrX/Y/MT are
+> classified per variant and MAF/HWE are ploidy- and sex-aware. See the
+> **Sex-chromosome handling** section of `README.md` and `test/sql/plink_sexchr.test`.
+>
+> The `exit()` integration caveat noted in *Cross-cutting notes #1* was addressed two
+> ways: every call site validates its inputs up front, and the `exit()`-prone paths are
+> the inverse-CDF/quantile helpers, which neither wrapper uses.
+
+---
+
 ## Executive Summary
 
 **Counts:** 🟢 GREEN ×11 · 🟡 YELLOW ×4 · 🔴 RED ×2.
@@ -93,7 +116,7 @@ clean buckets.
 
 ## Per-file findings
 
-### 🔴 `plink_hardy.cpp` — HWE exact test
+### 🔴 `plink_hardy.cpp` — HWE exact test  *(RESOLVED — now wraps `HweLnP` / `HweXchrLnP`)*
 
 - **Feature:** per-variant Hardy-Weinberg equilibrium exact-test p-values (ploidy/sex-aware for chrX/Y/MT).
 - **Wraps:** genotype counts via `PgrGetCounts` and `PgrGet` (fast, no decompression); standard `Pgfi/Pgr` open/init/cleanup. Sex-aware strata built by counting decoded bytes in `plink_common.cpp:~2090`.
@@ -102,7 +125,7 @@ clean buckets.
 - **Callability:** `plink2_stats.cc` depends only on `plink2_stats.h` + `plink2_string.h` (linked) + libc; **0** bigstack/thread refs → appears cleanly linkable. It is excluded only by the deliberate `CMakeLists.txt:128` decision.
 - **Score:** 🔴 **RED.** A callable, dependency-light, *superior* upstream function exists; the reimplementation is independent (not a faithful copy) and carries overflow + chrX-semantics drift risk. Refactor toward `exp(HweLnP(...))` / `HweXchrLnP(...)` once `plink2_stats.cc` is linked.
 
-### 🔴 `plink_glm.cpp` — p-value / distribution layer
+### 🔴 `plink_glm.cpp` — p-value / distribution layer  *(RESOLVED — now wraps `TstatToP2` / `ChisqToP`)*
 
 - **Feature:** t- and z-statistic → p-value conversions used to report GWAS `P`.
 - **Reimplements:** `LogGamma` (Lanczos, `:120`), `BetaIncomplete` (Lentz continued fraction, `:136`), `TstatToPvalue` (`:202`), `NormalCdf`/`ZstatToPvalue` (`:218–231`). All in `namespace duckdb`, no extraction provenance — original textbook numerics.
@@ -205,7 +228,7 @@ clean buckets.
 
 ## Cross-cutting notes
 
-1. **One build decision drives every RED.** Both RED findings (Hardy HWE, GLM p-values) exist
+1. **One build decision drives every RED.** ✅ **Done — `plink2_stats.cc` is linked; both REDs are closed.** Both RED findings (Hardy HWE, GLM p-values) exist
    solely because `plink2_stats.cc` is excluded (`CMakeLists.txt:128`). That file appears
    cleanly linkable (only `plink2_stats.h` + `plink2_string.h` + libc; 0 bigstack/thread refs).
    Linking it exposes callable `HweLnP`, `HweXchrLnP`, `FisherExact2x2P`, `TstatToP2`,

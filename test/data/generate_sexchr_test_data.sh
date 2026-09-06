@@ -64,4 +64,30 @@ EOF
 awk 'BEGIN{OFS="\t"} /^#/{print;next} $3=="par1"{$1="X"; print; next} {print}' \
     sexchr_example.pvar > sexchr_xpar.pvar
 
-echo "Generated sexchr_example.{pgen,pvar,psam} and sexchr_xpar.pvar"
+# Companion .psam variants that exercise the sex-unavailable code paths.
+#  sexchr_nosex.psam      no SEX column at all -> chrX/chrY stats must be NULL
+#                         (chrMT is sex-independent and still computes).
+#  sexchr_unknownsex.psam M1 has SEX=0 (unknown) -> M1 is excluded from the
+#                         chrX/chrY strata while the rest of the cohort stands.
+cat > sexchr_nosex.psam <<'EOF'
+#IID
+M1
+M2
+M3
+F1
+F2
+F3
+EOF
+
+cat > sexchr_unknownsex.psam <<'EOF'
+#IID	SEX
+M1	0
+M2	1
+M3	1
+F1	2
+F2	2
+F3	2
+EOF
+
+echo "Generated sexchr_example.{pgen,pvar,psam}, sexchr_xpar.pvar,"
+echo "          sexchr_nosex.psam and sexchr_unknownsex.psam"
