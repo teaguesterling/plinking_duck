@@ -211,6 +211,12 @@ struct VariantMetadataIndex {
 	//! Sparse mode: file-row vidx → local index in the vectors. Empty in dense mode.
 	unordered_map<uint32_t, uint32_t> vidx_map;
 
+	//! Fast path for region-pushdown subsets whose file-row variant indices are
+	//! contiguous. Avoids an unordered_map lookup per GetChrom()/GetPos() call in
+	//! dense LD window scans.
+	bool has_contiguous_vidx_range = false;
+	uint32_t contiguous_start_vidx = 0;
+
 	//! Sparse mode: local index → file-row vidx (reverse of vidx_map).
 	//! Empty in dense mode (where local index == file-row vidx).
 	//! Keeping both directions lets Local()/GetChrom()/etc. stay O(1) AND lets
@@ -244,6 +250,13 @@ struct VariantMetadataIndex {
 
 	//! Local index for a file-row vidx.
 	inline idx_t Local(idx_t vidx) const {
+		if (has_contiguous_vidx_range) {
+			if (vidx >= contiguous_start_vidx && vidx < contiguous_start_vidx + chroms.size()) {
+				return vidx - contiguous_start_vidx;
+			}
+			throw InternalException("VariantMetadataIndex: vidx %llu not in contiguous loaded subset",
+			                        static_cast<unsigned long long>(vidx));
+		}
 		if (IsDense()) {
 			return vidx;
 		}
@@ -259,7 +272,7 @@ struct VariantMetadataIndex {
 	//! subset index is never dense — even when it loaded zero rows (vidx_map
 	//! empty), its vectors are a subset, not raw_variant_ct-sized.
 	inline bool IsDense() const {
-		return vidx_map.empty() && !is_subset;
+		return vidx_map.empty() && !is_subset && !has_contiguous_vidx_range;
 	}
 
 	//! Returns [first_local_idx, past_end_local_idx) for a chromosome; {0,0} if absent.
@@ -289,6 +302,9 @@ struct VariantMetadataIndex {
 	//! O(1) in both modes. Use this when iterating the loaded subset (e.g. all of
 	//! chroms.size()) and you need the pgenlib-compatible vidx for each row.
 	inline uint32_t VidxForLocal(idx_t local) const {
+		if (has_contiguous_vidx_range) {
+			return contiguous_start_vidx + static_cast<uint32_t>(local);
+		}
 		if (local_to_vidx.empty()) {
 			return static_cast<uint32_t>(local); // dense: local == vidx
 		}
@@ -390,6 +406,14 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context, const string &path,
                                                           const string &chrom, int64_t pos_start, int64_t pos_end,
                                                           idx_t variant_ct_hint, const string &func_name);
+
+//! Region-pushdown text loader for native .pvar/.bim companions. Scans only
+//! until the sorted target interval has been passed and materializes only
+//! matching rows. Returns a sparse VariantMetadataIndex keyed by global
+//! pgenlib-compatible file-row variant indices.
+VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, const string &path, const string &chrom,
+                                                       int64_t pos_start, int64_t pos_end, idx_t variant_ct_hint,
+                                                       const string &func_name);
 
 //! Row count from a parquet file via row-group metadata aggregation
 //! (DuckDB-optimized `COUNT(*)`). Typically sub-ms but O(num_row_groups),

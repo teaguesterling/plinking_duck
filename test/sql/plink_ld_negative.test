@@ -80,3 +80,69 @@ SELECT * FROM plink_ld('test/data/pgen_example.pgen',
     region := 'invalid_region', variant1 := 'rs1', variant2 := 'rs2');
 ----
 region
+
+# --- Population-weighted LD parameter errors (maintainer-added for PR #37) ---
+
+# population_column and population_weights are only meaningful together
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP');
+----
+population_column and population_weights must be supplied together
+
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_weights := 'A=0.5,B=0.5');
+----
+population_column and population_weights must be supplied together
+
+# Unknown metadata column
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'NOSUCHCOLUMN', population_weights := 'A=0.5,B=0.5');
+----
+population_column 'NOSUCHCOLUMN' not found
+
+# A weighted population with no matching samples is an error rather than a
+# silently dropped weight -- otherwise the remaining weights are quietly
+# renormalized and the caller gets a different statistic than they asked for.
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP', population_weights := 'A=0.5,NOSUCHPOP=0.5');
+----
+no included samples have that POP
+
+# Malformed weight spec
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP', population_weights := 'garbage');
+----
+population_weights entries must be
+
+# All-zero weights
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP', population_weights := 'A=0,B=0');
+----
+at least one positive weight
+
+# Negative weight
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP', population_weights := 'A=-1,B=2');
+----
+invalid non-negative population weight

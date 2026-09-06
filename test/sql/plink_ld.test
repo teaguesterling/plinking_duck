@@ -140,6 +140,20 @@ SELECT R2, D_PRIME, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
 ----
 NULL	NULL	2
 
+# --- GAUSS-like population-weighted LD ---
+
+# POP A: SAMPLE1+SAMPLE2, POP B: SAMPLE3+SAMPLE4.
+# With A=0.25,B=0.75 and rs1 missing in SAMPLE4, shared observations have
+# weights proportional to [0.125, 0.125, 0.375], yielding r=-0.9185587.
+query RRI
+SELECT round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP',
+    population_weights := 'A=0.25,B=0.75');
+----
+-0.918559	0.84375	3
+
 # --- All-missing genotypes ---
 
 # Both variants fully missing → OBS_CT = 0, R2 = NULL
@@ -166,3 +180,153 @@ SELECT R2, OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
     variant1 := 'rs1', variant2 := 'rs2');
 ----
 0.75	3
+
+# ===========================================================================
+# Signed R (added on top of PR #37 by the maintainer, not by the contributor)
+# ===========================================================================
+#
+# Expected values below were derived by hand from the genotype matrix at the
+# top of this file, NOT read back out of the implementation:
+#
+#   rs1 [0, 1, 2, NULL]   rs2 [1, 1, 0, 2]
+#   rs3 [2, NULL, 1, 0]   rs4 [0, 0, 1, 2]
+#
+#   rs1/rs2 over {S1,S2,S3}: cov=-1/3, var=2/3 & 2/9  -> r = -sqrt(3)/2
+#   rs1/rs3 over {S1,S3}   : gB = 2 - gA/2            -> r = -1 exactly
+#   rs2/rs3 over {S1,S3,S4}: cov=-1/3, var=2/3 & 2/3  -> r = -1/2 exactly
+#   rs1/rs4 over {S1,S2,S3}: cov=+1/3, var=2/3 & 2/9  -> r = +sqrt(3)/2
+#   rs2/rs4 over all four  : cov=1/4, var=1/2 & 11/16 -> r = 1/sqrt(11/2)/...
+#                                                        = 0.4264014327
+#
+# The sign is the point: r2 alone cannot distinguish rs1/rs2 from rs1/rs4.
+
+query TTRI
+SELECT ID_A, ID_B, round(R, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+rs1	rs2	-0.866025	3
+
+query TTRI
+SELECT ID_A, ID_B, round(R, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs3');
+----
+rs1	rs3	-1.0	2
+
+query TTRI
+SELECT ID_A, ID_B, round(R, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs2', variant2 := 'rs3');
+----
+rs2	rs3	-0.5	3
+
+# Opposite sign to rs1/rs2 despite the identical r2 -- this is what R adds.
+query TTRRI
+SELECT ID_A, ID_B, round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs4');
+----
+rs1	rs4	0.866025	0.75	3
+
+query TTRRI
+SELECT ID_A, ID_B, round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs2', variant2 := 'rs4');
+----
+rs2	rs4	0.426401	0.181818	4
+
+# Self-LD is +1, not -1.
+query R
+SELECT round(R, 6) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs1');
+----
+1.0
+
+# R2 must equal R*R regardless of which of the two is projected.
+query RR
+SELECT round(R * R, 9), round(R2, 9) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs2', variant2 := 'rs4');
+----
+0.181818182	0.181818182
+
+# --- Projection pushdown (plink_ld sets projection_pushdown = true) ---
+# EmitRow now writes by column_ids position rather than by fixed output index,
+# so an out-of-order / partial projection must still land in the right columns.
+
+query ITRT
+SELECT OBS_CT, ID_B, round(R, 6), ID_A FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+3	rs2	-0.866025	rs1
+
+query R
+SELECT round(D_PRIME, 6) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+0.5
+
+# R is only computed when projected; R2 must be unaffected by that.
+query R
+SELECT round(R2, 9) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+0.75
+
+query I
+SELECT COUNT(*) FROM plink_ld('test/data/pgen_example.pgen',
+    variant1 := 'rs1', variant2 := 'rs2');
+----
+1
+
+# ===========================================================================
+# Population-weighted LD -- additional cases (maintainer-added)
+# ===========================================================================
+
+# Uniform weights must reproduce the unweighted statistic exactly: POP A and
+# POP B each hold 2 samples, so A=0.5,B=0.5 gives every sample weight 0.25.
+query RRI
+SELECT round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs2', variant2 := 'rs4',
+    population_column := 'POP', population_weights := 'A=0.5,B=0.5');
+----
+0.426401	0.181818	4
+
+# ... including when one variant has a missing call (rs1 in SAMPLE4).
+query RRI
+SELECT round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs1', variant2 := 'rs2',
+    population_column := 'POP', population_weights := 'A=0.5,B=0.5');
+----
+-0.866025	0.75	3
+
+# Non-uniform weights, no missing calls. Sample weights are
+# [0.125, 0.125, 0.375, 0.375]; hand-computed cov=0.375, var=0.75 & 0.609375,
+# so r = 2/sqrt(13) and r2 = 4/13.
+query RRI
+SELECT round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs2', variant2 := 'rs4',
+    population_column := 'POP', population_weights := 'A=0.25,B=0.75');
+----
+0.5547	0.307692	4
+
+# Weights are normalized, and both the column name and the population labels
+# match case-insensitively: 'a=1,b=3' == 'A=0.25,B=0.75'.
+query RRI
+SELECT round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs2', variant2 := 'rs4',
+    population_column := 'pop', population_weights := 'a=1,b=3');
+----
+0.5547	0.307692	4
+
+# Weights are re-derived over the SAMPLE SUBSET, not the whole file: with only
+# SAMPLE1 (POP A) and SAMPLE3 (POP B) included the per-population counts are
+# 1 each, so the sample weights become [0.25, 0.75] and rs2/rs4 reduces to a
+# perfect negative correlation over gA=[1,0], gB=[0,1].
+query RRI
+SELECT round(R, 6), round(R2, 6), OBS_CT FROM plink_ld('test/data/pgen_example.pgen',
+    psam := 'test/data/pgen_example_pop.psam',
+    variant1 := 'rs2', variant2 := 'rs4',
+    samples := ['SAMPLE1', 'SAMPLE3'],
+    population_column := 'POP', population_weights := 'A=0.25,B=0.75');
+----
+-1.0	1.0	2

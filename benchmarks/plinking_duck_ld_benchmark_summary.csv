@@ -1,0 +1,7 @@
+"scenario","repo","n","median_elapsed_sec","min_elapsed_sec","median_max_rss_mb","median_cpu_percent","output"
+"count_pairs","fork",3,1.55,1.55,120.55078125,1860,"count_star(); 42258"
+"count_pairs","upstream",3,6.76,5.59,348.33203125,1838,"count_star(); 42258"
+"sum_r2","fork",3,1.58,1.57,120.70703125,1856,"sum(R2); 26135.51331225652"
+"sum_r2","upstream",3,6.86,6.77,348.390625,1847,"sum(R2); 26135.513312256506"
+"sum_r2_dprime","fork",3,1.59,1.56,121.03125,1853,"count_star(),sum(R2),sum(D_PRIME); 42258,26135.51331225653,19214.231785830212"
+"sum_r2_dprime","upstream",3,6.94,6.87,348.17578125,1843,"count_star(),sum(R2),sum(D_PRIME); 42258,26135.513312256517,19214.231785830172"
