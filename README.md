@@ -337,6 +337,11 @@ On **chrX**, scores are **diploid for every sample**, males included (coded
 `--xchr-model 1` (halve male chrX values) is **not implemented**; if you need it,
 halve the chrX weights yourself. chrX scoring needs no sex information.
 
+`center := true` generalizes standardization from binomial(2,p) to
+binomial(ploidy,p), i.e. `sd = sqrt(ploidy * p * (1-p))`, so it remains correct
+on haploid variants. (plink2 instead *refuses* `variance-standardize` on chrX and
+chrMT; we allow it with the haploid variance rather than erroring.)
+
 ##### `plink_missing`
 
 Missingness counts **samples, not alleles**, so chrX and chrMT need no ploidy

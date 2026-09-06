@@ -280,3 +280,30 @@ WHERE ID IN ('a1', 'par1') ORDER BY ID;
 ----
 a1	0.75
 par1	-0.6
+
+# ===========================================================================
+# plink_score — center := true uses the HAPLOID variance on chrY/chrMT
+# ===========================================================================
+#
+# Standardization generalizes from binomial(2,p) to binomial(ploidy,p):
+#   sd = sqrt(ploidy * p * (1-p))
+# On mt1 the haploid ALT dosages are M1..F1 = 1 and F2,F3 = 0, so
+#   mean = 4/6 = 0.666667,  p = mean/ploidy = 0.666667,
+#   sd   = sqrt(1 * 0.666667 * 0.333333) = sqrt(0.222222) = 0.471405
+#   carrier:     (1 - 0.666667) / 0.471405 =  0.707107
+#   non-carrier: (0 - 0.666667) / 0.471405 = -1.414214
+#
+# Note plink2 REFUSES 'variance-standardize' on chrX/MT outright; we allow it
+# using the mathematically correct haploid SD rather than erroring.
+query TIR
+SELECT IID, ALLELE_CT, ROUND(SCORE_SUM, 6)
+FROM plink_score('test/data/sexchr_example.pgen', center := true,
+                 weights := [0.0, 0.0, 0.0, 0.0, 1.0])
+ORDER BY IID;
+----
+F1	1	0.707107
+F2	1	-1.414214
+F3	1	-1.414214
+M1	1	0.707107
+M2	1	0.707107
+M3	1	0.707107

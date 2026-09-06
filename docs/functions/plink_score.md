@@ -154,6 +154,11 @@ plink2's default `--xchr-model 2`. `--xchr-model 1` (halve male chrX values) is
 not implemented; halve the chrX weights yourself if you need it. chrX scoring
 requires no sex information.
 
+`center := true` generalizes standardization from binomial(2,p) to
+binomial(ploidy,p), i.e. `sd = sqrt(ploidy * p * (1-p))`, so it remains correct
+on haploid variants. (plink2 instead *refuses* `variance-standardize` on chrX and
+chrMT; we allow it with the haploid variance rather than erroring.)
+
 See [Sex-chromosome handling](https://github.com/teaguesterling/plinking_duck#sex-chromosome-handling).
 
 ## See Also
