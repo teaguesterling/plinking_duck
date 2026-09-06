@@ -174,15 +174,141 @@ WHERE ID = 'par1';
 par1	0.25	8
 
 # ===========================================================================
-# Missing sex information: sex-dependent chromosomes emit NULL, not a wrong number
-# (sexchr_example.pgen has no .psam companion path when we point pvar-only... here
-# we exercise the orphan behavior via a psam-less companion set is not available,
-# so this asserts chrMT — which is sex-independent — still computes.)
+# Missing sex information (psam with no SEX column): sex-dependent chromosomes
+# emit NULL rather than a plausible-looking wrong number.
+#
+# Fixture: test/data/sexchr_nosex.psam — same 6 samples, #IID only.
+# Expected values below are derived BY HAND from the genotype matrix in
+# generate_sexchr_test_data.sh, not read back from the implementation.
 # ===========================================================================
 
-# chrMT does not need sex → still a valid haploid frequency even without sex.
+# chrX non-PAR without sex: ploidy is unknowable → ALT_FREQ NULL, OBS_CT 0.
+# (The pre-fix code would have reported ALT_FREQ 0.416667 / OBS_CT 12 here.)
+query TII
+SELECT ID, ALT_FREQ IS NULL, OBS_CT
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID = 'x1';
+----
+x1	1	0
+
+# chrY without sex: same — males cannot be identified.
+query TII
+SELECT ID, ALT_FREQ IS NULL, OBS_CT
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID = 'y1';
+----
+y1	1	0
+
+# The genotype count columns are NULL too on chrX/chrY without sex — reporting
+# counts while the frequency is NULL would invite the same silent misuse.
+query TIIII
+SELECT ID, HOM_REF_CT IS NULL, HET_CT IS NULL, HOM_ALT_CT IS NULL, MISSING_CT IS NULL
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam',
+                counts := true)
+WHERE ID = 'x1';
+----
+x1	1	1	1	1
+
+# chrMT is sex-INDEPENDENT (haploid for everyone) → still a valid frequency
+# even with no SEX column. Hand-derived: alt = M1,M2,M3,F1 = 4; obs = 6.
 query TRI
 SELECT ID, ROUND(ALT_FREQ, 6), OBS_CT
-FROM plink_freq('test/data/sexchr_example.pgen') WHERE ID = 'mt1';
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID = 'mt1';
 ----
 mt1	0.666667	6
+
+# Autosomes and the chrX PAR are unaffected by absent sex (regression guard).
+query TRI
+SELECT ID, ROUND(ALT_FREQ, 6), OBS_CT
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID IN ('a1','par1') ORDER BY ID;
+----
+a1	0.5	12
+par1	0.333333	12
+
+# plink_hardy without sex: every chrX/chrY column is NULL, including the counts.
+query TIIIIII
+SELECT ID, HOM_REF_CT IS NULL, HET_CT IS NULL, HOM_ALT_CT IS NULL,
+       O_HET IS NULL, E_HET IS NULL, P_HWE IS NULL
+FROM plink_hardy('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID IN ('x1','y1') ORDER BY ID;
+----
+x1	1	1	1	1	1	1
+y1	1	1	1	1	1	1
+
+# chrMT still reports haploid carrier counts with a NULL p-value.
+query TIIII
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, P_HWE IS NULL
+FROM plink_hardy('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+WHERE ID = 'mt1';
+----
+mt1	2	0	4	1
+
+# ===========================================================================
+# Unknown sex for an individual sample (SEX=0): that sample is excluded from
+# the sex-dependent stratum; the rest of the cohort still yields a valid stat.
+#
+# Fixture: test/data/sexchr_unknownsex.psam — M1 SEX=0, M2/M3 SEX=1, F* SEX=2.
+# ===========================================================================
+
+# chrX non-PAR with M1 unknown. Hand-derived from the genotype matrix:
+#   males with known sex: M2 (REF), M3 (REF)          → 2 alleles, 0 ALT
+#   females:              F1 het, F2 hom-ref, F3 hom-alt → 6 alleles, 3 ALT
+#   ALT_FREQ = 3/8 = 0.375, OBS_CT = 8
+# (With M1's sex known this is 4/9 = 0.444444 / OBS_CT 9 — see above.)
+query TRI
+SELECT ID, ROUND(ALT_FREQ, 6), OBS_CT
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam')
+WHERE ID = 'x1';
+----
+x1	0.375	8
+
+# chrY with M1 unknown: only M2 (ALT) and M3 (REF) contribute.
+#   ALT_FREQ = 1/2 = 0.5, OBS_CT = 2 (vs 2/3 = 0.666667 / 3 with all males known)
+query TRI
+SELECT ID, ROUND(ALT_FREQ, 6), OBS_CT
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam')
+WHERE ID = 'y1';
+----
+y1	0.5	2
+
+# chrY counts with M1 unknown: M3 hom-ref, M2 hom-alt, and 4 excluded
+# (M1 unknown-sex + 3 females) reported as missing.
+query TIIII
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam',
+                counts := true)
+WHERE ID = 'y1';
+----
+y1	1	0	1	4
+
+# chrMT ignores sex entirely → unchanged by the unknown-sex sample.
+query TRI
+SELECT ID, ROUND(ALT_FREQ, 6), OBS_CT
+FROM plink_freq('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam')
+WHERE ID = 'mt1';
+----
+mt1	0.666667	6
+
+# chrX HWE with M1 unknown. The female stratum is untouched — counts (1,1,1),
+# O_HET 1/3, E_HET 2*0.5*0.5 = 0.5 — but the male hemizygous allele counts fed
+# to HweXchrLnP drop from (male_ref=2, male_alt=1) to (male_ref=2, male_alt=0),
+# which moves the p-value off 1.0.
+#
+# Hand-derived Graffelman & Weir exact test (n_f=3, n_m=2, N=8 alleles,
+# n_ALT=3). Enumerating every table with the same margins, with unnormalized
+# weight w = C(n_m, m_ALT) * [n_f!/(n_AA! n_AB! n_BB!)] * 2^n_AB:
+#   m_ALT=0, females (1,1,1): w = 1*6*2  = 12   <-- OBSERVED
+#   m_ALT=0, females (0,3,0): w = 1*1*8  =  8
+#   m_ALT=1, females (1,0,2): w = 2*3*1  =  6
+#   m_ALT=1, females (0,2,1): w = 2*3*4  = 24
+#   m_ALT=2, females (0,1,2): w = 1*3*2  =  6
+#   total = 56;  P(observed) = 12/56 = 0.214286
+# Exact p = sum of all tables with P <= P(obs) = (12+8+6+6)/56 = 32/56 = 0.571429
+query TIIIRRR
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, ROUND(O_HET, 6), ROUND(E_HET, 6), ROUND(P_HWE, 6)
+FROM plink_hardy('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_unknownsex.psam')
+WHERE ID = 'x1';
+----
+x1	1	1	1	0.333333	0.5	0.571429
