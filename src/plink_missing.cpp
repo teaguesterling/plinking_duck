@@ -61,6 +61,12 @@ struct PlinkMissingBindData : public TableFunctionData {
 	// For sample mode with subsetting: maps subset position → original sample index
 	vector<uint32_t> subset_original_indices;
 
+	// Sex, aligned to effective (post-subset) sample order. Only chrY consults it.
+	vector<uint8_t> aligned_sex;
+	bool have_sex = false;
+	vector<uintptr_t> male_mask; // bitvector over effective samples, set iff SEX==1
+	uint32_t male_ct = 0;
+
 	// Region filtering
 	VariantRange variant_range;
 
@@ -92,6 +98,9 @@ struct PlinkMissingGlobalState : public GlobalTableFunctionState {
 	std::atomic<bool> variant_scan_done {false};
 	std::atomic<uint32_t> next_sample_idx {0};
 	uint32_t total_variant_ct = 0;
+	// chrY variants within the scanned range; excluded from non-males' sample-mode
+	// denominator because those samples have no chrY at all.
+	uint32_t chry_variant_ct = 0;
 
 	// DuckDB-configured thread count
 	uint32_t db_thread_count = 1;
@@ -274,6 +283,26 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
 	}
 
+	// --- Sex (chrY only) ---
+	// Missingness counts SAMPLES, not alleles, so chrX and chrMT need no ploidy
+	// adjustment: a hemizygous sample either has a call or it does not. chrY is the
+	// exception — females have no chrY at all — and plink2 treats it as such, using
+	// a males-only denominator in .vmiss and dropping chrY from females' .smiss
+	// numerator and denominator alike.
+	bind_data->aligned_sex = BuildAlignedSex(
+	    bind_data->sample_info, bind_data->has_sample_subset ? &bind_data->subset_original_indices : nullptr);
+	bind_data->have_sex = !bind_data->aligned_sex.empty();
+	if (bind_data->have_sex) {
+		uintptr_t mask_word_ct = plink2::BitCtToWordCt(bind_data->effective_sample_ct);
+		bind_data->male_mask.assign(mask_word_ct, 0);
+		for (uint32_t i = 0; i < bind_data->effective_sample_ct; i++) {
+			if (bind_data->aligned_sex[i] == 1) {
+				bind_data->male_mask[i / plink2::kBitsPerWord] |= (uintptr_t {1} << (i % plink2::kBitsPerWord));
+				bind_data->male_ct++;
+			}
+		}
+	}
+
 	// --- Process region parameter ---
 	auto region_it = input.named_parameters.find("region");
 	if (region_it != input.named_parameters.end()) {
@@ -342,6 +371,22 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 	// Sample mode: pre-allocate accumulation array
 	if (bind_data.sample_mode) {
 		state->total_variant_ct = state->end_variant_idx - state->start_variant_idx;
+
+		// chrY variants in range: they do not apply to females/unknown-sex samples.
+		const ParBounds no_par; // PAR is irrelevant to chrY detection
+		for (uint32_t v = state->start_variant_idx; v < state->end_variant_idx; v++) {
+			if (ClassifyChromPloidy(bind_data.variants.GetChrom(v), bind_data.variants.GetPos(v), no_par) ==
+			    ChromPloidy::CHR_Y) {
+				state->chry_variant_ct++;
+			}
+		}
+		if (state->chry_variant_ct > 0 && !bind_data.have_sex) {
+			throw InvalidInputException(
+			    "plink_missing: sample mode covers %u chrY variant(s) but the .psam/.fam has no SEX column. "
+			    "Females have no chrY, so a per-sample missingness rate cannot be computed without sex; "
+			    "supply sex or restrict the region to exclude chrY.",
+			    state->chry_variant_ct);
+		}
 		if (state->need_missingness) {
 			state->sample_missing_counts.resize(bind_data.effective_sample_ct, 0);
 		}
@@ -457,6 +502,7 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 	}
 
 	uintptr_t word_ct = plink2::BitCtToWordCt(sample_ct);
+	const ParBounds no_par; // PAR is irrelevant here: only chrY changes the denominator
 
 	idx_t rows_emitted = 0;
 
@@ -470,9 +516,30 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
 		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
-			uint32_t missing_ct = 0;
+			// chrY is the only chromosome whose missingness denominator is sex-dependent.
+			// Missingness counts SAMPLES rather than alleles, so a hemizygous chrX or
+			// chrMT call is simply a call — no ploidy adjustment applies. On chrY,
+			// though, females have no chromosome at all, and counting them as "missing"
+			// inflates both the numerator and the denominator. plink2 matches this: its
+			// .vmiss uses a males-only denominator on chrY (chry_missingstat_sample_ct)
+			// and the full sample count everywhere else.
+			const bool is_y = (ClassifyChromPloidy(bind_data.variants.GetChrom(vidx), bind_data.variants.GetPos(vidx),
+			                                       no_par) == ChromPloidy::CHR_Y);
 
-			if (gstate.need_missingness && lstate.initialized) {
+			uint32_t missing_ct = 0;
+			uint32_t denom = sample_ct;
+			bool stats_are_null = false;
+
+			if (is_y) {
+				if (!bind_data.have_sex) {
+					// Cannot identify the males who carry chrY → NULL, not a wrong number.
+					stats_are_null = true;
+				} else {
+					denom = bind_data.male_ct;
+				}
+			}
+
+			if (!stats_are_null && gstate.need_missingness && lstate.initialized) {
 				auto *missingness = lstate.missingness_buf.As<uintptr_t>();
 				auto *genovec = lstate.genovec_buf.As<uintptr_t>();
 
@@ -483,11 +550,13 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 					throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
 				}
 
-				missing_ct = static_cast<uint32_t>(plink2::PopcountWords(missingness, word_ct));
+				missing_ct = is_y ? static_cast<uint32_t>(plink2::PopcountWordsIntersect(
+				                        missingness, bind_data.male_mask.data(), word_ct))
+				                  : static_cast<uint32_t>(plink2::PopcountWords(missingness, word_ct));
 			}
 
-			uint32_t obs_ct = sample_ct - missing_ct;
-			double f_miss = (sample_ct > 0) ? static_cast<double>(missing_ct) / static_cast<double>(sample_ct) : 0.0;
+			uint32_t obs_ct = denom - missing_ct;
+			double f_miss = (denom > 0) ? static_cast<double>(missing_ct) / static_cast<double>(denom) : 0.0;
 
 			// Fill projected columns
 			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
@@ -532,15 +601,27 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 					break;
 				}
 				case VCOL_MISSING_CT: {
-					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(missing_ct);
+					if (stats_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(missing_ct);
+					}
 					break;
 				}
 				case VCOL_OBS_CT: {
-					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
+					if (stats_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = static_cast<int32_t>(obs_ct);
+					}
 					break;
 				}
 				case VCOL_F_MISS: {
-					CompatFlatDataMutable<double>(vec)[rows_emitted] = f_miss;
+					if (stats_are_null) {
+						FlatVector::SetNull(vec, rows_emitted, true);
+					} else {
+						CompatFlatDataMutable<double>(vec)[rows_emitted] = f_miss;
+					}
 					break;
 				}
 				default:
@@ -589,6 +670,8 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 			}
 			uint32_t batch_end = std::min(batch_start + MISSING_BATCH_SIZE, end_idx);
 
+			const ParBounds no_par; // PAR is irrelevant here: only chrY is sex-dependent
+
 			for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
 				plink2::PglErr err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx,
 				                                               &lstate.pgr, missingness, genovec);
@@ -596,8 +679,19 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 					throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
 				}
 
+				// A female's chrY genotypes are structurally absent, not missing data.
+				// plink2 masks them out of her per-sample missing count (y_include in
+				// LoadSampleMissingCtsThread) and drops the same chrY variants from her
+				// denominator, so the rate stays coherent. We do both: mask here, and
+				// subtract chry_variant_ct from non-males' denominator below.
+				const bool is_y = (ClassifyChromPloidy(bind_data.variants.GetChrom(vidx),
+				                                       bind_data.variants.GetPos(vidx), no_par) == ChromPloidy::CHR_Y);
+
 				for (uintptr_t w = 0; w < word_ct; w++) {
 					uintptr_t word = missingness[w];
+					if (is_y) {
+						word &= bind_data.male_mask[w];
+					}
 					while (word) {
 						uint32_t bit_pos = plink2::ctzw(word);
 						uint32_t sample_idx = static_cast<uint32_t>(w) * plink2::kBitsPerWord + bit_pos;
@@ -641,9 +735,16 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 		}
 
 		uint32_t missing_ct = gstate.need_missingness ? gstate.sample_missing_counts[sidx] : 0;
-		uint32_t obs_ct = total_variant_ct - missing_ct;
-		double f_miss =
-		    (total_variant_ct > 0) ? static_cast<double>(missing_ct) / static_cast<double>(total_variant_ct) : 0.0;
+
+		// chrY variants do not apply to females or unknown-sex samples: they were
+		// masked out of missing_ct above, so drop them from the denominator too.
+		const bool is_male = bind_data.have_sex && bind_data.aligned_sex[sidx] == 1;
+		uint32_t applicable_variant_ct = is_male ? total_variant_ct : (total_variant_ct - gstate.chry_variant_ct);
+
+		uint32_t obs_ct = applicable_variant_ct - missing_ct;
+		double f_miss = (applicable_variant_ct > 0)
+		                    ? static_cast<double>(missing_ct) / static_cast<double>(applicable_variant_ct)
+		                    : 0.0;
 
 		// Map subset position → original sample index for FID/IID lookup
 		uint32_t orig_idx = bind_data.has_sample_subset ? bind_data.subset_original_indices[sidx] : sidx;

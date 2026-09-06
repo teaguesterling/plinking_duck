@@ -89,5 +89,17 @@ F2	2
 F3	2
 EOF
 
+# A phenotype-carrying .psam so plink_glm can be exercised on sex chromosomes
+# (plink_glm requires a phenotype column; the base sexchr_example.psam has none).
+cat > sexchr_pheno.psam <<'EOF'
+#IID	SEX	pheno
+M1	1	1.0
+M2	1	2.0
+M3	1	3.0
+F1	2	4.0
+F2	2	5.0
+F3	2	6.0
+EOF
+
 echo "Generated sexchr_example.{pgen,pvar,psam}, sexchr_xpar.pvar,"
-echo "          sexchr_nosex.psam and sexchr_unknownsex.psam"
+echo "          sexchr_nosex.psam, sexchr_unknownsex.psam and sexchr_pheno.psam"

@@ -103,6 +103,12 @@ FROM plink_freq('data/example.pgen',
     region := '22:1-50000000');
 ```
 
+## Sex chromosomes and ploidy
+
+Allele frequency is ploidy- and sex-aware: haploid calls contribute one allele, so
+`OBS_CT` is an allele count rather than `2 x samples`. See
+[Sex-chromosome handling](https://github.com/teaguesterling/plinking_duck#sex-chromosome-handling).
+
 ## See Also
 
 - [plink_hardy](plink_hardy.md) -- HWE test (also uses genotype counts)

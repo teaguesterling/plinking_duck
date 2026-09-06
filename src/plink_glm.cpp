@@ -5,6 +5,8 @@
 #include "psam_reader.hpp"
 #include "plink2_glm_logistic_math.hpp"
 
+#include "duckdb/common/printer.hpp"
+
 #include "plink2_stats.h"
 
 #include <atomic>
@@ -821,6 +823,40 @@ static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &co
 		if (col_id >= COL_A1_FREQ) {
 			state->need_regression = true;
 			break;
+		}
+	}
+
+	// --- Sex chromosomes: STATED LIMITATION, not silently handled ---
+	//
+	// plink_glm applies an additive diploid model to every variant. On chrX that
+	// matches the ALLELE CODING of plink2's default --xchr-model 2 ("code males
+	// 0..2"), but plink2 additionally adds SEX AS A COVARIATE for chrX variants
+	// under both --xchr-model 1 and 2, which we do not do. On chrY and chrMT
+	// plink2 treats calls as haploid (halving the genotype), which we also do not
+	// do — there a hemizygous ALT call enters the design matrix as 2, not 1.
+	//
+	// Injecting a sex covariate would silently rewrite a user-specified model (and
+	// collide with a sex covariate the user already supplied), so the encoding is
+	// deliberately left to the caller. Rather than emit a plausible-looking wrong
+	// number in silence, say so once per query. See issue #50 and the README's
+	// "Sex-chromosome handling" section.
+	if (state->need_regression) {
+		const ParBounds no_par; // PAR is diploid in both sexes; not worth warning about
+		uint32_t nonautosomal_ct = 0;
+		for (uint32_t v = state->start_variant_idx; v < state->end_variant_idx; v++) {
+			if (ClassifyChromPloidy(bind_data.variants.GetChrom(v), bind_data.variants.GetPos(v), no_par) !=
+			    ChromPloidy::AUTOSOMAL) {
+				nonautosomal_ct++;
+			}
+		}
+		if (nonautosomal_ct > 0) {
+			Printer::Print(StringUtil::Format(
+			    "plink_glm: %u non-autosomal variant(s) (chrX non-PAR / chrY / chrMT) are being analysed with "
+			    "an additive DIPLOID model and no sex covariate. plink2 adds sex as a covariate on chrX "
+			    "(--xchr-model 1/2) and treats chrY/chrMT as haploid; plink_glm does neither, so BETA/SE on "
+			    "these variants are not comparable to plink2 --glm. Restrict to autosomes, or supply sex as "
+			    "a covariate yourself and interpret accordingly.",
+			    nonautosomal_ct));
 		}
 	}
 

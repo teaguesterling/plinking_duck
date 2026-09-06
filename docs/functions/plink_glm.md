@@ -246,6 +246,25 @@ WHERE ERRCODE IS NULL
 ORDER BY CHROM, POS;
 ```
 
+## Sex chromosomes -- not ploidy-aware (stated limitation)
+
+`plink_glm` applies an **additive diploid model to every variant**, including
+chrX, chrY and chrMT, and **adds no sex covariate**.
+
+- On **chrX** the allele coding matches plink2's default `--xchr-model 2`
+  ("code males 0..2"), but plink2 *also* adds **sex as a covariate** on chrX.
+  `plink_glm` does not, because injecting one would silently rewrite a
+  user-specified model and could collide with a sex covariate you already passed.
+- On **chrY/chrMT** plink2 treats calls as haploid (halving the genotype);
+  `plink_glm` does not, so a hemizygous ALT call enters the design matrix as 2.
+
+**`BETA`/`SE` on non-autosomal variants are therefore not comparable to
+`plink2 --glm`.** A warning naming the affected variant count is printed once per
+query. Restrict to autosomes, or supply sex via `covariates` and interpret
+accordingly.
+
+See [Sex-chromosome handling](https://github.com/teaguesterling/plinking_duck#sex-chromosome-handling).
+
 ## See Also
 
 - [plink_freq](plink_freq.md) -- allele frequencies (useful for QC before GWAS)

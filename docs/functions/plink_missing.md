@@ -100,6 +100,24 @@ FROM plink_missing('data/example.pgen',
     region := '1:1-50000000');
 ```
 
+## Sex chromosomes and ploidy
+
+Missingness counts **samples, not alleles**, so chrX and chrMT need no ploidy
+adjustment -- a hemizygous sample either has a call or it does not.
+
+**chrY is the exception**, since females have no chrY at all. Matching plink2:
+
+- *Variant mode:* the denominator is the **male count** and only males' calls are
+  counted, so a fully genotyped chrY variant reports `F_MISS` 0, not 0.5.
+- *Sample mode:* chrY variants leave **both** the numerator and the denominator
+  for females and unknown-sex samples, so their `OBS_CT` is lower than males' by
+  the number of chrY variants in range.
+
+Unknown-sex samples are treated as not carrying chrY. Without a **SEX** column,
+chrY rows are `NULL` in variant mode and sample mode spanning chrY is an error.
+
+See [Sex-chromosome handling](https://github.com/teaguesterling/plinking_duck#sex-chromosome-handling).
+
 ## See Also
 
 - [plink_freq](plink_freq.md) -- allele frequencies (includes MISSING_CT with `counts := true`)
