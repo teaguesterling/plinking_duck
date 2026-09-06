@@ -814,6 +814,18 @@ static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &co
 	state->column_ids = input.column_ids;
 	state->max_threads_config = GetPlinkingMaxThreads(context);
 
+	// Check if any regression columns are projected, or if p_threshold requires it
+	state->need_regression = !std::isnan(bind_data.p_threshold);
+	for (auto col_id : input.column_ids) {
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		if (col_id >= COL_A1_FREQ) {
+			state->need_regression = true;
+			break;
+		}
+	}
+
 	// --- Sex chromosomes: STATED LIMITATION, not silently handled ---
 	//
 	// plink_glm applies an additive diploid model to every variant. On chrX that
@@ -828,7 +840,7 @@ static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &co
 	// deliberately left to the caller. Rather than emit a plausible-looking wrong
 	// number in silence, say so once per query. See issue #50 and the README's
 	// "Sex-chromosome handling" section.
-	{
+	if (state->need_regression) {
 		const ParBounds no_par; // PAR is diploid in both sexes; not worth warning about
 		uint32_t nonautosomal_ct = 0;
 		for (uint32_t v = state->start_variant_idx; v < state->end_variant_idx; v++) {
@@ -845,18 +857,6 @@ static unique_ptr<GlobalTableFunctionState> PlinkGlmInitGlobal(ClientContext &co
 			    "these variants are not comparable to plink2 --glm. Restrict to autosomes, or supply sex as "
 			    "a covariate yourself and interpret accordingly.",
 			    nonautosomal_ct));
-		}
-	}
-
-	// Check if any regression columns are projected, or if p_threshold requires it
-	state->need_regression = !std::isnan(bind_data.p_threshold);
-	for (auto col_id : input.column_ids) {
-		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
-			continue;
-		}
-		if (col_id >= COL_A1_FREQ) {
-			state->need_regression = true;
-			break;
 		}
 	}
 
