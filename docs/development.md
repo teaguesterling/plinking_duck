@@ -8,6 +8,8 @@
 - CMake 3.12+
 - Make
 - Git (with submodule support)
+- **Eigen3** — optional, but `plink_pca` is not built without it. See
+  [Optional dependency: Eigen3](#optional-dependency-eigen3).
 
 ### Build
 
@@ -25,6 +27,43 @@ Build outputs:
 | `build/release/test/unittest` | Test runner |
 | `build/release/extension/plinking_duck/plinking_duck.duckdb_extension` | Loadable extension binary |
 
+### Optional dependency: Eigen3
+
+`plink_pca` is the only function with a third-party dependency: **Eigen3**
+(header-only).
+
+```sh
+sudo apt install libeigen3-dev   # Debian/Ubuntu
+brew install eigen               # macOS
+```
+
+Released binaries always include `plink_pca` — `vcpkg.json` lists `eigen3` and
+the distribution pipeline builds through vcpkg. A plain local `make` does not
+use vcpkg, so this is the case that bites developers.
+
+When Eigen3 is not found, CMake prints a **configure-time warning** and then
+builds everything else successfully:
+
+```
+CMake Warning at /path/to/plinking_duck/CMakeLists.txt:223 (message):
+  Eigen3 not found — plink_pca will not be built.  Install via vcpkg or
+  libeigen3-dev.
+```
+
+`plink_pca` is then absent from the catalog. To tell which kind of build you
+have, ask the catalog rather than scrolling the log:
+
+```sql
+SELECT count(*) = 1 AS has_pca
+FROM duckdb_functions()
+WHERE function_name = 'plink_pca';
+```
+
+Whether this should be a hard requirement instead of a warning is an open
+question — see the
+[README](https://github.com/teaguesterling/plinking_duck#optional-dependency-eigen3-for-plink_pca)
+for the argument on both sides.
+
 ### Clean Build
 
 ```sh
@@ -38,6 +77,17 @@ make test
 ```
 
 Tests use DuckDB's [sqllogictest](https://duckdb.org/docs/dev/sqllogictest/intro.html) framework. Test files are in `test/sql/` and test data in `test/data/`.
+
+!!! warning "Two expected failures without Eigen3"
+
+    On a build where Eigen3 was not found, `make test` reports exactly two
+    failures — `test/sql/plink_pca.test` and `test/sql/plink_pca_negative.test`
+    — both with `Catalog Error: Table Function with name plink_pca does not
+    exist!`. That is the missing dependency, not a regression.
+
+    These tests are intentionally **not** guarded with `require`. A skip would
+    turn the suite green precisely when `plink_pca` stopped being built, making
+    a real regression indistinguishable from a healthy run.
 
 ### Test Data Files
 
@@ -116,6 +166,7 @@ Key pgenlib patterns:
 | libdeflate | plink-ng submodule | DuckDB doesn't include it |
 | zlib | System | |
 | simde | plink-ng submodule | Header-only SIMD emulation |
+| Eigen3 | vcpkg, or system `libeigen3-dev` | **Optional.** Header-only. Required by `plink_pca` only; absent ⇒ that one function is not registered (see [above](#optional-dependency-eigen3)) |
 
 ## CI / Platform Support
 
