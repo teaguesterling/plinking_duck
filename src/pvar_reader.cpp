@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 
 // Forward declaration from plink_common.hpp — avoid including the full header
@@ -27,28 +28,81 @@ namespace duckdb {
 // VFS line reader
 // ---------------------------------------------------------------------------
 
-//! Read one line from a DuckDB FileHandle, returning false at EOF.
-//! Handles \r\n and \n line endings (strips \r). This is a streaming
-//! alternative to ReadFileLines for files too large to slurp into memory
-//! (.pvar can be ~10GB at biobank scale).
-static bool ReadLineFromHandle(FileHandle &handle, string &line) {
-	line.clear();
-	char buffer[1];
-	bool read_any = false;
-	while (true) {
-		auto bytes = handle.Read(buffer, 1);
-		if (bytes == 0) {
-			return read_any; // EOF: true only if we got partial data
+//! Append [data, data + n) to `line`, dropping every '\r'.
+//! The byte-at-a-time reader this replaced skipped '\r' wherever it appeared,
+//! not only before a '\n', so a mid-line CR was silently removed. That is
+//! preserved here deliberately: changing it would alter parsed field values.
+static void AppendWithoutCarriageReturns(string &line, const char *data, idx_t n) {
+	const char *end = data + n;
+	while (data < end) {
+		const auto remaining = static_cast<size_t>(end - data);
+		const auto *cr = static_cast<const char *>(memchr(data, '\r', remaining));
+		if (cr == nullptr) {
+			line.append(data, remaining);
+			return;
 		}
-		read_any = true;
-		if (buffer[0] == '\n') {
-			return true;
-		}
-		if (buffer[0] != '\r') {
-			line += buffer[0];
-		}
+		line.append(data, static_cast<size_t>(cr - data));
+		data = cr + 1;
 	}
 }
+
+//! Buffered line reader over a DuckDB FileHandle.
+//!
+//! Replaces a `handle.Read(buffer, 1)` loop that cost one VFS call per byte —
+//! measurable on a local .pvar and ruinous over httpfs, where every byte was a
+//! separate range request. Reads in 64KB chunks instead and splits in memory.
+//!
+//! Line semantics are byte-identical to the reader it replaces: '\n' ends a
+//! line, every '\r' is dropped, and a final line with no trailing newline is
+//! still returned. Owns the handle so the buffered-but-unconsumed bytes cannot
+//! be stranded by someone reading the handle directly.
+class BufferedHandleLineReader {
+public:
+	explicit BufferedHandleLineReader(unique_ptr<FileHandle> handle_p) : handle(std::move(handle_p)) {
+		buffer.resize(READ_CHUNK_SIZE);
+	}
+
+	//! Read one line, returning false only at EOF with nothing accumulated.
+	bool ReadLine(string &line) {
+		line.clear();
+		bool read_any = false;
+		while (true) {
+			if (pos == len) {
+				if (eof) {
+					return read_any;
+				}
+				const auto bytes = handle->Read(buffer.data(), READ_CHUNK_SIZE);
+				len = bytes <= 0 ? 0 : static_cast<idx_t>(bytes);
+				pos = 0;
+				if (len == 0) {
+					eof = true;
+					return read_any; // EOF: true only if we got partial data
+				}
+			}
+			// The buffer holds at least one byte that this line will consume.
+			read_any = true;
+			const char *start = buffer.data() + pos;
+			const auto avail = len - pos;
+			const auto *nl = static_cast<const char *>(memchr(start, '\n', avail));
+			const auto take = nl != nullptr ? static_cast<idx_t>(nl - start) : avail;
+			AppendWithoutCarriageReturns(line, start, take);
+			pos += take;
+			if (nl != nullptr) {
+				pos++; // consume the '\n'
+				return true;
+			}
+		}
+	}
+
+private:
+	static constexpr idx_t READ_CHUNK_SIZE = 65536;
+
+	unique_ptr<FileHandle> handle;
+	vector<char> buffer;
+	idx_t pos = 0; //! read cursor within buffer
+	idx_t len = 0; //! valid bytes currently in buffer
+	bool eof = false;
+};
 
 // ---------------------------------------------------------------------------
 // Line splitting utilities
@@ -124,7 +178,7 @@ static LogicalType PvarColumnType(const string &name) {
 
 PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_READ);
+	BufferedHandleLineReader reader(fs.OpenFile(file_path, FileFlags::FILE_FLAGS_READ));
 
 	PvarHeaderInfo info;
 	info.skip_lines = 0;
@@ -132,7 +186,7 @@ PvarHeaderInfo ParsePvarHeader(ClientContext &context, const string &file_path) 
 	string line;
 	bool found_header_or_data = false;
 
-	while (ReadLineFromHandle(*handle, line)) {
+	while (reader.ReadLine(line)) {
 		// Skip empty lines
 		if (line.empty()) {
 			info.skip_lines++;
@@ -208,8 +262,8 @@ struct PvarBindData : public TableFunctionData {
 };
 
 struct PvarGlobalState : public GlobalTableFunctionState {
-	unique_ptr<FileHandle> handle;
-	idx_t current_file_idx = 0; //! index into bind_data.file_paths of the file `handle` is open on
+	unique_ptr<BufferedHandleLineReader> reader;
+	idx_t current_file_idx = 0; //! index into bind_data.file_paths of the file `reader` is open on
 	bool finished = false;
 	vector<column_t> column_ids;
 
@@ -331,12 +385,13 @@ static unique_ptr<GlobalTableFunctionState> PvarInitGlobal(ClientContext &contex
 	if (!bind_data.is_external_source) {
 		// Native path: open the first file and skip its header lines
 		auto &fs = FileSystem::GetFileSystem(context);
-		state->handle = fs.OpenFile(bind_data.file_paths[0], FileFlags::FILE_FLAGS_READ);
+		state->reader =
+		    make_uniq<BufferedHandleLineReader>(fs.OpenFile(bind_data.file_paths[0], FileFlags::FILE_FLAGS_READ));
 		state->current_file_idx = 0;
 
 		string skip;
 		for (idx_t i = 0; i < bind_data.header_info.skip_lines; i++) {
-			ReadLineFromHandle(*state->handle, skip);
+			state->reader->ReadLine(skip);
 		}
 	}
 	// For external sources, data is materialized in bind_data; nothing to open
@@ -454,13 +509,14 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 	string line;
 
 	while (row_count < STANDARD_VECTOR_SIZE) {
-		if (!ReadLineFromHandle(*state.handle, line)) {
+		if (!state.reader->ReadLine(line)) {
 			// Current file exhausted — advance to the next file, if any.
 			if (state.current_file_idx + 1 >= bind_data.file_paths.size()) {
 				break; // all files done
 			}
 			state.current_file_idx++;
-			state.handle = fs.OpenFile(bind_data.file_paths[state.current_file_idx], FileFlags::FILE_FLAGS_READ);
+			state.reader = make_uniq<BufferedHandleLineReader>(
+			    fs.OpenFile(bind_data.file_paths[state.current_file_idx], FileFlags::FILE_FLAGS_READ));
 			// The new file's header is skipped by the '#'-prefix check below, which
 			// adapts to each file's own header length (## meta + #CHROM). Reusing
 			// file[0]'s skip_lines would mis-skip files with differently sized headers.

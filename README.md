@@ -239,6 +239,40 @@ For full VCF/BCF parsing (multiallelic, INFO fields), use [DuckHTS](https://gith
 
 These functions use pgenlib's fast counting paths (no genotype decompression), making them efficient even on large datasets. All support sample subsetting, region filtering, and parallel execution.
 
+### Multiallelic variants are collapsed
+
+`plink_freq` and `plink_hardy` count genotypes with pgenlib's `PgrGetCounts`,
+which buckets every sample as REF vs **any** ALT. A variant whose `.pvar` lists
+several alternate alleles (`ALT` = `A,C`) therefore yields **one biallelic
+statistic covering all ALT alleles together**, not one per allele:
+
+```sql
+-- rs3 has ALT 'A,C'; ALT_FREQ is the combined frequency of A and C, not of A
+SELECT ID, ALT, ALT_FREQ FROM plink_freq('data/multiallelic.pgen');
+-- rs3  A,C  0.5
+```
+
+Two consequences worth knowing before you filter or join on these outputs:
+
+- **`ALT` is the raw `.pvar` field**, so it can be a comma-joined list rather
+  than a single allele. `plink_hardy`'s `A1` column is populated from the same
+  field, so on a multiallelic variant `A1` is **not** a single allele name and
+  will not join against a summary-statistics effect-allele column.
+- **HWE counts merge the alternate alleles.** `HOM_ALT_CT` counts samples
+  homozygous for *any* ALT, and heterozygotes between two different ALT alleles
+  are counted as ALT homozygotes, so `P_HWE` is an approximation on these
+  variants.
+
+Both functions print a one-line warning per query when the selected variants
+include any multiallelic site. To exclude them, filter on `ALT`:
+
+```sql
+SELECT * FROM plink_freq('data/example.pgen') WHERE ALT NOT LIKE '%,%';
+```
+
+For true per-allele multiallelic handling, split the variants first (plink2's
+`--make-pgen --multiallelics-already-joined` / `bcftools norm -m -`).
+
 ### `plink_freq(path [, pvar, psam, samples, region, counts, build])`
 
 Compute per-variant allele frequencies.
@@ -507,6 +541,27 @@ respectively.
 
 ```sh
 make
+```
+
+### Optional dependency: Eigen3 (for `plink_pca`)
+
+`plink_pca` is the one function that needs a third-party library, **Eigen3**.
+CMake looks for it and, if it is missing, prints
+
+```
+Eigen3 not found — plink_pca will not be built. Install via vcpkg or libeigen3-dev.
+```
+
+and builds everything else. The build still succeeds, but `plink_pca` is absent
+from the catalog, so calling it fails with `Table Function with name plink_pca
+does not exist!` and `make test` reports failures in `plink_pca.test` and
+`plink_pca_negative.test`. Those tests deliberately do **not** skip when the
+function is missing — a silent skip would hide a genuine "PCA stopped building"
+regression in CI.
+
+```sh
+sudo apt install libeigen3-dev   # Debian/Ubuntu
+brew install eigen               # macOS
 ```
 
 This produces:
