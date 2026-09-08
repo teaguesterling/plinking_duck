@@ -617,10 +617,15 @@ Did you mean "plink_ld"?
 To check a build you already have, ask the catalog rather than the log:
 
 ```sql
-SELECT count(*) = 1 AS has_pca
+SELECT count(*) > 0 AS has_pca
 FROM duckdb_functions()
 WHERE function_name = 'plink_pca';
 ```
+
+(`> 0`, not `= 1`: `duckdb_functions()` returns one row per overload, so
+`read_pvar` and `read_pfile` already yield two rows each. `plink_pca` has a
+single signature today, but a count-equals-one test would start reporting a
+present function as missing the day it gains a second one.)
 
 #### The two test failures are intentional
 

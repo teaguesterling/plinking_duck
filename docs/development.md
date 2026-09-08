@@ -54,7 +54,7 @@ CMake Warning at /path/to/plinking_duck/CMakeLists.txt:223 (message):
 have, ask the catalog rather than scrolling the log:
 
 ```sql
-SELECT count(*) = 1 AS has_pca
+SELECT count(*) > 0 AS has_pca
 FROM duckdb_functions()
 WHERE function_name = 'plink_pca';
 ```

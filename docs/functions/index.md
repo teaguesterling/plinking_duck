@@ -41,7 +41,7 @@ Catalog Error: Table Function with name plink_pca does not exist!
 To check a build before relying on it:
 
 ```sql
-SELECT count(*) = 1 AS has_pca
+SELECT count(*) > 0 AS has_pca
 FROM duckdb_functions()
 WHERE function_name = 'plink_pca';
 ```
