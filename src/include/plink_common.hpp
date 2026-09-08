@@ -324,6 +324,26 @@ unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &
 //! the header to determine column layout. Does NOT parse data lines.
 VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const string &path, const string &func_name);
 
+//! Count variants in the file-row range [start_vidx, end_vidx) whose ALT field
+//! names more than one alternate allele (i.e. contains a comma).
+//!
+//! Iterates the LOADED subset and maps each local row back to its file-row vidx,
+//! so it is safe for region-pushdown subsets (where Local() would throw on a
+//! vidx outside the subset). Returns 0 when alleles were not loaded
+//! (`has_alleles == false`, e.g. a lazy parquet path that skipped REF/ALT).
+uint64_t CountMultiallelicInRange(const VariantMetadataIndex &variants, uint32_t start_vidx, uint32_t end_vidx);
+
+//! Print a one-line warning if the selected range contains multiallelic variants.
+//!
+//! pgenlib's PgrGetCounts buckets genotypes as REF vs *any* ALT, so the
+//! per-variant statistics these functions emit collapse every alternate allele
+//! into a single biallelic figure. Nothing in the emitted row says so: ALT (and
+//! plink_hardy's A1) carry the raw comma-joined pvar field, which is not a
+//! single allele name. Warning once per query keeps the collapse from being
+//! silent. Mirrors read_plink_vcf's multiallelic warning.
+void WarnOnMultiallelicCollapse(const VariantMetadataIndex &variants, uint32_t start_vidx, uint32_t end_vidx,
+                                const char *func_name);
+
 // ---------------------------------------------------------------------------
 // File utilities
 // ---------------------------------------------------------------------------

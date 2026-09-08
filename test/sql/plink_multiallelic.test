@@ -1,0 +1,109 @@
+# name: test/sql/plink_multiallelic.test
+# description: Multiallelic variants collapse to one REF-vs-any-ALT statistic (issue #39)
+# group: [sql]
+
+# SCOPE. This file covers ONE of the two multiallelic cases -- the silent one.
+#
+#   * A genuinely multiallelic .pgen (plink2 records a per-variant allele count
+#     in the header) is REJECTED by plink_freq/plink_hardy, because they call
+#     PgfiInitPhase2 with allele_idx_offsets = nullptr:
+#       "pgfip->allele_idx_offsets must be allocated before PgfiInitPhase2Ex()"
+#     That path fails loudly and produces no statistic, so it is not what these
+#     assertions describe. It is also not covered here -- pinning it would mean
+#     shipping a real multiallelic .pgen fixture, which needs plink2.
+#
+#   * A .pvar that NAMES several ALT alleles next to a BIALLELIC .pgen is the
+#     silent case, and is what this file pins. It happens when the variant file
+#     and the genotype file come from different steps (a `pvar :=` override, or
+#     a .pvar carried over from an unsplit VCF).
+#
+# test/data/multiallelic.* is test/data/pgen_example.* with rs3's ALT rewritten
+# from 'A' to 'A,C'. The .pgen is a byte-for-byte copy -- still biallelic -- so
+# every emitted statistic below is the biallelic one. That is exactly the point:
+# nothing in the output moves or complains, while ALT (and plink_hardy's A1)
+# silently become a comma-joined field that is not an allele name.
+#
+# NOTE: these assertions describe behaviour that predates the warning added in
+# this change; they pass against the previous src/ as well. They are a
+# characterization of the hazard, not a regression test for the warning, which
+# goes to stderr and is not asserted here.
+
+require plinking_duck
+
+# =============================================================================
+# ALT is the raw .pvar field, so it can be a comma-joined list
+# =============================================================================
+
+query TTR
+SELECT ID, ALT, ALT_FREQ FROM plink_freq('test/data/multiallelic.pgen') ORDER BY ID;
+----
+rs1	G	0.5
+rs2	T	0.5
+rs3	A,C	0.5
+rs4	C	0.375
+
+# The collapsed statistic is identical to the biallelic one for the same
+# genotypes -- confirming ALT_FREQ covers A and C together, not A alone.
+query I
+SELECT b.ALT_FREQ = m.ALT_FREQ
+FROM plink_freq('test/data/pgen_example.pgen') b
+JOIN plink_freq('test/data/multiallelic.pgen') m USING (ID)
+WHERE ID = 'rs3';
+----
+true
+
+# =============================================================================
+# plink_hardy's A1 is populated from the same field, so on a multiallelic
+# variant it is NOT a single allele name. This is the join hazard: A1 will not
+# match an effect-allele column in a summary-statistics table.
+# =============================================================================
+
+query TT
+SELECT ID, A1 FROM plink_hardy('test/data/multiallelic.pgen') ORDER BY ID;
+----
+rs1	G
+rs2	T
+rs3	A,C
+rs4	C
+
+# The counts and p-value are those of the biallelic .pgen actually being read.
+# They describe neither 'A' nor 'C' on its own -- the .pgen stores one ALT and
+# knows nothing about the second allele the .pvar names.
+query TIIIR
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, P_HWE
+FROM plink_hardy('test/data/multiallelic.pgen')
+WHERE ID = 'rs3';
+----
+rs3	1	1	1	1.0
+
+# =============================================================================
+# The documented way to exclude multiallelic sites
+# =============================================================================
+
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/multiallelic.pgen') WHERE ALT NOT LIKE '%,%';
+----
+3
+
+# A purely biallelic file is unaffected (no rows filtered).
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/pgen_example.pgen') WHERE ALT NOT LIKE '%,%';
+----
+4
+
+# =============================================================================
+# Region pushdown must not trip the multiallelic scan. CountMultiallelicInRange
+# walks the loaded subset and maps back to file-row vidx; walking vidx directly
+# would call Local() on rows a region never loaded, which throws.
+# =============================================================================
+
+query TT
+SELECT ID, ALT FROM plink_freq('test/data/multiallelic.pgen', region := '1:25000-35000') ORDER BY ID;
+----
+rs3	A,C
+
+# A region that excludes the multiallelic variant still works.
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/multiallelic.pgen', region := '2:1-100000');
+----
+1
