@@ -2,6 +2,7 @@
 #include "duckdb_compat.hpp"
 #include "plink_profile.hpp"
 
+#include "duckdb/common/printer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/main/connection.hpp"
@@ -1870,6 +1871,41 @@ unordered_map<string, uint32_t> BuildVariantIdIndex(const VariantMetadataIndex &
 		}
 	}
 	return id_to_idx;
+}
+
+uint64_t CountMultiallelicInRange(const VariantMetadataIndex &variants, uint32_t start_vidx, uint32_t end_vidx) {
+	// A lazy parquet path may have skipped REF/ALT entirely; alts is then empty
+	// (or stale) and there is nothing to inspect.
+	if (!variants.has_alleles) {
+		return 0;
+	}
+	// Iterate the LOADED subset, exactly as BuildVariantIdIndex does. Walking
+	// vidx from start_vidx to end_vidx instead would call Local() on rows that a
+	// region pushdown never loaded, which throws. chroms is the canonical subset
+	// length; alts is only indexed where it actually has a row.
+	uint64_t multiallelic_ct = 0;
+	const auto subset_size = MinValue<idx_t>(variants.chroms.size(), variants.alts.size());
+	for (idx_t local = 0; local < subset_size; local++) {
+		const auto vidx = variants.VidxForLocal(local);
+		if (vidx < start_vidx || vidx >= end_vidx) {
+			continue;
+		}
+		if (variants.alts[local].find(',') != string::npos) {
+			multiallelic_ct++;
+		}
+	}
+	return multiallelic_ct;
+}
+
+void WarnOnMultiallelicCollapse(const VariantMetadataIndex &variants, uint32_t start_vidx, uint32_t end_vidx,
+                                const char *func_name) {
+	const auto multiallelic_ct = CountMultiallelicInRange(variants, start_vidx, end_vidx);
+	if (multiallelic_ct == 0) {
+		return;
+	}
+	Printer::Print(StringUtil::Format("%s: %llu variant(s) have multiple ALT alleles; statistics collapse them into "
+	                                  "a single REF-vs-any-ALT figure and ALT is reported verbatim",
+	                                  func_name, static_cast<unsigned long long>(multiallelic_ct)));
 }
 
 //! Lookup by (chrom, pos[, ref, alt]) using chrom_offsets + binary search on POS.

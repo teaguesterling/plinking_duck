@@ -351,6 +351,10 @@ static unique_ptr<GlobalTableFunctionState> PlinkHardyInitGlobal(ClientContext &
 	state->column_ids = input.column_ids;
 	state->max_threads_config = GetPlinkingMaxThreads(context);
 
+	// Warn once per query, here rather than in the scan, because the scan runs on
+	// several threads and only this point knows the final selected range.
+	WarnOnMultiallelicCollapse(bind_data.variants, state->start_variant_idx, state->end_variant_idx, "plink_hardy");
+
 	// Check if any genotype-dependent columns are projected
 	state->need_genotype_counts = false;
 	for (auto col_id : input.column_ids) {

@@ -1,0 +1,92 @@
+# name: test/sql/plink_multiallelic.test
+# description: Multiallelic variants collapse to one REF-vs-any-ALT statistic (issue #39)
+# group: [sql]
+
+# pgenlib's PgrGetCounts buckets samples as REF vs *any* ALT, so a variant whose
+# .pvar names several alternate alleles yields a single biallelic statistic.
+# These assertions pin that collapse so it is explicit rather than silent, and
+# so a future per-allele implementation has to update them deliberately.
+#
+# test/data/multiallelic.* is test/data/pgen_example.* with rs3's ALT rewritten
+# from 'A' to 'A,C'. The genotypes are unchanged, which is the point: the
+# emitted statistic does not move when the variant becomes multiallelic, because
+# the alternate alleles were already being counted together.
+
+require plinking_duck
+
+# =============================================================================
+# ALT is the raw .pvar field, so it can be a comma-joined list
+# =============================================================================
+
+query TTR
+SELECT ID, ALT, ALT_FREQ FROM plink_freq('test/data/multiallelic.pgen') ORDER BY ID;
+----
+rs1	G	0.5
+rs2	T	0.5
+rs3	A,C	0.5
+rs4	C	0.375
+
+# The collapsed statistic is identical to the biallelic one for the same
+# genotypes -- confirming ALT_FREQ covers A and C together, not A alone.
+query I
+SELECT b.ALT_FREQ = m.ALT_FREQ
+FROM plink_freq('test/data/pgen_example.pgen') b
+JOIN plink_freq('test/data/multiallelic.pgen') m USING (ID)
+WHERE ID = 'rs3';
+----
+true
+
+# =============================================================================
+# plink_hardy's A1 is populated from the same field, so on a multiallelic
+# variant it is NOT a single allele name. This is the join hazard: A1 will not
+# match an effect-allele column in a summary-statistics table.
+# =============================================================================
+
+query TT
+SELECT ID, A1 FROM plink_hardy('test/data/multiallelic.pgen') ORDER BY ID;
+----
+rs1	G
+rs2	T
+rs3	A,C
+rs4	C
+
+# HWE counts merge the alternate alleles: rs3's counts and p-value are those of
+# the collapsed biallelic table.
+query TIIIR
+SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, P_HWE
+FROM plink_hardy('test/data/multiallelic.pgen')
+WHERE ID = 'rs3';
+----
+rs3	1	1	1	1.0
+
+# =============================================================================
+# The documented way to exclude multiallelic sites
+# =============================================================================
+
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/multiallelic.pgen') WHERE ALT NOT LIKE '%,%';
+----
+3
+
+# A purely biallelic file is unaffected (no rows filtered).
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/pgen_example.pgen') WHERE ALT NOT LIKE '%,%';
+----
+4
+
+# =============================================================================
+# Region pushdown must not trip the multiallelic scan. CountMultiallelicInRange
+# walks the loaded subset and maps back to file-row vidx; walking vidx directly
+# would call Local() on rows a region never loaded, which throws.
+# =============================================================================
+
+query TT
+SELECT ID, ALT FROM plink_freq('test/data/multiallelic.pgen', region := '1:25000-35000') ORDER BY ID;
+----
+rs3	A,C
+
+# A region that excludes the multiallelic variant still works.
+query I
+SELECT COUNT(*) FROM plink_freq('test/data/multiallelic.pgen', region := '2:1-100000');
+----
+1
