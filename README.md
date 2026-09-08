@@ -239,12 +239,30 @@ For full VCF/BCF parsing (multiallelic, INFO fields), use [DuckHTS](https://gith
 
 These functions use pgenlib's fast counting paths (no genotype decompression), making them efficient even on large datasets. All support sample subsetting, region filtering, and parallel execution.
 
-### Multiallelic variants are collapsed
+### Multiallelic variants: what happens, and when
 
-`plink_freq` and `plink_hardy` count genotypes with pgenlib's `PgrGetCounts`,
-which buckets every sample as REF vs **any** ALT. A variant whose `.pvar` lists
-several alternate alleles (`ALT` = `A,C`) therefore yields **one biallelic
-statistic covering all ALT alleles together**, not one per allele:
+There are two distinct cases, and only one of them is silent.
+
+**1. A genuinely multiallelic `.pgen` is rejected, loudly.** When plink2 writes a
+`.pgen` containing variants with more than two alleles, the header records a
+per-variant allele count. `plink_freq`/`plink_hardy` initialise pgenlib without
+an `allele_idx_offsets` array, so such a file fails to open:
+
+```
+IO Error: plink_freq: failed to initialize 'x.pgen' (phase 2):
+Error: pgfip->allele_idx_offsets must be allocated before PgfiInitPhase2Ex() is called.
+```
+
+No wrong answer is produced. Split the variants first (`plink2 --make-pgen
+--max-alleles 2`, or `bcftools norm -m -` before conversion).
+
+**2. A `.pvar` that names several ALT alleles alongside a *biallelic* `.pgen`
+collapses silently.** This is the case to watch. It arises when the variant file
+and the genotype file come from different steps — most commonly a user-supplied
+`pvar := 'sites.pvar'` override, or a `.pvar` carried over from an unsplit VCF
+while the `.pgen` was written biallelic. pgenlib's `PgrGetCounts` buckets every
+sample as REF vs **any** ALT, so the row is emitted with **one biallelic statistic
+and the raw comma-joined `ALT` field**:
 
 ```sql
 -- rs3 has ALT 'A,C'; ALT_FREQ is the combined frequency of A and C, not of A
@@ -257,11 +275,12 @@ Two consequences worth knowing before you filter or join on these outputs:
 - **`ALT` is the raw `.pvar` field**, so it can be a comma-joined list rather
   than a single allele. `plink_hardy`'s `A1` column is populated from the same
   field, so on a multiallelic variant `A1` is **not** a single allele name and
-  will not join against a summary-statistics effect-allele column.
-- **HWE counts merge the alternate alleles.** `HOM_ALT_CT` counts samples
-  homozygous for *any* ALT, and heterozygotes between two different ALT alleles
-  are counted as ALT homozygotes, so `P_HWE` is an approximation on these
-  variants.
+  will not join against a summary-statistics effect-allele column. It is a raw
+  field, not a per-allele result — check it before joining on it.
+- **HWE counts are those of the biallelic `.pgen` actually being read**, which
+  does not distinguish the alleles the `.pvar` names. `HOM_ALT_CT` counts samples
+  homozygous for the single stored ALT, so `P_HWE` does not describe either named
+  allele on its own.
 
 Both functions print a one-line warning per query when the selected variants
 include any multiallelic site. To exclude them, filter on `ALT`:

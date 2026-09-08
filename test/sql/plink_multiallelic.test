@@ -2,15 +2,31 @@
 # description: Multiallelic variants collapse to one REF-vs-any-ALT statistic (issue #39)
 # group: [sql]
 
-# pgenlib's PgrGetCounts buckets samples as REF vs *any* ALT, so a variant whose
-# .pvar names several alternate alleles yields a single biallelic statistic.
-# These assertions pin that collapse so it is explicit rather than silent, and
-# so a future per-allele implementation has to update them deliberately.
+# SCOPE. This file covers ONE of the two multiallelic cases -- the silent one.
+#
+#   * A genuinely multiallelic .pgen (plink2 records a per-variant allele count
+#     in the header) is REJECTED by plink_freq/plink_hardy, because they call
+#     PgfiInitPhase2 with allele_idx_offsets = nullptr:
+#       "pgfip->allele_idx_offsets must be allocated before PgfiInitPhase2Ex()"
+#     That path fails loudly and produces no statistic, so it is not what these
+#     assertions describe. It is also not covered here -- pinning it would mean
+#     shipping a real multiallelic .pgen fixture, which needs plink2.
+#
+#   * A .pvar that NAMES several ALT alleles next to a BIALLELIC .pgen is the
+#     silent case, and is what this file pins. It happens when the variant file
+#     and the genotype file come from different steps (a `pvar :=` override, or
+#     a .pvar carried over from an unsplit VCF).
 #
 # test/data/multiallelic.* is test/data/pgen_example.* with rs3's ALT rewritten
-# from 'A' to 'A,C'. The genotypes are unchanged, which is the point: the
-# emitted statistic does not move when the variant becomes multiallelic, because
-# the alternate alleles were already being counted together.
+# from 'A' to 'A,C'. The .pgen is a byte-for-byte copy -- still biallelic -- so
+# every emitted statistic below is the biallelic one. That is exactly the point:
+# nothing in the output moves or complains, while ALT (and plink_hardy's A1)
+# silently become a comma-joined field that is not an allele name.
+#
+# NOTE: these assertions describe behaviour that predates the warning added in
+# this change; they pass against the previous src/ as well. They are a
+# characterization of the hazard, not a regression test for the warning, which
+# goes to stderr and is not asserted here.
 
 require plinking_duck
 
@@ -50,8 +66,9 @@ rs2	T
 rs3	A,C
 rs4	C
 
-# HWE counts merge the alternate alleles: rs3's counts and p-value are those of
-# the collapsed biallelic table.
+# The counts and p-value are those of the biallelic .pgen actually being read.
+# They describe neither 'A' nor 'C' on its own -- the .pgen stores one ALT and
+# knows nothing about the second allele the .pvar names.
 query TIIIR
 SELECT ID, HOM_REF_CT, HET_CT, HOM_ALT_CT, P_HWE
 FROM plink_hardy('test/data/multiallelic.pgen')
