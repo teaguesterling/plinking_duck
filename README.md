@@ -11,7 +11,7 @@ PlinkingDuck brings PLINK genotype, variant, and sample data into DuckDB, lettin
 
 ## What's Included
 
-PlinkingDuck provides **five file readers** and **six analysis functions**:
+PlinkingDuck provides **five file readers** and **seven analysis functions**:
 
 | Function | Purpose |
 |----------|---------|
@@ -25,6 +25,13 @@ PlinkingDuck provides **five file readers** and **six analysis functions**:
 | [`plink_missing`](#plink_missingpath--pvar-psam-samples-region-mode) | Per-variant or per-sample missingness |
 | [`plink_ld`](#plink_ldpath--variant1-variant2-window_kb-r2_threshold-inter_chr) | Pairwise linkage disequilibrium |
 | [`plink_score`](#plink_scorepath--weights-no_mean_imputation) | Polygenic risk scoring |
+| [`plink_glm`](https://plinking-duck.readthedocs.io/functions/plink_glm/) | Per-variant GWAS regression (linear, logistic, Firth) |
+| [`plink_pca`](#optional-dependency-eigen3-for-plink_pca) ⚠️ | Principal component analysis — **only present if the build found [Eigen3](#optional-dependency-eigen3-for-plink_pca)** |
+
+Every function except `plink_pca` is unconditional. `plink_pca` is compiled out
+when Eigen3 is not available at configure time, which is the one case where two
+builds of the same commit expose different catalogs — see
+[Optional dependency: Eigen3](#optional-dependency-eigen3-for-plink_pca).
 
 All functions support **projection pushdown** (skip expensive genotype decoding when columns aren't referenced) and **parallel scanning** (multi-threaded variant processing with atomic batch claiming).
 
@@ -562,33 +569,102 @@ respectively.
 make
 ```
 
-### Optional dependency: Eigen3 (for `plink_pca`)
-
-`plink_pca` is the one function that needs a third-party library, **Eigen3**.
-CMake looks for it and, if it is missing, prints
-
-```
-Eigen3 not found — plink_pca will not be built. Install via vcpkg or libeigen3-dev.
-```
-
-and builds everything else. The build still succeeds, but `plink_pca` is absent
-from the catalog, so calling it fails with `Table Function with name plink_pca
-does not exist!` and `make test` reports failures in `plink_pca.test` and
-`plink_pca_negative.test`. Those tests deliberately do **not** skip when the
-function is missing — a silent skip would hide a genuine "PCA stopped building"
-regression in CI.
-
-```sh
-sudo apt install libeigen3-dev   # Debian/Ubuntu
-brew install eigen               # macOS
-```
-
 This produces:
 ```
 ./build/release/duckdb                                              # DuckDB shell with extension loaded
 ./build/release/test/unittest                                       # Test runner
 ./build/release/extension/plinking_duck/plinking_duck.duckdb_extension  # Loadable extension binary
 ```
+
+### Optional dependency: Eigen3 (for `plink_pca`)
+
+`plink_pca` is the one function that needs a third-party library, **Eigen3**
+(header-only; nothing to link). Install it before building:
+
+```sh
+sudo apt install libeigen3-dev   # Debian/Ubuntu
+brew install eigen               # macOS
+```
+
+**Released binaries always have it.** `vcpkg.json` lists `eigen3`, and the
+GitHub Actions distribution pipeline builds through vcpkg, so every extension
+binary published from this repo includes `plink_pca`. The conditional path
+below only affects local builds that do not go through vcpkg — which is what
+`make` does by default.
+
+#### What happens when it is missing
+
+CMake looks for Eigen3, and if it is not found it prints a warning at
+**configure** time and builds everything else:
+
+```
+CMake Warning at /path/to/plinking_duck/CMakeLists.txt:223 (message):
+  Eigen3 not found — plink_pca will not be built.  Install via vcpkg or
+  libeigen3-dev.
+```
+
+That warning is the only signal, and it appears in the first ~40 lines of a
+build log several thousand lines long. The build itself **succeeds**. What you
+get is a `plinking_duck` extension, with the same name and version as any
+other, whose catalog is one function short:
+
+```console
+$ ./build/release/duckdb -c "SELECT * FROM plink_pca('data/example.pgen')"
+Catalog Error: Table Function with name plink_pca does not exist!
+Did you mean "plink_ld"?
+```
+
+To check a build you already have, ask the catalog rather than the log:
+
+```sql
+SELECT count(*) > 0 AS has_pca
+FROM duckdb_functions()
+WHERE function_name = 'plink_pca';
+```
+
+(`> 0`, not `= 1`: `duckdb_functions()` returns one row per overload, so
+`read_pvar` and `read_pfile` already yield two rows each. `plink_pca` has a
+single signature today, but a count-equals-one test would start reporting a
+present function as missing the day it gains a second one.)
+
+#### The two test failures are intentional
+
+`make test` on a build without Eigen3 reports exactly two failures:
+
+```
+test cases:   81 |   79 passed | 2 failed
+assertions: 4782 | 4780 passed | 2 failed
+```
+
+— `test/sql/plink_pca.test` and `test/sql/plink_pca_negative.test`, both with
+the `Catalog Error` above. If that is what you are seeing on a clean checkout,
+you have not broken anything; you are missing `libeigen3-dev`.
+
+Those tests deliberately do **not** `require` their way out of this. A skip
+would make the suite go green exactly when the feature disappeared, so a real
+"PCA stopped building" regression would be indistinguishable from a healthy
+run. A visible failure that names the cause is the lesser evil.
+
+#### Should Eigen3 be a hard requirement?
+
+Open question, currently answered "no" — the `find_package` is `QUIET` and only
+warns. The case for flipping it to a hard `FATAL_ERROR`:
+
+- Every **shipped** artifact has Eigen3, so a build without it is not the
+  product. It is a differently-shaped extension carrying the product's name
+  and version, and nothing in the binary records the difference.
+- The failure is deferred and misattributed. The build passes; the report
+  arrives minutes later as two red tests whose message points at the test
+  file, not at the missing header.
+- The cost of requiring it is one `apt`/`brew` line. The cost of not requiring
+  it is a red suite on a clean checkout with no obvious cause.
+
+The reason it is optional today is narrow: commit `63f44c2` made it conditional
+so a CI *tidy* job — which runs `cmake` without vcpkg — would stop failing. That
+is a CI configuration problem, not a statement about the product. Giving the
+tidy job `libeigen3-dev` (or an explicit `-DPLINKING_ALLOW_MISSING_EIGEN3=ON`
+opt-out, so the omission has to be *chosen* and is recorded in the build
+invocation) would let the default become strict.
 
 ## Running Tests
 
