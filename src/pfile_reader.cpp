@@ -1,5 +1,6 @@
 #include "pfile_reader.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "plink_profile.hpp"
 #include "pgen_vfs_opener.hpp"
@@ -3815,7 +3816,8 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	                   PfileInitLocal);
 	add_named_params(many);
 	set.AddFunction(many);
-	loader.RegisterFunction(set);
+	RegisterTableSetWithDesc(loader, set, {"files"}, "Read PLINK dataset files into tabular format.",
+	                         {"SELECT * FROM read_pfile('data/cohort.pgen')"});
 }
 
 } // namespace duckdb

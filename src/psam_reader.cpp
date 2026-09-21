@@ -1,5 +1,6 @@
 #include "psam_reader.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -647,7 +648,8 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 void RegisterPsamReader(ExtensionLoader &loader) {
 	TableFunction read_psam("read_psam", {LogicalType::VARCHAR}, PsamScan, PsamBind, PsamInitGlobal, PsamInitLocal);
 	read_psam.projection_pushdown = true;
-	loader.RegisterFunction(read_psam);
+	RegisterTableWithDesc(loader, read_psam, {"path"}, "Read PLINK .psam or .fam sample files into tabular format.",
+	                      {"SELECT * FROM read_psam('data/cohort.psam')"});
 }
 
 } // namespace duckdb

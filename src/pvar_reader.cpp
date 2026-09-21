@@ -1,5 +1,6 @@
 #include "pvar_reader.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -581,7 +582,8 @@ void RegisterPvarReader(ExtensionLoader &loader) {
 	                   PvarInitLocal);
 	many.projection_pushdown = true;
 	set.AddFunction(many);
-	loader.RegisterFunction(set);
+	RegisterTableSetWithDesc(loader, set, {"files"}, "Read PLINK .pvar or .bim variant files into tabular format.",
+	                         {"SELECT * FROM read_pvar('data/cohort.pvar')"});
 }
 
 } // namespace duckdb

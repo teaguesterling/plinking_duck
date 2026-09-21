@@ -12,6 +12,7 @@
 
 #include "plink_ld.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -1423,8 +1424,8 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	plink_ld.named_parameters["population_column"] = LogicalType::VARCHAR;
 	plink_ld.named_parameters["population_weights"] = LogicalType::VARCHAR;
 	plink_ld.projection_pushdown = true;
-
-	loader.RegisterFunction(plink_ld);
+	RegisterTableWithDesc(loader, plink_ld, {"pfile"}, "Compute pairwise linkage disequilibrium metrics.",
+	                      {"SELECT * FROM plink_ld('data/cohort.pgen', window_kb := 500, r2_threshold := 0.2)"});
 }
 
 } // namespace duckdb

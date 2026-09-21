@@ -1,5 +1,6 @@
 #include "plink_hardy.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -721,7 +722,8 @@ void RegisterPlinkHardy(ExtensionLoader &loader) {
 	plink_hardy.named_parameters["midp"] = LogicalType::BOOLEAN;
 	plink_hardy.named_parameters["build"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(plink_hardy);
+	RegisterTableWithDesc(loader, plink_hardy, {"pfile"}, "Compute Hardy-Weinberg equilibrium exact test statistics.",
+	                      {"SELECT * FROM plink_hardy('data/cohort.pgen')"});
 }
 
 } // namespace duckdb
