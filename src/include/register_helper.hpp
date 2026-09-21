@@ -8,10 +8,8 @@
 
 namespace duckdb {
 
-inline void RegisterScalarWithDesc(ExtensionLoader &loader, ScalarFunction fn,
-                                   const vector<string> &params = {},
-                                   const string &desc_str = "",
-                                   const vector<string> &examples = {}) {
+inline void RegisterScalarWithDesc(ExtensionLoader &loader, ScalarFunction fn, const vector<string> &params = {},
+                                   const string &desc_str = "", const vector<string> &examples = {}) {
 	CreateScalarFunctionInfo info(std::move(fn));
 	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	FunctionDescription desc;
@@ -24,8 +22,7 @@ inline void RegisterScalarWithDesc(ExtensionLoader &loader, ScalarFunction fn,
 }
 
 inline void RegisterScalarSetWithDesc(ExtensionLoader &loader, ScalarFunctionSet fn_set,
-                                      const vector<string> &params = {},
-                                      const string &desc_str = "",
+                                      const vector<string> &params = {}, const string &desc_str = "",
                                       const vector<string> &examples = {}) {
 	CreateScalarFunctionInfo info(std::move(fn_set));
 	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
@@ -38,10 +35,8 @@ inline void RegisterScalarSetWithDesc(ExtensionLoader &loader, ScalarFunctionSet
 	loader.RegisterFunction(std::move(info));
 }
 
-inline void RegisterTableWithDesc(ExtensionLoader &loader, TableFunction fn,
-                                  const vector<string> &params = {},
-                                  const string &desc_str = "",
-                                  const vector<string> &examples = {}) {
+inline void RegisterTableWithDesc(ExtensionLoader &loader, TableFunction fn, const vector<string> &params = {},
+                                  const string &desc_str = "", const vector<string> &examples = {}) {
 	CreateTableFunctionInfo info(std::move(fn));
 	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	FunctionDescription desc;
@@ -54,8 +49,7 @@ inline void RegisterTableWithDesc(ExtensionLoader &loader, TableFunction fn,
 }
 
 inline void RegisterTableSetWithDesc(ExtensionLoader &loader, TableFunctionSet fn_set,
-                                     const vector<string> &params = {},
-                                     const string &desc_str = "",
+                                     const vector<string> &params = {}, const string &desc_str = "",
                                      const vector<string> &examples = {}) {
 	CreateTableFunctionInfo info(std::move(fn_set));
 	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
