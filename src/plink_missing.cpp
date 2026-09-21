@@ -1,5 +1,6 @@
 #include "plink_missing.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -828,7 +829,8 @@ void RegisterPlinkMissing(ExtensionLoader &loader) {
 	plink_missing.named_parameters["samples"] = LogicalType::ANY;
 	plink_missing.named_parameters["region"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(plink_missing);
+	RegisterTableWithDesc(loader, plink_missing, {"pfile"}, "Compute missingness rates per variant or per sample.",
+	                      {"SELECT * FROM plink_missing('data/cohort.pgen', mode := 'variant')"});
 }
 
 } // namespace duckdb

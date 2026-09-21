@@ -1,5 +1,6 @@
 #include "vcf_reader.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "vcf_genotype_parse.hpp"
 
@@ -791,9 +792,8 @@ void RegisterPlinkVcfReader(ExtensionLoader &loader) {
 	func.named_parameters["min_dp"] = LogicalType::INTEGER;
 	func.named_parameters["max_dp"] = LogicalType::INTEGER;
 	func.named_parameters["halfcall"] = LogicalType::VARCHAR;
-	func.projection_pushdown = true;
-
-	loader.RegisterFunction(func);
+	RegisterTableWithDesc(loader, func, {"path"}, "Read VCF files using PLINK engine into tabular format.",
+	                      {"SELECT * FROM read_plink_vcf('data/cohort.vcf.gz')"});
 }
 
 } // namespace duckdb

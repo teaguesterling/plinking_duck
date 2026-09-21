@@ -1,5 +1,6 @@
 #include "pgen_reader.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -1116,7 +1117,8 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 	read_pgen.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
 	read_pgen.named_parameters["variants"] = LogicalType::ANY;
 
-	loader.RegisterFunction(read_pgen);
+	RegisterTableWithDesc(loader, read_pgen, {"path"}, "Read PLINK .pgen or .bed genotype files into tabular format.",
+	                      {"SELECT * FROM read_pgen('data/cohort.pgen')"});
 }
 
 } // namespace duckdb

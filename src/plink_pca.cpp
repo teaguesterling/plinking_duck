@@ -12,6 +12,7 @@
 
 #include "plink_pca.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -1100,7 +1101,8 @@ void RegisterPlinkPca(ExtensionLoader &loader) {
 	plink_pca.named_parameters["samples"] = LogicalType::ANY;
 	plink_pca.named_parameters["region"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(plink_pca);
+	RegisterTableWithDesc(loader, plink_pca, {"pfile"}, "Compute principal components analysis from PLINK files.",
+	                      {"SELECT * FROM plink_pca('data/cohort.pgen', n_pcs := 10)"});
 }
 
 } // namespace duckdb

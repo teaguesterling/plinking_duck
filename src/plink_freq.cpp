@@ -1,5 +1,6 @@
 #include "plink_freq.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -683,7 +684,8 @@ void RegisterPlinkFreq(ExtensionLoader &loader) {
 	plink_freq.named_parameters["dosage"] = LogicalType::BOOLEAN;
 	plink_freq.named_parameters["build"] = LogicalType::VARCHAR;
 
-	loader.RegisterFunction(plink_freq);
+	RegisterTableWithDesc(loader, plink_freq, {"pfile"}, "Compute allele frequencies and counts from PLINK files.",
+	                      {"SELECT * FROM plink_freq('data/cohort.pgen')"});
 }
 
 } // namespace duckdb

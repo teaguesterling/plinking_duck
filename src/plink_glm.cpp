@@ -1,5 +1,6 @@
 #include "plink_glm.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 #include "psam_reader.hpp"
@@ -1499,7 +1500,9 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 	plink_glm.named_parameters["firth"] = LogicalType::BOOLEAN;
 	plink_glm.named_parameters["p_threshold"] = LogicalType::DOUBLE;
 
-	loader.RegisterFunction(plink_glm);
+	RegisterTableWithDesc(loader, plink_glm, {"pfile"},
+	                      "Fit generalized linear models (linear/logistic regression) across variants.",
+	                      {"SELECT * FROM plink_glm('data/cohort.pgen', phenotype := 'trait')"});
 }
 
 } // namespace duckdb

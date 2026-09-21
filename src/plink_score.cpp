@@ -1,5 +1,6 @@
 #include "plink_score.hpp"
 #include "duckdb_compat.hpp"
+#include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -862,7 +863,8 @@ void RegisterPlinkScore(ExtensionLoader &loader) {
 	plink_score.named_parameters["center"] = LogicalType::BOOLEAN;
 	plink_score.named_parameters["no_mean_imputation"] = LogicalType::BOOLEAN;
 
-	loader.RegisterFunction(plink_score);
+	RegisterTableWithDesc(loader, plink_score, {"pfile"}, "Compute polygenic risk scores from variant weights.",
+	                      {"SELECT * FROM plink_score('data/cohort.pgen', weights := 'weights.tsv')"});
 }
 
 } // namespace duckdb
