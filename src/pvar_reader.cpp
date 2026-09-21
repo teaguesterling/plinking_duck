@@ -581,6 +581,7 @@ void RegisterPvarReader(ExtensionLoader &loader) {
 	TableFunction many("read_pvar", {LogicalType::LIST(LogicalType::VARCHAR)}, PvarScan, PvarBind, PvarInitGlobal,
 	                   PvarInitLocal);
 	many.projection_pushdown = true;
+	set.AddFunction(many);
 	RegisterTableSetWithDesc(loader, set, {"files"}, "Read PLINK .pvar or .bim variant files into tabular format.",
 	                         {"SELECT * FROM read_pvar('data/cohort.pvar')"});
 }
