@@ -128,11 +128,20 @@ DUCKDB_EXTENSION_API const char *plinking_duck_version() {
 }
 }
 
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+// Deliberately NOT guarded on DUCKDB_BUILD_LOADABLE_EXTENSION. v1.5.x defines
+// that macro from extension/extension_build_tools.cmake; v2.0-cyanoptera still
+// reads it in duckdb.h but no longer defines it anywhere, so the guard silently
+// compiled this block away and the extension exported no entry point:
+//
+//   Undefined symbols for architecture x86_64:
+//     "_plinking_duck_duckdb_cpp_init", referenced from: <initial-undefines>
+//
+// Linux links without complaint either way, which is why both v2.0 Linux legs
+// passed and only macOS -- the one symbol-enforcing platform this extension does
+// not exclude -- reported it.
 extern "C" {
 DUCKDB_CPP_EXTENSION_ENTRY(plinking_duck, loader) { // NOLINT
 	duckdb::PlinkingDuckExtension extension;
 	extension.Load(loader);
 }
 }
-#endif
