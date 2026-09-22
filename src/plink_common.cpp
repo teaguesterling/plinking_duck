@@ -1335,8 +1335,7 @@ SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path)
 //! Execute a query against a source string via a separate Connection.
 //! The source may be a file path (CSV, parquet, etc.) or a table/view name.
 //! DuckDB's replacement scan mechanism handles file extension dispatch.
-static unique_ptr<MaterializedQueryResult> QuerySource(ClientContext &context, const string &source,
-                                                       const string &func_name) {
+static unique_ptr<QueryResult> QuerySource(ClientContext &context, const string &source, const string &func_name) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 	// Escape single quotes for safety

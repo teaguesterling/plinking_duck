@@ -14,7 +14,6 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
 
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
