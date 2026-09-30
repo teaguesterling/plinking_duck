@@ -47,7 +47,7 @@ jobs:
       # Build/ship against the latest v1.5 RELEASE tag so the produced extension is
       # loadable in released DuckDB (branch-tip builds produce non-loadable -dev
       # binaries). The submodule pointers track the v1.5-variegata branch tips.
-      duckdb_version: v1.5.4
+      duckdb_version: v1.5.6
       ci_tools_version: v1.5-variegata
       extension_name: plinking_duck
       # plink-ng portability issues (not ours), independent of the DuckDB version:
@@ -63,7 +63,7 @@ jobs:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.4
+      duckdb_version: v1.5.6
       ci_tools_version: v1.5-variegata
       extension_name: plinking_duck
       format_checks: 'format;tidy'
