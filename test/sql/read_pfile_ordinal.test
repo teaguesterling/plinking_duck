@@ -54,6 +54,41 @@ SELECT __ordinal FROM read_pfile('test/data/pfile_example', genotypes := 'counts
 2
 3
 
+# --- Parallel / multi-batch path (PFILE_BATCH_SIZE=128, STANDARD_VECTOR_SIZE=2048) ---
+# large_example has 3000 variants, so the scan spans multiple atomic batch claims
+# AND multiple output chunks across (possibly) multiple threads. The ordinal must
+# stay a dense 0..2999 with no gaps or duplicates regardless of batch interleaving.
+
+query III
+SELECT COUNT(*), MIN(__ordinal), MAX(__ordinal) FROM read_pfile('test/data/large_example', with_ordinal := true);
+----
+3000	0	2999
+
+query I
+SELECT COUNT(DISTINCT __ordinal) FROM read_pfile('test/data/large_example', with_ordinal := true);
+----
+3000
+
+# Cross-validate the two readers on the same fileset: every variant's read_pfile
+# ordinal must equal its read_pvar ordinal (this is the contract downstream relies
+# on). A single mismatched/shifted ordinal makes this non-zero.
+query I
+SELECT COUNT(*)
+FROM read_pfile('test/data/large_example', with_ordinal := true) t
+JOIN (SELECT ID, __ordinal AS o FROM read_pvar('test/data/large_example.pvar', with_ordinal := true)) p
+  ON t.ID = p.ID
+WHERE t.__ordinal <> p.o;
+----
+0
+
+# --- region := keeps original ordinals (same ResolveVariantIdx mechanism as variants :=) ---
+# pfile_example: rs4 is the only chr2 variant, at natural index 3.
+
+query TI
+SELECT ID, __ordinal FROM read_pfile('test/data/pfile_example', region := '2:1-100000', with_ordinal := true);
+----
+rs4	3
+
 # --- Default-off: column set is unchanged (no __ordinal) ---
 
 query I

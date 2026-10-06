@@ -262,9 +262,12 @@ struct PvarBindData : public TableFunctionData {
 	vector<vector<Value>> materialized_rows;
 
 	//! When true, an extra BIGINT column "__ordinal" is appended to the schema,
-	//! carrying the 0-based row ordinal in natural (file) order. The ordinal is
-	//! derived from a running emission counter, so it is stable regardless of
-	//! projection/filter pushdown (filters are applied by DuckDB after the scan).
+	//! carrying the 0-based row ordinal in natural (file) order. The ordinal is a
+	//! running emission counter incremented per row, independent of projection.
+	//! It is stable under filtering ONLY because read_pvar does not declare
+	//! filter_pushdown — DuckDB applies every filter after the scan, so the scan
+	//! still visits (and counts) every row. Enabling filter_pushdown here would
+	//! require routing skipped rows through the counter, or ordinals would shift.
 	bool with_ordinal = false;
 	//! Schema index of the "__ordinal" column (only valid when with_ordinal). It
 	//! sits past header_info's real columns, which are left untouched so the

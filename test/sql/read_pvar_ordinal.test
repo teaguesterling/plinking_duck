@@ -58,3 +58,25 @@ POS
 ID
 REF
 ALT
+
+# --- External (parquet) source path: ordinal comes from the materialized row index ---
+# Kept last: if the parquet extension is unavailable, only these assertions skip.
+
+require parquet
+
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar')) TO '/tmp/plinking_duck_ordinal.pvar.parquet';
+
+query TI
+SELECT ID, __ordinal FROM read_pvar('/tmp/plinking_duck_ordinal.pvar.parquet', with_ordinal := true) ORDER BY __ordinal;
+----
+rs1	0
+rs2	1
+rs3	2
+rs4	3
+
+# Stable under a filter on the external path too.
+query I
+SELECT __ordinal FROM read_pvar('/tmp/plinking_duck_ordinal.pvar.parquet', with_ordinal := true) WHERE ID = 'rs4';
+----
+3
