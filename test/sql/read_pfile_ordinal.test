@@ -54,10 +54,51 @@ SELECT __ordinal FROM read_pfile('test/data/pfile_example', genotypes := 'counts
 2
 3
 
+# --- genotypes := 'columns' + with_ordinal: __ordinal appends AFTER the sample
+#     columns, and no sample genotype is clobbered (the ordinal handler runs
+#     ahead of the columns-mode switch branch). ---
+
+# Schema: CHROM/POS/ID/REF/ALT, one column per sample (SAMPLE1..4), then __ordinal last.
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'columns', with_ordinal := true));
+----
+CHROM
+POS
+ID
+REF
+ALT
+SAMPLE1
+SAMPLE2
+SAMPLE3
+SAMPLE4
+__ordinal
+
+# rs1 genotypes [0, 1, 2, NULL] are intact and __ordinal = 0 sits after them.
+query TIIIII
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4, __ordinal
+FROM read_pfile('test/data/pfile_example', genotypes := 'columns', with_ordinal := true)
+WHERE ID = 'rs1';
+----
+rs1	0	1	2	NULL	0
+
+# rs4 (natural index 3) with its genotypes [0, 0, 1, 2] intact.
+query TIIIII
+SELECT ID, SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4, __ordinal
+FROM read_pfile('test/data/pfile_example', genotypes := 'columns', with_ordinal := true)
+WHERE ID = 'rs4';
+----
+rs4	0	0	1	2	3
+
 # --- Parallel / multi-batch path (PFILE_BATCH_SIZE=128, STANDARD_VECTOR_SIZE=2048) ---
+# Force real parallelism so batch claims actually interleave across threads.
+statement ok
+PRAGMA threads=4;
+
 # large_example has 3000 variants, so the scan spans multiple atomic batch claims
-# AND multiple output chunks across (possibly) multiple threads. The ordinal must
-# stay a dense 0..2999 with no gaps or duplicates regardless of batch interleaving.
+# AND multiple output chunks across threads. This block is a dense-coverage smoke:
+# a dense 0..2999 with no gaps/dupes. (The genuine "ordinal == original vidx"
+# invariant is proven by the variants:=/region tests above, which pin exact values;
+# a merely off-by-something counter could still pass COUNT/MIN/MAX/DISTINCT.)
 
 query III
 SELECT COUNT(*), MIN(__ordinal), MAX(__ordinal) FROM read_pfile('test/data/large_example', with_ordinal := true);
@@ -69,15 +110,31 @@ SELECT COUNT(DISTINCT __ordinal) FROM read_pfile('test/data/large_example', with
 ----
 3000
 
-# Cross-validate the two readers on the same fileset: every variant's read_pfile
-# ordinal must equal its read_pvar ordinal (this is the contract downstream relies
-# on). A single mismatched/shifted ordinal makes this non-zero.
+# Cross-validate the two readers on the same single fileset: every variant's
+# read_pfile ordinal must equal its read_pvar ordinal. A shifted ordinal is non-zero.
 query I
 SELECT COUNT(*)
 FROM read_pfile('test/data/large_example', with_ordinal := true) t
 JOIN (SELECT ID, __ordinal AS o FROM read_pvar('test/data/large_example.pvar', with_ordinal := true)) p
   ON t.ID = p.ID
 WHERE t.__ordinal <> p.o;
+----
+0
+
+# Cross-reader agreement on a MULTI-FILE (2-shard) list: both readers are now
+# per-source, so the full (ID, __ordinal) multisets must be identical. The symmetric
+# multiset difference is 0 iff they agree. Had read_pvar stayed continuous
+# (0..n-1, n..2n-1) while read_pfile restarts per shard, this would be non-zero.
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, __ordinal FROM read_pfile(['test/data/large_example', 'test/data/large_example'], with_ordinal := true)
+   EXCEPT ALL
+   SELECT ID, __ordinal FROM read_pvar(['test/data/large_example.pvar', 'test/data/large_example.pvar'], with_ordinal := true))
+  UNION ALL
+  (SELECT ID, __ordinal FROM read_pvar(['test/data/large_example.pvar', 'test/data/large_example.pvar'], with_ordinal := true)
+   EXCEPT ALL
+   SELECT ID, __ordinal FROM read_pfile(['test/data/large_example', 'test/data/large_example'], with_ordinal := true))
+);
 ----
 0
 

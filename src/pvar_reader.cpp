@@ -263,12 +263,20 @@ struct PvarBindData : public TableFunctionData {
 
 	//! When true, an extra BIGINT column "__ordinal" is appended to the schema,
 	//! carrying the 0-based row ordinal in natural (file) order. The ordinal is a
-	//! running emission counter incremented per row, independent of projection.
-	//! It is stable under filtering ONLY because read_pvar does not declare
-	//! filter_pushdown — DuckDB applies every filter after the scan, so the scan
-	//! still visits (and counts) every row. Enabling filter_pushdown here would
+	//! per-file emission counter incremented per row and RESET at every file
+	//! boundary, so a path list restarts the ordinal at 0 for each file. This
+	//! matches read_pfile's per-shard ordinal (vidx within each pgen/pvar), which
+	//! is what per-shard consumers (ducks_in_a_row) key on. It is independent of
+	//! projection, and stable under filtering ONLY because read_pvar does not
+	//! declare filter_pushdown — DuckDB applies every filter after the scan, so the
+	//! scan still visits (and counts) every row. Enabling filter_pushdown here would
 	//! require routing skipped rows through the counter, or ordinals would shift.
 	bool with_ordinal = false;
+
+	//! Per-file 0-based ordinal for each materialized row (external/non-native
+	//! source), parallel to materialized_rows. Only populated when with_ordinal.
+	//! Resets at each file boundary, matching the native-text path.
+	vector<idx_t> materialized_ordinals;
 	//! Schema index of the "__ordinal" column (only valid when with_ordinal). It
 	//! sits past header_info's real columns, which are left untouched so the
 	//! per-line field-count validation is unaffected.
@@ -281,14 +289,15 @@ struct PvarGlobalState : public GlobalTableFunctionState {
 	bool finished = false;
 	vector<column_t> column_ids;
 
-	//! Next row index for materialized (non-native) sources. Doubles as the
-	//! 0-based ordinal for the row about to be emitted on the external path.
+	//! Next row index into materialized_rows (external/non-native sources). The
+	//! emitted ordinal is read from bind_data.materialized_ordinals[next_row_idx],
+	//! NOT from this index, so it respects per-file resets.
 	idx_t next_row_idx = 0;
 
-	//! Running count of rows emitted so far on the native path, across all
-	//! row-concatenated files. The ordinal of a row is this base plus its local
-	//! offset within the current chunk.
-	idx_t rows_emitted_total = 0;
+	//! 0-based ordinal within the CURRENT file for the native-text path. Reset to
+	//! 0 whenever the scan advances to the next file in a path list, so each file
+	//! restarts its ordinals (matches read_pfile's per-shard vidx).
+	idx_t file_row_idx = 0;
 
 	idx_t MaxThreads() const override {
 		return 1; // Sequential text file reading
@@ -385,7 +394,10 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 				bind_data->header_info.skip_lines = 0;
 			}
 
-			// Materialize all rows from this file, appending to the concatenated set
+			// Materialize all rows from this file, appending to the concatenated set.
+			// file_ordinal restarts at 0 for each file so a path list produces
+			// per-file ordinals (matching the native-text path and read_pfile).
+			idx_t file_ordinal = 0;
 			unique_ptr<DataChunk> chunk;
 			while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
 				for (idx_t row = 0; row < chunk->size(); row++) {
@@ -394,6 +406,9 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 						row_values.push_back(chunk->GetValue(col, row));
 					}
 					bind_data->materialized_rows.push_back(std::move(row_values));
+					if (bind_data->with_ordinal) {
+						bind_data->materialized_ordinals.push_back(file_ordinal++);
+					}
 				}
 			}
 		}
@@ -525,9 +540,11 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 					continue;
 				}
 				if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
-					// next_row_idx is this row's 0-based ordinal (incremented below).
-					output.data[out_col].SetValue(row_count,
-					                               Value::BIGINT(static_cast<int64_t>(state.next_row_idx)));
+					// Per-file ordinal recorded at bind time (restarts at 0 each file),
+					// NOT the concatenated next_row_idx.
+					output.data[out_col].SetValue(
+					    row_count,
+					    Value::BIGINT(static_cast<int64_t>(bind_data.materialized_ordinals[state.next_row_idx])));
 					continue;
 				}
 				output.data[out_col].SetValue(row_count, row_values[file_col]);
@@ -557,6 +574,7 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				break; // all files done
 			}
 			state.current_file_idx++;
+			state.file_row_idx = 0; // restart the ordinal for the new file
 			state.reader = make_uniq<BufferedHandleLineReader>(
 			    fs.OpenFile(bind_data.file_paths[state.current_file_idx], FileFlags::FILE_FLAGS_READ));
 			// The new file's header is skipped by the '#'-prefix check below, which
@@ -596,10 +614,11 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 			}
 
 			if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
-				// 0-based ordinal in natural file order: running base + local offset.
-				// Counted per emitted row, independent of which columns are projected.
+				// 0-based ordinal within the current file (file_row_idx is reset at
+				// each file boundary). Counted per emitted row and persisted on state
+				// so it spans chunk boundaries; independent of which columns project.
 				CompatFlatDataMutable<int64_t>(output.data[out_col])[row_count] =
-				    static_cast<int64_t>(state.rows_emitted_total + row_count);
+				    static_cast<int64_t>(state.file_row_idx);
 				continue;
 			}
 
@@ -607,9 +626,8 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 		}
 
 		row_count++;
+		state.file_row_idx++;
 	}
-
-	state.rows_emitted_total += row_count;
 
 	if (row_count == 0) {
 		state.finished = true;

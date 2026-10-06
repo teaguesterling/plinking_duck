@@ -36,6 +36,22 @@ SELECT __ordinal FROM read_pvar('test/data/pfile_example.pvar', with_ordinal := 
 2
 3
 
+# --- Multi-file path: the ordinal RESTARTS at 0 for each file in the list ---
+# read_pvar is single-threaded and row-concatenates in list order, so a two-file
+# list of the 4-variant fixture yields 0,1,2,3,0,1,2,3. This matches read_pfile's
+# per-shard ordinal (vidx within each pgen), which per-shard consumers key on.
+query I
+SELECT __ordinal FROM read_pvar(['test/data/pfile_example.pvar', 'test/data/pfile_example.pvar'], with_ordinal := true);
+----
+0
+1
+2
+3
+0
+1
+2
+3
+
 # --- Default-off: column set and values are unchanged (no __ordinal) ---
 
 query I
@@ -79,4 +95,17 @@ rs4	3
 query I
 SELECT __ordinal FROM read_pvar('/tmp/plinking_duck_ordinal.pvar.parquet', with_ordinal := true) WHERE ID = 'rs4';
 ----
+3
+
+# Multi-file list on the external path also restarts the ordinal per file.
+query I
+SELECT __ordinal FROM read_pvar(['/tmp/plinking_duck_ordinal.pvar.parquet', '/tmp/plinking_duck_ordinal.pvar.parquet'], with_ordinal := true);
+----
+0
+1
+2
+3
+0
+1
+2
 3
