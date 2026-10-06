@@ -491,6 +491,15 @@ struct PfileBindData : public TableFunctionData {
 		return sources[0];
 	}
 
+	// When true, an extra BIGINT "__ordinal" column is appended to the output,
+	// carrying each variant's 0-based index in the pgen/pvar natural order
+	// (i.e. source.ResolveVariantIdx(effective_pos) — the ORIGINAL index, not the
+	// scan position). Only supported for orient := 'variant'; other orient modes
+	// are rejected in bind. For a multi-file list the ordinal is per-source (each
+	// shard restarts at 0), matching the per-shard variant index.
+	bool with_ordinal = false;
+	idx_t ordinal_col_idx = 0; // schema index of "__ordinal" (valid when with_ordinal)
+
 	// --- Default mode column indices ---
 	static constexpr idx_t CHROM_COL = 0;
 	static constexpr idx_t POS_COL = 1;
@@ -941,11 +950,24 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			bind_data->region = ParseRegion(kv.second.GetValue<string>());
 		} else if (kv.first == "combine_samples") {
 			bind_data->combine_samples = ResolveCombineSamplesMode(kv.second.GetValue<string>());
+		} else if (kv.first == "with_ordinal") {
+			if (!kv.second.IsNull()) {
+				bind_data->with_ordinal = kv.second.GetValue<bool>();
+			}
 		}
 		// samples, variants, genotypes, af_range, ac_range handled after pgenlib init
 	}
 
 	bind_data->orient_mode = ResolveOrientMode(orient_str, "read_pfile");
+
+	// The synthetic ordinal column is only meaningful (and only wired into the
+	// emit path) for variant-orient output, where each row is one variant. The
+	// genotype (tidy) and sample orient modes reshape the output, so reject them
+	// explicitly rather than emit a wrong or unset ordinal.
+	if (bind_data->with_ordinal && bind_data->orient_mode != OrientMode::VARIANT) {
+		throw InvalidInputException(
+		    "read_pfile: with_ordinal := true is only supported with orient := 'variant' (the default)");
+	}
 
 	// Only IMPLICIT and IDENTICAL are implemented; the join modes are reserved.
 	if (bind_data->combine_samples == CombineSamplesMode::UNION ||
@@ -1928,6 +1950,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
+	// Append the synthetic ordinal column past every other column (including the
+	// per-sample columns of genotypes := 'columns'). It is reachable only in
+	// variant-orient mode (rejected above otherwise), so PfileDefaultScan is the
+	// only scan that needs to fill it.
+	if (bind_data->with_ordinal) {
+		bind_data->ordinal_col_idx = names.size();
+		names.push_back("__ordinal");
+		return_types.push_back(LogicalType::BIGINT);
+	}
+
 	return std::move(bind_data);
 }
 
@@ -2446,6 +2478,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 			auto file_col = column_ids[out_col];
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+
+			// Synthetic ordinal: the variant's natural (original) index. vidx is
+			// ResolveVariantIdx(effective_pos), so a variants := [5,6,7] selection
+			// yields 5,6,7 — not renumbered 0,1,2. Must precede the switch below,
+			// whose columns-mode default case would otherwise ignore this index.
+			if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
+				CompatFlatDataMutable<int64_t>(output.data[out_col])[rows_emitted] =
+				    static_cast<int64_t>(vidx);
 				continue;
 			}
 
@@ -3805,6 +3847,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		fn.named_parameters["genotype_range"] = LogicalType::ANY;
 		fn.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
 		fn.named_parameters["combine_samples"] = LogicalType::VARCHAR;
+		fn.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
 	};
 
 	TableFunctionSet set("read_pfile");

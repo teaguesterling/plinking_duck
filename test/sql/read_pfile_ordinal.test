@@ -1,0 +1,79 @@
+# name: test/sql/read_pfile_ordinal.test
+# description: with_ordinal := true appends a 0-based __ordinal (natural variant index) to read_pfile
+# group: [sql]
+
+require plinking_duck
+
+# --- Fixture: pfile_example has 4 variants in file order: rs1, rs2, rs3, rs4 ---
+
+# Ordinals are 0..n-1 in natural (pgen/pvar) order, paired with each variant.
+query TI
+SELECT ID, __ordinal FROM read_pfile('test/data/pfile_example', with_ordinal := true) ORDER BY __ordinal;
+----
+rs1	0
+rs2	1
+rs3	2
+rs4	3
+
+# __ordinal is BIGINT.
+query T
+SELECT column_type FROM (DESCRIBE SELECT * FROM read_pfile('test/data/pfile_example', with_ordinal := true)) WHERE column_name = '__ordinal';
+----
+BIGINT
+
+# Ordinal is stable under a filter (not renumbered).
+query I
+SELECT __ordinal FROM read_pfile('test/data/pfile_example', with_ordinal := true) WHERE ID = 'rs3';
+----
+2
+
+# --- Subset selection keeps ORIGINAL ordinals, not renumbered 0,1,2 ---
+# rare_small has 400 variants; variants := [5,6,7] selects originals 5,6,7.
+
+query I
+SELECT __ordinal FROM read_pfile('test/data/rare_small', variants := [5, 6, 7], with_ordinal := true) ORDER BY __ordinal;
+----
+5
+6
+7
+
+# A non-contiguous subset also keeps original indices.
+query I
+SELECT __ordinal FROM read_pfile('test/data/rare_small', variants := [0, 10, 399], with_ordinal := true) ORDER BY __ordinal;
+----
+0
+10
+399
+
+# with_ordinal composes with genotypes := 'counts' (aggregate variant-orient mode).
+query I
+SELECT __ordinal FROM read_pfile('test/data/pfile_example', genotypes := 'counts', with_ordinal := true) ORDER BY __ordinal;
+----
+0
+1
+2
+3
+
+# --- Default-off: column set is unchanged (no __ordinal) ---
+
+query I
+SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_pfile('test/data/pfile_example')) WHERE column_name = '__ordinal';
+----
+0
+
+query I
+SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_pfile('test/data/pfile_example', with_ordinal := false)) WHERE column_name = '__ordinal';
+----
+0
+
+# --- Rejected modes: ordinal only supported for orient := 'variant' ---
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', orient := 'genotype', with_ordinal := true);
+----
+only supported with orient := 'variant'
+
+statement error
+SELECT * FROM read_pfile('test/data/pfile_example', orient := 'sample', with_ordinal := true);
+----
+only supported with orient := 'variant'
