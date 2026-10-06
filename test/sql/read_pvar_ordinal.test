@@ -1,0 +1,60 @@
+# name: test/sql/read_pvar_ordinal.test
+# description: with_ordinal := true appends a 0-based __ordinal column to read_pvar
+# group: [sql]
+
+require plinking_duck
+
+# --- Fixture: pfile_example.pvar has 4 variants in file order: rs1, rs2, rs3, rs4 ---
+
+# Ordinals are 0..n-1 in natural (file) order, correctly paired with each variant.
+query TI
+SELECT ID, __ordinal FROM read_pvar('test/data/pfile_example.pvar', with_ordinal := true) ORDER BY __ordinal;
+----
+rs1	0
+rs2	1
+rs3	2
+rs4	3
+
+# __ordinal is BIGINT.
+query T
+SELECT column_type FROM (DESCRIBE SELECT * FROM read_pvar('test/data/pfile_example.pvar', with_ordinal := true)) WHERE column_name = '__ordinal';
+----
+BIGINT
+
+# Ordinals are stable under a filter (filter applied after the scan, not renumbered).
+query I
+SELECT __ordinal FROM read_pvar('test/data/pfile_example.pvar', with_ordinal := true) WHERE ID = 'rs3';
+----
+2
+
+# Ordinals are stable even when __ordinal is the only projected column.
+query I
+SELECT __ordinal FROM read_pvar('test/data/pfile_example.pvar', with_ordinal := true) ORDER BY __ordinal;
+----
+0
+1
+2
+3
+
+# --- Default-off: column set and values are unchanged (no __ordinal) ---
+
+query I
+SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_pvar('test/data/pfile_example.pvar')) WHERE column_name = '__ordinal';
+----
+0
+
+# with_ordinal := false is identical to default-off (no __ordinal column).
+query I
+SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_pvar('test/data/pfile_example.pvar', with_ordinal := false)) WHERE column_name = '__ordinal';
+----
+0
+
+# Existing column set (default-off) is the canonical CHROM/POS/ID/REF/ALT.
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_pvar('test/data/pfile_example.pvar'));
+----
+CHROM
+POS
+ID
+REF
+ALT

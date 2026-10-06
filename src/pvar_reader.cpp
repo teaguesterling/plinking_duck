@@ -260,6 +260,16 @@ struct PvarBindData : public TableFunctionData {
 	//! Materialized rows from a non-native source (one vector<Value> per row).
 	//! Only populated when is_external_source is true.
 	vector<vector<Value>> materialized_rows;
+
+	//! When true, an extra BIGINT column "__ordinal" is appended to the schema,
+	//! carrying the 0-based row ordinal in natural (file) order. The ordinal is
+	//! derived from a running emission counter, so it is stable regardless of
+	//! projection/filter pushdown (filters are applied by DuckDB after the scan).
+	bool with_ordinal = false;
+	//! Schema index of the "__ordinal" column (only valid when with_ordinal). It
+	//! sits past header_info's real columns, which are left untouched so the
+	//! per-line field-count validation is unaffected.
+	idx_t ordinal_col_idx = 0;
 };
 
 struct PvarGlobalState : public GlobalTableFunctionState {
@@ -268,8 +278,14 @@ struct PvarGlobalState : public GlobalTableFunctionState {
 	bool finished = false;
 	vector<column_t> column_ids;
 
-	//! Next row index for materialized (non-native) sources
+	//! Next row index for materialized (non-native) sources. Doubles as the
+	//! 0-based ordinal for the row about to be emitted on the external path.
 	idx_t next_row_idx = 0;
+
+	//! Running count of rows emitted so far on the native path, across all
+	//! row-concatenated files. The ordinal of a row is this base plus its local
+	//! offset within the current chunk.
+	idx_t rows_emitted_total = 0;
 
 	idx_t MaxThreads() const override {
 		return 1; // Sequential text file reading
@@ -297,6 +313,13 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
                                          vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PvarBindData>();
 	bind_data->file_paths = ResolvePathList(input.inputs[0], "read_pvar");
+
+	{
+		auto it = input.named_parameters.find("with_ordinal");
+		if (it != input.named_parameters.end() && !it->second.IsNull()) {
+			bind_data->with_ordinal = it->second.GetValue<bool>();
+		}
+	}
 
 	{
 		auto &fs = FileSystem::GetFileSystem(context);
@@ -371,6 +394,15 @@ static unique_ptr<FunctionData> PvarBind(ClientContext &context, TableFunctionBi
 				}
 			}
 		}
+	}
+
+	// Append the synthetic ordinal column past all real columns. header_info is
+	// left untouched (its column count still drives per-line field validation and
+	// the materialized-row layout); the scan recognizes ordinal_col_idx specially.
+	if (bind_data->with_ordinal) {
+		bind_data->ordinal_col_idx = names.size();
+		names.push_back("__ordinal");
+		return_types.push_back(LogicalType::BIGINT);
 	}
 
 	return std::move(bind_data);
@@ -489,6 +521,12 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
 					continue;
 				}
+				if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
+					// next_row_idx is this row's 0-based ordinal (incremented below).
+					output.data[out_col].SetValue(row_count,
+					                               Value::BIGINT(static_cast<int64_t>(state.next_row_idx)));
+					continue;
+				}
 				output.data[out_col].SetValue(row_count, row_values[file_col]);
 			}
 
@@ -554,11 +592,21 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				continue;
 			}
 
+			if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
+				// 0-based ordinal in natural file order: running base + local offset.
+				// Counted per emitted row, independent of which columns are projected.
+				CompatFlatDataMutable<int64_t>(output.data[out_col])[row_count] =
+				    static_cast<int64_t>(state.rows_emitted_total + row_count);
+				continue;
+			}
+
 			SetPvarValue(output.data[out_col], row_count, fields[file_col], header.column_types[file_col]);
 		}
 
 		row_count++;
 	}
+
+	state.rows_emitted_total += row_count;
 
 	if (row_count == 0) {
 		state.finished = true;
@@ -576,11 +624,13 @@ void RegisterPvarReader(ExtensionLoader &loader) {
 	// Single path
 	TableFunction one("read_pvar", {LogicalType::VARCHAR}, PvarScan, PvarBind, PvarInitGlobal, PvarInitLocal);
 	one.projection_pushdown = true;
+	one.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
 	set.AddFunction(one);
 	// List of paths (row-concatenated in order)
 	TableFunction many("read_pvar", {LogicalType::LIST(LogicalType::VARCHAR)}, PvarScan, PvarBind, PvarInitGlobal,
 	                   PvarInitLocal);
 	many.projection_pushdown = true;
+	many.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
 	set.AddFunction(many);
 	RegisterTableSetWithDesc(loader, set, {"files"}, "Read PLINK .pvar or .bim variant files into tabular format.",
 	                         {"SELECT * FROM read_pvar('data/cohort.pvar')"});
