@@ -169,3 +169,187 @@ statement error
 SELECT * FROM read_pfile('test/data/pfile_example', orient := 'sample', with_ordinal := true);
 ----
 only supported with orient := 'variant'
+
+# ===========================================================================
+# variant_range := [lo, hi) — half-open range selector in VARIANT ORDINAL SPACE
+# (the same 0-based space as __ordinal), NOT genomic base pairs (that is region :=).
+# ===========================================================================
+
+# --- DISCRIMINATING TEST (acceptance bar) ---
+# read_pfile(p, variant_range := [lo, hi), with_ordinal := true) must emit __ordinal
+# values identical to the [lo, hi) slice of the full-scan ordinals — ABSOLUTE ordinals
+# (e.g. [250, 260) -> 250..259), NOT restarted at 0. This is the exact class of bug
+# (scan-origin counter vs resolved index) that bit read_pvar before.
+
+# A1. Literal absolute ordinals for an offset-away-from-0 range on rare_small (400).
+query I
+SELECT __ordinal FROM read_pfile('test/data/rare_small', variant_range := [250, 260], with_ordinal := true) ORDER BY __ordinal;
+----
+250
+251
+252
+253
+254
+255
+256
+257
+258
+259
+
+# A2. Set-equality against the direct full-scan slice (catches a SHARED offset that
+# A1's literals could miss only if BOTH sides were wrong identically — they can't be,
+# since A1 pins literals and A2 pins the relationship). Symmetric difference == 0.
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', variant_range := [250, 260], with_ordinal := true)
+   EXCEPT ALL
+   SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', with_ordinal := true) WHERE __ordinal >= 250 AND __ordinal < 260)
+  UNION ALL
+  (SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', with_ordinal := true) WHERE __ordinal >= 250 AND __ordinal < 260
+   EXCEPT ALL
+   SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', variant_range := [250, 260], with_ordinal := true))
+);
+----
+0
+
+# A3. Full-range set equality over the WHOLE file, chunked at an arbitrary boundary:
+# the union of [0,137) and [137,400) must equal the unfiltered ordinal set exactly.
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', with_ordinal := true)
+   EXCEPT ALL
+   (SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', variant_range := [0, 137], with_ordinal := true)
+    UNION ALL
+    SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', variant_range := [137, 400], with_ordinal := true)))
+);
+----
+0
+
+# --- Edges: [0,k), tail [n-k,n), half-open boundary, empty, past-end clamp ---
+
+# [0, 5) -> 0..4
+query III
+SELECT MIN(__ordinal), MAX(__ordinal), COUNT(*) FROM read_pfile('test/data/rare_small', variant_range := [0, 5], with_ordinal := true);
+----
+0	4	5
+
+# tail [395, 400) -> 395..399 (last variant index is 399; hi == n is the valid end)
+query III
+SELECT MIN(__ordinal), MAX(__ordinal), COUNT(*) FROM read_pfile('test/data/rare_small', variant_range := [395, 400], with_ordinal := true);
+----
+395	399	5
+
+# half-open: [5, 8) yields exactly 5,6,7 (hi is exclusive, 8 not included)
+query I
+SELECT __ordinal FROM read_pfile('test/data/rare_small', variant_range := [5, 8], with_ordinal := true) ORDER BY __ordinal;
+----
+5
+6
+7
+
+# empty range lo == hi -> zero rows
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/rare_small', variant_range := [10, 10], with_ordinal := true);
+----
+0
+
+# hi past n is clamped to n (no error, no out-of-range read)
+query III
+SELECT MIN(__ordinal), MAX(__ordinal), COUNT(*) FROM read_pfile('test/data/rare_small', variant_range := [398, 99999], with_ordinal := true);
+----
+398	399	2
+
+# lo past n -> empty
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/rare_small', variant_range := [500, 600], with_ordinal := true);
+----
+0
+
+# --- variant_range works WITHOUT with_ordinal (plain row restriction) ---
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/rare_small', variant_range := [100, 200]);
+----
+100
+
+# --- variant_range intersects with variants := (both filters apply) ---
+# variants {5,6,7,100} ∩ [6,101) = {6,7,100}
+query I
+SELECT __ordinal FROM read_pfile('test/data/rare_small', variants := [5, 6, 7, 100], variant_range := [6, 101], with_ordinal := true) ORDER BY __ordinal;
+----
+6
+7
+100
+
+# --- variant_range on a large parallel scan keeps absolute ordinals ---
+statement ok
+PRAGMA threads=4;
+
+query III
+SELECT MIN(__ordinal), MAX(__ordinal), COUNT(*) FROM read_pfile('test/data/wes_chr10', variant_range := [12345, 20000], with_ordinal := true);
+----
+12345	19999	7655
+
+# --- variant_range composes across orient modes (it is a variant-set filter, not
+#     ordinal-only). The same restricted effective_variant_indices drives sample
+#     orient's genotype matrix and genotype orient's tidy emit as variants := does. ---
+
+# sample orient: variant_range restricts which variants feed the per-sample row;
+# the sample COUNT is unchanged (256), and each row's genotypes array is 10 wide.
+query II
+SELECT COUNT(*), bool_and(len(genotypes) = 10)
+FROM read_pfile('test/data/rare_small', orient := 'sample', variant_range := [0, 10]);
+----
+256	true
+
+# genotype (tidy) orient: one row per (variant, sample) — 3 variants * 256 samples.
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/rare_small', orient := 'genotype', variant_range := [0, 3]);
+----
+768
+
+# aggregate variant-orient (counts) + variant_range + with_ordinal: absolute ordinals.
+query I
+SELECT __ordinal FROM read_pfile('test/data/rare_small', genotypes := 'counts', variant_range := [5, 8], with_ordinal := true) ORDER BY __ordinal;
+----
+5
+6
+7
+
+# --- Validation errors ---
+
+statement error
+SELECT * FROM read_pfile('test/data/rare_small', variant_range := [10, 5]);
+----
+half-open [lo, hi)
+
+statement error
+SELECT * FROM read_pfile('test/data/rare_small', variant_range := [-1, 5]);
+----
+half-open [lo, hi)
+
+# Non-integer bounds are rejected (NOT silently rounded 10.5 -> 10).
+statement error
+SELECT * FROM read_pfile('test/data/rare_small', variant_range := [10.5, 15.9]);
+----
+variant_range bounds must be integers
+
+statement error
+SELECT * FROM read_pfile('test/data/rare_small', variant_range := [10.0, 15.9]);
+----
+variant_range bounds must be integers
+
+statement error
+SELECT * FROM read_pfile('test/data/rare_small', variant_range := [5]);
+----
+exactly 2 elements
+
+statement error
+SELECT * FROM read_pfile('test/data/rare_small', variant_range := [1, 2, 3]);
+----
+exactly 2 elements
+
+# multi-file list + variant_range is rejected (per-source ordinal space is ambiguous)
+statement error
+SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], variant_range := [0, 10]);
+----
+multi-file list is not yet supported

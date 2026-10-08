@@ -1,0 +1,170 @@
+# name: test/sql/pfile_partitions.test
+# description: pfile_partitions(prefix) returns disjoint, ordered, [0,n)-covering variant partitions
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# Output schema: source VARCHAR, dim VARCHAR, partition_id BIGINT, lo BIGINT, hi BIGINT
+# [lo, hi) is HALF-OPEN in VARIANT ORDINAL SPACE (same 0-based space as __ordinal).
+# ===========================================================================
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pfile_partitions('test/data/rare_small'));
+----
+source	VARCHAR
+dim	VARCHAR
+partition_id	BIGINT
+lo	BIGINT
+hi	BIGINT
+
+# dim is always 'variants' (samples are UNCHUNKED by design).
+query I
+SELECT COUNT(*) FROM pfile_partitions('test/data/wes_chr10') WHERE dim <> 'variants';
+----
+0
+
+# source is the resolved .pgen path (so a consumer can read each shard back by it).
+query I
+SELECT COUNT(*) FROM pfile_partitions('test/data/rare_small') WHERE source NOT LIKE '%rare_small.pgen';
+----
+0
+
+# --- Tiny file: one partition covering [0, n) (default formula rounds to 0 -> fallback) ---
+# rare_small has 400 variants; 400/16 = 25 -> rounds to 0 -> single partition.
+query TIII
+SELECT dim, partition_id, lo, hi FROM pfile_partitions('test/data/rare_small');
+----
+variants	0	0	400
+
+# large_example has 3000 variants; 3000/16 = 187 -> rounds to 0 -> single partition.
+query TIII
+SELECT dim, partition_id, lo, hi FROM pfile_partitions('test/data/large_example');
+----
+variants	0	0	3000
+
+# --- Default formula at MULTIPLE partitions: wes_chr10 has 30000 variants ---
+# 30000/16 = 1875 -> round to nearest 1000 = 2000 -> ceil(30000/2000) = 15 partitions.
+query I
+SELECT COUNT(*) FROM pfile_partitions('test/data/wes_chr10');
+----
+15
+
+# First / last partition exact bounds; last hi == n_variants (no gap, no overflow).
+query III
+SELECT partition_id, lo, hi FROM pfile_partitions('test/data/wes_chr10') ORDER BY partition_id LIMIT 1;
+----
+0	0	2000
+
+query III
+SELECT partition_id, lo, hi FROM pfile_partitions('test/data/wes_chr10') ORDER BY partition_id DESC LIMIT 1;
+----
+14	28000	30000
+
+# --- Coverage invariants on wes_chr10 default partitioning ---
+# disjoint & non-empty (lo < hi), contiguous (hi == next lo), starts at 0, ends at n.
+query IIII
+SELECT bool_and(lo < hi)                               AS disjoint_nonempty,
+       bool_and(next_lo IS NULL OR hi = next_lo)       AS contiguous_no_gap_no_overlap,
+       MIN(lo) = 0                                      AS starts_at_zero,
+       MAX(hi) = 30000                                  AS ends_at_n
+FROM (SELECT lo, hi, LEAD(lo) OVER (ORDER BY lo) AS next_lo FROM pfile_partitions('test/data/wes_chr10'));
+----
+true	true	true	true
+
+# partition_id is dense 0..k-1 in lo order.
+query I
+SELECT bool_and(partition_id = rn) FROM (
+  SELECT partition_id, (ROW_NUMBER() OVER (ORDER BY lo)) - 1 AS rn FROM pfile_partitions('test/data/wes_chr10')
+);
+----
+true
+
+# --- chunk_size override ---
+# rare_small (400) at chunk_size := 150 -> 3 partitions; last [300,400).
+query III
+SELECT partition_id, lo, hi FROM pfile_partitions('test/data/rare_small', chunk_size := 150) ORDER BY partition_id;
+----
+0	0	150
+1	150	300
+2	300	400
+
+# Exactly divisible: 400 / 100 = 4 even partitions; last hi == n, no short tail beyond.
+query III
+SELECT partition_id, lo, hi FROM pfile_partitions('test/data/rare_small', chunk_size := 100) ORDER BY partition_id;
+----
+0	0	100
+1	100	200
+2	200	300
+3	300	400
+
+# chunk_size larger than n -> one partition [0, n).
+query III
+SELECT partition_id, lo, hi FROM pfile_partitions('test/data/rare_small', chunk_size := 100000);
+----
+0	0	400
+
+# chunk_size == 1 -> n singleton partitions, fully covering.
+query IIII
+SELECT COUNT(*), MIN(lo), MAX(hi), bool_and(hi - lo = 1)
+FROM pfile_partitions('test/data/rare_small', chunk_size := 1);
+----
+400	0	400	true
+
+# --- Multi-shard: per-source partitions; partition_id and [lo,hi) restart per source ---
+# shard1/shard2/shard3 each have 1000 variants. At chunk_size := 400 each -> 3 parts.
+query TIII
+SELECT source, partition_id, lo, hi
+FROM pfile_partitions(['test/data/shard1', 'test/data/shard2'], chunk_size := 400)
+ORDER BY source, partition_id;
+----
+test/data/shard1.pgen	0	0	400
+test/data/shard1.pgen	1	400	800
+test/data/shard1.pgen	2	800	1000
+test/data/shard2.pgen	0	0	400
+test/data/shard2.pgen	1	400	800
+test/data/shard2.pgen	2	800	1000
+
+# Per-source coverage: each source independently covers [0, 1000), restarting lo at 0.
+query TIII
+SELECT source, MIN(lo), MAX(hi), bool_and(partition_id >= 0)
+FROM pfile_partitions(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], chunk_size := 300)
+GROUP BY source ORDER BY source;
+----
+test/data/shard1.pgen	0	1000	true
+test/data/shard2.pgen	0	1000	true
+test/data/shard3.pgen	0	1000	true
+
+# --- The partition [lo,hi) ranges are exactly consumable by read_pfile(variant_range) ---
+# A partition's [lo,hi) fed to read_pfile's variant_range yields exactly (hi-lo) variants,
+# whose __ordinals are the absolute [lo,hi) slice. (read_pfile takes only literal params,
+# so this uses one partition's literal bounds — the same bounds pfile_partitions emits.)
+query III
+SELECT MIN(__ordinal), MAX(__ordinal), COUNT(*)
+FROM read_pfile('test/data/wes_chr10.pgen', variant_range := [28000, 30000], with_ordinal := true);
+----
+28000	29999	2000
+
+# --- .pgen path accepted directly as the prefix (round-trips the emitted source) ---
+query TIII
+SELECT dim, partition_id, lo, hi FROM pfile_partitions('test/data/rare_small.pgen', chunk_size := 250) ORDER BY partition_id;
+----
+variants	0	0	250
+variants	1	250	400
+
+# --- Errors ---
+
+statement error
+SELECT * FROM pfile_partitions('test/data/rare_small', chunk_size := 0);
+----
+chunk_size must be a positive integer
+
+statement error
+SELECT * FROM pfile_partitions('test/data/rare_small', chunk_size := -5);
+----
+chunk_size must be a positive integer
+
+statement error
+SELECT * FROM pfile_partitions('test/data/does_not_exist');
+----
+cannot find .pgen file
