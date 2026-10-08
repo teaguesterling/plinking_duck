@@ -52,6 +52,13 @@ SELECT count(*) FROM read_pfile('test/data/rare_small', variant_range := [0, 1])
 ----
 1
 
+# The LIST(VARCHAR) overload must honor the param too — a capability claim means
+# "whichever overload the consumer calls". Catches an asymmetric registration.
+query I
+SELECT count(*) FROM read_pfile(['test/data/rare_small'], variant_range := [0, 1]);
+----
+1
+
 # --- with_ordinal: BOTH read_pfile and read_pvar append __ordinal ---
 query I
 SELECT list_contains(plinking_duck_capabilities(), 'with_ordinal');
@@ -65,6 +72,17 @@ SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pfile('test/data/rare_small', 
 
 query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pvar('test/data/rare_small.pvar', with_ordinal := true)) WHERE column_name = '__ordinal';
+----
+1
+
+# LIST(VARCHAR) overloads must honor with_ordinal too (both readers).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pfile(['test/data/rare_small'], with_ordinal := true)) WHERE column_name = '__ordinal';
+----
+1
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pvar(['test/data/rare_small.pvar'], with_ordinal := true)) WHERE column_name = '__ordinal';
 ----
 1
 

@@ -48,7 +48,13 @@ namespace duckdb {
 // facts are consumer-meaningful enough to surface as a token (we deliberately
 // do not enumerate every internal named parameter); they do not assert that the
 // feature works. The companion test (plinking_duck_capabilities.test) pins the
-// exact token set in both directions and proves each reported token binds.
+// exact reported set and proves each reported token binds. Note the asymmetry:
+// the test catches a reader LOSING a curated param (the token drops, set-
+// equality fails) — but by construction it cannot detect a reader GAINING a
+// param that is not in the curated lists. That is an accepted under-claim: an
+// uncurated param is simply not a capability token, so there is nothing to
+// catch. Surfacing a newly-meaningful param is a deliberate edit here, not an
+// automatic one.
 
 namespace {
 
@@ -83,19 +89,22 @@ optional_ptr<TableFunctionCatalogEntry> LookupTableFunction(ClientContext &conte
 	                                                    OnEntryNotFound::RETURN_NULL);
 }
 
-// True iff `reader` is registered AND at least one of its overloads exposes a
-// named parameter named `param`.
+// True iff `reader` is registered AND EVERY overload exposes a named parameter
+// named `param`. A capability claim means "whichever overload the consumer
+// calls, this param works", so the param must be present on all overloads (not
+// just one) — an asymmetric registration under-claims rather than over-claims.
+// A missing reader (no overloads) drops the token (returns false), never throws.
 bool ReaderHasParam(ClientContext &context, const string &reader, const string &param) {
 	auto entry = LookupTableFunction(context, reader);
-	if (!entry) {
+	if (!entry || entry->functions.functions.empty()) {
 		return false;
 	}
 	for (auto &fn : entry->functions.functions) {
-		if (fn.named_parameters.find(param) != fn.named_parameters.end()) {
-			return true;
+		if (fn.named_parameters.find(param) == fn.named_parameters.end()) {
+			return false;
 		}
 	}
-	return false;
+	return true;
 }
 
 // Compute the live capability set from the catalog.
