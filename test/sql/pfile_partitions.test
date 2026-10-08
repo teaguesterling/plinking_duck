@@ -80,6 +80,29 @@ SELECT bool_and(partition_id = rn) FROM (
 ----
 true
 
+# --- Default formula: half-up rounding discriminator (streaming_example, 50000 variants) ---
+# 50000/16 = 3125 -> ROUND HALF-UP to nearest 1000 = 3000 -> ceil(50000/3000) = 17 partitions.
+# This pins the C++ half-up rule specifically: a plain round-UP (ceil) would give 4000 (-> 13
+# partitions), which is exactly what a consumer's own round-up default (e.g. howard's
+# default_chunk_size, which returns 4000 here) computes. The two defaults genuinely diverge; no
+# consumer is affected because consumers forward an explicit chunk_size to pfile_partitions rather
+# than relying on this bare default. wes_chr10's 1875->2000 above cannot catch this (half-up and
+# ceil agree there); 3125->3000 vs 4000 does.
+query I
+SELECT COUNT(*) FROM pfile_partitions('test/data/streaming_example');
+----
+17
+
+query III
+SELECT partition_id, lo, hi FROM pfile_partitions('test/data/streaming_example') ORDER BY partition_id LIMIT 1;
+----
+0	0	3000
+
+query III
+SELECT partition_id, lo, hi FROM pfile_partitions('test/data/streaming_example') ORDER BY partition_id DESC LIMIT 1;
+----
+16	48000	50000
+
 # --- chunk_size override ---
 # rare_small (400) at chunk_size := 150 -> 3 partitions; last [300,400).
 query III
