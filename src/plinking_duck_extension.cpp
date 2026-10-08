@@ -12,6 +12,7 @@
 #include "plink_score.hpp"
 #include "plink_glm.hpp"
 #include "vcf_reader.hpp"
+#include "plinking_capabilities.hpp"
 #ifdef PLINKING_HAVE_EIGEN3
 #include "plink_pca.hpp"
 #endif
@@ -100,6 +101,9 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 #ifdef PLINKING_HAVE_EIGEN3
 	RegisterPlinkPca(loader);
 #endif
+
+	// Capability-detection scalar (derived from the live catalog above).
+	RegisterPlinkingCapabilities(loader);
 }
 
 std::string PlinkingDuckExtension::Name() {

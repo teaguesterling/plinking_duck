@@ -11,6 +11,7 @@ include_directories(src/include)
 
 set(EXTENSION_SOURCES
     src/plinking_duck_extension.cpp
+    src/plinking_capabilities.cpp
     src/pvar_reader.cpp
     src/psam_reader.cpp
     src/pgen_reader.cpp

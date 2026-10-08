@@ -1,0 +1,80 @@
+# name: test/sql/plinking_duck_capabilities.test
+# description: plinking_duck_capabilities() is the primary capability-detection mechanism. Every token it reports must correspond to a feature the readers actually honor (decoupling test), and the reported set is pinned in both directions.
+# group: [sql]
+
+require plinking_duck
+
+# --- The detection mechanism itself is catalog-visible by name ---
+# A consumer probes for this function before trusting its output.
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE function_name = 'plinking_duck_capabilities';
+----
+true
+
+# --- Return type is VARCHAR[] ---
+query T
+SELECT list_contains(['VARCHAR[]'], column_type)
+FROM (DESCRIBE SELECT plinking_duck_capabilities() AS c) WHERE column_name = 'c';
+----
+true
+
+# --- Exact token set (pins BOTH directions) ---
+# This fails if a token is added without a decoupling assertion below, or if a
+# token is silently dropped. The set is DERIVED from the live catalog, so this
+# also fails if the registration source of truth changes out from under it.
+query T
+SELECT list_sort(plinking_duck_capabilities());
+----
+[pfile_partitions, variant_range, with_ordinal]
+
+# The value is constant across rows (broadcast correctly).
+query I
+SELECT count(DISTINCT c) FROM (SELECT plinking_duck_capabilities() AS c FROM range(3));
+----
+1
+
+# ===========================================================================
+# Decoupling assertions: for EACH reported token, prove the feature is real.
+# Each block first asserts capabilities() claims the token, then exercises it.
+# If capabilities() ever claims a token the reader does not honor, the matching
+# block fails; if it omits one, the exact-set query above fails.
+# ===========================================================================
+
+# --- variant_range: read_pfile accepts variant_range := [lo, hi) (half-open) ---
+query I
+SELECT list_contains(plinking_duck_capabilities(), 'variant_range');
+----
+true
+
+# Binds without an "unknown named parameter" error and filters to [0,1) = 1 variant.
+query I
+SELECT count(*) FROM read_pfile('test/data/rare_small', variant_range := [0, 1]);
+----
+1
+
+# --- with_ordinal: BOTH read_pfile and read_pvar append __ordinal ---
+query I
+SELECT list_contains(plinking_duck_capabilities(), 'with_ordinal');
+----
+true
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pfile('test/data/rare_small', with_ordinal := true)) WHERE column_name = '__ordinal';
+----
+1
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pvar('test/data/rare_small.pvar', with_ordinal := true)) WHERE column_name = '__ordinal';
+----
+1
+
+# --- pfile_partitions: the table function exists and returns rows ---
+query I
+SELECT list_contains(plinking_duck_capabilities(), 'pfile_partitions');
+----
+true
+
+query I
+SELECT count(*) > 0 FROM pfile_partitions('test/data/rare_small', chunk_size := 100);
+----
+true
