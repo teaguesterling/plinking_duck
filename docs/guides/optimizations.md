@@ -66,6 +66,42 @@ Region filtering works by scanning the pre-loaded variant metadata (sorted by ch
 
 This avoids reading genotype data for variants outside the region.
 
+## Ordinal-Range Pushdown and Partitioning
+
+Where `region :=` selects variants in **base-pair** space, `variant_range := [lo, hi)`
+on `read_pfile` selects a **half-open range in variant ordinal space** — the same
+0-based space as the emitted `__ordinal` column. The scan starts at the first variant
+in the range and stops after the last, decoding only those records:
+
+```sql
+-- Variants with ordinal in [10000, 20000), emitting absolute ordinals
+SELECT __ordinal, ID FROM read_pfile('biobank',
+    with_ordinal := true, variant_range := [10000, 20000]);
+```
+
+This is the fast path for a **contiguous** variant selection: a single `[lo, hi)`
+range is cheaper to push down than a long `variants := [list]` of indices, and it
+avoids materializing the index list at all. `variant_range` is single-source (it is
+rejected on a multi-file prefix list, whose ordinal spaces are per-shard).
+
+[`pfile_partitions`](../functions/pfile_partitions.md) produces disjoint, covering
+`[lo, hi)` ranges over `[0, n_variants)`, so a consumer can split a large fileset
+into independent chunks and read each with its own `variant_range` — the basis for
+parallel or distributed scans:
+
+```sql
+-- One scan per partition
+SELECT p.partition_id, count(*)
+FROM pfile_partitions('biobank', chunk_size := 50000) p,
+     LATERAL read_pfile('biobank', variant_range := [p.lo, p.hi]) v
+GROUP BY p.partition_id;
+```
+
+A consumer that must run against both old and new builds can gate this form on
+[`plinking_duck_capabilities()`](../functions/plinking_duck_capabilities.md) (looking
+for the `variant_range` / `pfile_partitions` tokens) and fall back to a `variants :=`
+list or an after-the-scan filter when they are absent.
+
 ## Filter Pushdown
 
 The `af_range`, `ac_range`, `include_genotypes`, and `genotype_range` parameters let you filter variants or genotypes before full decompression:

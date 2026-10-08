@@ -60,6 +60,13 @@ PlinkingDuck provides **5 file readers** and **6 analysis functions**:
 | [`plink_score(path)`](functions/plink_score.md) | Polygenic risk scoring |
 | [`plink_glm(prefix)`](functions/plink_glm.md) | Per-variant GWAS regression (linear, logistic, Firth) |
 
+### Utility & Detection
+
+| Function | Description |
+|----------|-------------|
+| [`pfile_partitions(prefix)`](functions/pfile_partitions.md) | Half-open ordinal-range partitions over the variants dimension (chunked/parallel reads) |
+| [`plinking_duck_capabilities()`](functions/plinking_duck_capabilities.md) | Scalar: capability tokens this build supports, for SQL feature detection |
+
 ## Features
 
 - **Native SQL access** to PLINK 2 binary genotype data

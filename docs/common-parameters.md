@@ -195,3 +195,29 @@ SELECT * FROM read_pfile('data', genotype_range := {min: 1, max: 2});
 Incompatible with `dosages := true`.
 
 **Used by:** `read_pgen`, `read_pfile`
+
+## `with_ordinal`
+
+| Type | Default |
+|------|---------|
+| `BOOLEAN` | `false` |
+
+When `true`, append a `__ordinal` `BIGINT` column carrying each row's **0-based
+ordinal** in natural (file) order. The ordinal is emitted explicitly, so a
+consumer need not assume the reader returns rows in file order.
+
+- In [`read_pvar`](functions/read_pvar.md), it is the row ordinal in the `.pvar`/`.bim`.
+- In [`read_pfile`](functions/read_pfile.md), it is the variant's original index, and it is supported **only with `orient := 'variant'`** (the default); other orient modes reject it. Combined with [`variant_range`](functions/read_pfile.md#variant-range-ordinal-space), the emitted ordinals are **absolute** (not renumbered from 0).
+
+For a path/prefix **list**, the ordinal is **per-source** — it restarts at 0 for
+each file (matching the chunk ordinal space of [`pfile_partitions`](functions/pfile_partitions.md)).
+
+```sql
+SELECT __ordinal, CHROM, POS, ID FROM read_pvar('data.pvar', with_ordinal := true);
+```
+
+**Used by:** `read_pvar`, `read_pfile`
+
+> `variant_range := [lo, hi)` (an ordinal-space range) is `read_pfile`-only and
+> is documented on its [page](functions/read_pfile.md#variant-range-ordinal-space),
+> not here — it is not shared across functions.

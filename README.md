@@ -28,6 +28,17 @@ PlinkingDuck provides **five file readers** and **seven analysis functions**:
 | [`plink_glm`](https://plinking-duck.readthedocs.io/functions/plink_glm/) | Per-variant GWAS regression (linear, logistic, Firth) |
 | [`plink_pca`](#optional-dependency-eigen3-for-plink_pca) ⚠️ | Principal component analysis — **only present if the build found [Eigen3](#optional-dependency-eigen3-for-plink_pca)** |
 
+Plus a utility table function and a scalar feature-detection function:
+
+| Function | Purpose |
+|----------|---------|
+| [`pfile_partitions`](https://plinking-duck.readthedocs.io/functions/pfile_partitions/) | Half-open `[lo, hi)` ordinal-range partitions over the variants dimension (chunked/parallel reads) |
+| [`plinking_duck_capabilities`](https://plinking-duck.readthedocs.io/functions/plinking_duck_capabilities/) | Scalar `VARCHAR[]` of capability tokens this build supports, for SQL feature detection |
+
+Both `read_pvar` and `read_pfile` also take `with_ordinal := true` (append a
+`__ordinal` column), and `read_pfile` takes `variant_range := [lo, hi)` (a
+half-open range in variant ordinal space; pair it with `pfile_partitions`).
+
 Every function except `plink_pca` is unconditional. `plink_pca` is compiled out
 when Eigen3 is not available at configure time, which is the one case where two
 builds of the same commit expose different catalogs — see
