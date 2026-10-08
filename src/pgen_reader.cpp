@@ -1117,7 +1117,7 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 	read_pgen.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
 	read_pgen.named_parameters["variants"] = LogicalType::ANY;
 
-	RegisterTableWithDesc(loader, read_pgen, {"path"}, "Read PLINK .pgen or .bed genotype files into tabular format.",
+	RegisterTableWithDesc(loader, read_pgen, {}, "Read PLINK .pgen or .bed genotype files into tabular format.",
 	                      {"SELECT * FROM read_pgen('data/cohort.pgen')"});
 }
 

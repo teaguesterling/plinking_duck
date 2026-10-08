@@ -829,7 +829,7 @@ void RegisterPlinkMissing(ExtensionLoader &loader) {
 	plink_missing.named_parameters["samples"] = LogicalType::ANY;
 	plink_missing.named_parameters["region"] = LogicalType::VARCHAR;
 
-	RegisterTableWithDesc(loader, plink_missing, {"pfile"}, "Compute missingness rates per variant or per sample.",
+	RegisterTableWithDesc(loader, plink_missing, {}, "Compute missingness rates per variant or per sample.",
 	                      {"SELECT * FROM plink_missing('data/cohort.pgen', mode := 'variant')"});
 }
 

@@ -4142,7 +4142,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	                   PfileInitLocal);
 	add_named_params(many);
 	set.AddFunction(many);
-	RegisterTableSetWithDesc(loader, set, {"files"}, "Read PLINK dataset files into tabular format.",
+	RegisterTableSetWithDesc(loader, set, {}, "Read PLINK dataset files into tabular format.",
 	                         {"SELECT * FROM read_pfile('data/cohort.pgen')"});
 
 	// pfile_partitions: ordinal-range partitions along the variants dimension.
@@ -4160,7 +4160,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	add_chunk_size(part_many);
 	part_set.AddFunction(part_many);
 	RegisterTableSetWithDesc(
-	    loader, part_set, {"files", "chunk_size"},
+	    loader, part_set, {},
 	    "Compute the ordinal-range partitions of a pfile along the variants dimension (half-open [lo, hi)).",
 	    {"SELECT * FROM pfile_partitions('data/cohort')"});
 }

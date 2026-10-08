@@ -722,7 +722,7 @@ void RegisterPlinkHardy(ExtensionLoader &loader) {
 	plink_hardy.named_parameters["midp"] = LogicalType::BOOLEAN;
 	plink_hardy.named_parameters["build"] = LogicalType::VARCHAR;
 
-	RegisterTableWithDesc(loader, plink_hardy, {"pfile"}, "Compute Hardy-Weinberg equilibrium exact test statistics.",
+	RegisterTableWithDesc(loader, plink_hardy, {}, "Compute Hardy-Weinberg equilibrium exact test statistics.",
 	                      {"SELECT * FROM plink_hardy('data/cohort.pgen')"});
 }
 

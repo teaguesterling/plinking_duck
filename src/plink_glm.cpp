@@ -1500,7 +1500,7 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 	plink_glm.named_parameters["firth"] = LogicalType::BOOLEAN;
 	plink_glm.named_parameters["p_threshold"] = LogicalType::DOUBLE;
 
-	RegisterTableWithDesc(loader, plink_glm, {"pfile"},
+	RegisterTableWithDesc(loader, plink_glm, {},
 	                      "Fit generalized linear models (linear/logistic regression) across variants.",
 	                      {"SELECT * FROM plink_glm('data/cohort.pgen', phenotype := 'trait')"});
 }

@@ -863,7 +863,7 @@ void RegisterPlinkScore(ExtensionLoader &loader) {
 	plink_score.named_parameters["center"] = LogicalType::BOOLEAN;
 	plink_score.named_parameters["no_mean_imputation"] = LogicalType::BOOLEAN;
 
-	RegisterTableWithDesc(loader, plink_score, {"pfile"}, "Compute polygenic risk scores from variant weights.",
+	RegisterTableWithDesc(loader, plink_score, {}, "Compute polygenic risk scores from variant weights.",
 	                      {"SELECT * FROM plink_score('data/cohort.pgen', weights := 'weights.tsv')"});
 }
 

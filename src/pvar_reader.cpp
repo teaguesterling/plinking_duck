@@ -653,7 +653,7 @@ void RegisterPvarReader(ExtensionLoader &loader) {
 	many.projection_pushdown = true;
 	many.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
 	set.AddFunction(many);
-	RegisterTableSetWithDesc(loader, set, {"files"}, "Read PLINK .pvar or .bim variant files into tabular format.",
+	RegisterTableSetWithDesc(loader, set, {}, "Read PLINK .pvar or .bim variant files into tabular format.",
 	                         {"SELECT * FROM read_pvar('data/cohort.pvar')"});
 }
 

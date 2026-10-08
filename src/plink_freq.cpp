@@ -684,7 +684,7 @@ void RegisterPlinkFreq(ExtensionLoader &loader) {
 	plink_freq.named_parameters["dosage"] = LogicalType::BOOLEAN;
 	plink_freq.named_parameters["build"] = LogicalType::VARCHAR;
 
-	RegisterTableWithDesc(loader, plink_freq, {"pfile"}, "Compute allele frequencies and counts from PLINK files.",
+	RegisterTableWithDesc(loader, plink_freq, {}, "Compute allele frequencies and counts from PLINK files.",
 	                      {"SELECT * FROM plink_freq('data/cohort.pgen')"});
 }
 
