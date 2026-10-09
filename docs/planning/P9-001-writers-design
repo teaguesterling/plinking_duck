@@ -1,0 +1,312 @@
+# P9-001: pfile writers — design round (decisions to resolve)
+
+Goal for v0.8.0+: **write** PLINK 2 filesets — `.pvar`, `.psam`, `.pgen`, the
+bundled pfile, and PLINK-VCF. This doc enumerates the decisions we need to make
+*before* implementation. It resolves nothing yet; each decision lists options,
+tradeoffs, and a lean.
+
+## Grounding facts (verified against the code)
+
+- pgenlib's write path (`third_party/plink-ng/2.0/include/pgenlib_write.{h,cc}`)
+  is **excluded from the build** (`CMakeLists.txt:128`, "Read-path only").
+- The writer API is **variant-at-a-time append**: `PreinitSpgw` →
+  `SpgwInitPhase1(fname, sample_ct, variant_ct_limit, write_mode, phase_dosage_gflags, ...)`
+  (allocates; needs **sample_ct exact** + a **variant_ct limit** up front) →
+  allocate buffer → `SpgwInitPhase2` → per-variant `SpgwAppendBiallelicGenovec`
+  (or Hphase/Dosage/Multiallelic variants) → finish → cleanup.
+- The writer writes via **raw `FILE*`** (`pgen_outfile`) — **not** DuckDB's VFS.
+- `PgenWriteMode` variants: backward-seek (seekable output, header finalized at
+  end), separate-index (`.pgi`), write-and-copy (temp then copy; needed on macOS).
+
+## SPIKE RESULTS (both run — feasibility CONFIRMED)
+
+**Spike A — pgenlib write path: ✅ builds + round-trips (linux_amd64).** Un-excluding
+`pgenlib_write.cc` compiles/links; a 3×4 biallelic-hardcall write→read round-trips
+**exactly** (header magic `6c 1b 10`, counts correct, genotypes match). Confirmed
+API skeleton: `PreinitSpgw` → `SpgwInitPhase1(fname, allele_idx_offsets=nullptr,
+explicit_nonref_flags=nullptr, variant_ct_limit, sample_ct, allele_ct_upper_bound=0,
+write_mode, phase_dosage_gflags, nonref_flags_storage=1, &spgw, &alloc_cacheline_ct,
+&max_vrec_len)` → `cachealigned_malloc(alloc_cacheline_ct*kCacheline)` → `SpgwInitPhase2`
+→ per-variant `PackGenovec` + `ZeroTrailingBits(sample_ct*2, genovec)` +
+`SpgwAppendBiallelicGenovec` → `SpgwFinish` → `CleanupSpgw`. Genovec sizing:
+`NypCtToVecCt(sample_ct)*kBytesPerVec`. **Streaming (from source):** only
+`kPgenWriteBackwardSeek` needs the exact `variant_ct` up front; **`kPgenWriteSeparateIndex`
+/ `kPgenWriteAndCopy` accept an upper-bound `variant_ct_limit`** (actual count finalized
+at `SpgwFinish`) — so **we can stream without knowing the count**. (Still to confirm on
+other platforms — the read path already excludes musl/wasm/windows; write likely inherits.)
+
+**Spike B — DuckDB `CopyFunction`: ✅ does everything we need.** (1) **3-file fan-out**:
+`copy_to_initialize_global` gets a path *string* and owns all I/O — our writer opens
+`prefix.pgen/.pvar/.psam` itself (parquet is the precedent). (2) **Finalize hook**:
+`copy_to_finalize` runs **once, global, after all sink/combine**, handles still open —
+right place for pgenlib header-finalize. (3) **Options**: unrecognized COPY options pass
+through as `map<key, vector<Value>>`, arbitrary types → `variant_fields`/`sample_fields`/`genotype_fields` (STRUCTs) +
+`samples := […]` (LIST) work. (4) **Ordering**: return `REGULAR_COPY_TO_FILE` →
+single-threaded ordered sink; **require the query to carry `ORDER BY` on the variant key.**
+(5) **PARTITION_BY destroys order** → do NOT use it for `.pgen`; shard via a wrapper
+issuing **one ordered COPY per shard**. Caveats: writer must self-clean the sibling
+files on failure (DuckDB only auto-removes the one prefix path); set `use_tmp_file false`;
+backward-seek *writes* not executed (parquet only appends) — settle handle choice (raw
+`FILE*` for pgenlib) in impl.
+
+---
+
+## (historical) TWO co-equal feasibility spikes — now both DONE (see results above)
+
+**Spike A — pgenlib write path builds + round-trips.** Un-exclude
+`pgenlib_write.cc`, build, write a tiny `.pgen` and re-read it. Unknowns:
+1. Compile/link cleanly? (Read path excludes `linux_amd64_musl` (SIMD segfault),
+   `windows_amd64` (libdeflate), `wasm_*` (POSIX). Write likely inherits these —
+   confirm the platform matrix.)
+2. New symbols/deps it pulls that the read-only build dropped (`plink2_bitmap.cc`,
+   `plink2_stats.cc` are also excluded)?
+3. Which `PgenWriteMode` works with our I/O story (Decision 6).
+
+**Spike B — DuckDB `CopyFunction` can do what we need.** COPY is very likely the
+*only* viable surface (a table/scalar function **cannot consume a relation** in
+DuckDB — established earlier this session: `read_pfile` rejects subqueries and
+needs literal args; only COPY consumes a query's row stream). But COPY is built
+for **one** streaming target, and we need:
+1. **3-file fan-out** — can one `COPY … TO 'prefix'` emit `prefix.pgen` + `.pvar`
+   + `.psam`? Or must we register per-format COPY (`.pvar`/`.psam`/`.pgen`
+   separately) and compose?
+2. **A usable finalize/seek lifecycle** — does CopyFunction's finalize hook give
+   pgenlib the open→append→seek-back-to-write-header→close it needs?
+3. Where the out-of-band metadata (sample IIDs, variant-count) is supplied
+   (COPY options? see Decision 3).
+
+**These two spikes are the real gate on the whole feature.** The `.pvar`/`.psam`
+text writers are gated only by Spike B (not pgenlib) and can proceed once the
+COPY surface is settled.
+
+## Decision 1 — Invocation surface (COPY is likely forced, but gated by Spike B)
+
+A table/scalar function can't consume a relation in DuckDB, so **COPY is almost
+certainly the only mechanism** that can take a query's row stream. The real
+question isn't "COPY vs function" — it's *whether COPY can do what we need*
+(Spike B). Given it can:
+- **(a) `COPY (query) TO 'prefix' (FORMAT pfile)`** fanning out to all three
+  files — the headline, **if** CopyFunction supports multi-file output.
+- **(b) Per-format COPY** (`FORMAT pvar|psam|pgen`) as the low-level primitives —
+  and the **fallback** if fan-out isn't supported (user runs three COPYs, or a
+  macro wraps them).
+
+Lean: **(a) headline + (b) primitives**, but (a) is contingent on Spike B; if
+fan-out is unsupported, (b) becomes the surface and we provide a convenience
+wrapper.
+
+## Decision 2 — Column→role mapping (the Hail MatrixTable model)
+
+Adopt Hail's row/col/entry decomposition — it *is* the pfile decomposition:
+
+| Hail | pfile file | Fields |
+|------|-----------|--------|
+| **row** fields | `.pvar` | CHROM, POS, ID, REF, ALT (+ QUAL/FILTER/INFO) |
+| **col** fields | `.psam` | IID (+ FID, SEX, phenotype, covariates) |
+| **entry** fields | `.pgen` | genotype (GT hardcalls; + phase, dosage) |
+
+The write spec **assigns each input column a role**, with **defaults that mirror
+the reader's output conventions** so a round-trip needs no explicit mapping —
+`COPY (SELECT * FROM read_pfile('x')) TO 'y' (FORMAT pfile)` just works.
+
+**Structure the mapping by axis, named for the dimension it carries** (Teague) —
+consistent with the reader's `orient` vocabulary (variant/sample/genotype) and
+Hail's row/col/entry decomposition:
+
+```sql
+COPY (…) TO 'prefix' (FORMAT pfile,
+  variant_fields  := {chrom: CHROM, pos: POS, id: ID, ref: REF, alt: ALT, …},  -- -> .pvar
+  sample_fields   := {iid: IID, sex: SEX, …},                                  -- -> .psam
+  genotype_fields := genotypes,   -- -> .pgen; or {gt: …, dosage: …} for multiple tracks
+  samples := [...])               -- sample IIDs when the input is variant-oriented
+```
+
+- **`variant_fields` / `sample_fields` / `genotype_fields`** — the column→axis
+  mapping (Hail row/col/entry). Defaults follow the reader's output conventions,
+  so a round-trip of `read_pfile` output needs no mapping. The grouped form
+  extends cleanly to **multiple genotype tracks** (`genotype_fields := {gt: …,
+  dosage: …}`).
+- **`pvar :=` / `psam :=` / `pgen :=` are reserved for file-PATH overrides** —
+  **symmetric with the readers'** `pgen`/`pvar`/`psam` path overrides (e.g.
+  `pgen := 's3://…/custom.pgen'`). Field-mapping and path-override stay separate,
+  mirroring the read side.
+
+### Subset efficiency / "pushdown" (Teague) — mostly already free, with one hard limit
+
+- **The common case is already efficient via the READER's pushdown.** `COPY (SELECT …
+  FROM read_pfile('big') WHERE region := … / samples := …) TO 'subset'` — read_pfile's
+  region/variant/sample pushdown means only the subset is ever decoded, and the writer
+  only encodes the subset. Dropped variants/samples are never touched. No writer-specific
+  pushdown is needed for this; it falls out of composing reader + COPY.
+- **True zero-copy (raw compressed-record passthrough) is NOT available** — pgenlib's
+  public append API is entirely decode-based (`SpgwAppend*` all take a decoded genovec /
+  difflist / dosage struct); there is no "append these raw bytes." So a variant subset
+  still pays **decode → re-encode per kept variant** (still far cheaper than touching the
+  whole file). Sample subsets *must* re-encode anyway (removing samples changes every
+  genovec's packing).
+- **Possible future optimization (v2+):** pass pgenlib's **difflist** (sparse) form
+  reader→writer for rare variants via `SpgwAppendBiallelicDifflistLimited` + a difflist
+  read path — avoids densify/re-densify. Deep (couples reader/writer internal reps);
+  the column-role/`pgen` entry model should not *preclude* a future raw/difflist entry
+  type, but v1 goes through decoded genovecs.
+
+**Which dimension is "out-of-band" depends on the input orient** (this is the
+unification of the old 2a/3 sample-identity problem):
+
+- **variant-oriented input** (row=variant; genotypes as an `ARRAY` over samples):
+  pvar fields are columns; the entry/pgen payload is the genotypes array; **the
+  sample/col dimension is NOT in the rows** → `.psam` col-fields must be supplied
+  out-of-band (a `samples := [...]`/struct option, or a companion table). Matches
+  `read_pfile` variant orient. **Primary path** (streams; maps to per-variant append).
+- **tidy / genotype-oriented input** (one row per variant×sample): row-key =
+  variant, col-key = IID, entry = scalar genotype — **everything is in the
+  stream** (this is Hail's `Table.to_matrix_table`). No out-of-band metadata,
+  but N×M rows and must be **grouped/sorted by variant** to assemble each
+  per-variant genovec. Feasible if pre-sorted; expensive otherwise.
+- **sample-oriented input** (row=sample; genotypes array over variants): psam
+  fields are columns, **variants out-of-band**, and writing `.pgen` needs a full
+  **transpose** (buffer everything). Reject for streaming `.pgen`; only viable
+  for small data or as a materialize-then-write convenience.
+
+**Lean:** support the **column-role mapping** with reader-aligned defaults;
+**variant-oriented is the primary streaming path** for `.pgen`; tidy is
+supported when sorted-by-variant; sample-oriented `.pgen` is out of scope v1.
+`.pvar`/`.psam` text writers just consume their own role-columns (any orient).
+
+## Decision 3 — Variant count vs streaming (the hard one)
+
+Sample identity is handled by the column-role model (Decision 2): for the
+variant-oriented path, `sample_ct` comes from the genotypes array length and the
+IIDs from the `samples :=` col-field spec. **The remaining problem is the
+variant count.** `SpgwInitPhase1` needs a `variant_ct` **limit** before the first
+append, but COPY streams rows of unknown length and at 170M variants we
+**cannot** buffer all genotypes to count first. Options:
+- **(a) Backward-seek write mode + a declared/derived variant-count upper bound.**
+  Requires seekable local output (we have that — `FILE*`). Need an upper bound
+  at init: a COPY option `variant_count := N`, or derive from the query if a
+  cardinality is known, or a first counting pass over the (cheap) `.pvar` side.
+- **(b) Separate-index mode (`.pgi`)** — may relax the up-front-count need; verify
+  in the spike.
+- **(c) Two-pass** — count then write; only OK if the source is re-runnable
+  (a base table/file), not a streaming pipe.
+**RESOLVED (Spike A):** exact count is **not** required. Default streaming path =
+`kPgenWriteSeparateIndex` or `kPgenWriteAndCopy` with a generous **upper-bound**
+`variant_ct_limit` (memory ∝ bound; actual count finalized at `SpgwFinish`).
+`AndCopy` keeps a single embedded-index `.pgen` (cost: temp+copy); `SeparateIndex`
+avoids the copy but writes a `.pgi` sidecar. Offer `kPgenWriteBackwardSeek` (fastest,
+no copy/sidecar) when the count is known via a `variant_count :=` option. Pick the
+default (AndCopy vs SeparateIndex) during impl based on the copy-cost vs sidecar tradeoff.
+
+## Decision 4 — Genotype encoding & scope
+
+- Hardcalls: `ARRAY(TINYINT)` 0/1/2, `-9`→missing → pack to genovec. **Lean: v1.**
+- **Phase and dosage are IN v1** (Teague's call). They are not alternatives to
+  hardcalls but additive layers, with one wrinkle: the `.pgen` declares its
+  capability **at init** (`phase_dosage_gflags`), so the writer detects the
+  genotype type from the input schema/roles *before* the first append and picks
+  the matching call: `SpgwAppendBiallelicGenovec` (hardcall) / `…GenovecHphase`
+  (+ `phasepresent`/`phaseinfo` bitmasks) / `…GenovecDosage16` (+ `dosage_present`
+  bitmask + `dosage_main` uint16 = `round(d*16384)`, 0–32768 for 0–2) /
+  `…GenovecHphaseDosage16`. Dosages sit **on top of** a hardcall genovec (derive
+  the hardcall by rounding if not supplied). Same append loop; more encoding.
+- **Multiallelic** — pgenlib supports it (`SpgwAppendMultiallelicSparse`), but
+  it's complex. **Lean: biallelic first, multiallelic deferred.**
+- **Ploidy / half-calls / sex-chromosome encoding** — haploid calls (chrY/MT),
+  half-calls, and the male-chrX conventions. This project already ships ploidy-
+  and sex-aware chrX/Y/MT stats on the read side, so it *will* surface on write.
+  **Lean: biallelic diploid only in v1; ploidy-aware writing an explicit deferral
+  (named here so it's a decision, not a surprise).**
+
+## Decision 5 — Which writers, coupling, and build order
+
+- `.pvar` writer — text, from variant-metadata columns. **Easy; first.**
+- `.psam` writer — text, from sample metadata. **Easy; first.**
+- `.pgen` writer — pgenlib, variant-oriented. **Hard; gated by the spike.**
+- pfile writer — the bundle (one `COPY` → all three); composes the above.
+- PLINK-VCF writer — separate VCF-text format; independent track.
+Lean order: **text writers → pgen writer (post-spike) → pfile bundle → plink_vcf.**
+
+## Decision 6 — I/O, VFS, paths, atomicity
+
+`.pgen` uses raw `FILE*` → **local paths only** (no `s3://`, no `pathmacro:`, no
+DuckDB `allowed_directories`/`enable_external_access` gating). Decisions:
+- Accept local-only for `.pgen` (document it), or write to a temp local path
+  then hand off to VFS for the final move (works for S3-ish targets but doubles
+  I/O). **Lean: local-only v1, documented; VFS-copy as a follow-up.**
+- The **text** writers CAN and SHOULD use DuckDB VFS (we own that I/O) — so
+  `.pvar`/`.psam` to `s3://`/`pathmacro:` is feasible even while `.pgen` is local.
+  Do we allow a split (text via VFS, pgen local) in one `COPY`? Probably force
+  the whole pfile local for consistency; revisit.
+- Overwrite/atomicity: pgenlib's write-and-copy mode already implies a temp;
+  align our overwrite semantics with DuckDB COPY (and scalarfs `pathmacro:` if
+  ever writing through it).
+
+## Decision 7 — Partitioned (sharded) output (the inverse of multi-file read)
+
+Write a **sharded fileset** — one pfile per partition — so it reads back with
+`read_pfile([...])` or a `pathmacro:` catalog. Closes the loop: **write
+partitioned → read as a list.** Mirrors `COPY … TO 'dir' (PARTITION_BY (col))`.
+
+- **Partition key = a variant-derived (`.pvar`/row) column.** `PARTITION_BY
+  (CHROM)` for per-chromosome; a computed column for chrom + K-megabase chunks
+  (`chunk = CHROM || '_' || (POS // 1000000)`); or any variant attribute. General
+  model: partition on any variant-derived column the user computes — we shard on
+  it. **Sample-based partitioning is out of scope** (splitting samples changes
+  every shard's `.psam`/genotype width — breaks the sharded-genotype model the
+  reader assumes).
+- **`.psam` is identical across shards** (same samples) — write the same `.psam`
+  into each. This is exactly the reader's identical-psam contract.
+- **Streaming**: each shard needs its own `variant_ct` (Decision 3) + its own
+  `STPgenWriter`. If the input is **sorted by the partition key**, we write one
+  shard at a time (open → append → finalize → next) — one live writer, per-shard
+  count via the single-file mechanism. Unsorted → many concurrent open writers
+  (expensive). **Lean: require/encourage sort-by-partition**, as DuckDB's
+  partitioned writes already do.
+- **Layout**: hive dir per shard (`out/CHROM=1/{data.pgen,.pvar,.psam}`) like
+  DuckDB PARTITION_BY — feeds a `pathmacro:` catalog naturally — vs a prefix
+  scheme (`out/chr1.{pgen,pvar,psam}`). Decide with Spike B (does CopyFunction's
+  partition handling compose with our 3-file fan-out?).
+
+## Decision 8 — Parallelism
+
+`.pgen` append is inherently ordered (variant order). `STPgenWriter`
+(single-thread) is correct-first; `MTPgenWriter` exists but coordinating with
+DuckDB's parallel COPY (row order, per-thread vblocks) is hard. **Lean:
+single-threaded v1; MT later.** (Writing is I/O-bound anyway.)
+
+## Decision 9 — Correctness bar
+
+Primary strategy: **round-trip** — `read_pfile(write(read_pfile(X))) == X`
+value-for-value (genotypes, .pvar metadata, .psam), across genotype modes,
+phase, dosage, missing, and multi-file inputs. Cross-check against `plink2`
+itself (write with us, read with plink2 and vice-versa) for format conformance.
+
+## Sequencing — run BOTH spikes before the design round converges
+
+Several questions below can't be answered honestly until the spikes run — don't
+pre-decide them. Order:
+1. **Spike A** (pgenlib_write builds + tiny round-trip; which platforms).
+2. **Spike B** (CopyFunction: 3-file fan-out? finalize/seek hook? options for
+   out-of-band metadata?).
+3. Then resolve Decisions 1/3/6 with real answers and pick the v1 scope.
+
+## Open questions for Teague
+
+**Spike-dependent (answer after the spikes, not now):**
+- Invocation exact shape — one `COPY` fan-out vs per-format primitives (Spike B).
+- Automatic variant count vs a `variant_count :=` hint vs two-pass (Spike A modes).
+- Local-only `.pgen` for v1, or temp-then-VFS-copy (Spike A I/O + Decision 6).
+
+**Resolved by Teague:**
+- **Release**: hold everything for one **v0.8.x** (text + `.pgen` + pfile +
+  partitioning together) — no interim text-only release.
+- **v1 genotype scope**: hardcalls **and** phase **and** dosage (biallelic
+  diploid). Multiallelic + ploidy/half-calls still deferred.
+- **Partitioning is in scope** (Decision 7) — variant-based sharding, mirroring
+  the multi-file reader.
+
+**Still open (mostly spike-dependent):**
+- Sample identity via a `samples :=` col-field option — confirm the mechanism.
+- Exact invocation / 3-file fan-out / partition layout (Spike B).
+- Automatic variant count vs a `variant_count :=` hint vs write-mode (Spike A).
+- Local-only `.pgen` for v1, or temp-then-VFS-copy.
