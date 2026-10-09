@@ -1342,15 +1342,28 @@ struct PfileWriteBindData : public FunctionData {
 };
 
 struct PfileWriteGlobalState : public GlobalFunctionData {
-	PvarWriteGlobalState pvar_g;
-	PgenWriteGlobalState pgen_g;
-	string psam_path;
+	// ATOMIC STAGING. All three writers target `.staging` paths in the SAME directory
+	// as the final files; InitGlobal therefore NEVER touches an existing fileset. Only
+	// a SUCCESSFUL finalize renames staging -> final (overwriting intra-filesystem via
+	// rename(2)). So an upstream-query error that bypasses the sink/finalize cleanup
+	// cannot clobber a prior fileset — it only leaves staging files, removed by the
+	// destructor. (`pvar_g.path` / `pgen_g.path` / `psam_path` all hold STAGING paths;
+	// pgenlib owns `<pgen.staging>.tmp` underneath, hence the distinct `.staging`
+	// suffix — never `.tmp`, which is pgenlib's.)
+	PvarWriteGlobalState pvar_g; //! pvar_g.path = <pvar_final>.staging
+	PgenWriteGlobalState pgen_g; //! pgen_g.path = <pgen_final>.staging
+	string psam_path;            //! staging .psam path
+	string pvar_final;
+	string pgen_final;
+	string psam_final;
+	FileSystem *fs = nullptr; //! captured in InitGlobal so the destructor can clean staging
 	bool cleaned = false;
+	bool finished = false; //! staging fully promoted to final (don't clean in the destructor)
 
-	// Remove every sibling we created, in a safe order: close the pvar handle, then
-	// close pgenlib + remove .pgen/.pgen.tmp, then remove .psam, then the .pvar.
-	// Idempotent; never masks the original error.
-	void CleanupPartial(FileSystem &fs) {
+	// Remove the STAGING siblings we created, in a safe order: close the pvar handle,
+	// then close pgenlib + remove .pgen.staging/.pgen.staging.tmp, then .psam.staging,
+	// then .pvar.staging. NEVER touches the final files. Idempotent.
+	void CleanupPartial(FileSystem &sysfs) {
 		if (cleaned) {
 			return;
 		}
@@ -1358,18 +1371,39 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 		if (pvar_g.handle) {
 			pvar_g.handle.reset();
 		}
-		pgen_g.CleanupPartial(fs); // closes STPgenWriter + removes .pgen + .pgen.tmp
-		try {
-			if (!psam_path.empty() && fs.FileExists(psam_path)) {
-				fs.RemoveFile(psam_path);
+		pgen_g.CleanupPartial(sysfs); // closes STPgenWriter + removes .pgen.staging(+.tmp)
+		for (const string *p : {&psam_path, &pvar_g.path}) {
+			try {
+				if (!p->empty() && sysfs.FileExists(*p)) {
+					sysfs.RemoveFile(*p);
+				}
+			} catch (...) {
 			}
-		} catch (...) {
 		}
-		try {
-			if (!pvar_g.path.empty() && fs.FileExists(pvar_g.path)) {
-				fs.RemoveFile(pvar_g.path);
-			}
-		} catch (...) {
+	}
+
+	// On a fully-written fileset, rename each staging file onto its final path. The
+	// `.pgen` is renamed LAST on purpose: its absence makes `read_pfile` fail cleanly
+	// (no .pgen), so until it lands the fileset reads as "not there" rather than
+	// half-new. The three renames are NOT atomic as a GROUP — a crash between them can
+	// leave a new .pvar/.psam beside an OLD .pgen, which `read_pfile` catches as a
+	// variant-count mismatch (a clean error, never a silent mis-serve). That residual
+	// window is far smaller than truncating the real targets up front (which is what
+	// staging avoids); we do not claim group-atomicity we do not have.
+	void PromoteStaging(FileSystem &sysfs) {
+		sysfs.MoveFile(pvar_g.path, pvar_final);
+		sysfs.MoveFile(psam_path, psam_final);
+		sysfs.MoveFile(pgen_g.path, pgen_final); // LAST
+		finished = true;
+	}
+
+	// Catches an UPSTREAM-query error (e.g. a cast failure) that errors the pipeline
+	// WITHOUT running the sink/finalize cleanup: remove the staging files so they are
+	// never orphaned. Only staging — the final fileset is only ever written by a
+	// successful PromoteStaging, after which finished == true and this is a no-op.
+	~PfileWriteGlobalState() override {
+		if (!finished && fs) {
+			CleanupPartial(*fs);
 		}
 	}
 };
@@ -1390,8 +1424,42 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
                                        const vector<LogicalType> &sql_types) {
 	auto bind = make_uniq<PfileWriteBindData>();
 
-	// Genotypes / pgen roles (also detects STRUCT genotypes + validates the local
-	// target for the prefix / pgen override).
+	// --- path overrides (reader symmetry), parsed first so the local-only check
+	//     below sees the EFFECTIVE target of each of the three files. ---
+	for (auto &opt : input.info.options) {
+		auto key = StringUtil::Lower(opt.first);
+		if (key == "pvar" && !opt.second.empty() && !opt.second[0].IsNull()) {
+			bind->pvar_override = opt.second[0].ToString();
+		} else if (key == "psam" && !opt.second.empty() && !opt.second[0].IsNull()) {
+			bind->psam_override = opt.second[0].ToString();
+		} else if (key == "pgen" && !opt.second.empty() && !opt.second[0].IsNull()) {
+			bind->pgen_override = opt.second[0].ToString();
+		}
+	}
+
+	// --- local-only (the whole fileset): .pgen is written through a raw FILE* that
+	//     bypasses DuckDB's VFS, so EVERY one of the three files must be local. Check
+	//     the EFFECTIVE target of each: the prefix-derived path when no override, the
+	//     override when present. This rejects a remote PREFIX regardless of any
+	//     per-file override (a remote prefix + local `pgen` override must NOT bind and
+	//     then write .pvar/.psam to the remote store). Done BEFORE BuildPgenBind so the
+	//     message is named for the pfile bundle, not for `write pgen`. ---
+	string prefix = PfilePrefix(input.info.file_path);
+	string eff_pvar = bind->pvar_override.empty() ? prefix + ".pvar" : bind->pvar_override;
+	string eff_pgen = bind->pgen_override.empty() ? prefix + ".pgen" : bind->pgen_override;
+	string eff_psam = bind->psam_override.empty() ? prefix + ".psam" : bind->psam_override;
+	for (const string *t : {&eff_pvar, &eff_pgen, &eff_psam}) {
+		if (!t->empty() && !PathIsLocalWritable(*t)) {
+			throw BinderException(
+			    "write pfile: '%s' is not a local path. The pfile bundle writes a .pgen through a raw file handle that "
+			    "bypasses DuckDB's VFS, so the whole fileset (.pvar/.pgen/.psam) must be written to a local path (no "
+			    "s3://, http://, or pathmacro:// targets).",
+			    *t);
+		}
+	}
+
+	// Genotypes / pgen roles (also detects STRUCT genotypes). Its own local-check is
+	// now redundant — every effective target was just confirmed local above.
 	bind->pgen_bind = BuildPgenBind(input, names, sql_types);
 
 	// pvar roles + carried-through extras, EXCLUDING the genotypes column (so it is
@@ -1424,28 +1492,6 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	bind->pgen_bind->sample_ct = static_cast<uint32_t>(bind->iids.size());
 	bind->pgen_bind->sample_ct_known = true;
 
-	// Path overrides (reader symmetry). pvar/psam are text (VFS-capable) but the
-	// bundle forces the WHOLE target local because .pgen is involved — reject any
-	// remote/scheme override (and the prefix, already checked by BuildPgenBind).
-	for (auto &opt : input.info.options) {
-		auto key = StringUtil::Lower(opt.first);
-		if (key == "pvar" && !opt.second.empty() && !opt.second[0].IsNull()) {
-			bind->pvar_override = opt.second[0].ToString();
-			bind->pvar_bind->path_override = bind->pvar_override;
-		} else if (key == "psam" && !opt.second.empty() && !opt.second[0].IsNull()) {
-			bind->psam_override = opt.second[0].ToString();
-		} else if (key == "pgen" && !opt.second.empty() && !opt.second[0].IsNull()) {
-			bind->pgen_override = opt.second[0].ToString();
-		}
-	}
-	for (auto *ov : {&bind->pvar_override, &bind->psam_override, &bind->pgen_override}) {
-		if (!ov->empty() && !PathIsLocalWritable(*ov)) {
-			throw BinderException("write pfile: '%s' is not a local path. The bundle writes a .pgen through a raw file "
-			                      "handle that bypasses DuckDB's VFS, so the whole fileset must be local (no s3://, "
-			                      "http://, or pathmacro:// targets).",
-			                      *ov);
-		}
-	}
 	(void)context;
 	return std::move(bind);
 }
@@ -1456,23 +1502,31 @@ unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, Funct
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto g = make_uniq<PfileWriteGlobalState>();
 
+	// Final destinations, and the `.staging` siblings we actually write first (same
+	// directory → intra-filesystem rename at promote; never truncate the real files).
 	string prefix = PfilePrefix(file_path);
-	string pvar_path = bind.pvar_override.empty() ? prefix + ".pvar" : bind.pvar_override;
-	string pgen_path = bind.pgen_override.empty() ? prefix + ".pgen" : bind.pgen_override;
-	string psam_path = bind.psam_override.empty() ? prefix + ".psam" : bind.psam_override;
-	g->psam_path = psam_path;
+	g->pvar_final = bind.pvar_override.empty() ? prefix + ".pvar" : bind.pvar_override;
+	g->pgen_final = bind.pgen_override.empty() ? prefix + ".pgen" : bind.pgen_override;
+	g->psam_final = bind.psam_override.empty() ? prefix + ".psam" : bind.psam_override;
+	string pvar_staging = g->pvar_final + ".staging";
+	string pgen_staging = g->pgen_final + ".staging";
+	string psam_staging = g->psam_final + ".staging";
+	g->psam_path = psam_staging;
+	g->fs = &fs; // so the destructor can remove staging on an upstream-query error
 
 	// pgen writer init is DEFERRED to the first sink row (same as standalone pgen):
-	// carry the path + sample_ct + bound in its global state now.
-	g->pgen_g.path = pgen_path;
+	// carry the staging path + sample_ct + bound in its global state now. pgenlib owns
+	// `<pgen_staging>.tmp` under this.
+	g->pgen_g.path = pgen_staging;
 	g->pgen_g.sample_ct_known = bind.pgen_bind->sample_ct_known;
 	g->pgen_g.sample_ct = bind.pgen_bind->sample_ct;
 	g->pgen_g.variant_ct_limit = bind.pgen_bind->variant_ct_limit;
 
 	try {
-		// pvar: open + header. psam: written in full now (out-of-band identity).
-		PvarOpenAndWriteHeader(g->pvar_g, fs, *bind.pvar_bind, pvar_path);
-		WritePsamFromIids(fs, psam_path, bind.iids);
+		// pvar: open staging + header. psam: written in full to staging now (out-of-band
+		// identity). Neither touches the existing final fileset.
+		PvarOpenAndWriteHeader(g->pvar_g, fs, *bind.pvar_bind, pvar_staging);
+		WritePsamFromIids(fs, psam_staging, bind.iids);
 	} catch (...) {
 		g->CleanupPartial(fs);
 		throw;
@@ -1508,12 +1562,16 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionDat
 	auto &fs = FileSystem::GetFileSystem(context);
 	try {
 		// pgen finalize throws on zero variants (pgenlib cannot finish a 0-variant
-		// .pgen) → cleanup removes the already-written .pvar/.psam too.
+		// .pgen) → cleanup removes the staging .pvar/.psam too (finals untouched).
 		PgenFinish(g.pgen_g);
 		if (g.pvar_g.handle) {
 			g.pvar_g.handle->Sync();
 			g.pvar_g.handle.reset();
 		}
+		// All three staging files are complete — promote them to the final paths
+		// (rename, overwriting any prior fileset intra-filesystem). ONLY here does an
+		// existing fileset change; an earlier failure never reached this point.
+		g.PromoteStaging(fs);
 	} catch (...) {
 		g.CleanupPartial(fs);
 		throw;

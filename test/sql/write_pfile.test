@@ -273,6 +273,89 @@ TO '__TEST_DIR__/loc' (FORMAT pfile, psam 's3://bucket/x.psam');
 ----
 not a local path
 
+# The rejection names the pfile bundle (not `write pgen`) — it is a FORMAT pfile COPY.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO 's3://bucket/out' (FORMAT pfile);
+----
+pfile bundle
+
+# A remote PREFIX with a LOCAL `pgen` override must STILL be rejected — otherwise the
+# .pvar/.psam would be written to the remote store. (The bug the local-check-per-
+# effective-target fix closes: checking only non-empty overrides let the prefix slip.)
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO 's3://bucket/out' (FORMAT pfile, pgen '__TEST_DIR__/local.pgen');
+----
+not a local path
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO 'pathmacro://cat/out' (FORMAT pfile, pgen '__TEST_DIR__/local2.pgen');
+----
+not a local path
+
+# ===========================================================================
+# ATOMIC STAGING — overwriting an existing fileset with a query that then ERRORS
+# UPSTREAM (a data-dependent cast failure) must NOT destroy the prior fileset.
+# The writers target `.staging` siblings; only a successful finalize renames them
+# onto the finals, and the global-state destructor removes staging on an upstream
+# error that bypasses the sink/finalize cleanup. This is the discriminating test:
+# a fresh-dir leak test would pass even with the clobber bug.
+# ===========================================================================
+
+# A known-good fileset, and a snapshot of its exact bytes.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/G' (FORMAT pfile);
+
+statement ok
+CREATE TABLE g_before AS
+  SELECT 'pvar' k, md5(content) m FROM read_blob('__TEST_DIR__/G.pvar')
+  UNION ALL SELECT 'pgen', md5(content) FROM read_blob('__TEST_DIR__/G.pgen')
+  UNION ALL SELECT 'psam', md5(content) FROM read_blob('__TEST_DIR__/G.psam');
+
+# Overwrite G with a query that errors mid-stream (CAST fails at POS=20000, row 2).
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes,
+             CASE WHEN POS = 20000 THEN CAST('nope' AS INTEGER) ELSE 0 END AS x
+      FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/G' (FORMAT pfile);
+----
+nope
+
+# The ORIGINAL G.{pvar,pgen,psam} are byte-identical to before (0 rows changed).
+query I
+SELECT count(*) FROM g_before b
+JOIN (
+  SELECT 'pvar' k, md5(content) m FROM read_blob('__TEST_DIR__/G.pvar')
+  UNION ALL SELECT 'pgen', md5(content) FROM read_blob('__TEST_DIR__/G.pgen')
+  UNION ALL SELECT 'psam', md5(content) FROM read_blob('__TEST_DIR__/G.psam')) a
+  USING (k)
+WHERE b.m IS DISTINCT FROM a.m;
+----
+0
+
+# And no .staging residue left behind.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/G.*.staging');
+----
+0
+
+# Fresh-prefix upstream error: no fileset, no staging residue.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes,
+             CASE WHEN POS = 20000 THEN CAST('nope' AS INTEGER) ELSE 0 END AS x
+      FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/fresh' (FORMAT pfile);
+----
+nope
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/fresh*');
+----
+0
+
 # ===========================================================================
 # CLEANUP-ON-FAILURE — a mid-write throw must leave NONE of the four siblings
 # (prefix.pvar / prefix.pgen / prefix.pgen.tmp / prefix.psam). DuckDB only
