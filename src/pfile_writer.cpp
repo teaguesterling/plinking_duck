@@ -70,7 +70,7 @@ idx_t ResolveColumn(const vector<string> &names, const string &target, const str
 		}
 	}
 	throw BinderException("write pvar: required field '%s' maps to column '%s', which is not in the input "
-	                      "(available columns: %s). Supply variant_fields := {%s: '<col>'} to remap it.",
+	                      "(available columns: %s). Supply variant_fields {%s: '<col>'} to remap it.",
 	                      role, target, StringUtil::Join(names, ", "), role);
 }
 
@@ -83,7 +83,7 @@ struct PvarWriteBindData : public FunctionData {
 	//! Input column index for the pos / chrom roles (for the monotonicity check).
 	idx_t pos_input_idx = 0;
 	idx_t chrom_input_idx = 0;
-	//! File-path override from `pvar :=`; empty means use DuckDB's COPY target.
+	//! File-path override from the `pvar` option; empty means use DuckDB's COPY target.
 	string path_override;
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -116,7 +116,7 @@ struct PvarWriteGlobalState : public GlobalFunctionData {
 
 	//! Close the handle and remove the partial file. Used both on the failure
 	//! path (sink throw) and so cleanup is idempotent. DuckDB only auto-removes
-	//! its single COPY target; a `pvar :=` override would otherwise be orphaned.
+	//! its single COPY target; a `pvar` override would otherwise be orphaned.
 	void CleanupPartial(FileSystem &fs) {
 		if (handle) {
 			handle.reset();
@@ -135,11 +135,23 @@ struct PvarWriteLocalState : public LocalFunctionData {};
 
 // Convert one cell to its `.pvar` text form. NULL -> "." (round-trips with the
 // reader, which maps "." -> NULL for every column type).
-string CellToField(const Value &v) {
+//
+// A `.pvar` is strictly tab-delimited with newline-terminated records, and the
+// reader drops every '\r'. A cell containing any of those bytes cannot be
+// represented without an escaping scheme (which PLINK's format does not define),
+// and writing it raw would silently shift/split fields on read-back. Reject it
+// with an actionable error rather than corrupt the file.
+string CellToField(const Value &v, const string &col_name) {
 	if (v.IsNull()) {
 		return ".";
 	}
-	return v.ToString();
+	auto s = v.ToString();
+	if (s.find('\t') != string::npos || s.find('\n') != string::npos || s.find('\r') != string::npos) {
+		throw InvalidInputException("write pvar: field '%s' value contains a tab, newline, or carriage return, "
+		                            "which cannot be written to a tab-delimited .pvar",
+		                            col_name);
+	}
+	return s;
 }
 
 unique_ptr<FunctionData> PvarCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<string> &names,
@@ -227,6 +239,22 @@ unique_ptr<FunctionData> PvarCopyBind(ClientContext &, CopyFunctionBindInput &in
 		}
 	}
 
+	// A role remapped off a column whose name equals a canonical header, while
+	// that same column is also carried through as an extra, would emit a
+	// duplicate output header (e.g. "#CHROM ... CHROM"), which read_pvar then
+	// refuses. Catch it at bind with an actionable error (case-insensitive,
+	// since DuckDB column binding is case-insensitive).
+	for (idx_t a = 0; a < bind->out_headers.size(); a++) {
+		for (idx_t b = a + 1; b < bind->out_headers.size(); b++) {
+			if (StringUtil::CIEquals(bind->out_headers[a], bind->out_headers[b])) {
+				throw BinderException("write pvar: output column '%s' appears twice in the .pvar header — a "
+				                      "variant_fields role was remapped off a column that is also carried "
+				                      "through as an extra. Drop or rename the duplicate input column.",
+				                      bind->out_headers[b]);
+			}
+		}
+	}
+
 	return std::move(bind);
 }
 
@@ -305,7 +333,7 @@ void PvarCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 				if (c > 0) {
 					buffer += '\t';
 				}
-				buffer += CellToField(input.GetValue(bind.out_source_idx[c], row));
+				buffer += CellToField(input.GetValue(bind.out_source_idx[c], row), bind.out_headers[c]);
 			}
 			buffer += '\n';
 		}
@@ -314,7 +342,7 @@ void PvarCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 		}
 	} catch (...) {
 		// Remove the partial file we created before propagating — DuckDB only
-		// auto-removes its single COPY target, not a `pvar :=` override.
+		// auto-removes its single COPY target, not a `pvar` override.
 		g.CleanupPartial(fs);
 		throw;
 	}

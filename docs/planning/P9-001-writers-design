@@ -1,6 +1,7 @@
 # P9-001: pfile writers — design round (decisions to resolve)
 
-Goal for v0.8.0+: **write** PLINK 2 filesets — `.pvar`, `.psam`, `.pgen`, the
+Goal for v0.10.0+ (the writer release per docs/planning/ROADMAP §v0.10.0): **write**
+PLINK 2 filesets — `.pvar`, `.psam`, `.pgen`, the
 bundled pfile, and PLINK-VCF. This doc enumerates the decisions we need to make
 *before* implementation. It resolves nothing yet; each decision lists options,
 tradeoffs, and a lean.
@@ -41,7 +42,12 @@ other platforms — the read path already excludes musl/wasm/windows; write like
 `copy_to_finalize` runs **once, global, after all sink/combine**, handles still open —
 right place for pgenlib header-finalize. (3) **Options**: unrecognized COPY options pass
 through as `map<key, vector<Value>>`, arbitrary types → `variant_fields`/`sample_fields`/`genotype_fields` (STRUCTs) +
-`samples := […]` (LIST) work. (4) **Ordering**: return `REGULAR_COPY_TO_FILE` →
+`samples [...]` (LIST) work. **Syntax note (verified against DuckDB v1.5.6 during Phase A):**
+COPY options are `KEY value` space-separated — the `:=` form shown elsewhere in this doc is
+the *table-function* argument operator and the COPY parser rejects it (`Parser Error: syntax
+error at or near ":="`). STRUCT (`variant_fields {chrom: 'CHROM'}`), string (`pvar 'path'`),
+and LIST (`samples ['a','b']`) values all parse with the space form; struct *keys* are
+barewords, struct/scalar *values* are string literals. (4) **Ordering**: return `REGULAR_COPY_TO_FILE` →
 single-threaded ordered sink; **require the query to carry `ORDER BY` on the variant key.**
 (5) **PARTITION_BY destroys order** → do NOT use it for `.pgen`; shard via a wrapper
 issuing **one ordered COPY per shard**. Caveats: writer must self-clean the sibling
@@ -114,21 +120,23 @@ consistent with the reader's `orient` vocabulary (variant/sample/genotype) and
 Hail's row/col/entry decomposition:
 
 ```sql
+-- COPY options are `KEY value` (space-separated), NOT `:=` (see the Spike B
+-- syntax note above). Struct keys are barewords; struct/scalar values are strings.
 COPY (…) TO 'prefix' (FORMAT pfile,
-  variant_fields  := {chrom: CHROM, pos: POS, id: ID, ref: REF, alt: ALT, …},  -- -> .pvar
-  sample_fields   := {iid: IID, sex: SEX, …},                                  -- -> .psam
-  genotype_fields := genotypes,   -- -> .pgen; or {gt: …, dosage: …} for multiple tracks
-  samples := [...])               -- sample IIDs when the input is variant-oriented
+  variant_fields  {chrom: 'CHROM', pos: 'POS', id: 'ID', ref: 'REF', alt: 'ALT', …},  -- -> .pvar
+  sample_fields   {iid: 'IID', sex: 'SEX', …},                                        -- -> .psam
+  genotype_fields 'genotypes',   -- -> .pgen; or {gt: '…', dosage: '…'} for multiple tracks
+  samples ['IID1', 'IID2', …])   -- sample IIDs when the input is variant-oriented
 ```
 
 - **`variant_fields` / `sample_fields` / `genotype_fields`** — the column→axis
   mapping (Hail row/col/entry). Defaults follow the reader's output conventions,
   so a round-trip of `read_pfile` output needs no mapping. The grouped form
-  extends cleanly to **multiple genotype tracks** (`genotype_fields := {gt: …,
-  dosage: …}`).
-- **`pvar :=` / `psam :=` / `pgen :=` are reserved for file-PATH overrides** —
+  extends cleanly to **multiple genotype tracks** (`genotype_fields {gt: '…',
+  dosage: '…'}`).
+- **`pvar` / `psam` / `pgen` options are reserved for file-PATH overrides** —
   **symmetric with the readers'** `pgen`/`pvar`/`psam` path overrides (e.g.
-  `pgen := 's3://…/custom.pgen'`). Field-mapping and path-override stay separate,
+  `pgen 's3://…/custom.pgen'`). Field-mapping and path-override stay separate,
   mirroring the read side.
 
 ### Subset efficiency / "pushdown" (Teague) — mostly already free, with one hard limit
@@ -156,7 +164,7 @@ unification of the old 2a/3 sample-identity problem):
 - **variant-oriented input** (row=variant; genotypes as an `ARRAY` over samples):
   pvar fields are columns; the entry/pgen payload is the genotypes array; **the
   sample/col dimension is NOT in the rows** → `.psam` col-fields must be supplied
-  out-of-band (a `samples := [...]`/struct option, or a companion table). Matches
+  out-of-band (a `samples [...]`/struct option, or a companion table). Matches
   `read_pfile` variant orient. **Primary path** (streams; maps to per-variant append).
 - **tidy / genotype-oriented input** (one row per variant×sample): row-key =
   variant, col-key = IID, entry = scalar genotype — **everything is in the
@@ -177,13 +185,13 @@ supported when sorted-by-variant; sample-oriented `.pgen` is out of scope v1.
 
 Sample identity is handled by the column-role model (Decision 2): for the
 variant-oriented path, `sample_ct` comes from the genotypes array length and the
-IIDs from the `samples :=` col-field spec. **The remaining problem is the
+IIDs from the `samples` col-field spec. **The remaining problem is the
 variant count.** `SpgwInitPhase1` needs a `variant_ct` **limit** before the first
 append, but COPY streams rows of unknown length and at 170M variants we
 **cannot** buffer all genotypes to count first. Options:
 - **(a) Backward-seek write mode + a declared/derived variant-count upper bound.**
   Requires seekable local output (we have that — `FILE*`). Need an upper bound
-  at init: a COPY option `variant_count := N`, or derive from the query if a
+  at init: a COPY option `variant_count N`, or derive from the query if a
   cardinality is known, or a first counting pass over the (cheap) `.pvar` side.
 - **(b) Separate-index mode (`.pgi`)** — may relax the up-front-count need; verify
   in the spike.
@@ -194,7 +202,7 @@ append, but COPY streams rows of unknown length and at 170M variants we
 `variant_ct_limit` (memory ∝ bound; actual count finalized at `SpgwFinish`).
 `AndCopy` keeps a single embedded-index `.pgen` (cost: temp+copy); `SeparateIndex`
 avoids the copy but writes a `.pgi` sidecar. Offer `kPgenWriteBackwardSeek` (fastest,
-no copy/sidecar) when the count is known via a `variant_count :=` option. Pick the
+no copy/sidecar) when the count is known via a `variant_count` option. Pick the
 default (AndCopy vs SeparateIndex) during impl based on the copy-cost vs sidecar tradeoff.
 
 ## Decision 4 — Genotype encoding & scope
@@ -294,19 +302,22 @@ pre-decide them. Order:
 
 **Spike-dependent (answer after the spikes, not now):**
 - Invocation exact shape — one `COPY` fan-out vs per-format primitives (Spike B).
-- Automatic variant count vs a `variant_count :=` hint vs two-pass (Spike A modes).
+- Automatic variant count vs a `variant_count` hint vs two-pass (Spike A modes).
 - Local-only `.pgen` for v1, or temp-then-VFS-copy (Spike A I/O + Decision 6).
 
 **Resolved by Teague:**
-- **Release**: hold everything for one **v0.8.x** (text + `.pgen` + pfile +
-  partitioning together) — no interim text-only release.
+- **Release**: originally planned to hold everything for one **v0.10.x** (text +
+  `.pgen` + pfile + partitioning together) — no interim text-only release.
+  *(Superseded: the writer is being landed as incremental slices on
+  `feat/pgen-writer`, starting with `FORMAT pvar` alone; the single-release
+  decision no longer holds.)*
 - **v1 genotype scope**: hardcalls **and** phase **and** dosage (biallelic
   diploid). Multiallelic + ploidy/half-calls still deferred.
 - **Partitioning is in scope** (Decision 7) — variant-based sharding, mirroring
   the multi-file reader.
 
 **Still open (mostly spike-dependent):**
-- Sample identity via a `samples :=` col-field option — confirm the mechanism.
+- Sample identity via a `samples` col-field option — confirm the mechanism.
 - Exact invocation / 3-file fan-out / partition layout (Spike B).
-- Automatic variant count vs a `variant_count :=` hint vs write-mode (Spike A).
+- Automatic variant count vs a `variant_count` hint vs write-mode (Spike A).
 - Local-only `.pgen` for v1, or temp-then-VFS-copy.

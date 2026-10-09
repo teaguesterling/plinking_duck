@@ -2,7 +2,9 @@
 
 The actionable, phased build plan for the writers. **Decisions live in
 `P9-001-writers-design`** (feasibility confirmed by two spikes); this doc is the
-"how/steps." Target: everything ships together as **v0.8.x**.
+"how/steps." Target: the writer release, **v0.10.x** (docs/planning/ROADMAP
+§v0.10.0). *(The original "ships together" plan is being superseded by
+incremental slices on `feat/pgen-writer`, starting with `FORMAT pvar`.)*
 
 ## Status
 
@@ -21,19 +23,25 @@ the multi-file reader (write sharded → `read_pfile([...])`/`pathmacro:`).
 
 ## Branch
 
-`feature/P9-writers` (one branch; phases land as commits, released as v0.8.x).
+`feat/pgen-writer` (phases land as commits; released under v0.10.x). *(Earlier
+drafts named `feature/P9-writers` and a single v0.8.x release — both stale.)*
 
 ---
 
 ## Shared invocation (from P9-001, locked)
 
+COPY options are `KEY value` (space-separated), NOT `:=` — the COPY parser
+rejects `:=` (verified against DuckDB v1.5.6 in Phase A: `Parser Error: syntax
+error at or near ":="`). Struct keys are barewords; struct/scalar/list values
+are string literals.
+
 ```sql
 COPY (SELECT … ORDER BY chrom, pos) TO 'prefix' (FORMAT pfile,
-  variant_fields  := {chrom: CHROM, pos: POS, id: ID, ref: REF, alt: ALT},
-  sample_fields   := {iid: IID, sex: SEX, …},
-  genotype_fields := genotypes,            -- or {gt:…, dosage:…}
-  samples := […],                          -- IIDs when input is variant-oriented
-  pgen := '…', pvar := '…', psam := '…')   -- optional path overrides (reader symmetry)
+  variant_fields  {chrom: 'CHROM', pos: 'POS', id: 'ID', ref: 'REF', alt: 'ALT'},
+  sample_fields   {iid: 'IID', sex: 'SEX', …},
+  genotype_fields 'genotypes',               -- or {gt: '…', dosage: '…'}
+  samples ['IID1', 'IID2', …],               -- IIDs when input is variant-oriented
+  pgen '…', pvar '…', psam '…')              -- optional path overrides (reader symmetry)
 ```
 Register via DuckDB `CopyFunction` (the function owns file I/O). Input is
 variant-oriented (row = variant; `genotype_fields` an `ARRAY/LIST` over samples);
@@ -55,7 +63,7 @@ Proves the whole surface without touching pgenlib.
    `variant_fields`) then one line per variant row (sink). `.bim` variant if asked.
 5. `.psam` writer: from `sample_fields`/`samples`. **Sample-source is out-of-band**
    for a variant-oriented stream (Decision 2/3) — write `.psam` once from the
-   `samples := […]`/`sample_fields` spec (at init or finalize), not per row.
+   `samples […]`/`sample_fields` spec (at init or finalize), not per row.
 6. Cleanup-on-failure: remove any sibling files we created (DuckDB only
    auto-removes the one prefix path).
 7. Tests `test/sql/write_pvar.test` / `write_psam.test`: round-trip vs
@@ -71,7 +79,7 @@ Proves the whole surface without touching pgenlib.
    phased-dosage → set `phase_dosage_gflags`. `sample_ct` from the genotypes
    array length (cross-check vs `samples`). Pick `PgenWriteMode`: default
    `AndCopy` or `SeparateIndex` with an **upper-bound** `variant_ct_limit` (no
-   exact count needed); `BackwardSeek` when `variant_count :=` is given.
+   exact count needed); `BackwardSeek` when `variant_count` is given.
    `.pgen` uses **raw `FILE*` → local paths only** (document; error on
    s3/pathmacro: targets for `.pgen`).
 3. Global-init: `PreinitSpgw` → `SpgwInitPhase1` → `cachealigned_malloc` →
@@ -137,4 +145,4 @@ write; zero-copy/difflist sparse passthrough (P9-001 pushdown note); VFS/remote
 A (surface + text) is the on-ramp and de-risks the API — do first. B (`.pgen`) is
 the core and the bulk. C is glue. D is small (mostly a wrapper) but high-value
 (closes the read/write loop). E is independent and last. Each phase: implement →
-round-trip test → verify → commit; release all as v0.8.x when green on CI.
+round-trip test → verify → commit; release under v0.10.x when green on CI.

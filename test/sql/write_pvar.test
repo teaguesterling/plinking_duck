@@ -189,7 +189,7 @@ SELECT list(column_name) FROM (DESCRIBE SELECT * FROM read_pvar('__TEST_DIR__/re
 ----
 [CHROM, POS, ID, REF, ALT]
 
-# --- pvar := path override: data lands at the override, not the COPY target --
+# --- pvar path override: data lands at the override, not the COPY target -----
 statement ok
 COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar'))
 TO '__TEST_DIR__/override_prefix' (FORMAT pvar, pvar '__TEST_DIR__/override_target.pvar');
@@ -206,12 +206,78 @@ TO '__TEST_DIR__/missing_chrom.pvar' (FORMAT pvar);
 ----
 required field 'chrom'
 
-# --- overwrite: re-running the same COPY truncates/overwrites cleanly ---------
+# --- reordered / name-based role resolution: roles resolve by NAME, not input
+# column position, so a scrambled SELECT still produces canonical headers and
+# round-trips (0/0 both directions). -----------------------------------------
 statement ok
-COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar'))
+COPY (SELECT ALT, REF, ID, POS, CHROM FROM read_pvar('test/data/pfile_example.pvar'))
+TO '__TEST_DIR__/reordered.pvar' (FORMAT pvar);
+
+query I
+SELECT list(column_name) FROM (DESCRIBE SELECT * FROM read_pvar('__TEST_DIR__/reordered.pvar'));
+----
+[CHROM, POS, ID, REF, ALT]
+
+query III
+SELECT
+  (SELECT count(*) FROM read_pvar('test/data/pfile_example.pvar'))
+    = (SELECT count(*) FROM read_pvar('__TEST_DIR__/reordered.pvar')),
+  (SELECT count(*) FROM (SELECT * FROM read_pvar('test/data/pfile_example.pvar')
+                         EXCEPT SELECT * FROM read_pvar('__TEST_DIR__/reordered.pvar'))),
+  (SELECT count(*) FROM (SELECT * FROM read_pvar('__TEST_DIR__/reordered.pvar')
+                         EXCEPT SELECT * FROM read_pvar('test/data/pfile_example.pvar')));
+----
+true	0	0
+
+# ===========================================================================
+# Negative: corruption guards
+# ===========================================================================
+
+# --- embedded tab/newline in a cell must be REJECTED (not silently corrupt
+# the tab-delimited layout, which read_pvar would read back shifted). --------
+statement error
+COPY (SELECT CHROM, POS, ID || chr(9) || 'x' AS ID, REF, ALT
+      FROM read_pvar('test/data/pfile_example.pvar'))
+TO '__TEST_DIR__/bad_tab.pvar' (FORMAT pvar);
+----
+contains a tab, newline, or carriage return
+
+statement error
+COPY (SELECT CHROM, POS, ID || chr(10) || 'x' AS ID, REF, ALT
+      FROM read_pvar('test/data/pfile_example.pvar'))
+TO '__TEST_DIR__/bad_nl.pvar' (FORMAT pvar);
+----
+contains a tab, newline, or carriage return
+
+# --- duplicate output header must be caught at bind (a role remapped off a
+# column that is ALSO carried through as an extra). read_pvar would otherwise
+# refuse the "#CHROM ... CHROM" file. ----------------------------------------
+statement error
+COPY (SELECT CHROM AS CONTIG, CHROM, POS, ID, REF, ALT
+      FROM read_pvar('test/data/pfile_example.pvar'))
+TO '__TEST_DIR__/dup_header.pvar' (FORMAT pvar, variant_fields {chrom: 'CONTIG'});
+----
+appears twice
+
+# --- overwrite TRUNCATES: a shorter re-write must leave no stale rows ---------
+# rt_pfile.pvar holds 4 rows from the first round-trip above. Overwrite it with a
+# single row and assert the old rows are gone (not merely that count==4, which
+# would pass even without truncation).
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') WHERE ID = 'rs1')
 TO '__TEST_DIR__/rt_pfile.pvar' (FORMAT pvar);
 
 query I
 SELECT count(*) FROM read_pvar('__TEST_DIR__/rt_pfile.pvar');
 ----
-4
+1
+
+query I
+SELECT count(*) FROM read_pvar('__TEST_DIR__/rt_pfile.pvar') WHERE ID IN ('rs2', 'rs3', 'rs4');
+----
+0
+
+query TI
+SELECT ID, POS FROM read_pvar('__TEST_DIR__/rt_pfile.pvar');
+----
+rs1	10000
