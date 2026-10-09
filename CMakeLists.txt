@@ -13,6 +13,7 @@ set(EXTENSION_SOURCES
     src/plinking_duck_extension.cpp
     src/plinking_capabilities.cpp
     src/pvar_reader.cpp
+    src/pfile_writer.cpp
     src/psam_reader.cpp
     src/pgen_reader.cpp
     src/pfile_reader.cpp
@@ -167,12 +168,13 @@ set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 check_symbol_exists(rawmemchr "string.h" HAVE_RAWMEMCHR)
 
 # --- pgenlib (C++ library) ---
-# Read-path only — pgenlib_write.cc, plink2_bitmap.cc are intentionally
-# excluded. plink2_fmath.cc is included for LogisticSseF. plink2_stats.cc is
-# included to wrap plink2's own statistical functions (HweLnP / HweXchrLnP for
-# HWE, TstatToP2 / ChisqToP for GLM p-values) instead of reimplementing them;
-# it depends only on plink2_stats.h + plink2_string.h (both already linked) and
-# has no bigstack/thread/CLI entanglement.
+# Read + write path. pgenlib_write.cc is included for the P9 writers (FORMAT
+# pgen). plink2_bitmap.cc remains excluded unless the linker demands it (it is a
+# plink2-CLI/image helper with no biallelic-hardcall-write dependency). plink2_fmath.cc
+# is included for LogisticSseF. plink2_stats.cc is included to wrap plink2's own
+# statistical functions (HweLnP / HweXchrLnP for HWE, TstatToP2 / ChisqToP for GLM
+# p-values) instead of reimplementing them; it depends only on plink2_stats.h +
+# plink2_string.h (both already linked) and has no bigstack/thread/CLI entanglement.
 add_library(pgenlib STATIC
     ${PGENLIB_DIR}/plink2_base.cc
     ${PGENLIB_DIR}/plink2_bits.cc
@@ -187,6 +189,7 @@ add_library(pgenlib STATIC
     ${PGENLIB_DIR}/plink2_zstfile.cc
     ${PGENLIB_DIR}/pgenlib_misc.cc
     ${PGENLIB_DIR}/pgenlib_read.cc
+    ${PGENLIB_DIR}/pgenlib_write.cc
     ${PGENLIB_DIR}/pgenlib_ffi_support.cc
     ${PGENLIB_DIR}/pvar_ffi_support.cc
     # plinking_duck VFS shim: pgenlib_read.cc's fopen sites call plinking_pgen_fopen

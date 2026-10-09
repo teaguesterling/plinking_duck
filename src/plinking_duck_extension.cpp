@@ -2,6 +2,7 @@
 
 #include "plinking_duck_extension.hpp"
 #include "pvar_reader.hpp"
+#include "pfile_writer.hpp"
 #include "psam_reader.hpp"
 #include "pgen_reader.hpp"
 #include "pfile_reader.hpp"
@@ -88,6 +89,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 
 	// Register table functions
 	RegisterPvarReader(loader);
+	RegisterPfileWriter(loader);
 	RegisterPsamReader(loader);
 	RegisterPgenReader(loader);
 	RegisterPfileReader(loader);

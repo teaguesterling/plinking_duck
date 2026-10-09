@@ -1,0 +1,381 @@
+# name: test/sql/write_pgen.test
+# description: COPY (query) TO 'path' (FORMAT pgen) — the binary .pgen writer, biallelic HARDCALLS only (P9 Phase B)
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# Round-trip on DECODED genotype values (never a byte diff — AndCopy vs the
+# fixtures' storage can differ byte-for-byte for identical data). Write a .pgen
+# from a read_pfile stream, read it back pairing the SOURCE fixture's companions
+# (pvar :=/psam := overrides), and assert the genotype matrix is identical BOTH
+# directions, including per-variant positional order.
+#
+# The checks are deliberately discriminating:
+#   count equality      -> catches dropped / duplicated variants
+#   orig EXCEPT rt == 0  -> catches dropped / mangled genotypes (set-based)
+#   rt EXCEPT orig == 0  -> catches fabricated / mangled genotypes (set-based)
+#   positional join      -> catches a variant<->genotype mis-pairing that the
+#                           set-based EXCEPT is blind to when values collide
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/rt.pgen' (FORMAT pgen);
+
+query III
+SELECT
+  (SELECT count(*) FROM read_pfile('test/data/pfile_example'))
+    = (SELECT count(*) FROM read_pgen('__TEST_DIR__/rt.pgen',
+         pvar := 'test/data/pfile_example.pvar', psam := 'test/data/pfile_example.psam')),
+  (SELECT count(*) FROM (
+     SELECT ID, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example')
+     EXCEPT
+     SELECT ID, genotypes::TINYINT[] g FROM read_pgen('__TEST_DIR__/rt.pgen',
+        pvar := 'test/data/pfile_example.pvar', psam := 'test/data/pfile_example.psam'))),
+  (SELECT count(*) FROM (
+     SELECT ID, genotypes::TINYINT[] g FROM read_pgen('__TEST_DIR__/rt.pgen',
+        pvar := 'test/data/pfile_example.pvar', psam := 'test/data/pfile_example.psam')
+     EXCEPT
+     SELECT ID, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example')));
+----
+true	0	0
+
+# Positional pairing: join on ID, assert no variant's genotype vector differs,
+# and that every variant matched (join count == variant count).
+query II
+SELECT
+  count(*),
+  count(*) FILTER (WHERE a.genotypes::VARCHAR IS DISTINCT FROM b.genotypes::VARCHAR)
+FROM read_pfile('test/data/pfile_example') a
+JOIN read_pgen('__TEST_DIR__/rt.pgen',
+       pvar := 'test/data/pfile_example.pvar', psam := 'test/data/pfile_example.psam') b
+  USING (ID);
+----
+4	0
+
+# Exact ordered positional read — catches a reordered variant that the set-based
+# EXCEPT cannot see when two variants share a genotype vector.
+query TT
+SELECT ID, genotypes::VARCHAR FROM read_pgen('__TEST_DIR__/rt.pgen',
+  pvar := 'test/data/pfile_example.pvar', psam := 'test/data/pfile_example.psam');
+----
+rs1	[0, 1, 2, NULL]
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+rs4	[0, 0, 1, 2]
+
+# ===========================================================================
+# all_missing — the critical -9/NULL -> 0b11 missing case. If the writer dropped
+# missing calls or wrote 0b00 (hom-ref) for them, this reads back non-NULL.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/all_missing'))
+TO '__TEST_DIR__/am.pgen' (FORMAT pgen);
+
+# Explicit literal block so the missing encoding is visible in the test file.
+query TT
+SELECT ID, genotypes::VARCHAR FROM read_pgen('__TEST_DIR__/am.pgen',
+  pvar := 'test/data/all_missing.pvar', psam := 'test/data/all_missing.psam');
+----
+rs_miss1	[NULL, NULL]
+rs_miss2	[NULL, NULL]
+
+query III
+SELECT
+  (SELECT count(*) FROM read_pfile('test/data/all_missing'))
+    = (SELECT count(*) FROM read_pgen('__TEST_DIR__/am.pgen',
+         pvar := 'test/data/all_missing.pvar', psam := 'test/data/all_missing.psam')),
+  (SELECT count(*) FROM (
+     SELECT ID, genotypes::TINYINT[] g FROM read_pfile('test/data/all_missing')
+     EXCEPT
+     SELECT ID, genotypes::TINYINT[] g FROM read_pgen('__TEST_DIR__/am.pgen',
+        pvar := 'test/data/all_missing.pvar', psam := 'test/data/all_missing.psam'))),
+  (SELECT count(*) FROM (
+     SELECT ID, genotypes::TINYINT[] g FROM read_pgen('__TEST_DIR__/am.pgen',
+        pvar := 'test/data/all_missing.pvar', psam := 'test/data/all_missing.psam')
+     EXCEPT
+     SELECT ID, genotypes::TINYINT[] g FROM read_pfile('test/data/all_missing')));
+----
+true	0	0
+
+# ===========================================================================
+# Multi-word packing — pca_example has 250 samples (8 genovec words, last word
+# partial: 250 = 7*32 + 26). pfile_example/all_missing/the anchor are all <= 32
+# samples, i.e. a single word; this is the only case that exercises widx>0 in
+# the pack loop AND ZeroTrailingBits on a partial final word. Decoded-values
+# only — at this width pgenlib LD/difflist-compresses, so no byte assertion.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pca_example'))
+TO '__TEST_DIR__/rt_wide.pgen' (FORMAT pgen);
+
+query III
+SELECT
+  (SELECT count(*) FROM read_pfile('test/data/pca_example'))
+    = (SELECT count(*) FROM read_pgen('__TEST_DIR__/rt_wide.pgen',
+         pvar := 'test/data/pca_example.pvar', psam := 'test/data/pca_example.psam')),
+  (SELECT count(*) FROM (
+     SELECT ID, genotypes::TINYINT[] g FROM read_pfile('test/data/pca_example')
+     EXCEPT
+     SELECT ID, genotypes::TINYINT[] g FROM read_pgen('__TEST_DIR__/rt_wide.pgen',
+        pvar := 'test/data/pca_example.pvar', psam := 'test/data/pca_example.psam'))),
+  (SELECT count(*) FROM (
+     SELECT ID, genotypes::TINYINT[] g FROM read_pgen('__TEST_DIR__/rt_wide.pgen',
+        pvar := 'test/data/pca_example.pvar', psam := 'test/data/pca_example.psam')
+     EXCEPT
+     SELECT ID, genotypes::TINYINT[] g FROM read_pfile('test/data/pca_example')));
+----
+true	0	0
+
+# Positional pairing across all 500 variants (no variant<->genotype mis-pairing).
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE a.genotypes::VARCHAR IS DISTINCT FROM b.genotypes::VARCHAR)
+FROM read_pfile('test/data/pca_example') a
+JOIN read_pgen('__TEST_DIR__/rt_wide.pgen',
+       pvar := 'test/data/pca_example.pvar', psam := 'test/data/pca_example.psam') b
+  USING (ID);
+----
+500	0
+
+# ===========================================================================
+# 0xE4 packing anchor (variant {0,1,2,-9} -> low byte 0xE4). Pins the exact on-
+# disk 2-bit packing (sample 0 in the low bits; 0->00,1->01,2->10,-9->11),
+# independent of the reader — so a pack/unpack that are consistently-wrong
+# TOGETHER (which the round-trip cannot see) is still caught.
+#
+# A single variant {0,1,2,-9} x 4 samples stores as a raw genovec record whose
+# single data byte is the file's last byte (verified against the written file).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * REPLACE ([0,1,2,-9]::TINYINT[4] AS genotypes)
+      FROM read_pfile('test/data/pfile_example') WHERE ID = 'rs1')
+TO '__TEST_DIR__/anchor.pgen' (FORMAT pgen);
+
+query T
+SELECT right(hex(content), 2) FROM read_blob('__TEST_DIR__/anchor.pgen');
+----
+E4
+
+# Multi-variant data bytes pin every variant's packing at once:
+#   rs1 {0,1,2,-9} -> E4   rs2 {1,1,0,2} -> 85
+#   rs3 {2,-9,1,0} -> 1E   rs4 {0,0,1,2} -> 90
+# (catches a swapped 1<->2, a dropped missing, or a reordered sample in ANY variant).
+query T
+SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/rt.pgen');
+----
+E4851E90
+
+# ===========================================================================
+# Options
+# ===========================================================================
+
+# --- genotype_fields: name a differently-named genotypes column --------------
+statement ok
+COPY (SELECT genotypes AS gt FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/remap.pgen' (FORMAT pgen, genotype_fields 'gt');
+
+query T
+SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/remap.pgen');
+----
+E4851E90
+
+# --- STRUCT genotypes (genotypes:='struct') pack identically to the LIST form -
+# The struct's field VALUES (in field order) are the per-sample calls; field order
+# must map to .pgen sample order exactly as the LIST does. Same data bytes as the
+# plain rt.pgen (E4851E90) proves struct field order -> .pgen sample order, with
+# ZERO .psam involvement (the field NAMES/IIDs are irrelevant to the .pgen).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/struct.pgen' (FORMAT pgen);
+
+query T
+SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/struct.pgen');
+----
+E4851E90
+
+# --- variant_count upper bound (>= actual) succeeds --------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/vc.pgen' (FORMAT pgen, variant_count 1000);
+
+query I
+SELECT count(*) FROM read_pgen('__TEST_DIR__/vc.pgen',
+  pvar := 'test/data/pfile_example.pvar', psam := 'test/data/pfile_example.psam');
+----
+4
+
+# --- pgen path override: data lands at the override, not the COPY target -----
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/override_prefix' (FORMAT pgen, pgen '__TEST_DIR__/override_target.pgen');
+
+query I
+SELECT count(*) FROM read_pgen('__TEST_DIR__/override_target.pgen',
+  pvar := 'test/data/pfile_example.pvar', psam := 'test/data/pfile_example.psam');
+----
+4
+
+# --- overwrite TRUNCATES (and exercises the use_tmp_file flip) ----------------
+# A second COPY to an already-existing target makes DuckDB route through a
+# tmp_-prefixed path + rename (bind_copy.cpp: use_tmp_file = is_file_and_exists),
+# which pgenlib's raw FILE* + AndCopy .tmp must survive. Write a 4-variant file,
+# overwrite it with a 1-variant subset, and assert the result is byte-identical
+# to a FRESH 1-variant write — proving no stale 4-variant bytes remain and the
+# rename landed the whole file.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example') WHERE ID = 'rs1')
+TO '__TEST_DIR__/ow_ref.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/ow.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example') WHERE ID = 'rs1')
+TO '__TEST_DIR__/ow.pgen' (FORMAT pgen);
+
+query I
+SELECT (SELECT hex(content) FROM read_blob('__TEST_DIR__/ow.pgen'))
+     = (SELECT hex(content) FROM read_blob('__TEST_DIR__/ow_ref.pgen'));
+----
+true
+
+# No tmp_/.tmp/.pgi sibling left behind after the rename.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/*ow.pgen.*') WHERE file LIKE '%.tmp' OR file LIKE '%.pgi';
+----
+0
+
+# ===========================================================================
+# Zero-variant input must fail CLEANLY (never crash) and leave no file. pgenlib
+# cannot finish a 0-variant .pgen (SpgwFinish asserts variant_ct>0 — compiled
+# out in release, then SIGSEGVs). Writer init is deferred to the first sink row
+# for BOTH input shapes, so a zero-row query never opens a file and Finalize
+# throws. The fixed-ARRAY case (read_pfile emits TINYINT[4]) was the crash.
+# ===========================================================================
+
+# Fixed-size ARRAY, zero rows (the historical nondeterministic SIGSEGV).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example') WHERE false)
+TO '__TEST_DIR__/zero_array.pgen' (FORMAT pgen);
+----
+zero variants
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/zero_array.pgen*');
+----
+0
+
+# LIST, zero rows (sample count never determinable) — same clean failure.
+statement error
+COPY (SELECT genotypes FROM (SELECT [0, 1]::TINYINT[] genotypes) WHERE false)
+TO '__TEST_DIR__/zero_list.pgen' (FORMAT pgen);
+----
+zero variants
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/zero_list.pgen*');
+----
+0
+
+# ===========================================================================
+# Negatives — each must THROW a clean, actionable error (not silently proceed).
+# ===========================================================================
+
+# --- phased input (TINYINT[2][N]) rejected at bind ---------------------------
+statement error
+COPY (SELECT * FROM read_pfile('test/data/phased_example', phased := true))
+TO '__TEST_DIR__/bad_phased.pgen' (FORMAT pgen);
+----
+phased
+
+# --- dosage input (DOUBLE[N]) rejected at bind -------------------------------
+statement error
+COPY (SELECT * FROM read_pfile('test/data/dosage_example', dosages := true))
+TO '__TEST_DIR__/bad_dosage.pgen' (FORMAT pgen);
+----
+DOSAGES
+
+# --- multiallelic (comma in ALT) rejected (best-effort, ALT in the stream) ---
+statement error
+COPY (SELECT * FROM read_pfile('test/data/multiallelic'))
+TO '__TEST_DIR__/bad_multi.pgen' (FORMAT pgen);
+----
+multiallelic
+
+# --- a genotype value outside {-9,0,1,2} rejected ----------------------------
+statement error
+COPY (SELECT * REPLACE ([0,3,1,2]::TINYINT[4] AS genotypes)
+      FROM read_pfile('test/data/pfile_example') WHERE ID = 'rs1')
+TO '__TEST_DIR__/bad_val.pgen' (FORMAT pgen);
+----
+out of range
+
+# --- inconsistent per-row sample count rejected ------------------------------
+# Built from a LIST (ragged) relation so lengths genuinely differ across rows.
+statement error
+COPY (SELECT genotypes FROM (
+        SELECT 1 k, [0, 1]::TINYINT[] genotypes
+        UNION ALL
+        SELECT 2 k, [0, 1, 2]::TINYINT[] genotypes
+        ORDER BY k))
+TO '__TEST_DIR__/bad_samplect.pgen' (FORMAT pgen);
+----
+same number of samples
+
+# --- a non-list genotypes column rejected at bind ----------------------------
+statement error
+COPY (SELECT 0::TINYINT AS genotypes)
+TO '__TEST_DIR__/bad_scalar.pgen' (FORMAT pgen);
+----
+LIST or ARRAY
+
+# --- a remote/scheme .pgen target rejected at bind (raw FILE*, no VFS) --------
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO 's3://bucket/x.pgen' (FORMAT pgen);
+----
+not a local path
+
+# --- an implausibly large variant_count (likely typo) rejected at bind --------
+# Guards against silently pre-allocating multiple GB; 4e9 > the 2e9 sanity ceiling.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/bad_vc.pgen' (FORMAT pgen, variant_count 4000000000);
+----
+implausibly large
+
+# ===========================================================================
+# Cleanup-on-failure: a mid-write throw must leave NO partial .pgen (or its
+# AndCopy .pgi/.tmp sibling). The multiallelic throw fires at variant 3, i.e.
+# AFTER two successful appends, so this exercises cleanup of a partial write.
+# (DuckDB only auto-removes its single COPY target; we remove the siblings.)
+# ===========================================================================
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/multiallelic'))
+TO '__TEST_DIR__/cleanup_multi.pgen' (FORMAT pgen);
+----
+multiallelic
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/cleanup_multi.pgen*');
+----
+0
+
+# Same guarantee when the throw is the variant_count overflow guard.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/cleanup_vc.pgen' (FORMAT pgen, variant_count 2);
+----
+exceeds variant_count
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/cleanup_vc.pgen*');
+----
+0

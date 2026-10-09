@@ -128,4 +128,27 @@ derived form.
 
 ### Limitations
 
-- Remote **writes** are not supported (there is no writer yet).
+- **Writing is local-only.** The writer (below) lands a fileset on a local path;
+  a remote/VFS write target is rejected at bind (the `.pgen` is written through a
+  raw `FILE*`). To put a fileset on a remote store, write it locally and copy it up.
+
+## Writing filesets
+
+PlinkingDuck closes the loop: a fileset read with `read_pfile` can be written back
+out through the `COPY … TO` **writer formats**. The headline round-trips the
+reader — the `genotypes := 'struct'` field names become the `.psam` IIDs:
+
+```sql
+COPY (SELECT * FROM read_pfile('in', genotypes := 'struct')) TO 'out' (FORMAT pfile);
+```
+
+`FORMAT pfile` fans out to `out.pvar` + `out.pgen` + `out.psam` in one statement;
+`FORMAT pvar` / `pgen` / `psam` write the individual files. Writing is
+**local-only**, requires **position-sorted** input (`ORDER BY CHROM, POS`), is
+**atomic** (a failed overwrite leaves the prior fileset byte-identical — the final
+three-rename promote is not group-atomic; see the function page), and in this
+release writes **biallelic hardcalls** with an **IID-only** `.psam`. The target's
+`.pfile` suffix, if present, is stripped to the companion prefix. See
+[Writing filesets](../functions/write_pfile.md) for the full surface: options, the
+sample-identity contract, and the deferred cases (phase/dosage/multiallelic,
+per-sample metadata, parquet/`.pgi`/sharded companions).

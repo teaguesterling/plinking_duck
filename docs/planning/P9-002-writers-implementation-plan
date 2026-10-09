@@ -1,0 +1,148 @@
+# P9-002: pfile writers — implementation plan
+
+The actionable, phased build plan for the writers. **Decisions live in
+`P9-001-writers-design`** (feasibility confirmed by two spikes); this doc is the
+"how/steps." Target: the writer release, **v0.10.x** (docs/planning/ROADMAP
+§v0.10.0). *(The original "ships together" plan is being superseded by
+incremental slices on `feat/pgen-writer`, starting with `FORMAT pvar`.)*
+
+## Status
+
+- [ ] Phase A — CopyFunction scaffold + `.pvar`/`.psam` text writers (no pgenlib)
+- [ ] Phase B — `.pgen` writer (pgenlib; hardcalls → phase → dosage)
+- [ ] Phase C — `pfile` bundle (one COPY fans out all three)
+- [ ] Phase D — partitioned (sharded) output wrapper
+- [ ] Phase E — PLINK-VCF writer
+- [ ] Docs + round-trip test suite + platform matrix
+
+## Prerequisites
+
+None blocking — feasibility is proven (`P9-001` "SPIKE RESULTS"). Reuses the
+reader's companion-discovery, genotype packing, and shard fixtures. Pairs with
+the multi-file reader (write sharded → `read_pfile([...])`/`pathmacro:`).
+
+## Branch
+
+`feat/pgen-writer` (phases land as commits; released under v0.10.x). *(Earlier
+drafts named `feature/P9-writers` and a single v0.8.x release — both stale.)*
+
+---
+
+## Shared invocation (from P9-001, locked)
+
+COPY options are `KEY value` (space-separated), NOT `:=` — the COPY parser
+rejects `:=` (verified against DuckDB v1.5.6 in Phase A: `Parser Error: syntax
+error at or near ":="`). Struct keys are barewords; struct/scalar/list values
+are string literals.
+
+```sql
+COPY (SELECT … ORDER BY chrom, pos) TO 'prefix' (FORMAT pfile,
+  variant_fields  {chrom: 'CHROM', pos: 'POS', id: 'ID', ref: 'REF', alt: 'ALT'},
+  sample_fields   {iid: 'IID', sex: 'SEX', …},
+  genotype_fields 'genotypes',               -- or {gt: '…', dosage: '…'}
+  samples ['IID1', 'IID2', …],               -- IIDs when input is variant-oriented
+  pgen '…', pvar '…', psam '…')              -- optional path overrides (reader symmetry)
+```
+Register via DuckDB `CopyFunction` (the function owns file I/O). Input is
+variant-oriented (row = variant; `genotype_fields` an `ARRAY/LIST` over samples);
+require the query to carry `ORDER BY` on the variant key; return
+`REGULAR_COPY_TO_FILE` (single-threaded, ordered). Set `use_tmp_file false`.
+
+## Phase A — CopyFunction scaffold + text writers (no pgenlib risk)
+
+Proves the whole surface without touching pgenlib.
+1. New `src/pfile_writer.cpp` (+ registration in `plinking_duck_extension.cpp`).
+   Register `CopyFunction`s: `FORMAT pvar`, `FORMAT psam`, `FORMAT pfile`.
+2. `copy_to_bind`: parse options from `input.info.options`
+   (`map<key, vector<Value>>`) — the `*_fields` STRUCT maps, `samples` LIST, path
+   overrides; apply reader-aligned defaults (so `SELECT * FROM read_pfile('x')`
+   round-trips). Validate roles vs the input schema.
+3. `copy_to_initialize_global`: open output file handle(s) via **DuckDB VFS**
+   (`FileSystem::GetFileSystem`) — text writers are VFS-capable (s3/pathmacro:).
+4. `.pvar` writer: emit the header (`#CHROM POS ID REF ALT …` + any extra
+   `variant_fields`) then one line per variant row (sink). `.bim` variant if asked.
+5. `.psam` writer: from `sample_fields`/`samples`. **Sample-source is out-of-band**
+   for a variant-oriented stream (Decision 2/3) — write `.psam` once from the
+   `samples […]`/`sample_fields` spec (at init or finalize), not per row.
+6. Cleanup-on-failure: remove any sibling files we created (DuckDB only
+   auto-removes the one prefix path).
+7. Tests `test/sql/write_pvar.test` / `write_psam.test`: round-trip vs
+   `read_pvar`/`read_psam` (write → read → value-equal), plus overwrite + VFS path.
+
+## Phase B — `.pgen` writer (pgenlib)
+
+1. **Un-exclude** `pgenlib_write.cc` in `CMakeLists.txt` (+ `plink2_bitmap.cc`/
+   `plink2_stats.cc` if the linker needs them — confirm from Spike A). Update the
+   CI `exclude_archs` note: `.pgen` write inherits the read path's musl/wasm/
+   windows exclusions (verify on the matrix).
+2. Bind: from `genotype_fields` schema detect hardcall / phased / dosage /
+   phased-dosage → set `phase_dosage_gflags`. `sample_ct` from the genotypes
+   array length (cross-check vs `samples`). Pick `PgenWriteMode`: default
+   `AndCopy` or `SeparateIndex` with an **upper-bound** `variant_ct_limit` (no
+   exact count needed); `BackwardSeek` when `variant_count` is given.
+   `.pgen` uses **raw `FILE*` → local paths only** (document; error on
+   s3/pathmacro: targets for `.pgen`).
+3. Global-init: `PreinitSpgw` → `SpgwInitPhase1` → `cachealigned_malloc` →
+   `SpgwInitPhase2` (skeleton confirmed in Spike A). Genovec buffer
+   `NypCtToVecCt(sample_ct)*kBytesPerVec`.
+4. Sink (per variant, ordered): pack the row's genotypes → genovec
+   (`ZeroTrailingBits(sample_ct*2, …)`), pick the matching `SpgwAppend*`
+   (hardcall / `…Hphase` / `…Dosage16` / `…HphaseDosage16`; dosage `DOUBLE`→uint16
+   `round(d*16384)`). Hardcalls first, then add phase, then dosage.
+5. Finalize (`copy_to_finalize`, once/global): `SpgwFinish` → `CleanupSpgw`.
+   Settle seek-back handle choice (raw `FILE*` for pgenlib, per Spike B caveat).
+6. Tests `test/sql/write_pgen.test`: write `.pgen` → read with `read_pgen` →
+   ground-truth (bidirectional EXCEPT == 0) for hardcalls, phase, dosage,
+   missing; and **cross-check vs plink2** (write with us, `plink2 --validate` /
+   read; and write with plink2, read with us) for format conformance.
+
+## Phase C — `pfile` bundle (one COPY → 3 files)
+
+Compose A + B: `copy_to_initialize_global` opens `.pvar` (VFS) + `.pgen` (local
+`FILE*`) + writes `.psam` from `samples`. Sink writes each variant row to both
+`.pvar` (text) and `.pgen` (genovec). Finalize both. Enforce local target when
+`.pgen` is involved. Test: **`write_pfile(read_pfile(X)) == X`** value-for-value
+across orient/genotype modes (the headline correctness bar).
+
+## Phase D — partitioned (sharded) output
+
+**Not** DuckDB `PARTITION_BY` (kills row order — Spike B). A convenience
+wrapper/macro (or a thin table-function) that, given a partition key expression,
+issues **one ordered COPY per shard**:
+`… WHERE <key> = v ORDER BY pos … TO 'prefix_v' (FORMAT pfile, …)`. Writes the
+**identical `.psam`** into each shard (reader's contract). Layout feeds a
+`pathmacro:` catalog. Test: write sharded → `read_pfile([shards]) == whole` and
+via a `pathmacro:` macro.
+
+## Phase E — PLINK-VCF writer
+
+Separate `FORMAT plink_vcf` (VCF text via VFS); independent of the pfile family.
+Round-trip vs `read_plink_vcf`. Lowest priority in the release.
+
+## Testing strategy
+
+- **Round-trip** is the bar: `read(write(x)) == x` value-for-value, every phase.
+- **Cross-check vs plink2** for `.pgen`/`.pvar`/`.psam` format conformance.
+- Reuse shard fixtures (`test/data/shard{1,2,3}.*`) for partitioned round-trips.
+- Negatives: missing required `variant_fields`, `.pgen` to a non-local target,
+  unsorted input (document/require ORDER BY), sample_ct mismatch.
+
+## Deferred (explicit)
+
+Multiallelic; ploidy/half-calls/sex-chrom encoding; MT (`MTPgenWriter`) parallel
+write; zero-copy/difflist sparse passthrough (P9-001 pushdown note); VFS/remote
+`.pgen` (temp-then-copy); serialize/deserialize (prepared-statement plans).
+
+## Open implementation choices (settle in-phase, not blocking)
+
+- Default `PgenWriteMode`: `AndCopy` (embedded index, temp+copy cost) vs
+  `SeparateIndex` (`.pgi` sidecar, no copy).
+- DuckDB `FileHandle` vs raw `FILE*` for the `.pgen` (pgenlib wants `FILE*`).
+- Whether Phase D is a SQL macro shipped with the extension vs a C++ helper.
+
+## Rough sequencing / effort
+
+A (surface + text) is the on-ramp and de-risks the API — do first. B (`.pgen`) is
+the core and the bulk. C is glue. D is small (mostly a wrapper) but high-value
+(closes the read/write loop). E is independent and last. Each phase: implement →
+round-trip test → verify → commit; release under v0.10.x when green on CI.
