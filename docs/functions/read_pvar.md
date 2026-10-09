@@ -5,16 +5,23 @@ Read PLINK 2 `.pvar` or legacy `.bim` variant metadata files.
 ## Synopsis
 
 ```sql
-read_pvar(path VARCHAR | LIST(VARCHAR)) -> TABLE
+read_pvar(path VARCHAR | LIST(VARCHAR) [, with_ordinal := ...]) -> TABLE
 ```
 
 ## Parameters
 
-| Name | Type | Description |
-|------|------|-------------|
-| `path` | `VARCHAR` or `LIST(VARCHAR)` | Path to a `.pvar` or `.bim` file, or a list of paths to read as one table (see [Multi-File Input](#multi-file-input)) |
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `path` | `VARCHAR` or `LIST(VARCHAR)` | *(required)* | Path to a `.pvar` or `.bim` file, or a list of paths to read as one table (see [Multi-File Input](#multi-file-input)) |
+| `with_ordinal` | `BOOLEAN` | `false` | When `true`, append a `__ordinal` `BIGINT` column (see [Named Parameters](#named-parameters)) |
 
-No named parameters. The file format is auto-detected from the file contents.
+The file format is auto-detected from the file contents. See [Common Parameters](../common-parameters.md#with_ordinal) for `with_ordinal`, shared with `read_pfile`.
+
+### Named Parameters
+
+#### `with_ordinal`
+
+With `with_ordinal := true`, an extra `__ordinal` `BIGINT` column is appended to the schema, carrying the **0-based row ordinal in natural (file) order**. In a path list the ordinal **restarts at 0 for each file** (it is per-source, matching `read_pfile`'s per-shard variant ordinal), so a multi-file read produces per-file ordinals, not a single global sequence. This retires any need to assume `read_pvar` returns rows in file order: the ordinal is emitted explicitly.
 
 ### Multi-File Input
 
@@ -101,6 +108,12 @@ ORDER BY CHROM;
 ```sql
 -- Read a legacy .bim file (same interface)
 SELECT * FROM read_pvar('data/example.bim');
+```
+
+```sql
+-- Append the natural-order 0-based ordinal
+SELECT __ordinal, CHROM, POS, ID
+FROM read_pvar('data/example.pvar', with_ordinal := true);
 ```
 
 ## See Also

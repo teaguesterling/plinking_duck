@@ -793,7 +793,7 @@ void RegisterPlinkVcfReader(ExtensionLoader &loader) {
 	func.named_parameters["max_dp"] = LogicalType::INTEGER;
 	func.named_parameters["halfcall"] = LogicalType::VARCHAR;
 	func.projection_pushdown = true;
-	RegisterTableWithDesc(loader, func, {"path"}, "Read VCF files using PLINK engine into tabular format.",
+	RegisterTableWithDesc(loader, func, {}, "Read VCF files using PLINK engine into tabular format.",
 	                      {"SELECT * FROM read_plink_vcf('data/cohort.vcf.gz')"});
 }
 

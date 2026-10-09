@@ -7,9 +7,10 @@ Read a complete PLINK 2 fileset (`.pgen` + `.pvar` + `.psam`) from a common pref
 ```sql
 read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := ...,
            orient := ..., genotypes := ..., phased := ..., dosages := ...,
-           samples := ..., variants := ..., region := ...,
+           samples := ..., variants := ..., region := ..., variant_range := ...,
            af_range := ..., ac_range := ...,
-           include_genotypes := ..., genotype_range := ...]) -> TABLE
+           include_genotypes := ..., genotype_range := ...,
+           with_ordinal := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -27,13 +28,15 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | `dosages` | `BOOLEAN` | `false` | Output dosage values instead of hard calls |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific samples |
 | `variants` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific variants |
-| `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
+| `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) — base-pair space (distinct from `variant_range`) |
+| `variant_range` | `LIST` `[lo, hi]` | All | Filter to a **half-open** `[lo, hi)` range in variant **ordinal** space (see [Variant-Range](#variant-range-ordinal-space)) |
 | `af_range` | `STRUCT(min DOUBLE, max DOUBLE)` | All | Filter variants by allele frequency range |
 | `ac_range` | `STRUCT(min INTEGER, max INTEGER)` | All | Filter variants by allele count range |
 | `include_genotypes` | `LIST(VARCHAR)` | All | Filter by hardcall category: `'hom_ref'`, `'het'`, `'hom_alt'`, `'missing'` (any subset; canonical genotype filter) |
 | `genotype_range` | `STRUCT(min TINYINT, max TINYINT [, include_missing BOOLEAN])` | All | Numeric alias of `include_genotypes` for contiguous ranges over [0, 2] |
+| `with_ordinal` | `BOOLEAN` | `false` | Append a `__ordinal` `BIGINT` column of each variant's natural (original) index; **requires `orient := 'variant'`** (see [Variant Ordinal](#variant-ordinal-with_ordinal)) |
 
-See [Common Parameters](../common-parameters.md) for details on `samples`, `region`, and filter parameters.
+See [Common Parameters](../common-parameters.md) for details on `samples`, `region`, `with_ordinal`, and filter parameters.
 
 ### Variant Filtering
 
@@ -43,6 +46,18 @@ The `variants` parameter accepts:
 - **`LIST(INTEGER)`** -- 0-based variant indices
 
 When both `region` and `variants` are specified, the result is the intersection (variants must match both filters).
+
+### Variant-Range (ordinal space)
+
+`variant_range := [lo, hi]` restricts the scan to variants whose **original 0-based ordinal** (the same space as the emitted `__ordinal`, and as [`pfile_partitions`](pfile_partitions.md)' `lo`/`hi`) falls in the **half-open** interval `[lo, hi)`. This is distinct from `region :=`, which filters in **base-pair** space.
+
+- The literal is a 2-element list `[lo, hi]`; bounds must be integers with `0 <= lo <= hi`, and are clamped to the variant count.
+- It is a **single-source** filter: passing `variant_range` with a multi-file prefix list is rejected with an actionable error (a single range is ambiguous across shards' per-source ordinal spaces — read each shard separately, e.g. from [`pfile_partitions`](pfile_partitions.md)' per-source `source`).
+- When combined with `with_ordinal := true`, the emitted `__ordinal` values are **absolute** (not renumbered from 0): `variant_range := [5, 8]` emits ordinals `5, 6, 7`.
+
+### Variant Ordinal (`with_ordinal`)
+
+With `with_ordinal := true`, an extra `__ordinal` `BIGINT` column carries each variant's natural (original) 0-based index. It is supported **only with `orient := 'variant'`** (the default); the other orient modes reject it in bind rather than emit a wrong ordinal. For a multi-file list the ordinal is **per-source** (each shard restarts at 0), matching [`read_pvar`](read_pvar.md#named-parameters) and `pfile_partitions`.
 
 ## Output Columns
 
@@ -260,6 +275,17 @@ SELECT * FROM read_pfile('data/example',
     genotypes := 'columns');
 ```
 
+```sql
+-- Emit the natural-order variant ordinal (variant orient only)
+SELECT __ordinal, ID FROM read_pfile('data/example', with_ordinal := true);
+```
+
+```sql
+-- Ordinal-range scan: variants [1, 3) — emits absolute ordinals 1, 2
+SELECT __ordinal, ID FROM read_pfile('data/example',
+    with_ordinal := true, variant_range := [1, 3]);
+```
+
 ### Multi-file, sharded filesets
 
 ```sql
@@ -320,4 +346,6 @@ SET plinking_sample_counts_sparse = true;       -- 4-6x faster on rare variants
 - [read_pgen](read_pgen.md) -- lower-level genotype reader
 - [read_pvar](read_pvar.md) -- variant metadata only
 - [read_psam](read_psam.md) -- sample metadata only
+- [pfile_partitions](pfile_partitions.md) -- ordinal-range partitions to drive `variant_range` reads
+- [plinking_duck_capabilities](plinking_duck_capabilities.md) -- detect `variant_range` / `with_ordinal` support
 - [Genotype Encoding](../genotype-encoding.md) -- encoding and phased output reference

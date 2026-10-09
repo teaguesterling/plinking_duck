@@ -1101,7 +1101,7 @@ void RegisterPlinkPca(ExtensionLoader &loader) {
 	plink_pca.named_parameters["samples"] = LogicalType::ANY;
 	plink_pca.named_parameters["region"] = LogicalType::VARCHAR;
 
-	RegisterTableWithDesc(loader, plink_pca, {"pfile"}, "Compute principal components analysis from PLINK files.",
+	RegisterTableWithDesc(loader, plink_pca, {}, "Compute principal components analysis from PLINK files.",
 	                      {"SELECT * FROM plink_pca('data/cohort.pgen', n_pcs := 10)"});
 }
 

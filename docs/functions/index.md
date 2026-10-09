@@ -1,6 +1,6 @@
 # Function Reference
 
-PlinkingDuck provides 12 SQL table functions: 5 file readers and 7 analysis functions. Eleven of them are always present. `plink_pca` is the exception — it is registered only when the build found Eigen3.
+PlinkingDuck provides 12 core SQL table functions: 5 file readers and 7 analysis functions. Eleven of them are always present. `plink_pca` is the exception — it is registered only when the build found Eigen3. In addition there is a utility table function ([`pfile_partitions`](pfile_partitions.md)) and a scalar feature-detection function ([`plinking_duck_capabilities`](plinking_duck_capabilities.md)).
 
 ## File Readers
 
@@ -23,6 +23,18 @@ PlinkingDuck provides 12 SQL table functions: 5 file readers and 7 analysis func
 | [`plink_score(path)`](plink_score.md) | `.pgen` | Polygenic risk scoring |
 | [`plink_glm(prefix)`](plink_glm.md) | pfile prefix | Per-variant GWAS regression (linear, logistic, Firth) |
 | `plink_pca(path)` ⚠️ | `.pgen` | Principal component analysis. **Conditional — see below.** |
+
+## Utility Functions
+
+| Function | Input | Description |
+|----------|-------|-------------|
+| [`pfile_partitions(prefix)`](pfile_partitions.md) | pfile prefix (single or list) | Half-open `[lo, hi)` ordinal-range partitions over the variants dimension, for chunked/parallel reads |
+
+## Scalar Functions
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| [`plinking_duck_capabilities()`](plinking_duck_capabilities.md) | `VARCHAR[]` | Capability tokens this build supports, for SQL feature detection |
 
 ### `plink_pca` is conditional on Eigen3
 

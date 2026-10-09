@@ -648,7 +648,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 void RegisterPsamReader(ExtensionLoader &loader) {
 	TableFunction read_psam("read_psam", {LogicalType::VARCHAR}, PsamScan, PsamBind, PsamInitGlobal, PsamInitLocal);
 	read_psam.projection_pushdown = true;
-	RegisterTableWithDesc(loader, read_psam, {"path"}, "Read PLINK .psam or .fam sample files into tabular format.",
+	RegisterTableWithDesc(loader, read_psam, {}, "Read PLINK .psam or .fam sample files into tabular format.",
 	                      {"SELECT * FROM read_psam('data/cohort.psam')"});
 }
 

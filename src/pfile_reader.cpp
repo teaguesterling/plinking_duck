@@ -440,6 +440,16 @@ struct PfileBindData : public TableFunctionData {
 	// The effective variant list (region ∩ variants) lives on each PfileSource.
 	bool has_variant_filter = false;
 
+	// Variant-range filtering — the `variant_range := [lo, hi)` named param. A
+	// half-open range in VARIANT ORDINAL SPACE (the same 0-based original pgen index
+	// that __ordinal / ResolveVariantIdx report), NOT genomic base pairs (that is
+	// `region :=`). Single-file only (rejected for a multi-file list, like variants).
+	// Applied by post-filtering each source's effective variant list in bind, so it
+	// composes with region/variants and every variant-orient genotype mode for free.
+	bool has_variant_range = false;
+	int64_t variant_range_lo = 0; // inclusive
+	int64_t variant_range_hi = 0; // exclusive
+
 	// Count-based filtering (af_range, ac_range)
 	CountFilter count_filter;
 	unique_ptr<SampleSubset> count_filter_subset; // shared bind-time subset for PgrGetCounts
@@ -490,6 +500,15 @@ struct PfileBindData : public TableFunctionData {
 	const PfileSource &Primary() const {
 		return sources[0];
 	}
+
+	// When true, an extra BIGINT "__ordinal" column is appended to the output,
+	// carrying each variant's 0-based index in the pgen/pvar natural order
+	// (i.e. source.ResolveVariantIdx(effective_pos) — the ORIGINAL index, not the
+	// scan position). Only supported for orient := 'variant'; other orient modes
+	// are rejected in bind. For a multi-file list the ordinal is per-source (each
+	// shard restarts at 0), matching the per-shard variant index.
+	bool with_ordinal = false;
+	idx_t ordinal_col_idx = 0; // schema index of "__ordinal" (valid when with_ordinal)
 
 	// --- Default mode column indices ---
 	static constexpr idx_t CHROM_COL = 0;
@@ -941,11 +960,24 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			bind_data->region = ParseRegion(kv.second.GetValue<string>());
 		} else if (kv.first == "combine_samples") {
 			bind_data->combine_samples = ResolveCombineSamplesMode(kv.second.GetValue<string>());
+		} else if (kv.first == "with_ordinal") {
+			if (!kv.second.IsNull()) {
+				bind_data->with_ordinal = kv.second.GetValue<bool>();
+			}
 		}
 		// samples, variants, genotypes, af_range, ac_range handled after pgenlib init
 	}
 
 	bind_data->orient_mode = ResolveOrientMode(orient_str, "read_pfile");
+
+	// The synthetic ordinal column is only meaningful (and only wired into the
+	// emit path) for variant-orient output, where each row is one variant. The
+	// genotype (tidy) and sample orient modes reshape the output, so reject them
+	// explicitly rather than emit a wrong or unset ordinal.
+	if (bind_data->with_ordinal && bind_data->orient_mode != OrientMode::VARIANT) {
+		throw InvalidInputException(
+		    "read_pfile: with_ordinal := true is only supported with orient := 'variant' (the default)");
+	}
 
 	// Only IMPLICIT and IDENTICAL are implemented; the join modes are reserved.
 	if (bind_data->combine_samples == CombineSamplesMode::UNION ||
@@ -981,12 +1013,64 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			throw InvalidInputException("read_pfile: variants := [...] with a multi-file list is not yet supported; "
 			                            "use region := for selection across files");
 		}
+		// `variant_range` is a half-open [lo, hi) in PER-SOURCE ordinal space (each
+		// shard restarts at 0, like __ordinal). Across a multi-file list a single
+		// range is ambiguous (which shard's ordinals?), so reject it, mirroring
+		// `variants`. The partition consumer calls pfile_partitions per shard and
+		// reads each resolved `source` separately with its own variant_range.
+		auto vr_mf = input.named_parameters.find("variant_range");
+		if (vr_mf != input.named_parameters.end() && !vr_mf->second.IsNull()) {
+			throw InvalidInputException(
+			    "read_pfile: variant_range with a multi-file list is not yet supported (it is per-source ordinal "
+			    "space); read each shard separately (see pfile_partitions' per-source `source` column)");
+		}
 	}
 
 	// Resolve the `variants` param against the variant index below. Multi-file +
 	// `variants` is rejected above, so here it only ever applies to a single source.
 	auto variants_it = input.named_parameters.find("variants");
 	bind_data->has_variant_filter = variants_it != input.named_parameters.end();
+
+	// Parse `variant_range := [lo, hi)` — a half-open range in variant ordinal space.
+	// Multi-file is rejected above, so this only ever applies to a single source.
+	auto vr_it = input.named_parameters.find("variant_range");
+	bind_data->has_variant_range = vr_it != input.named_parameters.end() && !vr_it->second.IsNull();
+	if (bind_data->has_variant_range) {
+		const Value &vr = vr_it->second;
+		if (vr.type().id() != LogicalTypeId::LIST) {
+			throw InvalidInputException(
+			    "read_pfile: variant_range must be a 2-element list [lo, hi) in variant ordinal space (got %s)",
+			    vr.type().ToString());
+		}
+		auto &children = ListValue::GetChildren(vr);
+		if (children.size() != 2) {
+			throw InvalidInputException(
+			    "read_pfile: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
+			    static_cast<unsigned long long>(children.size()));
+		}
+		if (children[0].IsNull() || children[1].IsNull()) {
+			throw InvalidInputException("read_pfile: variant_range bounds must not be NULL");
+		}
+		// Reject non-integer bounds explicitly rather than silently rounding them
+		// (GetValue<int64_t> would round 10.5 -> 10). Every other malformed-input
+		// path on this param errors cleanly, so an out-of-type bound should too.
+		if (!children[0].type().IsIntegral()) {
+			throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
+			                            children[0].ToString());
+		}
+		if (!children[1].type().IsIntegral()) {
+			throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
+			                            children[1].ToString());
+		}
+		bind_data->variant_range_lo = children[0].GetValue<int64_t>();
+		bind_data->variant_range_hi = children[1].GetValue<int64_t>();
+		if (bind_data->variant_range_lo < 0 || bind_data->variant_range_hi < bind_data->variant_range_lo) {
+			throw InvalidInputException(
+			    "read_pfile: variant_range must be a half-open [lo, hi) with 0 <= lo <= hi (got [%lld, %lld))",
+			    static_cast<long long>(bind_data->variant_range_lo),
+			    static_cast<long long>(bind_data->variant_range_hi));
+		}
+	}
 
 	// --- Build sources (one per prefix) ---
 	bind_timer.Note("resolving %llu source(s)", (unsigned long long)prefixes.size());
@@ -1024,6 +1108,43 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 		}
 		BuildEffectiveVariantList(src, bind_data->region, variant_set, bind_data->has_variant_filter);
+
+		// variant_range := [lo, hi) — restrict to variants whose ORIGINAL ordinal
+		// (0-based pgen index, == __ordinal / ResolveVariantIdx) is in [lo, hi).
+		// Applied AFTER BuildEffectiveVariantList — a post-filter on the (sorted,
+		// ascending) effective list — so it cannot miss one of that function's three
+		// branches and silently no-op when combined with region/variants. __ordinal =
+		// ResolveVariantIdx(pos) then yields ABSOLUTE ordinals (e.g. [5,8) -> 5,6,7),
+		// never restarted at 0, for free.
+		if (bind_data->has_variant_range) {
+			// Clamp both bounds to [0, raw_variant_ct]; hi == n is the valid end
+			// boundary of the half-open range. lo >= n or lo >= hi yields an empty set.
+			uint32_t lo = static_cast<uint32_t>(
+			    std::min<int64_t>(bind_data->variant_range_lo, static_cast<int64_t>(src.raw_variant_ct)));
+			uint32_t hi = static_cast<uint32_t>(
+			    std::min<int64_t>(bind_data->variant_range_hi, static_cast<int64_t>(src.raw_variant_ct)));
+			if (!src.has_effective_variant_list) {
+				// No prior filter: build [lo, hi) directly (no full-variant scan).
+				src.has_effective_variant_list = true;
+				src.effective_variant_indices.clear();
+				if (hi > lo) {
+					src.effective_variant_indices.reserve(hi - lo);
+					for (uint32_t v = lo; v < hi; v++) {
+						src.effective_variant_indices.push_back(v);
+					}
+				}
+			} else {
+				// Intersect with an existing region/variants list (sorted ascending).
+				vector<uint32_t> kept;
+				kept.reserve(src.effective_variant_indices.size());
+				for (auto v : src.effective_variant_indices) {
+					if (v >= lo && v < hi) {
+						kept.push_back(v);
+					}
+				}
+				src.effective_variant_indices = std::move(kept);
+			}
+		}
 
 		bind_data->sources.push_back(std::move(src));
 	}
@@ -1928,6 +2049,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
+	// Append the synthetic ordinal column past every other column (including the
+	// per-sample columns of genotypes := 'columns'). It is reachable only in
+	// variant-orient mode (rejected above otherwise), so PfileDefaultScan is the
+	// only scan that needs to fill it.
+	if (bind_data->with_ordinal) {
+		bind_data->ordinal_col_idx = names.size();
+		names.push_back("__ordinal");
+		return_types.push_back(LogicalType::BIGINT);
+	}
+
 	return std::move(bind_data);
 }
 
@@ -2446,6 +2577,16 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 			auto file_col = column_ids[out_col];
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+
+			// Synthetic ordinal: the variant's natural (original) index. vidx is
+			// ResolveVariantIdx(effective_pos), so a variants := [5,6,7] selection
+			// yields 5,6,7 — not renumbered 0,1,2. Must precede the switch below,
+			// whose columns-mode default case would otherwise ignore this index.
+			if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
+				CompatFlatDataMutable<int64_t>(output.data[out_col])[rows_emitted] =
+				    static_cast<int64_t>(vidx);
 				continue;
 			}
 
@@ -3780,6 +3921,189 @@ static void PfileScan(ClientContext &context, TableFunctionInput &data_p, DataCh
 }
 
 // ---------------------------------------------------------------------------
+// pfile_partitions table function
+//
+// Returns the ordinal-range partitions of a pfile along the variants dimension.
+// Output columns: source (resolved .pgen path), dim ('variants' only — samples are
+// unchunked by design), partition_id (0-based within the source), lo/hi (half-open
+// [lo, hi) in VARIANT ORDINAL SPACE, the same 0-based space as read_pfile /
+// read_pvar __ordinal). For a multi-prefix list the partitions are emitted per
+// source; partition_id and the [lo, hi) ordinal space restart at 0 per source
+// (matching read_pfile's per-source __ordinal), and `source` lets a consumer map
+// per-source partitions into a global chunk space when concatenating shards.
+// ---------------------------------------------------------------------------
+
+struct PfilePartitionRow {
+	string source;
+	int64_t partition_id;
+	int64_t lo;
+	int64_t hi;
+};
+
+struct PfilePartitionsBindData : public TableFunctionData {
+	vector<PfilePartitionRow> rows;
+};
+
+struct PfilePartitionsGlobalState : public GlobalTableFunctionState {
+	idx_t emitted = 0;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+//! Resolve one prefix to its .pgen path and read the variant count cheaply from the
+//! pgen header (PgfiInitPhase1 reads only the header — no variant-record scan, no
+//! .pvar/.psam load). This is the SAME count read_pfile uses for its ordinal space
+//! (src.raw_variant_ct), so partitions cover exactly read_pfile's [0, n_variants).
+static uint32_t PfilePartitionsVariantCount(ClientContext &context, FileSystem &fs, const string &prefix,
+                                            string &resolved_pgen_out) {
+	string pgen_path;
+	if (!prefix.empty()) {
+		string resolved = ResolveExistingPath(context, fs, prefix + ".pgen");
+		if (!resolved.empty()) {
+			pgen_path = resolved;
+		} else {
+			resolved = ResolveExistingPath(context, fs, prefix);
+			if (!resolved.empty()) {
+				pgen_path = resolved;
+			} else {
+				throw InvalidInputException("pfile_partitions: cannot find .pgen file for prefix '%s' (tried '%s')",
+				                            prefix, prefix + ".pgen");
+			}
+		}
+	}
+	if (pgen_path.empty()) {
+		throw InvalidInputException("pfile_partitions: no .pgen file path provided");
+	}
+	resolved_pgen_out = pgen_path;
+
+	// Route the header open through the VFS for a remote/VFS path (Path V), matching
+	// LoadPfileSource. No localize: the header read is a tiny range read.
+	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, pgen_path));
+	plink2::PgenFileInfo pgfi;
+	plink2::PreinitPgfi(&pgfi);
+	char errstr_buf[plink2::kPglErrstrBufBlen];
+	plink2::PgenHeaderCtrl header_ctrl;
+	uintptr_t pgfi_alloc_cacheline_ct = 0;
+	plink2::PglErr err = plink2::PgfiInitPhase1(pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX, &header_ctrl, &pgfi,
+	                                            &pgfi_alloc_cacheline_ct, errstr_buf);
+	if (err != plink2::kPglRetSuccess) {
+		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
+		plink2::CleanupPgfi(&pgfi, &cleanup_err);
+		throw IOException("pfile_partitions: failed to open '%s': %s", pgen_path, errstr_buf);
+	}
+	uint32_t n = pgfi.raw_variant_ct;
+	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
+	plink2::CleanupPgfi(&pgfi, &cleanup_err);
+	return n;
+}
+
+//! Default chunk size: min(n_variants / 16, 50000) rounded to the nearest 1000, but
+//! never 0 — a file too small for that formula is a single partition covering [0, n).
+//! Caller guarantees n > 0.
+static int64_t PfilePartitionsDefaultChunkSize(int64_t n) {
+	int64_t raw = n / 16;
+	if (raw > 50000) {
+		raw = 50000;
+	}
+	// Round half-up to the nearest 1000 (integer, deterministic).
+	int64_t cs = ((raw + 500) / 1000) * 1000;
+	if (cs == 0) {
+		cs = n; // tiny file -> one partition [0, n)
+	}
+	return cs;
+}
+
+static unique_ptr<FunctionData> PfilePartitionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<CompatName> &names) {
+	auto bind_data = make_uniq<PfilePartitionsBindData>();
+	auto &fs = FileSystem::GetFileSystem(context);
+
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw InvalidInputException("pfile_partitions: a pfile prefix (or list of prefixes) is required");
+	}
+	vector<string> prefixes = ResolvePathList(input.inputs[0], "pfile_partitions");
+	prefixes = ExpandPathInputs(context, fs, prefixes, "pfile_partitions");
+
+	// Optional chunk_size override (positive integer).
+	bool has_chunk_size = false;
+	int64_t chunk_size_override = 0;
+	auto cs_it = input.named_parameters.find("chunk_size");
+	if (cs_it != input.named_parameters.end() && !cs_it->second.IsNull()) {
+		chunk_size_override = cs_it->second.GetValue<int64_t>();
+		if (chunk_size_override <= 0) {
+			throw InvalidInputException("pfile_partitions: chunk_size must be a positive integer (got %lld)",
+			                            static_cast<long long>(chunk_size_override));
+		}
+		has_chunk_size = true;
+	}
+
+	for (auto &prefix : prefixes) {
+		string resolved_pgen;
+		int64_t n = static_cast<int64_t>(PfilePartitionsVariantCount(context, fs, prefix, resolved_pgen));
+		if (n == 0) {
+			continue; // cover [0, 0) = no partitions (and avoids a divide-by-zero below)
+		}
+		int64_t cs = has_chunk_size ? chunk_size_override : PfilePartitionsDefaultChunkSize(n);
+		int64_t partition_id = 0;
+		for (int64_t lo = 0; lo < n; lo += cs) {
+			int64_t hi = lo + cs;
+			if (hi > n) {
+				hi = n;
+			}
+			bind_data->rows.push_back(PfilePartitionRow {resolved_pgen, partition_id, lo, hi});
+			partition_id++;
+		}
+	}
+
+	names.push_back("source");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("dim");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("partition_id");
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("lo");
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("hi");
+	return_types.push_back(LogicalType::BIGINT);
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> PfilePartitionsInitGlobal(ClientContext &context,
+                                                                      TableFunctionInitInput &input) {
+	return make_uniq<PfilePartitionsGlobalState>();
+}
+
+static void PfilePartitionsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<PfilePartitionsBindData>();
+	auto &gstate = data_p.global_state->Cast<PfilePartitionsGlobalState>();
+
+	const idx_t total = bind_data.rows.size();
+	const idx_t count = MinValue<idx_t>(total - gstate.emitted, STANDARD_VECTOR_SIZE);
+	if (count == 0) {
+		output.SetCardinality(0);
+		return;
+	}
+
+	auto source_data = CompatFlatDataMutable<string_t>(output.data[0]);
+	auto dim_data = CompatFlatDataMutable<string_t>(output.data[1]);
+	auto pid_data = CompatFlatDataMutable<int64_t>(output.data[2]);
+	auto lo_data = CompatFlatDataMutable<int64_t>(output.data[3]);
+	auto hi_data = CompatFlatDataMutable<int64_t>(output.data[4]);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto &row = bind_data.rows[gstate.emitted + i];
+		source_data[i] = StringVector::AddString(output.data[0], row.source);
+		dim_data[i] = StringVector::AddString(output.data[1], "variants");
+		pid_data[i] = row.partition_id;
+		lo_data[i] = row.lo;
+		hi_data[i] = row.hi;
+	}
+	gstate.emitted += count;
+	output.SetCardinality(count);
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -3805,6 +4129,9 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		fn.named_parameters["genotype_range"] = LogicalType::ANY;
 		fn.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
 		fn.named_parameters["combine_samples"] = LogicalType::VARCHAR;
+		fn.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
+		// variant_range := [lo, hi) — ANY so bind can accept a 2-element list.
+		fn.named_parameters["variant_range"] = LogicalType::ANY;
 	};
 
 	TableFunctionSet set("read_pfile");
@@ -3815,8 +4142,27 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	                   PfileInitLocal);
 	add_named_params(many);
 	set.AddFunction(many);
-	RegisterTableSetWithDesc(loader, set, {"files"}, "Read PLINK dataset files into tabular format.",
+	RegisterTableSetWithDesc(loader, set, {}, "Read PLINK dataset files into tabular format.",
 	                         {"SELECT * FROM read_pfile('data/cohort.pgen')"});
+
+	// pfile_partitions: ordinal-range partitions along the variants dimension.
+	// Single-prefix and list-of-prefixes overloads (per-source partitions).
+	auto add_chunk_size = [](TableFunction &fn) {
+		fn.named_parameters["chunk_size"] = LogicalType::BIGINT;
+	};
+	TableFunctionSet part_set("pfile_partitions");
+	TableFunction part_one("pfile_partitions", {LogicalType::VARCHAR}, PfilePartitionsScan, PfilePartitionsBind,
+	                       PfilePartitionsInitGlobal);
+	add_chunk_size(part_one);
+	part_set.AddFunction(part_one);
+	TableFunction part_many("pfile_partitions", {LogicalType::LIST(LogicalType::VARCHAR)}, PfilePartitionsScan,
+	                        PfilePartitionsBind, PfilePartitionsInitGlobal);
+	add_chunk_size(part_many);
+	part_set.AddFunction(part_many);
+	RegisterTableSetWithDesc(
+	    loader, part_set, {},
+	    "Compute the ordinal-range partitions of a pfile along the variants dimension (half-open [lo, hi)).",
+	    {"SELECT * FROM pfile_partitions('data/cohort')"});
 }
 
 } // namespace duckdb
