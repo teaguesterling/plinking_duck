@@ -1385,11 +1385,18 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 	// On a fully-written fileset, rename each staging file onto its final path. The
 	// `.pgen` is renamed LAST on purpose: its absence makes `read_pfile` fail cleanly
 	// (no .pgen), so until it lands the fileset reads as "not there" rather than
-	// half-new. The three renames are NOT atomic as a GROUP — a crash between them can
-	// leave a new .pvar/.psam beside an OLD .pgen, which `read_pfile` catches as a
-	// variant-count mismatch (a clean error, never a silent mis-serve). That residual
-	// window is far smaller than truncating the real targets up front (which is what
-	// staging avoids); we do not claim group-atomicity we do not have.
+	// half-new. The three renames are NOT atomic as a GROUP: a failure between them (these
+	// MoveFile calls are not individually guarded — a throw unwinds into PfileCopyFinalize's
+	// catch, whose CleanupPartial removes only staging, never the finals) can leave a NEW
+	// .pvar/.psam beside an OLD .pgen. When the new fileset has a DIFFERENT variant count
+	// than the old .pgen, `read_pfile` catches that as a variant-count mismatch — a clean
+	// error, never a silent mis-serve. The ONE edge it does not cover: a `.pgen`-rename
+	// failure on a SAME-variant-count overwrite (new .pvar/.psam already promoted, old .pgen
+	// left in place) would serve the new metadata over the old genotypes undetected (the
+	// counts match, so the reader's guard stays silent). That requires an intra-directory
+	// rename(2) to fail on a just-fsync'd file — effectively impossible on a local fs — and
+	// is still strictly better than the pre-staging truncate-in-place, which corrupted the
+	// real targets on ANY mid-write failure. We do not claim the group-atomicity we lack.
 	void PromoteStaging(FileSystem &sysfs) {
 		sysfs.MoveFile(pvar_g.path, pvar_final);
 		sysfs.MoveFile(psam_path, psam_final);

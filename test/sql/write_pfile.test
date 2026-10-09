@@ -198,6 +198,39 @@ SELECT count(*) FROM glob('__TEST_DIR__/ignored_prefix*');
 0
 
 # ===========================================================================
+# `.pfile` SUFFIX STRIPPING — a `TO 'x.pfile'` target yields the companion prefix
+# 'x' (x.pvar/.pgen/.psam), the same as `TO 'x'`. Documented surface (PfilePrefix)
+# that no other case exercised. Assert the three companions land AND that no file
+# literally named 'x.pfile' is created (a naive prefix = target would write
+# 'x.pfile.pvar' / leave 'x.pfile' behind).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/suffixed.pfile' (FORMAT pfile);
+
+# The three companions exist at the stripped prefix 'suffixed'.
+query I
+SELECT count(*) FROM read_pfile('__TEST_DIR__/suffixed');
+----
+4
+
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/suffixed.psam');
+----
+SAMPLE1
+SAMPLE2
+SAMPLE3
+SAMPLE4
+
+# No file named exactly 'suffixed.pfile' (or 'suffixed.pfile.*') was created —
+# the suffix was stripped to the prefix, not appended to.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/suffixed.pfile*');
+----
+0
+
+# ===========================================================================
 # NEGATIVE — the SAMPLE-IDENTITY CONTRACT. A default read_pfile (LIST genotypes,
 # no IIDs) with no identity source → clean BinderException, NO files written.
 # ===========================================================================
