@@ -238,6 +238,38 @@ SELECT count(*) FROM glob('__TEST_DIR__/*ow.pgen.*') WHERE file LIKE '%.tmp' OR 
 0
 
 # ===========================================================================
+# Zero-variant input must fail CLEANLY (never crash) and leave no file. pgenlib
+# cannot finish a 0-variant .pgen (SpgwFinish asserts variant_ct>0 — compiled
+# out in release, then SIGSEGVs). Writer init is deferred to the first sink row
+# for BOTH input shapes, so a zero-row query never opens a file and Finalize
+# throws. The fixed-ARRAY case (read_pfile emits TINYINT[4]) was the crash.
+# ===========================================================================
+
+# Fixed-size ARRAY, zero rows (the historical nondeterministic SIGSEGV).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example') WHERE false)
+TO '__TEST_DIR__/zero_array.pgen' (FORMAT pgen);
+----
+zero variants
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/zero_array.pgen*');
+----
+0
+
+# LIST, zero rows (sample count never determinable) — same clean failure.
+statement error
+COPY (SELECT genotypes FROM (SELECT [0, 1]::TINYINT[] genotypes) WHERE false)
+TO '__TEST_DIR__/zero_list.pgen' (FORMAT pgen);
+----
+zero variants
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/zero_list.pgen*');
+----
+0
+
+# ===========================================================================
 # Negatives — each must THROW a clean, actionable error (not silently proceed).
 # ===========================================================================
 
@@ -295,6 +327,14 @@ COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
 TO 's3://bucket/x.pgen' (FORMAT pgen);
 ----
 not a local path
+
+# --- an implausibly large variant_count (likely typo) rejected at bind --------
+# Guards against silently pre-allocating multiple GB; 4e9 > the 2e9 sanity ceiling.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/bad_vc.pgen' (FORMAT pgen, variant_count 4000000000);
+----
+implausibly large
 
 # ===========================================================================
 # Cleanup-on-failure: a mid-write throw must leave NO partial .pgen (or its

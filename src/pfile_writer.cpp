@@ -422,22 +422,46 @@ CopyFunctionExecutionMode PvarCopyExecMode(bool /*preserve_insertion_order*/, bo
 // target is rejected at bind (P9-001 Decision 6 — a mechanism constraint).
 // ===========================================================================
 
-// pgenlib allocates ~a few bytes per variant in `variant_ct_limit` for the
-// on-the-fly index. 2^24 ≈ 16.7M variants (exome / chip / single-chromosome
-// scale); larger datasets pass `variant_count N`. The sink guard makes an
-// exceeded bound a clean error, so this is safe to exceed, not a silent cap.
+// pgenlib pre-allocates ~1.5 bytes per variant of `variant_ct_limit` for the
+// on-the-fly index (the vrec-length + vrtype buffers). At the 2^24 default that
+// is ~25 MB of address space, but only ~8–10 MB resident in practice (measured
+// maxRSS at 4 and 250 samples). 2^24 ≈ 16.7M variants (exome / chip / single-
+// chromosome scale); larger datasets pass `variant_count N`. The sink guard
+// makes an exceeded bound a clean error, so this is safe to exceed, not a cap.
 constexpr uint32_t kDefaultPgenVariantCtLimit = 1u << 24;
 
-bool PathIsLocalWritable(const string &path) {
-	// raw FILE* target: reject remote (s3/http/gcs/…) and any scheme:// URL
-	// (e.g. pathmacro://). A bare local path (absolute/relative) is writable.
-	if (FileSystem::IsRemoteFile(path)) {
+// Upper sanity bound on the `variant_count` option: a value above this is almost
+// certainly a typo and would reserve multiple GB (~1.5 bytes/variant). 2e9 is
+// comfortably above any real single-file whole-genome variant count (~1e9), and
+// below UINT32_MAX so the cast to variant_ct_limit is safe.
+constexpr uint32_t kMaxPgenVariantCountOption = 2000000000u;
+
+// True iff `path` begins with a URI scheme ("scheme://" where the scheme starts
+// with a letter) — e.g. s3://, http://, pathmacro://. A local filename that
+// merely contains "://" somewhere (not as a leading scheme) is NOT flagged.
+bool HasUriScheme(const string &path) {
+	auto pos = path.find("://");
+	if (pos == string::npos || pos == 0) {
 		return false;
 	}
-	if (path.find("://") != string::npos) {
+	auto is_alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+	if (!is_alpha(path[0])) {
 		return false;
+	}
+	for (idx_t i = 1; i < pos; i++) {
+		char c = path[i];
+		if (!is_alpha(c) && !(c >= '0' && c <= '9') && c != '+' && c != '-' && c != '.') {
+			return false;
+		}
 	}
 	return true;
+}
+
+bool PathIsLocalWritable(const string &path) {
+	// raw FILE* target: reject real remote schemes (s3/http/gcs/… via IsRemoteFile)
+	// and any other leading scheme:// URL (e.g. pathmacro://). A bare local path —
+	// even one whose name happens to contain "://" mid-string — stays writable.
+	return !FileSystem::IsRemoteFile(path) && !HasUriScheme(path);
 }
 
 struct PgenWriteBindData : public FunctionData {
@@ -573,9 +597,16 @@ unique_ptr<FunctionData> PgenCopyBind(ClientContext &, CopyFunctionBindInput &in
 				if (vc <= 0) {
 					throw BinderException("write pgen: variant_count must be a positive integer");
 				}
-				if (static_cast<uint64_t>(vc) > std::numeric_limits<uint32_t>::max()) {
-					throw BinderException("write pgen: variant_count %lld exceeds the .pgen maximum",
-					                      static_cast<long long>(vc));
+				// variant_count is an UPPER BOUND pgenlib pre-allocates against at ~1.5
+				// bytes per variant. Reject an implausibly large value (a likely typo)
+				// that would reserve multiple GB before a single row is seen.
+				if (static_cast<uint64_t>(vc) > kMaxPgenVariantCountOption) {
+					throw BinderException(
+					    "write pgen: variant_count %lld is implausibly large (> %u) — this looks like a typo and would "
+					    "pre-allocate multiple GB (~1.5 bytes per variant of the bound). Pass an upper bound at or below "
+					    "%u (above any real single-file whole-genome variant count), or omit variant_count to stream "
+					    "against the default bound.",
+					    static_cast<long long>(vc), kMaxPgenVariantCountOption, kMaxPgenVariantCountOption);
 				}
 				bind->variant_ct_limit = static_cast<uint32_t>(vc);
 			}
@@ -664,12 +695,17 @@ unique_ptr<GlobalFunctionData> PgenCopyInitGlobal(ClientContext &, FunctionData 
 	g->sample_ct = bind.sample_ct;
 	g->variant_ct_limit = bind.variant_ct_limit;
 
-	// If sample_ct is known from a fixed-size ARRAY type, init the writer now so
-	// even a zero-row query yields a valid empty .pgen. For a LIST input the
-	// sample count is only known from the first row, so defer to the sink.
-	if (bind.sample_ct_known) {
-		PgenEnsureWriterInited(*g, bind.sample_ct);
-	}
+	// Writer init (SpgwInitPhase1/2, which fopens the .pgen + its .tmp sibling) is
+	// DEFERRED to the first sink row for BOTH input shapes — even when sample_ct
+	// is already known from a fixed-size ARRAY type. Two reasons:
+	//   1. A zero-row query then never opens a file, and Finalize fails cleanly
+	//      (pgenlib cannot finish a 0-variant .pgen — SpgwFinish's PwcFinish
+	//      asserts variant_ct, which is compiled out in release and then SIGSEGVs).
+	//   2. An init failure happens INSIDE the sink's try-guard, so CleanupPartial
+	//      removes the partial .pgen/.tmp instead of orphaning them (InitGlobal has
+	//      no try/catch).
+	// sample_ct_known/sample_ct are carried in the global state and used to size
+	// the writer on the first row (so a wrong first-row length is still caught).
 	return std::move(g);
 }
 
@@ -713,8 +749,11 @@ void PgenCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 			idx_t n = calls.size();
 
 			// --- establish / validate the sample count ---
+			// Use the bind-known sample_ct (fixed ARRAY width) when we have it, else
+			// take it from this first row's list length (LIST input).
 			if (!g.writer_inited) {
-				PgenEnsureWriterInited(g, static_cast<uint32_t>(n));
+				uint32_t sc = g.sample_ct_known ? g.sample_ct : static_cast<uint32_t>(n);
+				PgenEnsureWriterInited(g, sc);
 			}
 			if (n != g.sample_ct) {
 				throw InvalidInputException(
@@ -795,11 +834,14 @@ void PgenCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionData
 	if (g.finished) {
 		return;
 	}
-	if (!g.writer_inited) {
-		// Zero rows AND sample_ct never determined (a LIST-typed zero-row query).
-		// No file was opened; a fixed-ARRAY input would have inited in InitGlobal.
-		throw IOException("write pgen: no variants were written and the sample count could not be determined from the "
-		                  "genotypes type — provide a fixed-size genotypes ARRAY (TINYINT[N]) or at least one row");
+	if (!g.writer_inited || g.appended == 0) {
+		// Zero variants. Init is deferred to the first sink row, so normally
+		// !writer_inited here (no file opened). The appended==0 arm is defensive:
+		// never feed vidx=0 to SpgwFinish — pgenlib asserts variant_ct>0 (compiled
+		// out in release) and then SIGSEGVs. Remove any file we did open and fail
+		// cleanly; pgenlib cannot write a 0-variant .pgen.
+		g.CleanupPartial(fs);
+		throw IOException("write pgen: cannot write a .pgen with zero variants — the input query produced no rows");
 	}
 	try {
 		plink2::PglErr e = plink2::SpgwFinish(&g.spgw);
