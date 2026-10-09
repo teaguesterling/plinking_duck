@@ -1,0 +1,370 @@
+# name: test/sql/write_pfile.test
+# description: COPY (query) TO 'prefix' (FORMAT pfile) — the bundled .pvar+.pgen+.psam writer, and standalone FORMAT psam (P9 Phase C)
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# HEADLINE ROUND-TRIP (the acceptance bar). Write the whole fileset from a
+# genotypes:='struct' stream — the STRUCT field names ARE the sample IIDs (the
+# SAMPLE-IDENTITY CONTRACT), the field values (in field order) are the per-sample
+# calls. Read it back and assert equality on DECODED values: the .pvar columns,
+# the genotype matrix, and the IID set/order — NOT a byte diff.
+#
+# The struct::VARCHAR literal block below is the single most discriminating check:
+# it pins field NAMES (IIDs), field ORDER, and values simultaneously, so a dropped
+# sample, a permuted IID order, or a genotype assigned to the wrong sample all show.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/pe' (FORMAT pfile);
+
+# Struct form pins IID names + order + values together (STRUCT field order ==
+# .pgen sample order == .psam IID order must all agree).
+query TT
+SELECT ID, genotypes::VARCHAR FROM read_pfile('__TEST_DIR__/pe', genotypes := 'struct');
+----
+rs1	{'SAMPLE1': 0, 'SAMPLE2': 1, 'SAMPLE3': 2, 'SAMPLE4': NULL}
+rs2	{'SAMPLE1': 1, 'SAMPLE2': 1, 'SAMPLE3': 0, 'SAMPLE4': 2}
+rs3	{'SAMPLE1': 2, 'SAMPLE2': NULL, 'SAMPLE3': 1, 'SAMPLE4': 0}
+rs4	{'SAMPLE1': 0, 'SAMPLE2': 0, 'SAMPLE3': 1, 'SAMPLE4': 2}
+
+# The written .psam carries exactly the struct field names as IIDs, in order
+# (catches a dropped / reordered sample independently of the .pgen).
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/pe.psam');
+----
+SAMPLE1
+SAMPLE2
+SAMPLE3
+SAMPLE4
+
+query I
+SELECT count(*) FROM read_psam('__TEST_DIR__/pe.psam');
+----
+4
+
+# .pvar columns round-trip exactly.
+query TITT
+SELECT CHROM, POS, REF, ALT FROM read_pfile('__TEST_DIR__/pe');
+----
+1	10000	A	G
+1	20000	C	T
+1	30000	G	A
+2	15000	T	C
+
+# Bidirectional EXCEPT == 0 on the decoded plain (LIST) form: variant columns +
+# genotype matrix. (count equal; orig-rt catches dropped/mangled; rt-orig catches
+# fabricated.)
+query III
+SELECT
+  (SELECT count(*) FROM read_pfile('test/data/pfile_example'))
+    = (SELECT count(*) FROM read_pfile('__TEST_DIR__/pe')),
+  (SELECT count(*) FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example')
+     EXCEPT
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/pe'))),
+  (SELECT count(*) FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/pe')
+     EXCEPT
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example')));
+----
+true	0	0
+
+# Bidirectional EXCEPT on the genotype-oriented (ID, IID, genotype) triple —
+# catches a sample<->genotype mis-pairing the variant-oriented EXCEPT is blind to.
+# Only (ID, IID, genotype): FID/SEX are deferred sample_fields, legitimately absent
+# from the IID-only .psam, so they are NOT compared.
+query II
+SELECT
+  (SELECT count(*) FROM (
+     SELECT ID, IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype')
+     EXCEPT
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/pe', orient := 'genotype'))),
+  (SELECT count(*) FROM (
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/pe', orient := 'genotype')
+     EXCEPT
+     SELECT ID, IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype')));
+----
+0	0
+
+# ===========================================================================
+# all_missing — every call is -9/NULL. If the writer dropped missing calls or
+# wrote 0b00 (hom-ref), the struct reads back non-NULL.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/all_missing', genotypes := 'struct'))
+TO '__TEST_DIR__/am' (FORMAT pfile);
+
+query TT
+SELECT ID, genotypes::VARCHAR FROM read_pfile('__TEST_DIR__/am', genotypes := 'struct');
+----
+rs_miss1	{'SAMPLE1': NULL, 'SAMPLE2': NULL}
+rs_miss2	{'SAMPLE1': NULL, 'SAMPLE2': NULL}
+
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/am.psam');
+----
+SAMPLE1
+SAMPLE2
+
+# ===========================================================================
+# pca_example — 250 samples (multi-word genovec: 250 = 7*32 + 26), 500 variants.
+# At this width the struct::VARCHAR literal is unwieldy, so check: counts, the
+# full IID order, and the (ID, IID, genotype) EXCEPT both directions.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'struct'))
+TO '__TEST_DIR__/pca' (FORMAT pfile);
+
+query II
+SELECT (SELECT count(*) FROM read_pfile('__TEST_DIR__/pca')),
+       (SELECT count(*) FROM read_psam('__TEST_DIR__/pca.psam'));
+----
+500	250
+
+# IID set AND positional order identical to the source .psam.
+query I
+SELECT count(*) FROM (
+  SELECT row_number() OVER () rn, IID FROM read_psam('__TEST_DIR__/pca.psam')) a
+JOIN (
+  SELECT row_number() OVER () rn, IID FROM read_psam('test/data/pca_example.psam')) b
+  USING (rn)
+WHERE a.IID IS DISTINCT FROM b.IID;
+----
+0
+
+query II
+SELECT
+  (SELECT count(*) FROM (
+     SELECT ID, IID, genotype FROM read_pfile('test/data/pca_example', orient := 'genotype')
+     EXCEPT
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/pca', orient := 'genotype'))),
+  (SELECT count(*) FROM (
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/pca', orient := 'genotype')
+     EXCEPT
+     SELECT ID, IID, genotype FROM read_pfile('test/data/pca_example', orient := 'genotype')));
+----
+0	0
+
+# ===========================================================================
+# Identity via the `samples` option: a LIST-genotypes input (no struct, no IIDs)
+# + an explicit IID list round-trips with those IIDs.
+# ===========================================================================
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes
+      FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/sm' (FORMAT pfile, samples ['A', 'B', 'C', 'D']);
+
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/sm.psam');
+----
+A
+B
+C
+D
+
+query TT
+SELECT ID, genotypes::VARCHAR FROM read_pfile('__TEST_DIR__/sm', genotypes := 'struct');
+----
+rs1	{'A': 0, 'B': 1, 'C': 2, 'D': NULL}
+rs2	{'A': 1, 'B': 1, 'C': 0, 'D': 2}
+rs3	{'A': 2, 'B': NULL, 'C': 1, 'D': 0}
+rs4	{'A': 0, 'B': 0, 'C': 1, 'D': 2}
+
+# ===========================================================================
+# Path overrides (reader symmetry): pvar/pgen/psam land at the overrides.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/ignored_prefix' (FORMAT pfile,
+  pvar '__TEST_DIR__/ov.pvar', pgen '__TEST_DIR__/ov.pgen', psam '__TEST_DIR__/ov.psam');
+
+query I
+SELECT count(*) FROM read_pgen('__TEST_DIR__/ov.pgen',
+  pvar := '__TEST_DIR__/ov.pvar', psam := '__TEST_DIR__/ov.psam');
+----
+4
+
+# The bare prefix was never written (we only write the three companions).
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/ignored_prefix*');
+----
+0
+
+# ===========================================================================
+# NEGATIVE — the SAMPLE-IDENTITY CONTRACT. A default read_pfile (LIST genotypes,
+# no IIDs) with no identity source → clean BinderException, NO files written.
+# ===========================================================================
+
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes
+      FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/noid' (FORMAT pfile);
+----
+needs sample identity
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/noid*');
+----
+0
+
+# `samples` length != genotype count (LIST input) → clean error, no files left.
+# LIST width is unknown at bind, so this fails at the first row (sink).
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes
+      FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/badn' (FORMAT pfile, samples ['A', 'B']);
+----
+same number of samples
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badn*');
+----
+0
+
+# `samples` length != a FIXED-ARRAY genotypes width (plain read_pfile emits
+# TINYINT[4]) is a bind-time error — caught before any file is opened.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/badarr' (FORMAT pfile, samples ['A', 'B']);
+----
+per-sample slots
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badarr*');
+----
+0
+
+# `samples` list that disagrees with the STRUCT field names → error (explicit
+# `samples` is never silently ignored).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/disagree' (FORMAT pfile, samples ['X', 'Y', 'Z', 'W']);
+----
+does not match
+
+# sample_fields metadata beyond IID → explicit "not yet supported" (never dropped).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/meta' (FORMAT pfile, sample_fields {iid: 'IID', sex: 'SEX'});
+----
+beyond IID is not yet supported
+
+# ===========================================================================
+# LOCAL-ONLY — a remote/scheme prefix is rejected at bind (.pgen involved).
+# ===========================================================================
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO 's3://bucket/out' (FORMAT pfile);
+----
+not a local path
+
+# A remote path OVERRIDE is also rejected (whole fileset must be local).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/loc' (FORMAT pfile, psam 's3://bucket/x.psam');
+----
+not a local path
+
+# ===========================================================================
+# CLEANUP-ON-FAILURE — a mid-write throw must leave NONE of the four siblings
+# (prefix.pvar / prefix.pgen / prefix.pgen.tmp / prefix.psam). DuckDB only
+# auto-removes its single COPY-target path; the bundle removes the rest.
+# ===========================================================================
+
+# (a) pvar (CHROM, POS) monotonicity throw on unsorted input. The .psam was
+# already written at init, the .pvar header too — both must be removed.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY POS DESC)
+TO '__TEST_DIR__/cl_uns' (FORMAT pfile);
+----
+not position-sorted
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/cl_uns*');
+----
+0
+
+# (b) zero-row input: the throw comes from FINALIZE (pgen cannot finish a
+# 0-variant .pgen), a different path than the sink — the .pvar/.psam written at
+# init must still be removed.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') WHERE false)
+TO '__TEST_DIR__/cl_zero' (FORMAT pfile);
+----
+zero variants
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/cl_zero*');
+----
+0
+
+# (c) mid-write sample-count throw (samples length mismatch, LIST input): the
+# .psam (out-of-band, already on disk) + the partial .pgen/.tmp + .pvar removed.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes
+      FROM read_pfile('test/data/pfile_example'))
+TO '__TEST_DIR__/cl_mis' (FORMAT pfile, samples ['A', 'B', 'C']);
+----
+same number of samples
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/cl_mis*');
+----
+0
+
+# ===========================================================================
+# STANDALONE FORMAT psam — minimal IID-only round-trip through read_psam.
+# ===========================================================================
+
+# (a) Row-stream from an IID column (sample-oriented input).
+statement ok
+COPY (SELECT IID FROM read_psam('test/data/pfile_example.psam'))
+TO '__TEST_DIR__/rs.psam' (FORMAT psam);
+
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/rs.psam');
+----
+SAMPLE1
+SAMPLE2
+SAMPLE3
+SAMPLE4
+
+# (b) Out-of-band from a STRUCT genotypes column (field names == IIDs), written
+# once regardless of the variant row stream.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/oob.psam' (FORMAT psam);
+
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/oob.psam');
+----
+SAMPLE1
+SAMPLE2
+SAMPLE3
+SAMPLE4
+
+# (c) Out-of-band from a `samples` list.
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/sl.psam' (FORMAT psam, samples ['P1', 'P2', 'P3']);
+
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/sl.psam');
+----
+P1
+P2
+P3
+
+# Duplicate IID in a row-stream is rejected (read_psam cannot read a dup-IID file).
+statement error
+COPY (SELECT 'DUP' AS IID UNION ALL SELECT 'DUP')
+TO '__TEST_DIR__/dup.psam' (FORMAT psam);
+----
+duplicate IID

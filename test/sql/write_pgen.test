@@ -184,6 +184,20 @@ SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/remap.pgen');
 ----
 E4851E90
 
+# --- STRUCT genotypes (genotypes:='struct') pack identically to the LIST form -
+# The struct's field VALUES (in field order) are the per-sample calls; field order
+# must map to .pgen sample order exactly as the LIST does. Same data bytes as the
+# plain rt.pgen (E4851E90) proves struct field order -> .pgen sample order, with
+# ZERO .psam involvement (the field NAMES/IIDs are irrelevant to the .pgen).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/struct.pgen' (FORMAT pgen);
+
+query T
+SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/struct.pgen');
+----
+E4851E90
+
 # --- variant_count upper bound (>= actual) succeeds --------------------------
 statement ok
 COPY (SELECT * FROM read_pfile('test/data/pfile_example'))
