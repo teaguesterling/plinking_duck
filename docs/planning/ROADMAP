@@ -81,26 +81,45 @@ Cohesive "nicer queries, easier GWAS" release. Moderate effort, no vendored fork
 ## v0.10.0 — the pfile WRITER (headline feature)
 
 The biggest earmarked capability: make plinking_duck **read *and* write**.
-`COPY (SELECT … ORDER BY chrom,pos) TO 'prefix' (FORMAT pfile, variant_fields:={…},
-sample_fields:={…}, genotype_fields:=…)`. Design + both feasibility spikes are
-**green** (`P9-001-writers-design` + `P9-002-writers-implementation-plan`, on the
-archived `feature/reader-completion` branch); build not started. Brings in
-pgenlib's write path (currently excluded), same `FILE*`-local-only constraint as
-the reader (so a remote writer waits, like `localize`).
+`COPY (SELECT … ORDER BY CHROM, POS) TO 'prefix' (FORMAT pfile, variant_fields {…},
+genotype_fields 'genotypes', samples ['IID1', …])`. (COPY options are space-
+separated `KEY value`, **not** `:=` — the COPY parser rejects `:=`, which is the
+table-function argument operator.) Design + both feasibility spikes are **green**
+(`docs/planning/P9-001-writers-design` + `P9-002-writers-implementation-plan`, on
+this branch). Brings in pgenlib's write path (previously excluded), same
+`FILE*`-local-only constraint as the reader (so a remote writer waits, like
+`localize`).
 
-**Modular — write any subset, not just the bundle:**
-- Individual `.pvar` / `.psam` / `.pgen` writers (e.g. `FORMAT pvar`/`psam`/`pgen`,
-  or `write_pvar`/`write_psam`/`write_pgen`) AND the bundled `FORMAT pfile`.
+**Phases A–C SHIPPED on `feat/pgen-writer`:**
+- **`FORMAT pvar`** — text `.pvar` writer with role remapping + carried-through
+  extras + in-stream `(CHROM, POS)` monotonicity check.
+- **`FORMAT pgen`** — binary `.pgen` writer via pgenlib, **biallelic diploid
+  hardcalls** (`LIST`/`ARRAY` or `STRUCT` genotypes), streaming against an upper-
+  bound `variant_count` (default 2²⁴, exceeding it is a clean error).
+- **`FORMAT psam`** — minimal `#IID`-only `.psam` (three IID sources: STRUCT field
+  names > `samples` list > per-row IID column).
+- **`FORMAT pfile`** — the bundle: one COPY → `.pvar` + `.pgen` + `.psam`, with
+  **atomic staging** (a failed overwrite leaves the prior fileset byte-identical)
+  and the **identity-safe** contract (a real `.psam` is written only from explicit
+  identity — struct field names or a `samples` list — never fabricated). Whole
+  fileset is **local-only**.
+
+**Still deferred (named cuts, not oversights):** phased/dosage genotypes;
+multiallelic (a multiallelic site collapses to a biallelic `.pgen`); per-sample
+metadata beyond IID (`sample_fields` beyond `iid` errors); `.pvar` `##` meta lines
+(round-trip is value-equal, not byte-equal); and the later phases below.
+
+**Modular — write any subset, not just the bundle:** the four standalone/bundle
+formats above ship; the following companion/output options remain **deferred**:
 - Options to **also emit companions**: `.pgi` (split index) and/or
   `.pvar.parquet` / `.psam.parquet` (parquet companions), so the output is
   round-trippable by the reader's fast paths.
 
-Build order A→E: CopyFunction scaffold + text `.pvar`/`.psam` writers → `.pgen`
-(+ optional `.pgi`) → pfile bundle (+ optional parquet companions) → shard wrapper
-→ plink-VCF. Only a **plink-flavored** text VCF (biallelic, GT-only, zero-dep) is
-in scope here; **spec-grade VCF/BCF is delegated to duckhts** (below). Its own
-release given the size. *(Could move to v0.9.0 if the writer is the priority over
-ergonomics — the main open sequencing call.)*
+Build order A→E: ✅ A CopyFunction scaffold + text `.pvar`/`.psam` writers → ✅ B
+`.pgen` → ✅ C pfile bundle → **D** shard/partitioned wrapper (deferred) → **E**
+plink-VCF (deferred). Only a **plink-flavored** text VCF (biallelic, GT-only,
+zero-dep) is in scope for E; **spec-grade VCF/BCF is delegated to duckhts**
+(below).
 
 ## Deferred — VCF/BCF export via duckhts (BLOCKED on their write path)
 

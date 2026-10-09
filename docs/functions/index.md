@@ -46,6 +46,22 @@ FROM duckdb_functions()
 WHERE function_name = 'plink_pca';
 ```
 
+## Writing filesets
+
+Beyond reading, PlinkingDuck can **write** PLINK 2 filesets back out of SQL
+through DuckDB **COPY** formats (not table functions, so they are not in the table
+above):
+
+```sql
+COPY (SELECT * FROM read_pfile('in', genotypes := 'struct')) TO 'out' (FORMAT pfile);
+```
+
+`FORMAT pfile` writes a whole fileset (`.pvar` + `.pgen` + `.psam`); `FORMAT pvar`
+/ `pgen` / `psam` write the individual files. See
+[Writing filesets](write_pfile.md) for the options, the sample-identity contract,
+local-only / atomic-overwrite behavior, and the current limitations (biallelic
+hardcalls only).
+
 ## Common Features
 
 All functions support **projection pushdown**: columns not referenced in the query are not computed. For genotype-based functions, this means metadata-only queries skip genotype decoding entirely.

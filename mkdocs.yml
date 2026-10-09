@@ -49,6 +49,7 @@ nav:
       - read_psam: functions/read_psam.md
       - read_pgen: functions/read_pgen.md
       - read_pfile: functions/read_pfile.md
+      - Writing filesets (COPY TO): functions/write_pfile.md
       - plink_freq: functions/plink_freq.md
       - plink_hardy: functions/plink_hardy.md
       - plink_missing: functions/plink_missing.md
