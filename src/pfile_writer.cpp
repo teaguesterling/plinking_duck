@@ -10,6 +10,7 @@
 
 #include <pgenlib_write.h> // STPgenWriter write path (P9 Phase B, FORMAT pgen)
 
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -118,6 +119,16 @@ struct PvarWriteGlobalState : public GlobalFunctionData {
 	string last_chrom;
 	int64_t last_pos = 0;
 	std::set<string> seen_chroms;
+
+	// Per-shard POS extent, for the sharded writer's `.howard.json` `range.POS` (§7.4).
+	// `first_pos` is the running MINIMUM POS and `pos_max` the running MAXIMUM, over the
+	// non-null POS values in this shard. These are TRUE min/max (not first-/last-seen), so a
+	// shard that happens to span more than one CHROM still reports a correct — never
+	// too-narrow — extent: a narrow `range` would wrongly PRUNE a shard the predicate needs
+	// (spec §10 trust model). The non-sharded writers simply never read these.
+	bool has_pos_extent = false;
+	int64_t first_pos = 0;
+	int64_t pos_max = 0;
 
 	//! Close the handle and remove the partial file. Used both on the failure
 	//! path (sink throw) and so cleanup is idempotent. DuckDB only auto-removes
@@ -307,11 +318,12 @@ unique_ptr<LocalFunctionData> PvarCopyInitLocal(ExecutionContext &, FunctionData
 // the (CHROM, POS) monotonicity contract. Throws on disorder / unrepresentable
 // cell; the CALLER owns cleanup-on-failure (so the bundle can remove all
 // siblings, not just the `.pvar`). Shared by the standalone sink and the bundle.
-void PvarWriteChunk(const PvarWriteBindData &bind, PvarWriteGlobalState &g, DataChunk &input) {
+void PvarWriteChunk(const PvarWriteBindData &bind, PvarWriteGlobalState &g, DataChunk &input, idx_t row_begin,
+                    idx_t row_end) {
 	{
 		input.Flatten();
 		string buffer;
-		for (idx_t row = 0; row < input.size(); row++) {
+		for (idx_t row = row_begin; row < row_end; row++) {
 			// --- (CHROM, POS) monotonicity ----------------------------------
 			// A CopyFunction cannot force ORDER BY on its input, and a round-trip
 			// test is blind to disorder (the `.pvar` stays internally consistent).
@@ -345,6 +357,20 @@ void PvarWriteChunk(const PvarWriteBindData &bind, PvarWriteGlobalState &g, Data
 				g.last_chrom = chrom;
 				g.last_pos = pos;
 				g.has_last = true;
+
+				// Running true min/max POS for the per-shard catalog `range` (sharded writer).
+				if (!g.has_pos_extent) {
+					g.first_pos = pos;
+					g.pos_max = pos;
+					g.has_pos_extent = true;
+				} else {
+					if (pos < g.first_pos) {
+						g.first_pos = pos;
+					}
+					if (pos > g.pos_max) {
+						g.pos_max = pos;
+					}
+				}
 			}
 
 			// --- emit the row -----------------------------------------------
@@ -368,7 +394,7 @@ void PvarCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 	auto &g = gstate.Cast<PvarWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
 	try {
-		PvarWriteChunk(bind, g, input);
+		PvarWriteChunk(bind, g, input, 0, input.size());
 	} catch (...) {
 		// Remove the partial file we created before propagating — DuckDB only
 		// auto-removes its single COPY target, not a `pvar` override.
@@ -780,10 +806,11 @@ unique_ptr<LocalFunctionData> PgenCopyInitLocal(ExecutionContext &, FunctionData
 // Append one chunk of variant rows to the `.pgen` (deferred writer init on the
 // first row). Throws on a bad shape/value/overrun; the CALLER owns cleanup (so
 // the bundle removes all siblings). Shared by the standalone sink and the bundle.
-void PgenWriteChunk(const PgenWriteBindData &bind, PgenWriteGlobalState &g, DataChunk &input) {
+void PgenWriteChunk(const PgenWriteBindData &bind, PgenWriteGlobalState &g, DataChunk &input, idx_t row_begin,
+                    idx_t row_end) {
 	{
 		input.Flatten();
-		for (idx_t row = 0; row < input.size(); row++) {
+		for (idx_t row = row_begin; row < row_end; row++) {
 			// --- best-effort multiallelic guard (only when ALT is in the stream) ---
 			// A genotypes-only input carries NO multiallelic signal (PgrGet collapses
 			// a multiallelic site to biallelic 0/1/2/missing). When the natural
@@ -914,7 +941,7 @@ void PgenCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 	auto &g = gstate.Cast<PgenWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
 	try {
-		PgenWriteChunk(bind, g, input);
+		PgenWriteChunk(bind, g, input, 0, input.size());
 	} catch (...) {
 		g.CleanupPartial(fs);
 		throw;
@@ -1324,6 +1351,13 @@ struct PfileWriteBindData : public FunctionData {
 	string pgen_override; //! `pgen` path option (empty -> prefix + ".pgen")
 	string psam_override; //! `psam` path option (empty -> prefix + ".psam")
 
+	//! `shard_by '<col>'` — empty means the plain (single-fileset) bundle. When set, the one
+	//! ordered COPY fans out one pfile per contiguous key value under a hive layout, a single
+	//! shared root `.psam`, and a `.howard.json` catalog (see the sharded block below).
+	string shard_by;
+	idx_t shard_key_input_idx = 0; //! input chunk column index of the shard key
+	string shard_key_header;       //! the key column's name, used as the hive dir label (`<col>=<value>`)
+
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PfileWriteBindData>();
 		r->pvar_bind = unique_ptr_cast<FunctionData, PvarWriteBindData>(pvar_bind->Copy());
@@ -1332,12 +1366,17 @@ struct PfileWriteBindData : public FunctionData {
 		r->pvar_override = pvar_override;
 		r->pgen_override = pgen_override;
 		r->psam_override = psam_override;
+		r->shard_by = shard_by;
+		r->shard_key_input_idx = shard_key_input_idx;
+		r->shard_key_header = shard_key_header;
 		return std::move(r);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PfileWriteBindData>();
 		return pvar_bind->Equals(*o.pvar_bind) && pgen_bind->Equals(*o.pgen_bind) && iids == o.iids &&
-		       pvar_override == o.pvar_override && pgen_override == o.pgen_override && psam_override == o.psam_override;
+		       pvar_override == o.pvar_override && pgen_override == o.pgen_override &&
+		       psam_override == o.psam_override && shard_by == o.shard_by &&
+		       shard_key_input_idx == o.shard_key_input_idx && shard_key_header == o.shard_key_header;
 	}
 };
 
@@ -1427,6 +1466,361 @@ string PfilePrefix(const string &file_path) {
 	return file_path;
 }
 
+// Last path component of `p` (after the final '/' or '\\'); the whole string if neither is present.
+// Used for the sharded writer's dataset name + the relative-path prefix in the catalog, computed
+// identically at bind (the empty-name guard) and at runtime (InitGlobal).
+string PfileBaseName(const string &p) {
+	auto slash = p.find_last_of("/\\");
+	return (slash == string::npos) ? p : p.substr(slash + 1);
+}
+
+// ===========================================================================
+// FORMAT pfile + shard_by — the sharded bundle (Phase D): one ordered COPY fans
+// out one pfile per contiguous key value + one shared root .psam + a .howard.json.
+//
+//   COPY (SELECT … ORDER BY <col>, POS) TO 'out' (FORMAT pfile, shard_by '<col>');
+//
+// We implement PARTITION_BY *semantics* by hand because native PARTITION_BY is
+// unusable for .pgen: it forces preserve_insertion_order=false (its parallel sink
+// interleaves rows), its max_open_files eviction can split one key across files,
+// and it strips the partition column. So the SINGLE ordered COPY rolls shards in
+// the sink: on a <col> transition, finalize+promote the open shard's .pgen/.pvar
+// (atomic per-shard staging, .pgen renamed LAST), then open the next. Input MUST
+// be sorted so each key value is contiguous — a value that reappears after another
+// is rejected (the same contiguity contract the non-sharded .pvar monotonicity
+// enforces, lifted here to the shard key). `variant_count N`, if given, bounds
+// EACH shard (the pgen writer's per-shard global re-arms it — per-chromosome, not
+// genome-wide). Layout (the catalog records it, so the reader never parses paths):
+//   out/<col>=<value>/data.pgen   out/<col>=<value>/data.pvar   (per shard)
+//   out.psam        — one shared copy (supersedes "a .psam per shard")
+//   out.howard.json — the catalog, emitted LAST (the completion marker: a shard
+//                     set without a catalog is incomplete-by-construction).
+// ===========================================================================
+
+// One finalized shard's catalog facts → one `files[]` entry in the .howard.json.
+struct ShardCatalogEntry {
+	string rel_prefix;         //! shard fileset path, NO extension, RELATIVE to the catalog dir
+	string rel_pvar;           //! the shard's own .pvar, relative to the catalog dir
+	uint64_t variant_count = 0;
+	uint64_t start = 0;        //! global half-open [start, stop) variant ordinal (concat axis, §6)
+	uint64_t stop = 0;
+	uint64_t source_ordinal = 0;
+	vector<string> chroms;     //! sorted CHROM values the shard covers (range.CHROM membership)
+	bool has_pos = false;
+	int64_t pos_min = 0;       //! inclusive range.POS [min, max]
+	int64_t pos_max = 0;
+};
+
+// JSON-escape a string for the catalog (RFC 8259: quote, backslash, control chars).
+string JsonEscape(const string &s) {
+	string out;
+	out.reserve(s.size() + 2);
+	for (unsigned char c : s) {
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			if (c < 0x20) {
+				char buf[8];
+				snprintf(buf, sizeof(buf), "\\u%04x", c);
+				out += buf;
+			} else {
+				out += static_cast<char>(c);
+			}
+		}
+	}
+	return out;
+}
+
+struct PfileShardedGlobalState : public GlobalFunctionData {
+	// resolved config (InitGlobal)
+	string shard_dir_root;     //! the shard-tree dir, e.g. "<dir>/out"
+	string shard_dir_basename; //! basename, e.g. "out" (prefix for relative catalog paths + dataset name)
+	string shard_col_label;    //! hive key column label, e.g. "CHROM"
+	string psam_final;         //! "<dir>/out.psam"
+	string psam_staging;       //! "<dir>/out.psam.staging"
+	string psam_rel;           //! "out.psam", relative to the catalog dir
+	string catalog_path;       //! "<dir>/out.howard.json"
+	string dataset_name;       //! diar dataset name (= shard_dir_basename)
+	FileSystem *fs = nullptr;
+	bool finished = false;     //! catalog emitted — destructor must not clean
+	bool cleaned = false;
+
+	// the open shard
+	bool has_active = false;
+	string active_key;
+	unique_ptr<PvarWriteGlobalState> cur_pvar;
+	unique_ptr<PgenWriteGlobalState> cur_pgen;
+	string cur_pvar_final, cur_pvar_staging;
+	string cur_pgen_final, cur_pgen_staging;
+	string cur_rel_prefix, cur_rel_pvar;
+
+	// cross-shard
+	std::set<string> seen_keys;
+	uint64_t running_start = 0;
+	vector<ShardCatalogEntry> entries;
+
+	// Close the open shard's staging (handles + pgenlib + the .staging siblings), WITHOUT
+	// promoting. Leaves already-promoted shards untouched.
+	void CleanupActiveStaging(FileSystem &sysfs) {
+		if (cur_pvar && cur_pvar->handle) {
+			cur_pvar->handle.reset();
+		}
+		if (cur_pgen) {
+			cur_pgen->CleanupPartial(sysfs); // closes STPgenWriter + removes .pgen.staging(+.tmp)
+		}
+		if (cur_pvar) {
+			try {
+				if (!cur_pvar_staging.empty() && sysfs.FileExists(cur_pvar_staging)) {
+					sysfs.RemoveFile(cur_pvar_staging);
+				}
+			} catch (...) {
+			}
+		}
+		has_active = false;
+		cur_pvar.reset();
+		cur_pgen.reset();
+	}
+
+	// Remove ALL staging we created (the open shard's + the shared psam's). NEVER touches a
+	// promoted shard or the catalog — earlier shards are durable-by-design (the reader treats a
+	// missing catalog as "incomplete", so a durable shard set with no catalog reads as absent).
+	void CleanupPartial(FileSystem &sysfs) {
+		if (cleaned) {
+			return;
+		}
+		cleaned = true;
+		CleanupActiveStaging(sysfs);
+		try {
+			if (!psam_staging.empty() && sysfs.FileExists(psam_staging)) {
+				sysfs.RemoveFile(psam_staging);
+			}
+		} catch (...) {
+		}
+	}
+
+	~PfileShardedGlobalState() override {
+		if (!finished && fs) {
+			CleanupPartial(*fs);
+		}
+	}
+};
+
+// Open a fresh shard for `key`: enforce contiguity (reject a reappearing key), create the hive
+// dir, open the .pvar staging + header, and prime the .pgen staging (pgenlib init is deferred to
+// the first appended row, as in the non-sharded bundle). Each shard gets its OWN Pvar/Pgen global
+// state, so the .pvar monotonicity + `seen_chroms` guards and the POS extent reset per shard.
+void PfileShardOpen(PfileShardedGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs, const string &key) {
+	if (g.seen_keys.count(key) != 0) {
+		throw InvalidInputException(
+		    "write pfile: shard_by key '%s=%s' reappears after another value — input is not grouped by the "
+		    "shard key. Add ORDER BY %s, POS to the query so each shard key is contiguous.",
+		    g.shard_col_label, key, g.shard_col_label);
+	}
+	string shard_dir = fs.JoinPath(g.shard_dir_root, g.shard_col_label + "=" + key);
+	fs.CreateDirectoriesRecursive(shard_dir);
+	g.cur_pgen_final = fs.JoinPath(shard_dir, "data.pgen");
+	g.cur_pvar_final = fs.JoinPath(shard_dir, "data.pvar");
+	g.cur_pgen_staging = g.cur_pgen_final + ".staging";
+	g.cur_pvar_staging = g.cur_pvar_final + ".staging";
+	// Relative paths for the catalog (resolved by the loader against the catalog's own dir, which
+	// is the PARENT of out/, §7.2). basename(out)/<col>=<key>/data(.pvar).
+	string rel_dir = g.shard_dir_basename + "/" + g.shard_col_label + "=" + key;
+	g.cur_rel_prefix = rel_dir + "/data";
+	g.cur_rel_pvar = g.cur_rel_prefix + ".pvar";
+
+	g.cur_pvar = make_uniq<PvarWriteGlobalState>();
+	PvarOpenAndWriteHeader(*g.cur_pvar, fs, *bind.pvar_bind, g.cur_pvar_staging);
+
+	g.cur_pgen = make_uniq<PgenWriteGlobalState>();
+	g.cur_pgen->path = g.cur_pgen_staging;
+	g.cur_pgen->sample_ct_known = bind.pgen_bind->sample_ct_known;
+	g.cur_pgen->sample_ct = bind.pgen_bind->sample_ct;
+	g.cur_pgen->variant_ct_limit = bind.pgen_bind->variant_ct_limit; // per-shard bound re-arms here
+
+	g.active_key = key;
+	g.has_active = true;
+	g.seen_keys.insert(key);
+}
+
+// Finalize + promote the open shard, recording its catalog entry. Catalog facts are read from the
+// shard's own writer state BEFORE the staging files are renamed away. .pgen renamed LAST (its
+// absence makes a half-written shard read as "not there", same rationale as the bundle).
+void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
+	PgenFinish(*g.cur_pgen); // a shard opens only on a row, so appended>=1 (never the 0-variant throw)
+	if (g.cur_pvar->handle) {
+		g.cur_pvar->handle->Sync();
+		g.cur_pvar->handle.reset();
+	}
+	ShardCatalogEntry e;
+	e.rel_prefix = g.cur_rel_prefix;
+	e.rel_pvar = g.cur_rel_pvar;
+	e.variant_count = g.cur_pgen->appended;
+	e.start = g.running_start;
+	e.stop = g.running_start + e.variant_count;
+	e.source_ordinal = g.entries.size();
+	for (auto &c : g.cur_pvar->seen_chroms) {
+		e.chroms.push_back(c); // std::set → already sorted ascending
+	}
+	e.has_pos = g.cur_pvar->has_pos_extent;
+	e.pos_min = g.cur_pvar->first_pos;
+	e.pos_max = g.cur_pvar->pos_max;
+
+	fs.MoveFile(g.cur_pvar_staging, g.cur_pvar_final);
+	fs.MoveFile(g.cur_pgen_staging, g.cur_pgen_final); // LAST
+
+	g.running_start = e.stop;
+	g.entries.push_back(std::move(e));
+	g.has_active = false;
+	g.cur_pvar.reset();
+	g.cur_pgen.reset();
+}
+
+// Emit the .howard.json catalog (variant-shards over a shared .psam: concat_dim "variants",
+// shared.psam at the root, one files[] entry per shard). Matches the howard loader's parse_catalog
+// schema (howard/src/howard/core/catalog.py): global half-open partition ordinals tiling [0,total),
+// per-file `pvar` (never a per-file `psam` — that is the shared one), optional `range`.
+void PfileWriteCatalog(PfileShardedGlobalState &g, FileSystem &fs) {
+	string j = "{\n";
+	j += "  \"howard\": 1,\n";
+	j += "  \"dataset\": \"" + JsonEscape(g.dataset_name) + "\",\n";
+	j += "  \"concat_dim\": \"variants\",\n";
+	j += "  \"shared\": { \"psam\": \"" + JsonEscape(g.psam_rel) + "\" },\n";
+	j += "  \"files\": [\n";
+	for (idx_t i = 0; i < g.entries.size(); i++) {
+		auto &e = g.entries[i];
+		j += "    {\n";
+		j += "      \"prefix\": \"" + JsonEscape(e.rel_prefix) + "\",\n";
+		j += "      \"pvar\": \"" + JsonEscape(e.rel_pvar) + "\",\n";
+		j += "      \"partition\": { \"start\": " + std::to_string(e.start) + ", \"stop\": " +
+		     std::to_string(e.stop) + ", \"source_ordinal\": " + std::to_string(e.source_ordinal) + " },\n";
+		j += "      \"range\": { \"CHROM\": [";
+		for (idx_t c = 0; c < e.chroms.size(); c++) {
+			if (c != 0) {
+				j += ", ";
+			}
+			j += "\"" + JsonEscape(e.chroms[c]) + "\"";
+		}
+		j += "]";
+		if (e.has_pos) {
+			j += ", \"POS\": { \"min\": " + std::to_string(e.pos_min) + ", \"max\": " +
+			     std::to_string(e.pos_max) + " }";
+		}
+		j += " }\n";
+		j += "    }";
+		if (i + 1 < g.entries.size()) {
+			j += ",";
+		}
+		j += "\n";
+	}
+	j += "  ]\n";
+	j += "}\n";
+	auto h = fs.OpenFile(g.catalog_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	h->Write(const_cast<char *>(j.data()), j.size());
+	h->Sync();
+	h.reset();
+}
+
+unique_ptr<GlobalFunctionData> PfileShardedInitGlobal(FileSystem &fs, const PfileWriteBindData &bind,
+                                                      const string &file_path) {
+	auto g = make_uniq<PfileShardedGlobalState>();
+	string base = PfilePrefix(file_path); // strips a trailing ".pfile" → "out"
+	g->shard_dir_root = base;
+	g->shard_dir_basename = PfileBaseName(base);
+	g->shard_col_label = bind.shard_key_header;
+	g->psam_final = base + ".psam";
+	g->psam_staging = g->psam_final + ".staging";
+	g->psam_rel = g->shard_dir_basename + ".psam";
+	g->catalog_path = base + ".howard.json";
+	g->dataset_name = g->shard_dir_basename;
+	g->fs = &fs;
+
+	// The ONE shared .psam is written once, now, to staging (identity is out-of-band, fully known
+	// at bind). It lives in the PARENT of out/ (which is the COPY target's dir — assumed to exist);
+	// the out/ hive dirs are created lazily per shard. Promoted at finalize, just before the catalog.
+	try {
+		WritePsamFromIids(fs, g->psam_staging, bind.iids);
+	} catch (...) {
+		g->CleanupPartial(fs);
+		throw;
+	}
+	return std::move(g);
+}
+
+void PfileShardedSink(ExecutionContext &context, const PfileWriteBindData &bind, GlobalFunctionData &gstate,
+                      DataChunk &input) {
+	auto &g = gstate.Cast<PfileShardedGlobalState>();
+	auto &fs = FileSystem::GetFileSystem(context.client);
+	try {
+		input.Flatten();
+		idx_t n = input.size();
+		idx_t row = 0;
+		while (row < n) {
+			auto kv = input.GetValue(bind.shard_key_input_idx, row);
+			if (kv.IsNull()) {
+				throw InvalidInputException(
+				    "write pfile: the shard_by key column '%s' is NULL for a row — a shard key cannot be NULL",
+				    g.shard_col_label);
+			}
+			string key = kv.ToString();
+			// Maximal contiguous run [row, run_end) with the same key, so one Pvar/Pgen write covers it.
+			idx_t run_end = row + 1;
+			while (run_end < n) {
+				auto kv2 = input.GetValue(bind.shard_key_input_idx, run_end);
+				if (kv2.IsNull() || kv2.ToString() != key) {
+					break;
+				}
+				run_end++;
+			}
+			if (!g.has_active || g.active_key != key) {
+				if (g.has_active) {
+					PfileShardClose(g, fs); // promote the previous shard before opening the next
+				}
+				PfileShardOpen(g, bind, fs, key);
+			}
+			PvarWriteChunk(*bind.pvar_bind, *g.cur_pvar, input, row, run_end);
+			PgenWriteChunk(*bind.pgen_bind, *g.cur_pgen, input, row, run_end);
+			row = run_end;
+		}
+	} catch (...) {
+		g.CleanupPartial(fs);
+		throw;
+	}
+}
+
+void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
+	try {
+		if (g.has_active) {
+			PfileShardClose(g, fs); // promote the last shard
+		}
+		if (g.entries.empty()) {
+			// No rows → no shards. An empty `files` array is also rejected by the loader, so there is
+			// nothing valid to emit. Distinct message from the non-sharded "zero variants" throw.
+			throw IOException("write pfile: shard_by produced no shards — the input query returned no rows");
+		}
+		// Promote the shared psam, THEN write the catalog LAST (the completion marker).
+		fs.MoveFile(g.psam_staging, g.psam_final);
+		PfileWriteCatalog(g, fs);
+		g.finished = true;
+	} catch (...) {
+		g.CleanupPartial(fs);
+		throw;
+	}
+}
+
 unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
                                        const vector<LogicalType> &sql_types) {
 	auto bind = make_uniq<PfileWriteBindData>();
@@ -1441,6 +1835,8 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 			bind->psam_override = opt.second[0].ToString();
 		} else if (key == "pgen" && !opt.second.empty() && !opt.second[0].IsNull()) {
 			bind->pgen_override = opt.second[0].ToString();
+		} else if (key == "shard_by" && !opt.second.empty() && !opt.second[0].IsNull()) {
+			bind->shard_by = opt.second[0].ToString();
 		}
 	}
 
@@ -1499,6 +1895,44 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	bind->pgen_bind->sample_ct = static_cast<uint32_t>(bind->iids.size());
 	bind->pgen_bind->sample_ct_known = true;
 
+	// --- shard_by: resolve the key column + guard incompatible options ---
+	if (!bind->shard_by.empty()) {
+		if (!bind->pvar_override.empty() || !bind->pgen_override.empty() || !bind->psam_override.empty()) {
+			throw BinderException("write pfile: shard_by cannot be combined with pvar/pgen/psam path overrides — the "
+			                      "sharded layout generates each shard's paths under the hive tree (out/<col>=<value>/"
+			                      "data.{pgen,pvar}) and one shared root .psam");
+		}
+		idx_t sidx = names.size();
+		for (idx_t i = 0; i < names.size(); i++) {
+			if (StringUtil::CIEquals(names[i], bind->shard_by)) {
+				sidx = i;
+				break;
+			}
+		}
+		if (sidx == names.size()) {
+			throw BinderException("write pfile: shard_by column '%s' is not in the input (available columns: %s)",
+			                      bind->shard_by, StringUtil::Join(names, ", "));
+		}
+		// The shard key must survive into the written fileset so each shard round-trips. CHROM (the
+		// common case) is a required .pvar role → always written; any other scalar key is carried
+		// through as a .pvar column. shard_by the genotypes column would drop the key (it is excluded
+		// from the .pvar) and is meaningless — reject it.
+		if (sidx == bind->pgen_bind->geno_input_idx) {
+			throw BinderException("write pfile: shard_by '%s' is the genotypes column — the shard key must be a scalar "
+			                      "variant column (e.g. CHROM)",
+			                      bind->shard_by);
+		}
+		bind->shard_key_input_idx = sidx;
+		bind->shard_key_header = names[sidx];
+		// A degenerate target with no name component would yield an empty dataset name (the loader
+		// rejects that) and no shard tree. Guard it at bind, before any file is touched.
+		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
+			throw BinderException("write pfile: shard_by target '%s' has no filename component for the shard tree / "
+			                      "dataset name — give the COPY target a name, e.g. TO 'out'",
+			                      input.info.file_path);
+		}
+	}
+
 	(void)context;
 	return std::move(bind);
 }
@@ -1507,6 +1941,9 @@ unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, Funct
                                                    const string &file_path) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (!bind.shard_by.empty()) {
+		return PfileShardedInitGlobal(fs, bind, file_path);
+	}
 	auto g = make_uniq<PfileWriteGlobalState>();
 
 	// Final destinations, and the `.staging` siblings we actually write first (same
@@ -1548,13 +1985,17 @@ unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, FunctionDat
 void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
                    DataChunk &input) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
+	if (!bind.shard_by.empty()) {
+		PfileShardedSink(context, bind, gstate, input);
+		return;
+	}
 	auto &g = gstate.Cast<PfileWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
 	try {
 		// pvar first: its (CHROM, POS) monotonicity check fires here, so unsorted
 		// input throws before any .pgen append — and the catch removes all siblings.
-		PvarWriteChunk(*bind.pvar_bind, g.pvar_g, input);
-		PgenWriteChunk(*bind.pgen_bind, g.pgen_g, input);
+		PvarWriteChunk(*bind.pvar_bind, g.pvar_g, input, 0, input.size());
+		PgenWriteChunk(*bind.pgen_bind, g.pgen_g, input, 0, input.size());
 	} catch (...) {
 		g.CleanupPartial(fs);
 		throw;
@@ -1564,9 +2005,14 @@ void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFun
 void PfileCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
 }
 
-void PfileCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionData &gstate) {
-	auto &g = gstate.Cast<PfileWriteGlobalState>();
+void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (!bind.shard_by.empty()) {
+		PfileShardedFinalize(fs, gstate.Cast<PfileShardedGlobalState>());
+		return;
+	}
+	auto &g = gstate.Cast<PfileWriteGlobalState>();
 	try {
 		// pgen finalize throws on zero variants (pgenlib cannot finish a 0-variant
 		// .pgen) → cleanup removes the staging .pvar/.psam too (finals untouched).
