@@ -221,12 +221,14 @@ SELECT partition_stop FROM read_howard_manifest('test/data/howard_single.pfile.j
 ----
 3000
 
-# An omitted companion stays NULL (matching catalog.py's None), and the .pgen's own discovery
-# resolves it — howard_single.pfile.json declares no pvar/psam, so both columns are NULL.
+# An omitted companion is resolved the way read_pfile discovers it and the RESOLVED path is emitted
+# (so a consumer reads the companion straight from the column). howard_single.pfile.json declares no
+# pvar/psam; large_example has text .pvar/.psam (no parquet sidecar), so both resolve to those files.
 query TT
-SELECT pvar, psam FROM read_howard_manifest('test/data/howard_single.pfile.json');
+SELECT ends_with(pvar, 'large_example.pvar'), ends_with(psam, 'large_example.psam')
+FROM read_howard_manifest('test/data/howard_single.pfile.json');
 ----
-NULL	NULL
+true	true
 
 # chunk_size surfaces the single-fileset catalog's chunks.chunk_size (1000) so howard's
 # _register_single can pass it to register_pgen without re-reading the JSON.

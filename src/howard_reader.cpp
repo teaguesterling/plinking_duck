@@ -909,6 +909,20 @@ static unique_ptr<FunctionData> HowardManifestBind(ClientContext &context, Table
 		}
 	}
 
+	// ---- emit the RESOLVED companion path (output only) ----------------------------------------
+	// For each survivor, replace an OMITTED companion's empty value with the exact file read_pfile
+	// would open (ResolveExistingCompanion: a `<prefix>.pvar` text file, or a `<prefix>.pvar.parquet`
+	// sidecar — whatever read_pfile's discovery picks), so a consumer can read the companion straight
+	// from the column value instead of re-discovering it (and howard's `read_pvar('<prefix>.pvar')`,
+	// which only finds the text form, would miss a bare `.pvar.parquet` sidecar). A declared companion
+	// is returned unchanged; an omitted-and-absent one has already raised `file not found` in verify, so
+	// this never re-introduces an empty value for a shard that got this far. Verify + prune are untouched
+	// — only the output column VALUE changes (NULL → resolved path) for omitted companions.
+	for (auto &e : result->survivors) {
+		e.pvar = ResolveExistingCompanion(context, fs, e.prefix, e.pvar, CompanionKind::PVAR);
+		e.psam = ResolveExistingCompanion(context, fs, e.prefix, e.psam, CompanionKind::PSAM);
+	}
+
 	names = {"dataset",        "concat_dim", "prefix",  "pvar",    "psam",     "partition_start", "partition_stop",
 	         "source_ordinal", "chrom",      "pos_min", "pos_max", "verified", "chunk_size"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,

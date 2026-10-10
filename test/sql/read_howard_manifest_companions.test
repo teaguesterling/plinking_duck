@@ -68,12 +68,14 @@ FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
 ----
 0	3000	0	1,2,3	100	100000	true
 
-# The omitted companion stays NULL in the row (matching catalog.py's None) even though the sidecar was
-# read for the extent — concat_dim is NULL (single-fileset).
+# The omitted companions are emitted as their RESOLVED paths (the exact files read_pfile would open):
+# the variant companion resolves to the `.pvar.parquet` SIDECAR (no text .pvar exists), the sample
+# companion to the text `.psam` the bundle wrote. concat_dim is NULL (single-fileset).
 query TTT
-SELECT concat_dim, pvar, psam FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
+SELECT concat_dim, ends_with(pvar, 'pq_shard.pvar.parquet'), ends_with(psam, 'pq_shard.psam')
+FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
 ----
-NULL	NULL	NULL
+NULL	true	true
 
 # ===========================================================================
 # FIX B (psam side) — an omitted psam that exists ONLY as `<prefix>.psam.parquet` passes the count
@@ -94,8 +96,11 @@ statement ok
 COPY (SELECT '{"howard": 1, "dataset": "pqsam", "pfile": {"prefix": "pqsam_shard"}}' AS j)
 TO '__TEST_DIR__/pqsam_shard.howard.json' (FORMAT csv, HEADER false, QUOTE '');
 
-# The count check passes (probe reads the .psam.parquet sidecar) and the fileset enriches to 3000 variants.
-query IT
-SELECT partition_stop, verified FROM read_howard_manifest('__TEST_DIR__/pqsam_shard.howard.json');
+# The count check passes (probe reads the .psam.parquet sidecar) and the fileset enriches to 3000
+# variants. The omitted psam is emitted as the RESOLVED `.psam.parquet` sidecar path, the omitted pvar
+# as the text `.pvar` the bundle wrote — each the exact file read_pfile would open.
+query ITTT
+SELECT partition_stop, verified, ends_with(pvar, 'pqsam_shard.pvar'), ends_with(psam, 'pqsam_shard.psam.parquet')
+FROM read_howard_manifest('__TEST_DIR__/pqsam_shard.howard.json');
 ----
-3000	true
+3000	true	true	true
