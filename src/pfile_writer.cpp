@@ -103,9 +103,8 @@ struct PvarWriteBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PvarWriteBindData>();
-		return out_headers == o.out_headers && out_source_idx == o.out_source_idx &&
-		       pos_input_idx == o.pos_input_idx && chrom_input_idx == o.chrom_input_idx &&
-		       path_override == o.path_override;
+		return out_headers == o.out_headers && out_source_idx == o.out_source_idx && pos_input_idx == o.pos_input_idx &&
+		       chrom_input_idx == o.chrom_input_idx && path_override == o.path_override;
 	}
 };
 
@@ -282,12 +281,13 @@ unique_ptr<PvarWriteBindData> BuildPvarBind(CopyFunctionBindInput &input, const 
 
 unique_ptr<FunctionData> PvarCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<string> &names,
                                       const vector<LogicalType> &sql_types) {
-	return BuildPvarBind(input, names, sql_types, /*exclude=*/{});
+	return BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
 }
 
 // Open the `.pvar` handle at `path` (overwrite) and write its header line. Shared
 // by the standalone InitGlobal and the bundle. `path` is the resolved file path.
-void PvarOpenAndWriteHeader(PvarWriteGlobalState &g, FileSystem &fs, const PvarWriteBindData &bind, const string &path) {
+void PvarOpenAndWriteHeader(PvarWriteGlobalState &g, FileSystem &fs, const PvarWriteBindData &bind,
+                            const string &path) {
 	g.path = path;
 	// FILE_CREATE_NEW maps to OverwriteExistingFile() -> O_CREAT | O_TRUNC in
 	// LocalFileSystem (not O_EXCL), so re-running overwrites cleanly.
@@ -494,7 +494,9 @@ bool HasUriScheme(const string &path) {
 	if (pos == string::npos || pos == 0) {
 		return false;
 	}
-	auto is_alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+	auto is_alpha = [](char c) {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+	};
 	if (!is_alpha(path[0])) {
 		return false;
 	}
@@ -515,15 +517,15 @@ bool PathIsLocalWritable(const string &path) {
 }
 
 struct PgenWriteBindData : public FunctionData {
-	idx_t geno_input_idx = 0;    //! input chunk column index of the genotypes LIST/ARRAY/STRUCT
+	idx_t geno_input_idx = 0;     //! input chunk column index of the genotypes LIST/ARRAY/STRUCT
 	bool sample_ct_known = false; //! true iff genotypes is a fixed-size ARRAY or STRUCT (N in the type)
-	uint32_t sample_ct = 0;      //! sample count when known at bind
-	bool geno_is_struct = false; //! true iff genotypes column is a STRUCT (field NAMES are IIDs)
-	vector<string> struct_iids;  //! struct field names, in field order (= IIDs) when geno_is_struct
-	bool has_alt = false;        //! an ALT-role column is present (multiallelic guard)
+	uint32_t sample_ct = 0;       //! sample count when known at bind
+	bool geno_is_struct = false;  //! true iff genotypes column is a STRUCT (field NAMES are IIDs)
+	vector<string> struct_iids;   //! struct field names, in field order (= IIDs) when geno_is_struct
+	bool has_alt = false;         //! an ALT-role column is present (multiallelic guard)
 	idx_t alt_input_idx = 0;
 	uint32_t variant_ct_limit = kDefaultPgenVariantCtLimit;
-	string path_override;        //! `pgen` option; empty -> use the COPY target
+	string path_override; //! `pgen` option; empty -> use the COPY target
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PgenWriteBindData>();
@@ -540,15 +542,15 @@ struct PgenWriteBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PgenWriteBindData>();
-		return geno_input_idx == o.geno_input_idx && sample_ct_known == o.sample_ct_known &&
-		       sample_ct == o.sample_ct && geno_is_struct == o.geno_is_struct && struct_iids == o.struct_iids &&
-		       has_alt == o.has_alt && alt_input_idx == o.alt_input_idx &&
-		       variant_ct_limit == o.variant_ct_limit && path_override == o.path_override;
+		return geno_input_idx == o.geno_input_idx && sample_ct_known == o.sample_ct_known && sample_ct == o.sample_ct &&
+		       geno_is_struct == o.geno_is_struct && struct_iids == o.struct_iids && has_alt == o.has_alt &&
+		       alt_input_idx == o.alt_input_idx && variant_ct_limit == o.variant_ct_limit &&
+		       path_override == o.path_override;
 	}
 };
 
 struct PgenWriteGlobalState : public GlobalFunctionData {
-	string path;                 //! path handed to InitGlobal (what pgenlib fopens); for cleanup
+	string path; //! path handed to InitGlobal (what pgenlib fopens); for cleanup
 	plink2::STPgenWriter spgw;
 	AlignedBuffer spgw_alloc;    //! pgenlib's working allocation
 	AlignedBuffer genovec;       //! packed 2-bit genotype buffer (one variant)
@@ -557,8 +559,8 @@ struct PgenWriteGlobalState : public GlobalFunctionData {
 	bool sample_ct_known = false;
 	uint32_t variant_ct_limit = 0;
 	uint64_t appended = 0;
-	bool writer_inited = false;  //! SpgwInitPhase1/2 done (files opened)
-	bool finished = false;       //! SpgwFinish done (don't cleanup a completed file)
+	bool writer_inited = false; //! SpgwInitPhase1/2 done (files opened)
+	bool finished = false;      //! SpgwFinish done (don't cleanup a completed file)
 
 	//! Close pgenlib + remove the partial `.pgen` and its AndCopy `.tmp` sibling.
 	//! Best-effort; never masks the original error.
@@ -566,7 +568,7 @@ struct PgenWriteGlobalState : public GlobalFunctionData {
 		if (writer_inited && !finished) {
 			plink2::PglErr e = plink2::kPglRetSuccess;
 			plink2::CleanupSpgw(&spgw, &e); // closes the FILE*s so the files can be removed
-			finished = true;               // don't let the destructor CleanupSpgw a second time
+			finished = true;                // don't let the destructor CleanupSpgw a second time
 		}
 		if (path.empty()) {
 			return;
@@ -683,7 +685,8 @@ unique_ptr<PgenWriteBindData> BuildPgenBind(CopyFunctionBindInput &input, const 
 				if (static_cast<uint64_t>(vc) > kMaxPgenVariantCountOption) {
 					throw BinderException(
 					    "write pgen: variant_count %lld is implausibly large (> %u) — this looks like a typo and would "
-					    "pre-allocate multiple GB (~1.5 bytes per variant of the bound). Pass an upper bound at or below "
+					    "pre-allocate multiple GB (~1.5 bytes per variant of the bound). Pass an upper bound at or "
+					    "below "
 					    "%u (above any real single-file whole-genome variant count), or omit variant_count to stream "
 					    "against the default bound.",
 					    static_cast<long long>(vc), kMaxPgenVariantCountOption, kMaxPgenVariantCountOption);
@@ -737,8 +740,8 @@ unique_ptr<PgenWriteBindData> BuildPgenBind(CopyFunctionBindInput &input, const 
 		bind->sample_ct = static_cast<uint32_t>(child_types.size());
 		bind->sample_ct_known = true;
 	} else if (tid == LogicalTypeId::ARRAY || tid == LogicalTypeId::LIST) {
-		const LogicalType &child = (tid == LogicalTypeId::ARRAY) ? ArrayType::GetChildType(gtype)
-		                                                         : ListType::GetChildType(gtype);
+		const LogicalType &child =
+		    (tid == LogicalTypeId::ARRAY) ? ArrayType::GetChildType(gtype) : ListType::GetChildType(gtype);
 		ValidateHardcallElem(child, names[gidx]);
 		if (tid == LogicalTypeId::ARRAY) {
 			bind->sample_ct = static_cast<uint32_t>(ArrayType::GetSize(gtype));
@@ -1169,9 +1172,9 @@ enum class PsamWriteMode { OUT_OF_BAND, ROW_STREAM };
 
 struct PsamWriteBindData : public FunctionData {
 	PsamWriteMode mode = PsamWriteMode::ROW_STREAM;
-	vector<string> iids;      //! OUT_OF_BAND: the full IID list (written once at init)
-	idx_t iid_input_idx = 0;  //! ROW_STREAM: input column index of the per-row IID
-	string path_override;     //! `psam` option; empty -> use the COPY target
+	vector<string> iids;     //! OUT_OF_BAND: the full IID list (written once at init)
+	idx_t iid_input_idx = 0; //! ROW_STREAM: input column index of the per-row IID
+	string path_override;    //! `psam` option; empty -> use the COPY target
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PsamWriteBindData>();
@@ -1183,8 +1186,7 @@ struct PsamWriteBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PsamWriteBindData>();
-		return mode == o.mode && iids == o.iids && iid_input_idx == o.iid_input_idx &&
-		       path_override == o.path_override;
+		return mode == o.mode && iids == o.iids && iid_input_idx == o.iid_input_idx && path_override == o.path_override;
 	}
 };
 
@@ -1499,15 +1501,15 @@ string PfileBaseName(const string &p) {
 
 // One finalized shard's catalog facts → one `files[]` entry in the .howard.json.
 struct ShardCatalogEntry {
-	string rel_prefix;         //! shard fileset path, NO extension, RELATIVE to the catalog dir
-	string rel_pvar;           //! the shard's own .pvar, relative to the catalog dir
+	string rel_prefix; //! shard fileset path, NO extension, RELATIVE to the catalog dir
+	string rel_pvar;   //! the shard's own .pvar, relative to the catalog dir
 	uint64_t variant_count = 0;
-	uint64_t start = 0;        //! global half-open [start, stop) variant ordinal (concat axis, §6)
+	uint64_t start = 0; //! global half-open [start, stop) variant ordinal (concat axis, §6)
 	uint64_t stop = 0;
 	uint64_t source_ordinal = 0;
-	vector<string> chroms;     //! sorted CHROM values the shard covers (range.CHROM membership)
+	vector<string> chroms; //! sorted CHROM values the shard covers (range.CHROM membership)
 	bool has_pos = false;
-	int64_t pos_min = 0;       //! inclusive range.POS [min, max]
+	int64_t pos_min = 0; //! inclusive range.POS [min, max]
 	int64_t pos_max = 0;
 };
 
@@ -1556,7 +1558,7 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 	string catalog_path;       //! "<dir>/out.howard.json"
 	string dataset_name;       //! diar dataset name (= shard_dir_basename)
 	FileSystem *fs = nullptr;
-	bool finished = false;     //! catalog emitted — destructor must not clean
+	bool finished = false; //! catalog emitted — destructor must not clean
 	bool cleaned = false;
 
 	// the open shard
@@ -1747,8 +1749,8 @@ void PfileWriteCatalog(PfileShardedGlobalState &g, FileSystem &fs) {
 		j += "    {\n";
 		j += "      \"prefix\": \"" + JsonEscape(e.rel_prefix) + "\",\n";
 		j += "      \"pvar\": \"" + JsonEscape(e.rel_pvar) + "\",\n";
-		j += "      \"partition\": { \"start\": " + std::to_string(e.start) + ", \"stop\": " +
-		     std::to_string(e.stop) + ", \"source_ordinal\": " + std::to_string(e.source_ordinal) + " },\n";
+		j += "      \"partition\": { \"start\": " + std::to_string(e.start) + ", \"stop\": " + std::to_string(e.stop) +
+		     ", \"source_ordinal\": " + std::to_string(e.source_ordinal) + " },\n";
 		j += "      \"range\": { \"CHROM\": [";
 		for (idx_t c = 0; c < e.chroms.size(); c++) {
 			if (c != 0) {
@@ -1758,8 +1760,8 @@ void PfileWriteCatalog(PfileShardedGlobalState &g, FileSystem &fs) {
 		}
 		j += "]";
 		if (e.has_pos) {
-			j += ", \"POS\": { \"min\": " + std::to_string(e.pos_min) + ", \"max\": " +
-			     std::to_string(e.pos_max) + " }";
+			j +=
+			    ", \"POS\": { \"min\": " + std::to_string(e.pos_min) + ", \"max\": " + std::to_string(e.pos_max) + " }";
 		}
 		j += " }\n";
 		j += "    }";
@@ -1863,8 +1865,8 @@ void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
 	}
 }
 
-unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
-                                       const vector<LogicalType> &sql_types) {
+unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+                                       const vector<string> &names, const vector<LogicalType> &sql_types) {
 	auto bind = make_uniq<PfileWriteBindData>();
 
 	// --- path overrides (reader symmetry), parsed first so the local-only check
@@ -1924,8 +1926,7 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	// clearer than deferring to the first-row length check. (For a STRUCT the two
 	// are equal by construction; for a plain LIST sample_ct_known is false and the
 	// check is deferred to the first row.)
-	if (bind->pgen_bind->sample_ct_known &&
-	    bind->pgen_bind->sample_ct != static_cast<uint32_t>(bind->iids.size())) {
+	if (bind->pgen_bind->sample_ct_known && bind->pgen_bind->sample_ct != static_cast<uint32_t>(bind->iids.size())) {
 		throw BinderException("write pfile: the `samples` list has %llu IIDs but the genotypes column has %u "
 		                      "per-sample slots — they must match",
 		                      static_cast<unsigned long long>(bind->iids.size()), bind->pgen_bind->sample_ct);

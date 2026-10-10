@@ -1,8 +1,9 @@
 # name: test/sql/write_pfile_sharded.test
 # description: COPY (query) TO 'out' (FORMAT pfile, shard_by '<col>') — the sharded writer (Phase D):
+# group: [sql]
+
 #   one pfile per contiguous key value under a hive layout, ONE shared root .psam, and a
 #   .howard.json catalog emitted LAST (the write↔read loop with howard's .howard loader).
-# group: [sql]
 
 require plinking_duck
 

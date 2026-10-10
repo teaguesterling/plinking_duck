@@ -542,9 +542,8 @@ static void PvarScan(ClientContext &context, TableFunctionInput &data_p, DataChu
 				if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
 					// Per-file ordinal recorded at bind time (restarts at 0 each file),
 					// NOT the concatenated next_row_idx.
-					output.data[out_col].SetValue(
-					    row_count,
-					    Value::BIGINT(static_cast<int64_t>(bind_data.materialized_ordinals[state.next_row_idx])));
+					output.data[out_col].SetValue(row_count, Value::BIGINT(static_cast<int64_t>(
+					                                             bind_data.materialized_ordinals[state.next_row_idx])));
 					continue;
 				}
 				output.data[out_col].SetValue(row_count, row_values[file_col]);

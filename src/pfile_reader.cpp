@@ -1044,9 +1044,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 		auto &children = ListValue::GetChildren(vr);
 		if (children.size() != 2) {
-			throw InvalidInputException(
-			    "read_pfile: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
-			    static_cast<unsigned long long>(children.size()));
+			throw InvalidInputException("read_pfile: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
+			                            static_cast<unsigned long long>(children.size()));
 		}
 		if (children[0].IsNull() || children[1].IsNull()) {
 			throw InvalidInputException("read_pfile: variant_range bounds must not be NULL");
@@ -2585,8 +2584,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			// yields 5,6,7 — not renumbered 0,1,2. Must precede the switch below,
 			// whose columns-mode default case would otherwise ignore this index.
 			if (bind_data.with_ordinal && file_col == bind_data.ordinal_col_idx) {
-				CompatFlatDataMutable<int64_t>(output.data[out_col])[rows_emitted] =
-				    static_cast<int64_t>(vidx);
+				CompatFlatDataMutable<int64_t>(output.data[out_col])[rows_emitted] = static_cast<int64_t>(vidx);
 				continue;
 			}
 
