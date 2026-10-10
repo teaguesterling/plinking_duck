@@ -1,0 +1,14 @@
+{
+  "howard": 1,
+  "dataset": "wm",
+  "concat_dim": "variants",
+  "shared": { "psam": "large_example.psam" },
+  "files": [
+    {
+      "prefix": "large_example",
+      "pvar": "large_example.pvar",
+      "partition": { "start": 0, "stop": 2999, "source_ordinal": 0 },
+      "range": { "CHROM": ["1", "2", "3"], "POS": { "min": 100, "max": 100000 } }
+    }
+  ]
+}

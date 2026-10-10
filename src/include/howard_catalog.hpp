@@ -74,16 +74,17 @@ struct ShardEntry {
 	}
 };
 
-//! A parsed `.howard` catalog (multi-file / sharded form). `base_dir` is the directory every
-//! path resolved against. Single-fileset (`pfile`) catalogs are NOT handled by the manifest
-//! reader this phase (Phase A); only the multi-file `files` form is.
+//! A parsed `.howard` catalog. `base_dir` is the (absolute) directory every path resolved against.
+//! Both forms are supported: a single-fileset (`pfile`) catalog (`is_single`, empty `concat_dim`,
+//! one entry) and the multi-file / sharded `files` form.
 struct HowardCatalog {
 	int64_t version = 0;
 	string dataset;
 	string base_dir;
-	string concat_dim;  //! "variants" | "samples"
-	string shared_pvar; //! resolved (set when concat_dim == "samples")
-	string shared_psam; //! resolved (set when concat_dim == "variants")
+	bool is_single = false; //! single-fileset ('pfile') catalog — `concat_dim` is empty / NULL downstream
+	string concat_dim;      //! "variants" | "samples" (empty for a single-fileset catalog)
+	string shared_pvar;     //! resolved (set when concat_dim == "samples")
+	string shared_psam;     //! resolved (set when concat_dim == "variants")
 	vector<ShardEntry> files;
 };
 

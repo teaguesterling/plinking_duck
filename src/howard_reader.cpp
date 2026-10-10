@@ -10,6 +10,7 @@
 
 #include "yyjson.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -22,7 +23,7 @@ namespace duckdb {
 // `.howard` READING (the sharded pfile writer owns the WRITE, src/pfile_writer.cpp).
 //
 //   read_howard_manifest(path VARCHAR
-//       [, region := VARCHAR, variant_range := ANY, sample_index := ANY, verify_all := BOOLEAN])
+//       [, region := VARCHAR, variant_index := ANY, sample_index := ANY, verify_all := BOOLEAN])
 //
 // Parses a `.howard.json` with yyjson, resolves every path relative to the catalog's own
 // directory (§7.2), folds the `shared` companion into each shard, prunes shards a predicate
@@ -55,13 +56,19 @@ struct YyDocGuard {
 };
 
 //! Read a JSON integer (yyjson stores non-negative ints as UINT, negatives as SINT; the safe
-//! typed accessors each return 0 for the other subtype, so branch explicitly).
+//! typed accessors each return 0 for the other subtype, so branch explicitly). An unsigned value
+//! that will not fit in int64 is REJECTED (returns false) rather than silently wrapping negative
+//! — the caller turns that into a `catalog parse error` (M3).
 bool JsonGetInt64(yyjson_val *v, int64_t &out) {
 	if (!v) {
 		return false;
 	}
 	if (yyjson_is_uint(v)) {
-		out = static_cast<int64_t>(yyjson_get_uint(v));
+		uint64_t u = yyjson_get_uint(v);
+		if (u > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+			return false; // out of int64 range -> parse error upstream
+		}
+		out = static_cast<int64_t>(u);
 		return true;
 	}
 	if (yyjson_is_sint(v)) {
@@ -73,8 +80,57 @@ bool JsonGetInt64(yyjson_val *v, int64_t &out) {
 
 // ---- path resolution (§7.2) ----------------------------------------------
 
-//! Directory portion of `path` (the catalog's own directory, which shard paths resolve against).
-//! "." when `path` has no separator.
+//! Collapse `.`/`..`/duplicate separators in a POSIX-style path (os.path.normpath semantics, enough
+//! for catalog paths). Preserves a leading `/` (absolute) and a trailing-less form.
+string NormPath(const string &path) {
+	if (path.empty()) {
+		return ".";
+	}
+	bool absolute = path[0] == '/';
+	vector<string> out;
+	size_t i = 0;
+	while (i < path.size()) {
+		size_t j = path.find('/', i);
+		if (j == string::npos) {
+			j = path.size();
+		}
+		string seg = path.substr(i, j - i);
+		i = j + 1;
+		if (seg.empty() || seg == ".") {
+			continue;
+		}
+		if (seg == "..") {
+			if (!out.empty() && out.back() != "..") {
+				out.pop_back();
+			} else if (!absolute) {
+				out.push_back(seg); // keep leading .. on a relative path
+			}
+			continue;
+		}
+		out.push_back(seg);
+	}
+	string joined;
+	for (size_t k = 0; k < out.size(); k++) {
+		if (k != 0) {
+			joined += "/";
+		}
+		joined += out[k];
+	}
+	if (absolute) {
+		return "/" + joined;
+	}
+	return joined.empty() ? "." : joined;
+}
+
+//! Absolute-ize `path` against the process CWD (os.path.abspath), then normalize.
+string AbsPath(FileSystem &fs, const string &path) {
+	if (fs.IsPathAbsolute(path)) {
+		return NormPath(path);
+	}
+	return NormPath(FileSystem::GetWorkingDirectory() + "/" + path);
+}
+
+//! Directory portion of a path. "." when the path has no separator.
 string DirName(const string &path) {
 	auto slash = path.find_last_of("/\\");
 	if (slash == string::npos) {
@@ -87,12 +143,14 @@ string DirName(const string &path) {
 }
 
 //! Resolve a catalog path relative to the catalog's directory by default (§7.2); an absolute path
-//! is honored as-is, and `path_is_relative=false` opts one path out.
+//! is honored as-is, and `path_is_relative=false` opts one path out. The result is always ABSOLUTE
+//! and NORMALIZED (CWD-independent, `..` collapsed), so a consumer can use it as a chunk source path
+//! regardless of its own working directory (I5 / catalog.py `_resolve`).
 string ResolvePath(FileSystem &fs, const string &base_dir, const string &path, bool path_is_relative) {
 	if (!path_is_relative || fs.IsPathAbsolute(path)) {
-		return path;
+		return NormPath(path);
 	}
-	return fs.JoinPath(base_dir, path);
+	return NormPath(fs.JoinPath(base_dir, path));
 }
 
 // ---- SQL quoting ----------------------------------------------------------
@@ -221,7 +279,9 @@ HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &con
 	}
 
 	HowardCatalog cat;
-	cat.base_dir = DirName(path);
+	// Paths resolve relative to the catalog's own directory, ABSOLUTE-ized against CWD (§7.2 /
+	// catalog.py: base_dir = dirname(abspath(path))) so every resolved shard path is CWD-independent.
+	cat.base_dir = DirName(AbsPath(fs, path));
 
 	yyjson_val *ver = yyjson_obj_get(root, "howard");
 	int64_t version = 0;
@@ -245,19 +305,78 @@ HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &con
 	}
 	cat.dataset = yyjson_get_str(ds);
 
-	bool has_pfile = yyjson_obj_get(root, "pfile") != nullptr;
+	yyjson_val *pfile = yyjson_obj_get(root, "pfile");
+	bool has_pfile = pfile != nullptr;
 	bool has_multi = yyjson_obj_get(root, "files") != nullptr || yyjson_obj_get(root, "concat_dim") != nullptr ||
 	                 yyjson_obj_get(root, "shared") != nullptr;
-	if (has_pfile) {
-		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' is a single-fileset "
-		                            "'pfile' catalog; read_howard_manifest handles the multi-file 'files' "
-		                            "form this phase (Phase A)",
+	if (has_pfile && has_multi) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' has both a single-fileset "
+		                            "'pfile' and multi-file ('files'/'concat_dim'/'shared') keys; a catalog is "
+		                            "one or the other",
 		                            path);
 	}
-	if (!has_multi) {
-		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' must declare a "
-		                            "multi-file catalog ('concat_dim' + 'shared' + 'files')",
+	if (!has_pfile && !has_multi) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' must declare either a "
+		                            "'pfile' (single fileset) or 'concat_dim'+'shared'+'files' (multi-file)",
 		                            path);
+	}
+
+	// ---- single-fileset ('pfile') form (catalog.py `_parse_single`) ----
+	// One fileset → one row; `concat_dim` is empty (NULL downstream — the signal howard routes on).
+	// The partition/chrom/pos are not declared here; bind fills them by probing the single `.pvar`.
+	if (has_pfile) {
+		cat.is_single = true;
+		if (!yyjson_is_obj(pfile)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' 'pfile' must be an "
+			                            "object with a 'prefix'",
+			                            path);
+		}
+		yyjson_val *pfx = yyjson_obj_get(pfile, "prefix");
+		if (!pfx || !yyjson_is_str(pfx)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' 'pfile' needs a string "
+			                            "'prefix'",
+			                            path);
+		}
+		// Optional `chunks` {dim, chunk_size} — validated like catalog.py `_parse_single` (only variant
+		// chunking this phase; a positive chunk_size). The value itself is not surfaced in the row (the
+		// coordinator-fixed shape has no chunk_size column), but a malformed one must still be rejected
+		// here so it does not reach the loader unchallenged.
+		yyjson_val *chunks = yyjson_obj_get(root, "chunks");
+		if (chunks) {
+			if (!yyjson_is_obj(chunks)) {
+				throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' 'chunks' must be "
+				                            "an object {dim, chunk_size}",
+				                            path);
+			}
+			yyjson_val *cdim = yyjson_obj_get(chunks, "dim");
+			if (cdim && (!yyjson_is_str(cdim) || string(yyjson_get_str(cdim)) != "variants")) {
+				throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' chunks.dim must "
+				                            "be 'variants' (only variant chunking is supported this phase)",
+				                            path);
+			}
+			yyjson_val *csize = yyjson_obj_get(chunks, "chunk_size");
+			if (csize) {
+				int64_t cs;
+				if (!JsonGetInt64(csize, cs) || cs <= 0) {
+					throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' "
+					                            "chunks.chunk_size must be a positive integer",
+					                            path);
+				}
+			}
+		}
+
+		ShardEntry e;
+		e.prefix = ResolvePath(fs, cat.base_dir, yyjson_get_str(pfx), true);
+		yyjson_val *own_pvar = yyjson_obj_get(pfile, "pvar");
+		yyjson_val *own_psam = yyjson_obj_get(pfile, "psam");
+		// An omitted companion stays EMPTY (→ NULL column, matching catalog.py's `None`): the probe
+		// then lets read_pfile discover it (incl. the `.pvar.parquet`/`.psam.parquet` sidecar and
+		// legacy `.bim`/`.fam`), rather than hardcoding a text path that may not exist.
+		e.pvar = own_pvar ? ResolveCompanion(fs, cat.base_dir, own_pvar, "pfile.pvar") : "";
+		e.psam = own_psam ? ResolveCompanion(fs, cat.base_dir, own_psam, "pfile.psam") : "";
+		// partition/range left at defaults; bind probes the .pvar to fill start=0/stop=count/chrom/pos.
+		cat.files.push_back(std::move(e));
+		return cat;
 	}
 
 	yyjson_val *cd = yyjson_obj_get(root, "concat_dim");
@@ -335,16 +454,16 @@ HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &con
 		ShardEntry e;
 		e.prefix = ResolvePath(fs, cat.base_dir, yyjson_get_str(pfx), true);
 
-		// Each shard's own non-shared companion; fall back to the conventional <prefix>.<ext>.
+		// Each shard's own non-shared companion; an omitted one stays EMPTY (→ NULL column, matching
+		// catalog.py's `None`) so the probe lets read_pfile discover it (incl. a `.parquet` sidecar /
+		// legacy `.bim`/`.fam`). The SHARED companion (always declared) is folded into the other axis.
 		yyjson_val *own_pvar = yyjson_obj_get(fd, "pvar");
 		yyjson_val *own_psam = yyjson_obj_get(fd, "psam");
 		if (is_variants) {
-			e.pvar = own_pvar ? ResolveCompanion(fs, cat.base_dir, own_pvar, (where + ".pvar").c_str())
-			                  : (e.prefix + ".pvar");
+			e.pvar = own_pvar ? ResolveCompanion(fs, cat.base_dir, own_pvar, (where + ".pvar").c_str()) : "";
 			e.psam = cat.shared_psam; // fold the shared companion in
 		} else {
-			e.psam = own_psam ? ResolveCompanion(fs, cat.base_dir, own_psam, (where + ".psam").c_str())
-			                  : (e.prefix + ".psam");
+			e.psam = own_psam ? ResolveCompanion(fs, cat.base_dir, own_psam, (where + ".psam").c_str()) : "";
 			e.pvar = cat.shared_pvar;
 		}
 
@@ -377,8 +496,16 @@ HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &con
 				size_t ci, cmax;
 				yyjson_val *cv;
 				yyjson_arr_foreach(chrom, ci, cmax, cv) {
+					// Coerce every element to string (catalog.py `str(c)`): a numeric
+					// `"CHROM":[1,2,3]` must participate in prune-drop AND under-claim detection, not
+					// be silently dropped to an empty list (I4).
 					if (yyjson_is_str(cv)) {
 						e.chrom.emplace_back(yyjson_get_str(cv));
+					} else {
+						int64_t ci_val;
+						if (JsonGetInt64(cv, ci_val)) {
+							e.chrom.emplace_back(std::to_string(ci_val));
+						}
 					}
 				}
 			}
@@ -394,6 +521,22 @@ HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &con
 		}
 
 		cat.files.push_back(std::move(e));
+	}
+
+	// Canonicalize to ascending partition.start (catalog.py `parse_catalog`): the loader's canonical
+	// order. Two shards sharing a start cannot both be valid — each must occupy a distinct range on
+	// the concat axis — so that is a parse error. (The cross-shard [0, total) tiling/contiguity check
+	// is deliberately NOT done here: it stays in howard, which owns rebasing and re-validates the
+	// registered set — a design seam. This reader asserts only per-shard width + sort + dup-start.)
+	std::sort(cat.files.begin(), cat.files.end(),
+	          [](const ShardEntry &a, const ShardEntry &b) { return a.partition_start < b.partition_start; });
+	for (size_t i = 1; i < cat.files.size(); i++) {
+		if (cat.files[i].partition_start == cat.files[i - 1].partition_start) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' two files declare the "
+			                            "same partition start %lld — each shard must occupy a distinct range on "
+			                            "the '%s' axis",
+			                            path, (long long)cat.files[i].partition_start, cat.concat_dim);
+		}
 	}
 
 	return cat;
@@ -444,27 +587,114 @@ void VerifyCounts(ClientContext &context, FileSystem &fs, const ShardEntry &e) {
 	}
 }
 
-//! Range verify (concat_dim='variants' only): the declared `range` must COVER the shard's real
-//! `.pvar` extent (declared ⊇ actual). An UNDER-claim (a contig/POS the shard holds but `range`
-//! omits) would wrongly drop the shard, so it raises; an over-claim is harmless and passes. A
-//! shard with no `range` is skipped (nothing declared to be stale).
-void VerifyRange(ClientContext &context, const ShardEntry &e, const string &concat_dim) {
-	if (concat_dim != "variants" || !e.has_range) {
-		return;
-	}
-	string pvar = e.pvar.empty() ? (e.prefix + ".pvar") : e.pvar;
+//! Real stats from a shard's own `.pvar` (variants axis): row count, POS extent, and the distinct
+//! CHROM set (coerced to string). One query serves BOTH the width check and the range under-claim
+//! check (and single-file enrichment).
+struct PvarStats {
+	int64_t count = 0;
+	bool has_pos = false;
+	int64_t pos_min = 0;
+	int64_t pos_max = 0;
+	vector<string> chroms;
+};
+
+PvarStats QueryPvarStats(ClientContext &context, const string &pvar, const string &shard_prefix) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
-
-	if (!e.chrom.empty()) {
-		auto res = conn.Query("SELECT DISTINCT CHROM::VARCHAR FROM read_pvar(" + SqlStr(pvar) + ")");
-		if (res->HasError()) {
-			throw InvalidInputException("read_howard_manifest: verification failed (range under-claim): "
-			                            "shard '%s': cannot read .pvar for range check: %s",
-			                            e.prefix, res->GetError());
+	auto res = conn.Query("SELECT count(*), min(POS), max(POS), "
+	                      "list_sort(list_distinct(list(CHROM::VARCHAR))) FROM read_pvar(" +
+	                      SqlStr(pvar) + ")");
+	if (res->HasError()) {
+		throw InvalidInputException("read_howard_manifest: verification failed (companion unreadable): shard "
+		                            "'%s': cannot read .pvar '%s': %s",
+		                            shard_prefix, pvar, res->GetError());
+	}
+	auto row = res->Fetch();
+	PvarStats st;
+	if (row && row->size() != 0) {
+		st.count = row->GetValue(0, 0).GetValue<int64_t>();
+		if (!row->GetValue(1, 0).IsNull()) {
+			st.has_pos = true;
+			st.pos_min = row->GetValue(1, 0).GetValue<int64_t>();
+			st.pos_max = row->GetValue(2, 0).GetValue<int64_t>();
 		}
-		for (auto &row : *res) {
-			string actual = row.GetValue<string>(0);
+		Value chrom_list = row->GetValue(3, 0);
+		if (!chrom_list.IsNull()) {
+			for (auto &c : ListValue::GetChildren(chrom_list)) {
+				if (!c.IsNull()) {
+					st.chroms.push_back(c.GetValue<string>());
+				}
+			}
+		}
+	}
+	return st;
+}
+
+//! Count the rows of a `.psam` (samples axis) for the width check.
+int64_t QueryPsamCount(ClientContext &context, const string &psam, const string &shard_prefix) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto res = conn.Query("SELECT count(*) FROM read_psam(" + SqlStr(psam) + ")");
+	if (res->HasError()) {
+		throw InvalidInputException("read_howard_manifest: verification failed (companion unreadable): shard "
+		                            "'%s': cannot read .psam '%s': %s",
+		                            shard_prefix, psam, res->GetError());
+	}
+	return res->Fetch()->GetValue(0, 0).GetValue<int64_t>();
+}
+
+//! Verify a shard's declared width against its real companion row count, and (variants only) its
+//! declared `range` against the real `.pvar` extent; for a single-fileset catalog, instead ENRICH
+//! the entry from the probed `.pvar` (partition 0..count, source_ordinal 0, chrom/POS).
+//!
+//!  * WIDTH (catalog.py `_verify_partition_tiling`): declared `partition_stop - partition_start`
+//!    MUST equal the real companion count (pvar for variants, psam for samples) — a count mismatch.
+//!    This is why `verified` cannot lie: a wrong declared width is caught here.
+//!  * RANGE under-claim (spec §10): declared `range` must COVER the real `.pvar` extent (⊇). An
+//!    under-claim raises; an over-claim is harmless. A shard with no `range` is skipped.
+void VerifyWidthAndRange(ClientContext &context, ShardEntry &e, const string &concat_dim, bool is_single) {
+	if (concat_dim == "samples") {
+		int64_t real = QueryPsamCount(context, e.psam.empty() ? (e.prefix + ".psam") : e.psam, e.prefix);
+		int64_t width = e.partition_stop - e.partition_start;
+		if (width != real) {
+			throw InvalidInputException("read_howard_manifest: verification failed (count mismatch): shard "
+			                            "'%s': partition declares %lld samples ([%lld, %lld)) but the .psam "
+			                            "has %lld",
+			                            e.prefix, (long long)width, (long long)e.partition_start,
+			                            (long long)e.partition_stop, (long long)real);
+		}
+		return;
+	}
+
+	// variants axis (or single-fileset, counted on the variants axis).
+	PvarStats st = QueryPvarStats(context, e.pvar.empty() ? (e.prefix + ".pvar") : e.pvar, e.prefix);
+
+	if (is_single) {
+		// One fileset: the partition/range are not declared — derive them from the real .pvar.
+		e.partition_start = 0;
+		e.partition_stop = st.count;
+		e.source_ordinal = 0;
+		e.has_range = true;
+		e.chrom = st.chroms;
+		e.has_pos = st.has_pos;
+		e.pos_min = st.pos_min;
+		e.pos_max = st.pos_max;
+		return;
+	}
+
+	int64_t width = e.partition_stop - e.partition_start;
+	if (width != st.count) {
+		throw InvalidInputException("read_howard_manifest: verification failed (count mismatch): shard '%s': "
+		                            "partition declares %lld variants ([%lld, %lld)) but the .pvar has %lld",
+		                            e.prefix, (long long)width, (long long)e.partition_start,
+		                            (long long)e.partition_stop, (long long)st.count);
+	}
+
+	if (!e.has_range) {
+		return;
+	}
+	if (!e.chrom.empty()) {
+		for (auto &actual : st.chroms) {
 			bool declared = false;
 			for (auto &c : e.chrom) {
 				if (c == actual) {
@@ -481,26 +711,12 @@ void VerifyRange(ClientContext &context, const ShardEntry &e, const string &conc
 			}
 		}
 	}
-
-	if (e.has_pos) {
-		auto res = conn.Query("SELECT min(POS), max(POS) FROM read_pvar(" + SqlStr(pvar) + ")");
-		if (res->HasError()) {
-			throw InvalidInputException("read_howard_manifest: verification failed (range under-claim): "
-			                            "shard '%s': cannot read .pvar POS extent: %s",
-			                            e.prefix, res->GetError());
-		}
-		auto row = res->Fetch();
-		if (row && row->size() != 0 && !row->GetValue(0, 0).IsNull()) {
-			int64_t real_min = row->GetValue(0, 0).GetValue<int64_t>();
-			int64_t real_max = row->GetValue(1, 0).GetValue<int64_t>();
-			if (real_min < e.pos_min || real_max > e.pos_max) {
-				throw InvalidInputException(
-				    "read_howard_manifest: verification failed (range under-claim): shard '%s': declared "
-				    "range.POS [%lld, %lld] does not cover the real POS extent [%lld, %lld] — an "
-				    "under-claiming range would wrongly drop this shard (spec §10)",
-				    e.prefix, (long long)e.pos_min, (long long)e.pos_max, (long long)real_min, (long long)real_max);
-			}
-		}
+	if (e.has_pos && st.has_pos && (st.pos_min < e.pos_min || st.pos_max > e.pos_max)) {
+		throw InvalidInputException(
+		    "read_howard_manifest: verification failed (range under-claim): shard '%s': declared range.POS "
+		    "[%lld, %lld] does not cover the real POS extent [%lld, %lld] — an under-claiming range would "
+		    "wrongly drop this shard (spec §10)",
+		    e.prefix, (long long)e.pos_min, (long long)e.pos_max, (long long)st.pos_min, (long long)st.pos_max);
 	}
 }
 
@@ -514,6 +730,7 @@ struct HowardManifestBindData : public TableFunctionData {
 	vector<ShardEntry> survivors;
 	string dataset;
 	string concat_dim;
+	bool is_single = false; //! single-fileset catalog → emit NULL concat_dim (the signal howard routes on)
 };
 
 struct HowardManifestGlobalState : public GlobalTableFunctionState {
@@ -542,84 +759,94 @@ static unique_ptr<FunctionData> HowardManifestBind(ClientContext &context, Table
 	HowardCatalog cat = ParseCatalog(fs, path, content);
 	result->dataset = cat.dataset;
 	result->concat_dim = cat.concat_dim;
+	result->is_single = cat.is_single;
 
-	// ---- predicates ----
-	bool has_region = false, has_variant_range = false, has_sample_index = false, verify_all = false;
-	RegionPredicate region;
-	int64_t idx_lo = 0, idx_hi = 0;
-	bool use_index_prune = false;
-
-	auto np_region = input.named_parameters.find("region");
-	if (np_region != input.named_parameters.end() && !np_region->second.IsNull()) {
-		has_region = true;
-		region = ParseRegionString(np_region->second.GetValue<string>());
-	}
-	auto np_vr = input.named_parameters.find("variant_range");
-	if (np_vr != input.named_parameters.end() && !np_vr->second.IsNull()) {
-		has_variant_range = true;
-	}
-	auto np_si = input.named_parameters.find("sample_index");
-	if (np_si != input.named_parameters.end() && !np_si->second.IsNull()) {
-		has_sample_index = true;
-	}
-	auto np_va = input.named_parameters.find("verify_all");
-	if (np_va != input.named_parameters.end() && !np_va->second.IsNull()) {
-		verify_all = np_va->second.GetValue<bool>();
-	}
-
-	// Wrong-axis coherence (a silently-ignored off-axis predicate would quietly return the whole
-	// cohort — the unsafe failure mode, spec §10.1). Each predicate is valid on exactly one axis.
-	bool is_variants = cat.concat_dim == "variants";
-	if (has_variant_range && !is_variants) {
-		throw InvalidInputException("read_howard_manifest: invalid predicate: variant_range requires "
-		                            "concat_dim='variants', but this catalog is sharded on '%s'",
-		                            cat.concat_dim);
-	}
-	if (has_region && !is_variants) {
-		throw InvalidInputException("read_howard_manifest: invalid predicate: region (genomic) requires "
-		                            "concat_dim='variants', but this catalog is sharded on '%s' (variants "
-		                            "are identical across sample-shards, so a genomic predicate prunes "
-		                            "nothing, spec §10)",
-		                            cat.concat_dim);
-	}
-	if (has_sample_index && is_variants) {
-		throw InvalidInputException("read_howard_manifest: invalid predicate: sample_index requires "
-		                            "concat_dim='samples', but this catalog is sharded on '%s'",
-		                            cat.concat_dim);
-	}
-	if (has_variant_range) {
-		ParseIndexPredicate(np_vr->second, "variant_range", idx_lo, idx_hi);
-		use_index_prune = true;
-	}
-	if (has_sample_index) {
-		ParseIndexPredicate(np_si->second, "sample_index", idx_lo, idx_hi);
-		use_index_prune = true;
-	}
-
-	// ---- verify_all: verify EVERY shard before pruning (closes the dropped-shard hole, §10.1) ----
-	if (verify_all) {
-		for (auto &e : cat.files) {
-			VerifyCounts(context, fs, e);
-			VerifyRange(context, e, cat.concat_dim);
-		}
-	}
-
-	// ---- prune (pure, in C++, via the shared overlap predicates) ----
-	for (auto &e : cat.files) {
-		if (use_index_prune && !e.IndexOverlaps(idx_lo, idx_hi)) {
-			continue;
-		}
-		if (has_region && !e.RangeOverlaps(region.contig, region.pos_lo, region.pos_hi)) {
-			continue;
-		}
+	// ---- single-fileset: one fileset, always the whole candidate (catalog.py prune_files returns
+	// [pfile] for ANY predicate — no pruning, no wrong-axis check). Verify + enrich the one row. ----
+	if (cat.is_single) {
+		auto &e = cat.files[0];
+		VerifyCounts(context, fs, e);
+		VerifyWidthAndRange(context, e, cat.concat_dim, /*is_single=*/true);
 		result->survivors.push_back(e);
-	}
+	} else {
+		// ---- predicates ----
+		bool has_region = false, has_variant_index = false, has_sample_index = false, verify_all = false;
+		RegionPredicate region;
+		int64_t idx_lo = 0, idx_hi = 0;
+		bool use_index_prune = false;
 
-	// ---- verify survivors (default) ----
-	if (!verify_all) {
-		for (auto &e : result->survivors) {
-			VerifyCounts(context, fs, e);
-			VerifyRange(context, e, cat.concat_dim);
+		auto np_region = input.named_parameters.find("region");
+		if (np_region != input.named_parameters.end() && !np_region->second.IsNull()) {
+			has_region = true;
+			region = ParseRegionString(np_region->second.GetValue<string>());
+		}
+		auto np_vi = input.named_parameters.find("variant_index");
+		if (np_vi != input.named_parameters.end() && !np_vi->second.IsNull()) {
+			has_variant_index = true;
+		}
+		auto np_si = input.named_parameters.find("sample_index");
+		if (np_si != input.named_parameters.end() && !np_si->second.IsNull()) {
+			has_sample_index = true;
+		}
+		auto np_va = input.named_parameters.find("verify_all");
+		if (np_va != input.named_parameters.end() && !np_va->second.IsNull()) {
+			verify_all = np_va->second.GetValue<bool>();
+		}
+
+		// Wrong-axis coherence (a silently-ignored off-axis predicate would quietly return the whole
+		// cohort — the unsafe failure mode, spec §10.1). Each predicate is valid on exactly one axis.
+		bool is_variants = cat.concat_dim == "variants";
+		if (has_variant_index && !is_variants) {
+			throw InvalidInputException("read_howard_manifest: invalid predicate: variant_index requires "
+			                            "concat_dim='variants', but this catalog is sharded on '%s'",
+			                            cat.concat_dim);
+		}
+		if (has_region && !is_variants) {
+			throw InvalidInputException("read_howard_manifest: invalid predicate: region (genomic) requires "
+			                            "concat_dim='variants', but this catalog is sharded on '%s' (variants "
+			                            "are identical across sample-shards, so a genomic predicate prunes "
+			                            "nothing, spec §10)",
+			                            cat.concat_dim);
+		}
+		if (has_sample_index && is_variants) {
+			throw InvalidInputException("read_howard_manifest: invalid predicate: sample_index requires "
+			                            "concat_dim='samples', but this catalog is sharded on '%s'",
+			                            cat.concat_dim);
+		}
+		if (has_variant_index) {
+			ParseIndexPredicate(np_vi->second, "variant_index", idx_lo, idx_hi);
+			use_index_prune = true;
+		}
+		if (has_sample_index) {
+			ParseIndexPredicate(np_si->second, "sample_index", idx_lo, idx_hi);
+			use_index_prune = true;
+		}
+
+		// ---- verify_all: verify EVERY shard before pruning (closes the dropped-shard hole, §10.1) ----
+		if (verify_all) {
+			for (auto &e : cat.files) {
+				VerifyCounts(context, fs, e);
+				VerifyWidthAndRange(context, e, cat.concat_dim, /*is_single=*/false);
+			}
+		}
+
+		// ---- prune (pure, in C++, via the shared overlap predicates) ----
+		for (auto &e : cat.files) {
+			if (use_index_prune && !e.IndexOverlaps(idx_lo, idx_hi)) {
+				continue;
+			}
+			if (has_region && !e.RangeOverlaps(region.contig, region.pos_lo, region.pos_hi)) {
+				continue;
+			}
+			result->survivors.push_back(e);
+		}
+
+		// ---- verify survivors (default) ----
+		if (!verify_all) {
+			for (auto &e : result->survivors) {
+				VerifyCounts(context, fs, e);
+				VerifyWidthAndRange(context, e, cat.concat_dim, /*is_single=*/false);
+			}
 		}
 	}
 
@@ -646,7 +873,9 @@ static void HowardManifestScan(ClientContext &context, TableFunctionInput &data_
 	for (idx_t i = 0; i < count; i++) {
 		auto &e = bind.survivors[gstate.row_idx + i];
 		output.data[0].SetValue(i, Value(bind.dataset));
-		output.data[1].SetValue(i, Value(bind.concat_dim));
+		// A single-fileset catalog emits NULL concat_dim — the signal howard routes a whole-fileset
+		// load on, vs a sharded cohort.
+		output.data[1].SetValue(i, bind.is_single ? Value(LogicalType::VARCHAR) : Value(bind.concat_dim));
 		output.data[2].SetValue(i, Value(e.prefix));
 		output.data[3].SetValue(i, e.pvar.empty() ? Value(LogicalType::VARCHAR) : Value(e.pvar));
 		output.data[4].SetValue(i, e.psam.empty() ? Value(LogicalType::VARCHAR) : Value(e.psam));
@@ -677,11 +906,11 @@ void RegisterHowardReader(ExtensionLoader &loader) {
 	TableFunction fn("read_howard_manifest", {LogicalType::VARCHAR}, HowardManifestScan, HowardManifestBind,
 	                 HowardManifestInitGlobal);
 	fn.named_parameters["region"] = LogicalType::VARCHAR;
-	fn.named_parameters["variant_range"] = LogicalType::ANY;
+	fn.named_parameters["variant_index"] = LogicalType::ANY;
 	fn.named_parameters["sample_index"] = LogicalType::ANY;
 	fn.named_parameters["verify_all"] = LogicalType::BOOLEAN;
 	RegisterTableWithDesc(
-	    loader, fn, {"path", "region", "variant_range", "sample_index", "verify_all"},
+	    loader, fn, {"path", "region", "variant_index", "sample_index", "verify_all"},
 	    "Parse, verify, and prune a .howard.json shard catalog, returning one row per surviving shard. "
 	    "The parse+verify+prune surface plinking_duck owns for .howard reading (write side = the sharded "
 	    "pfile writer).",

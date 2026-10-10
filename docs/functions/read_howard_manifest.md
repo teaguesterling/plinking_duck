@@ -15,7 +15,7 @@ for them.
 ```sql
 read_howard_manifest(path VARCHAR
     [, region := VARCHAR,
-       variant_range := ANY,
+       variant_index := ANY,
        sample_index := ANY,
        verify_all := BOOLEAN]) -> TABLE
 ```
@@ -26,14 +26,15 @@ read_howard_manifest(path VARCHAR
 |------|------|---------|-------------|
 | `path` | `VARCHAR` | *(required)* | Path to a multi-file `.howard.json` catalog. Every path inside it resolves **relative to the catalog's own directory** (an absolute path is honored as-is). |
 | `region` | `VARCHAR` | *(none)* | Genomic prune, `'contig:lo-hi'` or a bare `'contig'`. Keeps only shards whose declared `range` could overlap. Valid **only** when `concat_dim = 'variants'`. POS bounds are **inclusive** `[lo, hi]`. |
-| `variant_range` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the variants axis. Keeps shards whose `partition` overlaps the **inclusive** index predicate `[lo, hi]`. Valid **only** when `concat_dim = 'variants'`. |
+| `variant_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the variants axis. Keeps shards whose `partition` overlaps the **inclusive** index predicate `[lo, hi]`. Valid **only** when `concat_dim = 'variants'`. |
 | `sample_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the samples axis, inclusive `[lo, hi]`. Valid **only** when `concat_dim = 'samples'`. |
 | `verify_all` | `BOOLEAN` | `false` | When `true`, verify **every** shard (counts + declared range) *before* pruning, closing the dropped-shard hole; otherwise only the survivors are verified. |
 
-!!! warning "`variant_range` here is INCLUSIVE `[lo, hi]`"
-    `read_pfile`'s `variant_range := [lo, hi)` is **half-open**, but `read_howard_manifest`'s
-    `variant_range` (and `sample_index`) are **inclusive** `[lo, hi]`, to match
-    `WHERE variant_index BETWEEN lo AND hi` and howard's phase-3 index prune. A shard's `partition`
+!!! warning "`variant_index` is INCLUSIVE `[lo, hi]` — not `read_pfile`'s `variant_range`"
+    This function's index param is named `variant_index` (and `sample_index`), deliberately distinct
+    from `read_pfile`'s `variant_range := [lo, hi)`, which is **half-open**. `variant_index` /
+    `sample_index` are **inclusive** `[lo, hi]`, to match `WHERE variant_index BETWEEN lo AND hi` and
+    howard's phase-3 index prune. A shard's `partition`
     is half-open `[start, stop)`, so a shard (holding ordinals `start..stop-1`) survives iff
     `start <= hi AND stop > lo`. Example: `[1000, 1000]` selects only the shard whose partition
     contains ordinal 1000 (`[1000, 2000)`), not `[0, 1000)`.
@@ -43,13 +44,27 @@ read_howard_manifest(path VARCHAR
 Pruning is on **monotonic** coordinates only, and a predicate is valid on exactly one axis (an
 off-axis predicate is an error, never a silent whole-cohort return):
 
-- **Index prune** (`variant_range` / `sample_index`) reads the existing `partition` ordinal range —
+- **Index prune** (`variant_index` / `sample_index`) reads the existing `partition` ordinal range —
   no `range` entry needed, and it is the prune key on **both** axes.
 - **Genomic prune** (`region`, variants only) reads the per-shard `range`: a shard is a candidate iff
   the contig is in its `range.CHROM` list **and** the query POS window intersects its inclusive
   `range.POS` extent. The test is **conservative**: a shard is dropped only when its declared `range`
   *proves* disjointness. A shard with **no `range`** (or a partial one) is **always** a candidate —
   it is never wrongly dropped.
+
+## Single-fileset catalogs
+
+A `.pfile.json` / single-`pfile` catalog (one fileset, no sharding) returns **one row** describing the
+whole fileset: `concat_dim` is `NULL`, `partition_start = 0`, `partition_stop = <probed variant
+count>`, `source_ordinal = 0`, resolved `prefix`/`pvar`/`psam`, and `chrom`/`pos_min`/`pos_max` read
+from the single `.pvar`. A single fileset is always the whole candidate, so a prune predicate is
+accepted and ignored (whole-load) rather than raising a wrong-axis error. A `chunks` object, if
+present, is validated (`dim` must be `variants`; `chunk_size` a positive integer) but is not itself
+surfaced as a column.
+
+An **omitted** companion (`pvar`/`psam` not declared, on any catalog form) resolves to `NULL` in the
+output column, and verification lets `read_pfile`'s own discovery find it — including a
+`.pvar.parquet` / `.psam.parquet` sidecar or a legacy `.bim` / `.fam`.
 
 ## Verification (the trust model)
 
@@ -58,7 +73,8 @@ eagerly at open rather than trusted:
 
 - **Count check** — each surviving shard's `.pgen` header `raw_variant_ct` / `raw_sample_ct` is
   asserted against its companion `.pvar` / `.psam` row counts (the shared companion for the shared
-  axis). A mismatch raises.
+  axis), **and** the declared `partition` width (`partition_stop - partition_start`) must equal the
+  real companion row count. Any mismatch raises — so `verified` is never a lie.
 - **Range check** (variants only) — a surviving shard's declared `range` must **cover** its real
   `.pvar` extent (declared ⊇ actual): every contig the `.pvar` holds must be in `range.CHROM`, and
   the real POS extent must lie within `range.POS`. An **under-claim** raises (it would wrongly drop
@@ -75,7 +91,7 @@ writer-constructed.
 | Column | Type | Description |
 |--------|------|-------------|
 | `dataset` | `VARCHAR` | The catalog's `dataset` name. |
-| `concat_dim` | `VARCHAR` | `'variants'` or `'samples'` — the axis the shards concatenate on. |
+| `concat_dim` | `VARCHAR` | `'variants'` or `'samples'` — the axis the shards concatenate on; **`NULL` for a single-fileset catalog** (the signal a consumer routes a whole-fileset load on). |
 | `prefix` | `VARCHAR` | Resolved fileset path (no extension). |
 | `pvar` | `VARCHAR` | Resolved `.pvar` (the shard's own for variant-shards; the shared one for sample-shards). |
 | `psam` | `VARCHAR` | Resolved `.psam` (the shared one for variant-shards; the shard's own for sample-shards). |
@@ -93,7 +109,7 @@ Errors carry distinct, classifiable message prefixes so a caller can tell failur
 
 | Prefix | Class | Exception |
 |--------|-------|-----------|
-| `read_howard_manifest: catalog parse error: …` | Malformed JSON or schema (incl. a single-fileset `pfile` catalog, out of scope this phase) | `InvalidInputException` |
+| `read_howard_manifest: catalog parse error: …` | Malformed JSON or schema (bad version, missing field, both `pfile` and multi-file keys, duplicate `partition.start`, out-of-range integer) | `InvalidInputException` |
 | `read_howard_manifest: file not found: …` | A referenced catalog / `.pgen` / `.pvar` / `.psam` is missing | `IOException` |
 | `read_howard_manifest: verification failed (count mismatch): …` | A `.pgen` header count disagrees with its companion | `InvalidInputException` |
 | `read_howard_manifest: verification failed (companion unreadable): …` | A companion exists but could not be read (corrupt `.pgen` header, wrong-format `.pvar`/`.psam`) | `InvalidInputException` |
@@ -110,7 +126,7 @@ SELECT * FROM read_howard_manifest('cohort.howard.json');
 SELECT prefix, pvar FROM read_howard_manifest('cohort.howard.json', region := '2:1-5000000');
 
 -- Index prune on the variants axis (inclusive): shards touching variant ordinals 1000..2000.
-SELECT prefix FROM read_howard_manifest('cohort.howard.json', variant_range := [1000, 2000]);
+SELECT prefix FROM read_howard_manifest('cohort.howard.json', variant_index := [1000, 2000]);
 
 -- Strict mode for a hand-written catalog: verify every shard's range before pruning.
 SELECT count(*) FROM read_howard_manifest('cohort.howard.json', region := '7:1-1000000', verify_all := true);
