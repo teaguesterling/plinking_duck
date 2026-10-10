@@ -1,0 +1,101 @@
+# name: test/sql/read_howard_manifest_companions.test
+# description: read_howard_manifest — OMITTED-companion verify: a missing default companion is a
+# group: [sql]
+
+#   MISSING FILE (file not found → CatalogError), not an unreadable one (→ AlignmentError); and an
+#   omitted companion that exists ONLY as a `.pvar.parquet` / `.psam.parquet` sidecar is resolved the
+#   way read_pfile discovers it, so the width/extent + count checks read the sidecar instead of a
+#   hardcoded text path that was never written. Covers the two linked fixes in VerifyCounts /
+#   VerifyWidthAndRange (helper: ResolveExistingCompanion, mirroring pfile_reader.cpp's discovery).
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# FIX A — an OMITTED pvar whose default `<prefix>.pvar` is simply ABSENT (someone moved it) must be a
+# `file not found` (→ CatalogError), NOT `verification failed (companion unreadable)` (→ AlignmentError).
+# Build a shard with .pgen + .psam present but NO variant companion at all: write the bundle with the
+# .pvar redirected to a throwaway path, so `<prefix>.pvar` (and `.pvar.parquet`/`.bim`) never exist.
+# The catalog is authored via the core CSV writer (QUOTE '' → raw bytes), so the test needs no json
+# extension (which is not statically linked / autoloaded in the test harness).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/missing_pvar' (FORMAT pfile, pvar '__TEST_DIR__/missing_pvar_throwaway.pvar');
+
+statement ok
+COPY (SELECT '{"howard": 1, "dataset": "wes_missing_pvar", "pfile": {"prefix": "missing_pvar"}}' AS j)
+TO '__TEST_DIR__/missing_pvar.howard.json' (FORMAT csv, HEADER false, QUOTE '');
+
+statement error
+SELECT * FROM read_howard_manifest('__TEST_DIR__/missing_pvar.howard.json');
+----
+file not found
+
+# The same must NOT regress into a count-mismatch or companion-unreadable message.
+statement error
+SELECT * FROM read_howard_manifest('__TEST_DIR__/missing_pvar.howard.json');
+----
+file not found: .pvar
+
+# ===========================================================================
+# FIX B — a shard whose ONLY variant companion is `<prefix>.pvar.parquet` (text `.pvar` never written,
+# field omitted) must VERIFY and return the correct extent, read FROM the parquet sidecar. Single-fileset
+# form routes through the enrichment branch, so partition_stop / chrom / pos_min / pos_max all come from
+# QueryPvarStats reading the companion — proving the extent came from the sidecar, not from thin air.
+# large_example: 3000 variants, CHROM 1/2/3, POS 100..100000.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pq_shard' (FORMAT pfile, pvar '__TEST_DIR__/pq_shard_throwaway.pvar');
+
+# The only variant companion for pq_shard is this parquet sidecar (no text pq_shard.pvar exists).
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/large_example.pvar'))
+TO '__TEST_DIR__/pq_shard.pvar.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT '{"howard": 1, "dataset": "pq", "pfile": {"prefix": "pq_shard"}}' AS j)
+TO '__TEST_DIR__/pq_shard.howard.json' (FORMAT csv, HEADER false, QUOTE '');
+
+# Verifies (no error) and the extent is read from the parquet sidecar.
+query IIITIIT
+SELECT partition_start, partition_stop, source_ordinal, array_to_string(chrom, ','), pos_min, pos_max, verified
+FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
+----
+0	3000	0	1,2,3	100	100000	true
+
+# The omitted companion stays NULL in the row (matching catalog.py's None) even though the sidecar was
+# read for the extent — concat_dim is NULL (single-fileset).
+query TTT
+SELECT concat_dim, pvar, psam FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
+----
+NULL	NULL	NULL
+
+# ===========================================================================
+# FIX B (psam side) — an omitted psam that exists ONLY as `<prefix>.psam.parquet` passes the count
+# check. Here read_pfile's probe (VerifyCounts) and the omitted-psam existence resolve both discover
+# the `.psam.parquet` sidecar; without the fix the omitted-psam existence check would raise file-not-found.
+# The variant companion is text here (so this isolates the psam/parquet path).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pqsam_shard' (FORMAT pfile, psam '__TEST_DIR__/pqsam_shard_throwaway.psam');
+
+statement ok
+COPY (SELECT * FROM read_psam('test/data/large_example.psam'))
+TO '__TEST_DIR__/pqsam_shard.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT '{"howard": 1, "dataset": "pqsam", "pfile": {"prefix": "pqsam_shard"}}' AS j)
+TO '__TEST_DIR__/pqsam_shard.howard.json' (FORMAT csv, HEADER false, QUOTE '');
+
+# The count check passes (probe reads the .psam.parquet sidecar) and the fileset enriches to 3000 variants.
+query IT
+SELECT partition_stop, verified FROM read_howard_manifest('__TEST_DIR__/pqsam_shard.howard.json');
+----
+3000	true
