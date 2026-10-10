@@ -62,7 +62,7 @@ the **single-fileset** form (`pfile`), never both.
 | `shared` | multi-file | The reused companion: `{ "psam": … }` for variant-shards, `{ "pvar": … }` for sample-shards. |
 | `files` | multi-file | Ordered array of shards; each `{ prefix, <own-companion>, partition, range? }`. |
 | `prefix` | per file | Fileset path with **no** extension (`<prefix>.pgen`/`.pvar`/`.psam`). |
-| `pvar` / `psam` | per file | The shard's **own** non-shared companion (the shared one comes from `shared`). Optional — an omitted companion falls back to the reader's own discovery. |
+| `pvar` / `psam` | per file | The shard's **own** non-shared companion (the shared one comes from `shared`). May be a **text** (`.pvar`/`.psam`) or **parquet** (`.pvar.parquet`/`.psam.parquet`) file. Optional — an omitted companion falls back to the reader's own discovery (see [Path resolution](#path-resolution)). |
 | `partition` | per file | `{ start, stop, source_ordinal }` — the shard's **global half-open** ordinal span on the concat axis (see [below](#partition-and-range)). Required. |
 | `range` | per file | `{ "CHROM": […], "POS": { "min", "max" } }` — the genomic extent, the pruning stat. **Strongly recommended** on every shard (it is the point of a shard catalog) but optional. |
 | `pfile` | single-file | `{ prefix, pvar?, psam? }` for one fileset. |
@@ -88,7 +88,22 @@ directory** by default — so a catalog moves together with its files: copy the
     them against the catalog directory and returns **absolute, normalized** paths,
     so a consumer can use them regardless of its own working directory. `path_is_relative`
     is honored on **companion objects** only; a `prefix` is always taken through
-    relative resolution (an absolute `prefix` is still honored).
+    relative resolution (an absolute `prefix` is still honored). This holds for a
+    parquet companion too: a declared `foo.pvar.parquet`, or a discovered sidecar, is
+    returned as its absolute, normalized path.
+
+### Companion kinds and omitted-companion discovery
+
+A companion may be a **text** PLINK file (`.pvar`/`.bim`, `.psam`/`.fam`) or a **parquet**
+sidecar (`.pvar.parquet`/`.psam.parquet`) — declared explicitly as that path, or **omitted**
+and discovered. An omitted companion is resolved **exactly the way `read_pfile` discovers it**:
+the `.pvar.parquet` / `.psam.parquet` sidecar **first** (parquet-first, when parquet companions
+are enabled), then the native text `.pvar`/`.bim` (or `.psam`/`.fam`). The manifest then **surfaces
+the resolved path** in its `pvar`/`psam` output columns — so a consumer reads the *same* file the
+manifest verified, instead of re-discovering it (and so a bare `.pvar.parquet` sidecar is not missed
+by a text-only `read_pvar('<prefix>.pvar')`). Verification is parquet-aware: the count and extent
+checks read the resolved companion natively. A companion that resolves to **nothing** (no declared
+file, no discoverable default) raises `file not found`.
 
 ### Example — a variant-sharded cohort (`cohort.howard.json`)
 
@@ -182,8 +197,9 @@ are identical across sample-shards — so sample-shards prune on `sample_index` 
 
 A single fileset declares no `partition`/`range` — the reader probes the fileset's
 `.pvar` to fill them (`partition` = `[0, variant_count)`, `source_ordinal` = 0, plus
-the contig set and POS extent). `pvar`/`psam` may be given as overrides; omitted,
-they fall back to `read_pfile`'s own discovery.
+the contig set and POS extent). `pvar`/`psam` may be given as overrides (text or parquet);
+omitted, they fall back to `read_pfile`'s own discovery (parquet sidecar first, then text), and the
+resolved path is surfaced in the output — see [Companion kinds and omitted-companion discovery](#companion-kinds-and-omitted-companion-discovery).
 
 ## The shared-companion invariant
 
@@ -317,6 +333,13 @@ passes `read_howard_manifest` is not guaranteed to be a complete, gapless cohort
 - **`columns`, `record_count`, `file_size_bytes` are not used.** A `columns`
   name-map on a companion object is accepted and ignored; `record_count` /
   `file_size_bytes` staleness stamps are not parsed at all.
+- **Companions may be text or parquet, and an omitted one is resolved — not left to the consumer.**
+  A `.pvar`/`.psam` may be declared as text or as a `.pvar.parquet`/`.psam.parquet` sidecar, and an
+  omitted companion is resolved by `read_pfile`'s discovery order (**parquet-first**, then native).
+  The manifest both **verifies** the resolved companion (parquet-aware) and **surfaces its resolved
+  path** in the output, so the consumer reads the exact file the manifest checked. What is still left
+  to the loader is the companion's *content* beyond the row count and (for `.pvar`) the CHROM/POS
+  extent — PlinkingDuck does not validate every field.
 
 ## See also
 
