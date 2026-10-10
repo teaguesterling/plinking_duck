@@ -10,6 +10,9 @@ shared `.psam`, or sample-shards over a shared `.pvar`); this function is Phase 
 does **not** itself scan genotypes or `ATTACH` — it resolves which shards a query needs and vouches
 for them.
 
+For the catalog format itself — the JSON schema, the boundary law, and the trust model — see the
+[**`.howard` catalog format reference**](../formats/howard.md).
+
 ## Synopsis
 
 ```sql
@@ -51,6 +54,14 @@ off-axis predicate is an error, never a silent whole-cohort return):
   `range.POS` extent. The test is **conservative**: a shard is dropped only when its declared `range`
   *proves* disjointness. A shard with **no `range`** (or a partial one) is **always** a candidate —
   it is never wrongly dropped.
+
+!!! note "Survivor ordinals stay global — no rebasing"
+
+    When a prune drops shards, the surviving rows keep their **original global**
+    `partition_start` / `partition_stop` and `source_ordinal` — this function does **not** rebase the
+    subset to `[0, subset_total)`. (The Python `howard` loader rebases a pruned sub-cohort to a
+    self-contained `[0, …)` index and warns when it does; the SQL manifest does not.) So after a prune
+    the returned ordinals are still positions in the *full* catalog, not a renumbered subset.
 
 ## Single-fileset catalogs
 
@@ -132,3 +143,9 @@ SELECT prefix FROM read_howard_manifest('cohort.howard.json', variant_index := [
 -- Strict mode for a hand-written catalog: verify every shard's range before pruning.
 SELECT count(*) FROM read_howard_manifest('cohort.howard.json', region := '7:1-1000000', verify_all := true);
 ```
+
+## See Also
+
+- [`.howard` catalog format](../formats/howard.md) — the format this function reads (schema, boundary law, trust model)
+- [Writing filesets (`COPY … TO`)](write_pfile.md#sharded-output-shard_by) — the sharded writer that emits the `.howard.json` (the write→read partner)
+- [`read_pfile`](read_pfile.md) — read a surviving shard's genotypes back

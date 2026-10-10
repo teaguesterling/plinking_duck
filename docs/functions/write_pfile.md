@@ -134,8 +134,10 @@ COPY (SELECT … ORDER BY CHROM, POS) TO 'out' (FORMAT pfile, shard_by 'CHROM');
 
 `shard_by '<col>'` writes **one pfile per contiguous value of `<col>`** — the
 common case is sharding a cohort by chromosome — plus **one shared `.psam`** and a
-**`.howard.json` catalog** that the [howard](https://github.com/teaguesterling/howard)
-`.howard` loader reads back as a single concatenated dataset. The layout is:
+**[`.howard.json` catalog](../formats/howard.md)** that
+[`read_howard_manifest`](read_howard_manifest.md) and the Python
+[howard](https://github.com/teaguesterling/howard) loader read back as a single
+concatenated dataset. The layout is:
 
 ```
 out/<col>=<value>/data.pgen      # one fileset per shard (hive-style dir)
@@ -323,6 +325,8 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
 
 ## See Also
 
+- [`.howard` catalog format](../formats/howard.md) — the catalog the sharded writer emits (schema, boundary law, trust model)
+- [read_howard_manifest](read_howard_manifest.md) — read the emitted `.howard.json` back in SQL
 - [read_pfile](read_pfile.md) — read a fileset back (the round-trip partner)
 - [read_pvar](read_pvar.md) · [read_pgen](read_pgen.md) · [read_psam](read_psam.md)
 - [File Handling](../guides/file-handling.md#writing-filesets) — where writing fits
