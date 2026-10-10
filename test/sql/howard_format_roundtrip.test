@@ -1,0 +1,194 @@
+# name: test/sql/howard_format_roundtrip.test
+# description: .howard FORMAT round-trip — the sharded writer emits a catalog, read_howard_manifest
+# group: [sql]
+
+#   reads it back, and the manifest is proven a USABLE INDEX: its declared partition widths and
+#   genomic range are backed by a real read_pfile scan of the very shards it points at, and the
+#   partitions form a gapless [0, total) tiling. This is the end-to-end seam the two component tests
+#   never touch: write_pfile_sharded.test reads shards with HARDCODED paths and asserts the catalog
+#   as TEXT substrings (never calls read_howard_manifest); read_howard_manifest.test asserts manifest
+#   COLUMNS (never reads a genotype). Nothing else proves the catalog round-trips as a working index.
+
+require plinking_duck
+
+# ===========================================================================
+# FIXTURE — large_example (CHROM 1/2/3, 1000 variants each, POS 100..100000, 8 samples), sharded by
+# CHROM. shard_by 'CHROM' → 3 variant-shards over one shared root .psam + one out.howard.json
+# (emitted LAST), tiling the variants axis [0,1000) [1000,2000) [2000,3000).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/out' (FORMAT pfile, shard_by 'CHROM');
+
+# ---------------------------------------------------------------------------
+# The literal per-shard facts the format round-trip is required to preserve (shard count, partition
+# tiling, range CHROM/POS, source_ordinal, verified). This block intentionally overlaps the opening
+# of read_howard_manifest.test — it is the explicit round-trip contract — while everything below is
+# the uncovered manifest-as-index seam. `ends_with` on the resolved prefix because the reader
+# absolutizes+normalizes paths (no byte-exact __TEST_DIR__ reproduction is guaranteed).
+# ---------------------------------------------------------------------------
+
+query TTIIIIIT
+SELECT ends_with(prefix, 'out/CHROM=' || chrom[1] || '/data'), chrom[1],
+       partition_start, partition_stop, source_ordinal, pos_min, pos_max, verified
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json')
+ORDER BY source_ordinal;
+----
+true	1	0	1000	0	100	100000	true
+true	2	1000	2000	1	100	100000	true
+true	3	2000	3000	2	100	100000	true
+
+# Exactly 3 shards came back.
+query I
+SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json');
+----
+3
+
+# ===========================================================================
+# COMPUTED TILING INVARIANT — the shards tile [0, total) with no gap or overlap. read_howard_manifest
+# .test asserts the literal partition values; write_pfile_sharded.test asserts catalog substrings;
+# neither asserts the PROPERTY. (The C++ reader deliberately does NOT do the cross-shard [0,total)
+# contiguity check — it validates per-shard width + sort + duplicate-start only, leaving the tiling
+# check to howard's Python loader — so proving the emitted catalog actually tiles is unasserted
+# anywhere until here.)
+# ===========================================================================
+
+# Widths sum to the full variant count; the span runs [0, 3000).
+query III
+SELECT sum(partition_stop - partition_start), min(partition_start), max(partition_stop)
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json');
+----
+3000	0	3000
+
+# No gap and no overlap: every shard's start equals the previous shard's stop (first starts at 0).
+query I
+SELECT count(*) FROM (
+  SELECT partition_start,
+         lag(partition_stop) OVER (ORDER BY partition_start) AS prev_stop
+  FROM read_howard_manifest('__TEST_DIR__/out.howard.json')
+) WHERE partition_start <> COALESCE(prev_stop, 0);
+----
+0
+
+# ===========================================================================
+# MANIFEST WIDTH ↔ REAL SCAN — the catalog's declared partition width for each shard equals the row
+# count of ACTUALLY READING that shard back through read_pfile (with the shared root .psam the
+# catalog references). This is the usable-index proof: the manifest's bounds are not merely
+# internally consistent, they match the genotype data on disk. (read_pfile paths must be constant-
+# foldable, so the real counts are materialized per known shard path and JOINed to the manifest on
+# source_ordinal — not FROM read_howard_manifest(...) m, read_pfile(m.prefix).)
+# ===========================================================================
+
+# All 3 shards join, and ZERO have a declared width disagreeing with the real read_pfile count.
+query II
+WITH real(source_ordinal, n) AS (
+  SELECT 0, (SELECT count(*) FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam'))
+  UNION ALL
+  SELECT 1, (SELECT count(*) FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam'))
+  UNION ALL
+  SELECT 2, (SELECT count(*) FROM read_pfile('__TEST_DIR__/out/CHROM=3/data', psam := '__TEST_DIR__/out.psam'))
+)
+SELECT count(*),
+       count(*) FILTER (WHERE (m.partition_stop - m.partition_start) <> r.n)
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json') m
+JOIN real r ON m.source_ordinal = r.source_ordinal;
+----
+3	0
+
+# ===========================================================================
+# MANIFEST RANGE ↔ REAL EXTENT — the declared range (CHROM membership + inclusive POS min/max) truly
+# bounds the shard it points at: the shard's only contig is the declared one, and every real POS
+# lies within [pos_min, pos_max]. read_howard_manifest.test asserts the literal pos_min/max; it never
+# confirms they actually bound the genotypes read back. A range that over/under-claimed the real data
+# would surface here.
+# ===========================================================================
+
+query II
+WITH real(source_ordinal, contig, lo, hi) AS (
+  SELECT 0, '1',
+         (SELECT min(POS) FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam')),
+         (SELECT max(POS) FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam'))
+  UNION ALL
+  SELECT 1, '2',
+         (SELECT min(POS) FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam')),
+         (SELECT max(POS) FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam'))
+  UNION ALL
+  SELECT 2, '3',
+         (SELECT min(POS) FROM read_pfile('__TEST_DIR__/out/CHROM=3/data', psam := '__TEST_DIR__/out.psam'))
+         , (SELECT max(POS) FROM read_pfile('__TEST_DIR__/out/CHROM=3/data', psam := '__TEST_DIR__/out.psam'))
+)
+SELECT count(*),
+       count(*) FILTER (WHERE m.chrom <> [r.contig] OR m.pos_min > r.lo OR m.pos_max < r.hi)
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json') m
+JOIN real r ON m.source_ordinal = r.source_ordinal;
+----
+3	0
+
+# ===========================================================================
+# PRUNED SURVIVORS KEEP GLOBAL ORDINALS — the SQL manifest does NOT rebase a pruned subset to
+# [0, subset_total). Pruning to CHROM=3 alone returns the shard's GLOBAL partition [2000, 3000) and
+# source_ordinal 2, NOT a renumbered [0, 1000) / ordinal 0. (The Python howard loader rebases and
+# warns; the manifest deliberately does not, so a consumer can join a pruned manifest row back to the
+# full cohort's index.) This behavior is documented in read_howard_manifest.md and formats/howard.md
+# and is asserted nowhere else in the suite.
+# ===========================================================================
+
+query IIII
+SELECT count(*), min(partition_start), max(partition_stop), min(source_ordinal)
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json', region := '3');
+----
+1	2000	3000	2
+
+# ===========================================================================
+# RECONSTITUTION THROUGH THE CATALOG — the union of the shards the catalog enumerates reproduces the
+# source dataset exactly, and the per-shard reads driven by the catalog's shared-.psam reference pair
+# the right samples to the right genotypes (genotype orient, bidirectional EXCEPT). The whole point of
+# the format: the catalog + its shared companion ARE a faithful serialization of the full cohort.
+# ===========================================================================
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype')
+   EXCEPT
+   SELECT * FROM (
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=3/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype')))
+  UNION ALL
+  (SELECT * FROM (
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=3/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype'))
+   EXCEPT
+   SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype')));
+----
+0
+
+# ===========================================================================
+# SINGLE-FILESET ROUND-TRIP — a `.pfile.json` catalog (one fileset, no sharding) is a usable index
+# too: its probed partition_stop equals a real read_pfile count of the fileset it names, concat_dim
+# is NULL (the whole-fileset signal), and the declared chunk_size surfaces. howard_single.pfile.json
+# points at large_example (3000 variants, chunk_size 1000). This proves the probe-and-enrich path,
+# not just the parse path read_howard_manifest.test exercises.
+# ===========================================================================
+
+query I
+SELECT count(*) FROM read_howard_manifest('test/data/howard_single.pfile.json') m
+WHERE m.partition_stop <> (SELECT count(*) FROM read_pfile('test/data/large_example'))
+   OR m.partition_start <> 0
+   OR m.source_ordinal <> 0
+   OR m.concat_dim IS NOT NULL
+   OR m.chunk_size <> 1000;
+----
+0
+
+# The single-fileset row probes the real .pvar for its range: contig set and POS extent match a
+# direct read of the fileset.
+query I
+SELECT count(*) FROM read_howard_manifest('test/data/howard_single.pfile.json') m
+WHERE list_sort(m.chrom) <> (SELECT list_sort(list_distinct(list(CHROM::VARCHAR))) FROM read_pvar('test/data/large_example.pvar'))
+   OR m.pos_min <> (SELECT min(POS) FROM read_pvar('test/data/large_example.pvar'))
+   OR m.pos_max <> (SELECT max(POS) FROM read_pvar('test/data/large_example.pvar'));
+----
+0

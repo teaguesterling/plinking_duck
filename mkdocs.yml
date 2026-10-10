@@ -41,6 +41,8 @@ nav:
   - Getting Started: getting-started.md
   - Tutorial: tutorial.md
   - File Formats: file-formats.md
+  - Format reference:
+      - .howard catalog: formats/howard.md
   - Genotype Encoding: genotype-encoding.md
   - Common Parameters: common-parameters.md
   - Functions:
