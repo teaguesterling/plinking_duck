@@ -1623,7 +1623,44 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 // dir, open the .pvar staging + header, and prime the .pgen staging (pgenlib init is deferred to
 // the first appended row, as in the non-sharded bundle). Each shard gets its OWN Pvar/Pgen global
 // state, so the .pvar monotonicity + `seen_chroms` guards and the POS extent reset per shard.
+// Reject a shard-key value that cannot form a safe hive directory label `<col>=<value>`. The key
+// value becomes a real on-disk directory name, so a value with a path separator would silently
+// nest/escape dirs, an '=' would mangle the hive label, whitespace/control chars are footguns, and
+// ''/'.'/'..' are degenerate. We REJECT rather than escape: escaping risks two distinct keys
+// colliding onto one dir, and the loader keys off the catalog's explicit `prefix` (never the dir
+// name), so the label is cosmetic — a clear rejection lets the user recode the key. CHROM values
+// (1..22/X/Y/MT) pass; a cohort/population label with '/', '=', or a space is the real footgun.
+void ValidateShardKeyValue(const string &col, const string &key) {
+	auto reject = [&](const char *why) {
+		throw InvalidInputException(
+		    "write pfile: shard_by key value '%s' (column '%s') %s — shard-key values must be path-safe "
+		    "(letters, digits, '_', '-'; e.g. chromosome names). Recode the key or shard by a different column.",
+		    key, col, why);
+	};
+	if (key.empty()) {
+		reject("is empty");
+	}
+	if (key == "." || key == "..") {
+		reject("is a reserved path name");
+	}
+	for (unsigned char c : key) {
+		if (c == '/' || c == '\\') {
+			reject("contains a path separator ('/' or '\\\\')");
+		}
+		if (c == '=') {
+			reject("contains '=' (the hive label separator)");
+		}
+		if (c < 0x20 || c == 0x7f) {
+			reject("contains a control character");
+		}
+		if (c == ' ') {
+			reject("contains whitespace");
+		}
+	}
+}
+
 void PfileShardOpen(PfileShardedGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs, const string &key) {
+	ValidateShardKeyValue(g.shard_col_label, key);
 	if (g.seen_keys.count(key) != 0) {
 		throw InvalidInputException(
 		    "write pfile: shard_by key '%s=%s' reappears after another value — input is not grouped by the "
@@ -1679,6 +1716,11 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 	e.pos_min = g.cur_pvar->first_pos;
 	e.pos_max = g.cur_pvar->pos_max;
 
+	// The two renames are not atomic as a pair: if the second (.pgen) MoveFile threw, a promoted
+	// .pvar with no .pgen would be left in the shard dir. It is effectively impossible (a same-dir
+	// rename of a just-created .staging file on a local fs) and harmless — PfileShardClose running
+	// at all means we are mid-COPY, so the .howard.json (written only at finalize, after every shard)
+	// never lands, and the loader keys off the catalog, so it never sees the orphaned .pvar.
 	fs.MoveFile(g.cur_pvar_staging, g.cur_pvar_final);
 	fs.MoveFile(g.cur_pgen_staging, g.cur_pgen_final); // LAST
 

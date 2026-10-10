@@ -175,6 +175,23 @@ variant-ordinal `partition` (tiling `[0, total)`), the shard's own `pvar`, and a
 `range` of the covered `CHROM`(s) + `POS` min/max (a pruning stat the writer fills
 for free as it streams). The shared `.psam` is referenced once under `shared.psam`.
 
+!!! warning "Re-running to an existing target can orphan stale shard directories"
+
+    A shard-key value must be **path-safe** — it becomes a real directory name
+    `out/<col>=<value>`. Values with a path separator, `=`, whitespace, a control
+    character, or the names `.`/`..`/empty are rejected with an actionable error
+    (CHROM names and ordinary alphanumeric/`_`/`-` labels are fine).
+
+    Re-running a sharded write to an **existing** target that produces a
+    **different** set of keys leaves the prior run's orphaned shard directories on
+    disk — the writer deliberately does **not** delete directories on the target
+    (auto-deletion on a target is exactly where data-loss bugs live). The
+    `.howard.json` catalog governs what is loaded (the loader never globs), so this
+    is **not** a correctness issue for catalog-driven reads. But a consumer that
+    globs `out/<col>=*/…` *outside* the catalog would see the stale filesets, and a
+    stale shard could pair with a changed shared `.psam`. If you rely on globbing
+    rather than the catalog, write to a fresh target (or clear it first).
+
 ## Standalone formats
 
 ### `FORMAT pvar`

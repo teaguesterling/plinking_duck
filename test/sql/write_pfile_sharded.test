@@ -285,6 +285,66 @@ TO '__TEST_DIR__/nullkey' (FORMAT pfile, shard_by 'grp');
 NULL
 
 # ===========================================================================
+# NEGATIVE — path-UNSAFE shard-key values. The key value becomes a hive directory name, so a
+# path separator, whitespace, or '.'/'..' is rejected with an actionable error (reject, not
+# escape — escaping could collide two keys onto one dir). Single constant-valued key → the error
+# fires at the first (only) shard open, before any dir is created → nothing partial on disk.
+# ===========================================================================
+
+# value containing '/' → "path separator"
+statement error
+COPY (SELECT *, 'a/b' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_slash' (FORMAT pfile, shard_by 'grp');
+----
+path separator
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_slash*');
+----
+0
+
+# value containing a space → "whitespace"
+statement error
+COPY (SELECT *, 'pop a' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_space' (FORMAT pfile, shard_by 'grp');
+----
+whitespace
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_space*');
+----
+0
+
+# value '..' → "reserved path name"
+statement error
+COPY (SELECT *, '..' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_dotdot' (FORMAT pfile, shard_by 'grp');
+----
+reserved path name
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_dotdot*');
+----
+0
+
+# value containing '=' (the hive label separator) → rejected
+statement error
+COPY (SELECT *, 'a=b' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_eq' (FORMAT pfile, shard_by 'grp');
+----
+hive label separator
+
+# A path-safe non-CHROM key with '_'/'-' is accepted (the normal path still works).
+statement ok
+COPY (SELECT *, 'pop-A_1' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_ok' (FORMAT pfile, shard_by 'grp');
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_ok/grp=pop-A_1/data.*');
+----
+2
+
+# ===========================================================================
 # ATOMICITY / CLEANUP — a mid-run failure in shard 2 (a bad genotype on the CHROM=2 variant)
 # leaves NO .howard.json (catalog-last) and NO .staging. The shared .psam is NOT promoted
 # (finalize never ran). The already-closed shard 1 .pgen/.pvar are durable — so without a
