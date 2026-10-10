@@ -1,0 +1,375 @@
+# name: test/sql/write_pfile_sharded.test
+# description: COPY (query) TO 'out' (FORMAT pfile, shard_by '<col>') — the sharded writer (Phase D):
+#   one pfile per contiguous key value under a hive layout, ONE shared root .psam, and a
+#   .howard.json catalog emitted LAST (the write↔read loop with howard's .howard loader).
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# HEADLINE — shard pfile_example by CHROM. pfile_example has CHROM 1 (3 variants:
+# POS 10000/20000/30000) + CHROM 2 (1 variant: POS 15000), 4 samples. shard_by
+# 'CHROM' → 2 shards (CHROM=1 with 3 variants, CHROM=2 with 1), one shared root
+# .psam, one out.howard.json. The STRUCT stream carries the IIDs (identity contract).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/out' (FORMAT pfile, shard_by 'CHROM');
+
+# Hive layout: one data.pgen + data.pvar per shard dir, a root .psam, a root catalog.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/out/CHROM=1/data.*');
+----
+2
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/out/CHROM=2/data.*');
+----
+2
+
+# Exactly one shared .psam and one catalog at the root (next to the out/ tree).
+query II
+SELECT (SELECT count(*) FROM glob('__TEST_DIR__/out.psam')),
+       (SELECT count(*) FROM glob('__TEST_DIR__/out.howard.json'));
+----
+1	1
+
+# The ONE shared .psam carries all 4 IIDs in order (not a per-shard copy).
+query T
+SELECT IID FROM read_psam('__TEST_DIR__/out.psam');
+----
+SAMPLE1
+SAMPLE2
+SAMPLE3
+SAMPLE4
+
+# ===========================================================================
+# CATALOG (.howard.json) — §7 schema. Assert via decode(read_blob) substrings:
+# the BLOB::VARCHAR cast escapes bytes, so decode() is used to get clean text.
+# (The structured/semantic cross-check is howard's parse_catalog, run out of band.)
+# ===========================================================================
+
+# Top-level + shared + both files' prefix/pvar + partition tiling + range (CHROM + POS min/max).
+# The two partitions tile [0,4): [0,3) then [3,4), global half-open ordinals (spec §6).
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/out.howard.json'))
+WHERE contains(c, '"howard": 1')
+  AND contains(c, '"dataset": "out"')
+  AND contains(c, '"concat_dim": "variants"')
+  AND contains(c, '"shared": { "psam": "out.psam" }')
+  AND contains(c, '"prefix": "out/CHROM=1/data"')
+  AND contains(c, '"pvar": "out/CHROM=1/data.pvar"')
+  AND contains(c, '"prefix": "out/CHROM=2/data"')
+  AND contains(c, '"pvar": "out/CHROM=2/data.pvar"')
+  AND contains(c, '"partition": { "start": 0, "stop": 3, "source_ordinal": 0 }')
+  AND contains(c, '"partition": { "start": 3, "stop": 4, "source_ordinal": 1 }')
+  AND contains(c, '"range": { "CHROM": ["1"], "POS": { "min": 10000, "max": 30000 } }')
+  AND contains(c, '"range": { "CHROM": ["2"], "POS": { "min": 15000, "max": 15000 } }');
+----
+1
+
+# A per-file `psam` must NEVER appear (that is the shared one; the loader rejects a per-file psam).
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/out.howard.json'))
+WHERE contains(c, '"psam":') AND NOT contains(c, '"shared": { "psam":');
+----
+0
+
+# INDEPENDENT WIDTH CHECK (the one parse_catalog can't give — it is parse-only; the width↔rowcount
+# check lives in howard's open_howard). The catalog above DECLARES shard widths 3 and 1; reading each
+# shard back gives 3 and 1 — so the declared partition widths match the real .pgen/.pvar contents.
+# Each shard reads with the shared root .psam (its own companion is the shared one).
+query II
+SELECT (SELECT count(*) FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam')),
+       (SELECT count(*) FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam'));
+----
+3	1
+
+# ===========================================================================
+# PER-SHARD ROUND-TRIP (decoded, bidirectional) — each shard equals the source slice
+# for its CHROM. Variant orient (cols + genotype matrix) AND genotype orient
+# (ID, IID, genotype — catches a sample<->genotype mis-pairing).
+# ===========================================================================
+
+# CHROM=1 shard == source WHERE CHROM='1' (count equal; both EXCEPT directions empty).
+query III
+SELECT
+  (SELECT count(*) FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam'))
+    = (SELECT count(*) FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1'),
+  (SELECT count(*) FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1'
+     EXCEPT
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam'))),
+  (SELECT count(*) FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam')
+     EXCEPT
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1'));
+----
+true	0	0
+
+# CHROM=1 shard, genotype orient (ID, IID, genotype) bidirectional == source slice.
+query II
+SELECT
+  (SELECT count(*) FROM (
+     SELECT ID, IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype') WHERE CHROM = '1'
+     EXCEPT
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype'))),
+  (SELECT count(*) FROM (
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam', orient := 'genotype')
+     EXCEPT
+     SELECT ID, IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype') WHERE CHROM = '1'));
+----
+0	0
+
+# CHROM=2 shard == source WHERE CHROM='2' (the single-variant shard).
+query III
+SELECT
+  (SELECT count(*) FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam'))
+    = (SELECT count(*) FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2'),
+  (SELECT count(*) FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2'
+     EXCEPT
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam'))),
+  (SELECT count(*) FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam')
+     EXCEPT
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2'));
+----
+true	0	0
+
+# Whole dataset reconstituted: the union of the two shards == the full source (variant orient).
+query I
+SELECT count(*) FROM (
+  (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example')
+   EXCEPT
+   SELECT * FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam')
+     UNION ALL
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam')))
+  UNION ALL
+  (SELECT * FROM (
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=1/data', psam := '__TEST_DIR__/out.psam')
+     UNION ALL
+     SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('__TEST_DIR__/out/CHROM=2/data', psam := '__TEST_DIR__/out.psam'))
+   EXCEPT
+   SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] g FROM read_pfile('test/data/pfile_example')));
+----
+0
+
+# ===========================================================================
+# LARGER FIXTURE — large_example: 3000 variants, chroms 1/2/3 (1000 each), 8 samples.
+# shard_by 'CHROM' → 3 shards tiling [0,3000), one shared .psam (8 IIDs).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/big' (FORMAT pfile, shard_by 'CHROM');
+
+query I
+SELECT count(*) FROM read_psam('__TEST_DIR__/big.psam');
+----
+8
+
+# 3 shards tiling [0,3000) with no gap/overlap, 1000 variants each, source_ordinal 0/1/2.
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/big.howard.json'))
+WHERE contains(c, '"partition": { "start": 0, "stop": 1000, "source_ordinal": 0 }')
+  AND contains(c, '"partition": { "start": 1000, "stop": 2000, "source_ordinal": 1 }')
+  AND contains(c, '"partition": { "start": 2000, "stop": 3000, "source_ordinal": 2 }')
+  AND contains(c, '"prefix": "big/CHROM=3/data"');
+----
+1
+
+# Independent width check: the middle shard's declared width (2000-1000=1000) == its real count.
+query I
+SELECT count(*) FROM read_pfile('__TEST_DIR__/big/CHROM=2/data', psam := '__TEST_DIR__/big.psam');
+----
+1000
+
+# Union of the 3 shards reproduces the whole-file read exactly (genotype orient, bidirectional).
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype')
+   EXCEPT
+   SELECT * FROM (
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/big/CHROM=1/data', psam := '__TEST_DIR__/big.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/big/CHROM=2/data', psam := '__TEST_DIR__/big.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/big/CHROM=3/data', psam := '__TEST_DIR__/big.psam', orient := 'genotype')))
+  UNION ALL
+  (SELECT * FROM (
+     SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/big/CHROM=1/data', psam := '__TEST_DIR__/big.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/big/CHROM=2/data', psam := '__TEST_DIR__/big.psam', orient := 'genotype')
+     UNION ALL SELECT ID, IID, genotype FROM read_pfile('__TEST_DIR__/big/CHROM=3/data', psam := '__TEST_DIR__/big.psam', orient := 'genotype'))
+   EXCEPT
+   SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype')));
+----
+0
+
+# ===========================================================================
+# NEGATIVE — unsorted input: a shard key that reappears after another value. The pvar
+# monotonicity/contiguity guard, lifted to the shard key. ORDER BY POS interleaves chroms
+# (POS 10000=chr1, 15000=chr2, 20000=chr1, …) → CHROM '1' reappears after '2'.
+# Earlier shard(s) promoted before the error MAY remain (durable-by-design); the guard is
+# that NO catalog (the completion marker) and NO .staging residue are left.
+# ===========================================================================
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY POS)
+TO '__TEST_DIR__/uns' (FORMAT pfile, shard_by 'CHROM');
+----
+reappears
+
+# No catalog was written (incomplete-by-construction).
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/uns.howard.json');
+----
+0
+
+# No .staging residue — neither the shared psam staging nor any shard staging.
+query I
+SELECT (SELECT count(*) FROM glob('__TEST_DIR__/uns.*.staging'))
+     + (SELECT count(*) FROM glob('__TEST_DIR__/uns/CHROM=*/data.*.staging'));
+----
+0
+
+# ===========================================================================
+# NEGATIVE — remote target rejected at bind (.pgen is local-only), the existing bundle guard.
+# ===========================================================================
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO 's3://bucket/out' (FORMAT pfile, shard_by 'CHROM');
+----
+not a local path
+
+# ===========================================================================
+# NEGATIVE — zero rows → no shards (distinct from the non-sharded "zero variants"); the loader
+# rejects an empty files[] array, so there is nothing valid to emit. Nothing left on disk.
+# ===========================================================================
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') WHERE false)
+TO '__TEST_DIR__/zero' (FORMAT pfile, shard_by 'CHROM');
+----
+no shards
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/zero*');
+----
+0
+
+# ===========================================================================
+# NEGATIVE — shard_by cannot be combined with pvar/pgen/psam path overrides (the sharded layout
+# generates each shard's paths); a non-existent shard_by column; a NULL shard key.
+# ===========================================================================
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/ov' (FORMAT pfile, shard_by 'CHROM', pvar '__TEST_DIR__/x.pvar');
+----
+cannot be combined
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/nocol' (FORMAT pfile, shard_by 'NOPE');
+----
+is not in the input
+
+# A NULL shard-key value cannot form a hive directory → clean error at the sink.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes, CAST(NULL AS VARCHAR) AS grp
+      FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/nullkey' (FORMAT pfile, shard_by 'grp');
+----
+NULL
+
+# ===========================================================================
+# NEGATIVE — path-UNSAFE shard-key values. The key value becomes a hive directory name, so a
+# path separator, whitespace, or '.'/'..' is rejected with an actionable error (reject, not
+# escape — escaping could collide two keys onto one dir). Single constant-valued key → the error
+# fires at the first (only) shard open, before any dir is created → nothing partial on disk.
+# ===========================================================================
+
+# value containing '/' → "path separator"
+statement error
+COPY (SELECT *, 'a/b' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_slash' (FORMAT pfile, shard_by 'grp');
+----
+path separator
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_slash*');
+----
+0
+
+# value containing a space → "whitespace"
+statement error
+COPY (SELECT *, 'pop a' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_space' (FORMAT pfile, shard_by 'grp');
+----
+whitespace
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_space*');
+----
+0
+
+# value '..' → "reserved path name"
+statement error
+COPY (SELECT *, '..' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_dotdot' (FORMAT pfile, shard_by 'grp');
+----
+reserved path name
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_dotdot*');
+----
+0
+
+# value containing '=' (the hive label separator) → rejected
+statement error
+COPY (SELECT *, 'a=b' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_eq' (FORMAT pfile, shard_by 'grp');
+----
+hive label separator
+
+# A path-safe non-CHROM key with '_'/'-' is accepted (the normal path still works).
+statement ok
+COPY (SELECT *, 'pop-A_1' AS grp FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/u_ok' (FORMAT pfile, shard_by 'grp');
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/u_ok/grp=pop-A_1/data.*');
+----
+2
+
+# ===========================================================================
+# ATOMICITY / CLEANUP — a mid-run failure in shard 2 (a bad genotype on the CHROM=2 variant)
+# leaves NO .howard.json (catalog-last) and NO .staging. The shared .psam is NOT promoted
+# (finalize never ran). The already-closed shard 1 .pgen/.pvar are durable — so without a
+# catalog AND without the shared .psam the set reads as incomplete, the intended semantics.
+# ===========================================================================
+
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+        CASE WHEN POS = 15000 THEN [5, 0, 0, 0]::TINYINT[] ELSE genotypes::TINYINT[] END AS genotypes
+      FROM read_pfile('test/data/pfile_example') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/atom' (FORMAT pfile, shard_by 'CHROM', samples ['A', 'B', 'C', 'D']);
+----
+out of range
+
+# Shard 1 (CHROM=1) promoted before the failure → its .pgen + .pvar are durable.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/atom/CHROM=1/data.*');
+----
+2
+
+# No catalog, no promoted shared .psam, no .staging anywhere — the completion markers never landed.
+query I
+SELECT (SELECT count(*) FROM glob('__TEST_DIR__/atom.howard.json'))
+     + (SELECT count(*) FROM glob('__TEST_DIR__/atom.psam'))
+     + (SELECT count(*) FROM glob('__TEST_DIR__/atom.*.staging'))
+     + (SELECT count(*) FROM glob('__TEST_DIR__/atom/CHROM=*/data.*.staging'));
+----
+0

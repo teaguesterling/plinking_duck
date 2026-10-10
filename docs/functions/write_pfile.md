@@ -126,6 +126,72 @@ chromosome never reappears after another). Unsorted input raises an error pointi
 you at `ORDER BY CHROM, POS`. This matches what PLINK tooling and the reader's
 region pushdown assume, and a round-trip test alone cannot catch disorder.
 
+### Sharded output (`shard_by`)
+
+```sql
+COPY (SELECT … ORDER BY CHROM, POS) TO 'out' (FORMAT pfile, shard_by 'CHROM');
+```
+
+`shard_by '<col>'` writes **one pfile per contiguous value of `<col>`** — the
+common case is sharding a cohort by chromosome — plus **one shared `.psam`** and a
+**`.howard.json` catalog** that the [howard](https://github.com/teaguesterling/howard)
+`.howard` loader reads back as a single concatenated dataset. The layout is:
+
+```
+out/<col>=<value>/data.pgen      # one fileset per shard (hive-style dir)
+out/<col>=<value>/data.pvar
+out.psam                         # ONE shared .psam (same samples across all shards)
+out.howard.json                  # the catalog — written LAST, the completion marker
+```
+
+The single ordered `COPY` rolls shards in the sink: on a `<col>` transition it
+finalizes and promotes the open shard's `.pgen`/`.pvar`, then opens the next. This
+is `PARTITION_BY` **semantics** implemented by hand — native DuckDB `PARTITION_BY`
+is unusable for `.pgen` (it forces an unordered parallel sink that interleaves
+rows, can split one key across files via `max_open_files` eviction, and strips the
+partition column).
+
+- **Input must be sorted so each key value is contiguous** — `ORDER BY <col>, POS`.
+  A key value that reappears after another is rejected (the same contiguity
+  contract the `.pvar` monotonicity enforces, lifted to the shard key).
+- **Variant-shards over a shared `.psam`.** All shards share the one root `.psam`
+  (same samples, different variants), so the catalog's `concat_dim` is `variants`.
+  Reading a shard directly back with `read_pfile` needs the shared `.psam`:
+  `read_pfile('out/CHROM=1/data', psam := 'out.psam')`.
+- **`variant_count N` bounds *each shard*** (it re-arms per shard — per-chromosome,
+  not genome-wide), so the default is almost always enough even for whole-genome
+  input.
+- **The catalog is the completion marker.** It is emitted only after every shard
+  and the shared `.psam` are durable. A mid-run failure leaves no `.howard.json`
+  and no `.staging` residue; shards that already closed before the failure remain
+  on disk, but without the catalog the set reads as incomplete-by-construction.
+- **`shard_by` cannot be combined with `pvar`/`pgen`/`psam` path overrides** (the
+  sharded layout generates each shard's paths), and the key must be a scalar
+  variant column (not the genotypes column). The whole tree is **local-only**, as
+  with the non-sharded bundle.
+
+The emitted `.howard.json` records, per shard, the global half-open `[start, stop)`
+variant-ordinal `partition` (tiling `[0, total)`), the shard's own `pvar`, and a
+`range` of the covered `CHROM`(s) + `POS` min/max (a pruning stat the writer fills
+for free as it streams). The shared `.psam` is referenced once under `shared.psam`.
+
+!!! warning "Re-running to an existing target can orphan stale shard directories"
+
+    A shard-key value must be **path-safe** — it becomes a real directory name
+    `out/<col>=<value>`. Values with a path separator, `=`, whitespace, a control
+    character, or the names `.`/`..`/empty are rejected with an actionable error
+    (CHROM names and ordinary alphanumeric/`_`/`-` labels are fine).
+
+    Re-running a sharded write to an **existing** target that produces a
+    **different** set of keys leaves the prior run's orphaned shard directories on
+    disk — the writer deliberately does **not** delete directories on the target
+    (auto-deletion on a target is exactly where data-loss bugs live). The
+    `.howard.json` catalog governs what is loaded (the loader never globs), so this
+    is **not** a correctness issue for catalog-driven reads. But a consumer that
+    globs `out/<col>=*/…` *outside* the catalog would see the stale filesets, and a
+    stale shard could pair with a changed shared `.psam`. If you rely on globbing
+    rather than the catalog, write to a fresh target (or clear it first).
+
 ## Standalone formats
 
 ### `FORMAT pvar`
@@ -249,8 +315,11 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
   reconstructed, so a round-trip is **value-equal, not byte-equal**.
 - **Position-sorted, chromosome-contiguous input is required** (the monotonicity
   check), and the whole fileset is **local-only**.
-- **Parquet companions, `.pgi` split index, sharded/partitioned output, and
-  PLINK-VCF export are deferred** (Phases D–E).
+- **Sharded output is `shard_by` a variant key only** (variant-shards over a
+  shared `.psam`, [above](#sharded-output-shard_by)). Sample-sharding (a shared
+  `.pvar` across sample batches) is a separate follow-on.
+- **Parquet companions, `.pgi` split index, and PLINK-VCF export are deferred**
+  (Phases D–E).
 
 ## See Also
 

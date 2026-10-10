@@ -19,6 +19,11 @@ class ExtensionLoader;
 //!   * `COPY (query) TO 'prefix' (FORMAT pfile)` — the bundle (P9 Phase C): fans
 //!     out `prefix.pvar` + `prefix.pgen` + `prefix.psam` from one query. Local-only
 //!     (`.pgen` involved); sample identity via STRUCT field names or `samples`.
+//!   * `COPY (query) TO 'out' (FORMAT pfile, shard_by '<col>')` — the sharded
+//!     bundle (Phase D): one ordered COPY fans out one pfile per contiguous key
+//!     value under a hive layout (out/<col>=<value>/data.{pgen,pvar}), ONE shared
+//!     root `out.psam`, and an `out.howard.json` catalog (emitted last) read back
+//!     by howard's `.howard` loader. Input must be sorted so each key is contiguous.
 void RegisterPfileWriter(ExtensionLoader &loader);
 
 } // namespace duckdb
