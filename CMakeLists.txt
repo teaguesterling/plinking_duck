@@ -17,6 +17,7 @@ set(EXTENSION_SOURCES
     src/psam_reader.cpp
     src/pgen_reader.cpp
     src/pfile_reader.cpp
+    src/howard_reader.cpp
     src/plink_common.cpp
     src/plink_freq.cpp
     src/plink_hardy.cpp
@@ -262,6 +263,22 @@ if(NOT HAVE_RAWMEMCHR)
     )
 endif()
 
+# --- yyjson (vendored from the duckdb submodule) for .howard.json parsing ---
+# Compiled into the extension exactly as DuckDB's own `json` extension does, with
+# hidden visibility so its symbols never clash with a host duckdb that also carries
+# yyjson. This is what makes plinking_duck the owner of .howard READING.
+set(PLINKING_YYJSON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson)
+add_library(plinking_yyjson STATIC ${PLINKING_YYJSON_DIR}/yyjson.cpp)
+target_include_directories(plinking_yyjson PUBLIC ${PLINKING_YYJSON_DIR}/include)
+set_target_properties(plinking_yyjson PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden)
+target_link_libraries(${EXTENSION_NAME} plinking_yyjson)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} plinking_yyjson)
+target_include_directories(${EXTENSION_NAME} PRIVATE ${PLINKING_YYJSON_DIR}/include)
+target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PLINKING_YYJSON_DIR}/include)
+
 # --- Link pgenlib and its dependencies to extension targets ---
 # Deps are listed explicitly because pgenlib links them PRIVATE (won't propagate
 # in static builds) and DuckDB's macros require the plain target_link_libraries
@@ -284,7 +301,7 @@ if(Eigen3_FOUND)
 endif()
 
 install(
-  TARGETS ${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd
+  TARGETS ${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd plinking_yyjson
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

@@ -6,6 +6,7 @@
 #include "psam_reader.hpp"
 #include "pgen_reader.hpp"
 #include "pfile_reader.hpp"
+#include "howard_reader.hpp"
 #include "plink_freq.hpp"
 #include "plink_hardy.hpp"
 #include "plink_missing.hpp"
@@ -93,6 +94,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPsamReader(loader);
 	RegisterPgenReader(loader);
 	RegisterPfileReader(loader);
+	RegisterHowardReader(loader);
 	RegisterPlinkFreq(loader);
 	RegisterPlinkHardy(loader);
 	RegisterPlinkMissing(loader);

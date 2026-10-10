@@ -1,0 +1,692 @@
+#include "howard_reader.hpp"
+#include "howard_catalog.hpp"
+#include "register_helper.hpp"
+
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+
+#include "yyjson.hpp"
+
+#include <cstring>
+#include <limits>
+
+using namespace duckdb_yyjson; // NOLINT
+
+namespace duckdb {
+
+// ===========================================================================
+// read_howard_manifest — the parse + verify + prune surface plinking_duck owns for
+// `.howard` READING (the sharded pfile writer owns the WRITE, src/pfile_writer.cpp).
+//
+//   read_howard_manifest(path VARCHAR
+//       [, region := VARCHAR, variant_range := ANY, sample_index := ANY, verify_all := BOOLEAN])
+//
+// Parses a `.howard.json` with yyjson, resolves every path relative to the catalog's own
+// directory (§7.2), folds the `shared` companion into each shard, prunes shards a predicate
+// cannot touch (§6/§10 overlap), verifies the survivors' `.pgen` header counts against their
+// companions (and their declared `range` against the real `.pvar` extent), and returns one row
+// per SURVIVING shard. Phase A: this is the manifest only — NOT the `read_howard` scan or ATTACH.
+//
+// ERROR TAXONOMY (distinct message prefixes so the Python consumer can classify — spec §8/§10.1):
+//   "read_howard_manifest: catalog parse error: ..."                 malformed JSON / schema  (InvalidInputException)
+//   "read_howard_manifest: file not found: ..."                      a referenced file missing (IOException)
+//   "read_howard_manifest: verification failed (count mismatch): ..." .pgen header vs companion (InvalidInputException)
+//   "read_howard_manifest: verification failed (range under-claim): ..." declared range < real  (InvalidInputException)
+//   "read_howard_manifest: invalid predicate: ..."                   wrong-axis / malformed arg (InvalidInputException)
+// ===========================================================================
+
+namespace {
+
+constexpr int64_t HOWARD_VERSION = 1;
+
+// ---- yyjson helpers -------------------------------------------------------
+
+//! RAII for a parsed yyjson document, so every throw path frees it.
+struct YyDocGuard {
+	yyjson_doc *doc = nullptr;
+	~YyDocGuard() {
+		if (doc) {
+			yyjson_doc_free(doc);
+		}
+	}
+};
+
+//! Read a JSON integer (yyjson stores non-negative ints as UINT, negatives as SINT; the safe
+//! typed accessors each return 0 for the other subtype, so branch explicitly).
+bool JsonGetInt64(yyjson_val *v, int64_t &out) {
+	if (!v) {
+		return false;
+	}
+	if (yyjson_is_uint(v)) {
+		out = static_cast<int64_t>(yyjson_get_uint(v));
+		return true;
+	}
+	if (yyjson_is_sint(v)) {
+		out = yyjson_get_sint(v);
+		return true;
+	}
+	return false;
+}
+
+// ---- path resolution (§7.2) ----------------------------------------------
+
+//! Directory portion of `path` (the catalog's own directory, which shard paths resolve against).
+//! "." when `path` has no separator.
+string DirName(const string &path) {
+	auto slash = path.find_last_of("/\\");
+	if (slash == string::npos) {
+		return ".";
+	}
+	if (slash == 0) {
+		return path.substr(0, 1); // root "/"
+	}
+	return path.substr(0, slash);
+}
+
+//! Resolve a catalog path relative to the catalog's directory by default (§7.2); an absolute path
+//! is honored as-is, and `path_is_relative=false` opts one path out.
+string ResolvePath(FileSystem &fs, const string &base_dir, const string &path, bool path_is_relative) {
+	if (!path_is_relative || fs.IsPathAbsolute(path)) {
+		return path;
+	}
+	return fs.JoinPath(base_dir, path);
+}
+
+// ---- SQL quoting ----------------------------------------------------------
+
+string SqlStr(const string &s) {
+	return "'" + StringUtil::Replace(s, "'", "''") + "'";
+}
+
+// ---- region string parsing (mirrors ParseRegion strictness, string half only) --------------
+
+struct RegionPredicate {
+	string contig;
+	int64_t pos_lo = std::numeric_limits<int64_t>::lowest();
+	int64_t pos_hi = std::numeric_limits<int64_t>::max();
+};
+
+//! Parse `"contig:lo-hi"` or a bare `"contig"` (whole-contig). Reject anything else. A manifest
+//! prune must NOT open any `.pvar`, so this resolves only the string — contig + inclusive POS
+//! window — never variant indices (unlike plink_common's ParseRegion).
+RegionPredicate ParseRegionString(const string &region) {
+	RegionPredicate out;
+	auto colon = region.find(':');
+	if (colon == string::npos) {
+		if (region.empty()) {
+			throw InvalidInputException("read_howard_manifest: invalid predicate: region is empty "
+			                            "(expected 'contig:lo-hi' or a bare 'contig')");
+		}
+		out.contig = region; // bare contig: whole-contig window
+		return out;
+	}
+	if (colon == 0) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: region '%s' has an empty "
+		                            "contig (expected 'contig:lo-hi')",
+		                            region);
+	}
+	out.contig = region.substr(0, colon);
+	string range_part = region.substr(colon + 1);
+	auto dash = range_part.find('-');
+	if (dash == string::npos) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: region '%s' is not "
+		                            "'contig:lo-hi'",
+		                            region);
+	}
+	string lo_s = range_part.substr(0, dash);
+	string hi_s = range_part.substr(dash + 1);
+	try {
+		out.pos_lo = std::stoll(lo_s);
+		out.pos_hi = std::stoll(hi_s);
+	} catch (std::exception &) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: region '%s' has "
+		                            "non-integer positions",
+		                            region);
+	}
+	if (out.pos_hi < out.pos_lo) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: region '%s' has inverted "
+		                            "POS bounds (lo=%lld > hi=%lld)",
+		                            region, (long long)out.pos_lo, (long long)out.pos_hi);
+	}
+	return out;
+}
+
+//! A 2-element inclusive index predicate `[lo, hi]` from an ANY value (a 2-element LIST).
+void ParseIndexPredicate(const Value &val, const string &param, int64_t &lo, int64_t &hi) {
+	if (val.type().id() != LogicalTypeId::LIST) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: %s must be a 2-element "
+		                            "list [lo, hi] (inclusive)",
+		                            param);
+	}
+	auto &children = ListValue::GetChildren(val);
+	if (children.size() != 2) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: %s must have exactly 2 "
+		                            "elements [lo, hi], got %llu",
+		                            param, (unsigned long long)children.size());
+	}
+	lo = children[0].GetValue<int64_t>();
+	hi = children[1].GetValue<int64_t>();
+	if (hi < lo) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: %s has inverted bounds "
+		                            "(lo=%lld > hi=%lld)",
+		                            param, (long long)lo, (long long)hi);
+	}
+}
+
+// ---- companion value resolution ------------------------------------------
+
+//! A companion value is a string path or an object {path, path_is_relative?, columns?} (§7.2).
+//! `columns` is accepted and ignored this phase. Returns the resolved path.
+string ResolveCompanion(FileSystem &fs, const string &base_dir, yyjson_val *v, const char *where) {
+	if (yyjson_is_str(v)) {
+		return ResolvePath(fs, base_dir, yyjson_get_str(v), true);
+	}
+	if (yyjson_is_obj(v)) {
+		yyjson_val *p = yyjson_obj_get(v, "path");
+		if (!p || !yyjson_is_str(p)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: %s companion object "
+			                            "needs a string 'path'",
+			                            where);
+		}
+		bool rel = true;
+		yyjson_val *r = yyjson_obj_get(v, "path_is_relative");
+		if (r && yyjson_is_bool(r)) {
+			rel = yyjson_get_bool(r);
+		}
+		return ResolvePath(fs, base_dir, yyjson_get_str(p), rel);
+	}
+	throw InvalidInputException("read_howard_manifest: catalog parse error: %s companion must be a "
+	                            "string path or an object",
+	                            where);
+}
+
+// ---- catalog parse (yyjson) -----------------------------------------------
+
+//! Parse + validate a multi-file `.howard.json`. Single-fileset (`pfile`) catalogs are out of
+//! scope for the manifest reader this phase and raise a clear parse error.
+HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &content) {
+	YyDocGuard guard;
+	guard.doc = yyjson_read(content.c_str(), content.size(), 0);
+	if (!guard.doc) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' is not valid JSON", path);
+	}
+	yyjson_val *root = yyjson_doc_get_root(guard.doc);
+	if (!yyjson_is_obj(root)) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' top level must be a "
+		                            "JSON object",
+		                            path);
+	}
+
+	HowardCatalog cat;
+	cat.base_dir = DirName(path);
+
+	yyjson_val *ver = yyjson_obj_get(root, "howard");
+	int64_t version = 0;
+	if (!ver || !JsonGetInt64(ver, version)) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' missing required "
+		                            "integer version key 'howard'",
+		                            path);
+	}
+	if (version != HOWARD_VERSION) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' unsupported 'howard' "
+		                            "version %lld (this reader supports %lld)",
+		                            path, (long long)version, (long long)HOWARD_VERSION);
+	}
+	cat.version = version;
+
+	yyjson_val *ds = yyjson_obj_get(root, "dataset");
+	if (!ds || !yyjson_is_str(ds)) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' missing required "
+		                            "string field 'dataset'",
+		                            path);
+	}
+	cat.dataset = yyjson_get_str(ds);
+
+	bool has_pfile = yyjson_obj_get(root, "pfile") != nullptr;
+	bool has_multi = yyjson_obj_get(root, "files") != nullptr || yyjson_obj_get(root, "concat_dim") != nullptr ||
+	                 yyjson_obj_get(root, "shared") != nullptr;
+	if (has_pfile) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' is a single-fileset "
+		                            "'pfile' catalog; read_howard_manifest handles the multi-file 'files' "
+		                            "form this phase (Phase A)",
+		                            path);
+	}
+	if (!has_multi) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' must declare a "
+		                            "multi-file catalog ('concat_dim' + 'shared' + 'files')",
+		                            path);
+	}
+
+	yyjson_val *cd = yyjson_obj_get(root, "concat_dim");
+	if (!cd || !yyjson_is_str(cd)) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' needs a string "
+		                            "'concat_dim' ('variants' or 'samples')",
+		                            path);
+	}
+	cat.concat_dim = yyjson_get_str(cd);
+	bool is_variants = cat.concat_dim == "variants";
+	bool is_samples = cat.concat_dim == "samples";
+	if (!is_variants && !is_samples) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' concat_dim must be "
+		                            "'variants' or 'samples', got '%s'",
+		                            path, cat.concat_dim);
+	}
+
+	// §5 invariant: shared companion must match the concat axis and cannot carry the forbidden one.
+	yyjson_val *shared = yyjson_obj_get(root, "shared");
+	if (!yyjson_is_obj(shared)) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' multi-file catalog "
+		                            "needs a 'shared' companion object",
+		                            path);
+	}
+	const char *expected_shared = is_variants ? "psam" : "pvar";
+	const char *forbidden_shared = is_variants ? "pvar" : "psam";
+	if (yyjson_obj_get(shared, forbidden_shared)) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' concat_dim='%s' "
+		                            "requires a shared '%s' but 'shared' carries a '%s' — a contradiction "
+		                            "(spec §5)",
+		                            path, cat.concat_dim, expected_shared, forbidden_shared);
+	}
+	yyjson_val *sc = yyjson_obj_get(shared, expected_shared);
+	if (!sc) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' concat_dim='%s' "
+		                            "requires 'shared.%s'",
+		                            path, cat.concat_dim, expected_shared);
+	}
+	string shared_resolved = ResolveCompanion(fs, cat.base_dir, sc, expected_shared);
+	if (is_variants) {
+		cat.shared_psam = shared_resolved;
+	} else {
+		cat.shared_pvar = shared_resolved;
+	}
+
+	yyjson_val *files = yyjson_obj_get(root, "files");
+	if (!yyjson_is_arr(files) || yyjson_arr_size(files) == 0) {
+		throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' multi-file catalog "
+		                            "needs a non-empty 'files' array",
+		                            path);
+	}
+
+	size_t idx, max;
+	yyjson_val *fd;
+	yyjson_arr_foreach(files, idx, max, fd) {
+		string where = StringUtil::Format("files[%llu]", (unsigned long long)idx);
+		if (!yyjson_is_obj(fd)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' %s must be an "
+			                            "object with a 'prefix'",
+			                            path, where);
+		}
+		yyjson_val *pfx = yyjson_obj_get(fd, "prefix");
+		if (!pfx || !yyjson_is_str(pfx)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' %s needs a string "
+			                            "'prefix'",
+			                            path, where);
+		}
+		// A per-file companion of the SHARED type is a contradiction (spec §5/§7).
+		if (yyjson_obj_get(fd, expected_shared)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' %s declares a "
+			                            "per-file '%s', but the catalog shares one (spec §5/§7)",
+			                            path, where, expected_shared);
+		}
+
+		ShardEntry e;
+		e.prefix = ResolvePath(fs, cat.base_dir, yyjson_get_str(pfx), true);
+
+		// Each shard's own non-shared companion; fall back to the conventional <prefix>.<ext>.
+		yyjson_val *own_pvar = yyjson_obj_get(fd, "pvar");
+		yyjson_val *own_psam = yyjson_obj_get(fd, "psam");
+		if (is_variants) {
+			e.pvar = own_pvar ? ResolveCompanion(fs, cat.base_dir, own_pvar, (where + ".pvar").c_str())
+			                  : (e.prefix + ".pvar");
+			e.psam = cat.shared_psam; // fold the shared companion in
+		} else {
+			e.psam = own_psam ? ResolveCompanion(fs, cat.base_dir, own_psam, (where + ".psam").c_str())
+			                  : (e.prefix + ".psam");
+			e.pvar = cat.shared_pvar;
+		}
+
+		// partition {start, stop, source_ordinal} — required, half-open [start, stop) (§6).
+		yyjson_val *part = yyjson_obj_get(fd, "partition");
+		if (!yyjson_is_obj(part)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' %s needs a "
+			                            "'partition' object {start, stop, source_ordinal}",
+			                            path, where);
+		}
+		if (!JsonGetInt64(yyjson_obj_get(part, "start"), e.partition_start) ||
+		    !JsonGetInt64(yyjson_obj_get(part, "stop"), e.partition_stop) ||
+		    !JsonGetInt64(yyjson_obj_get(part, "source_ordinal"), e.source_ordinal)) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' %s partition needs "
+			                            "integer start, stop, source_ordinal",
+			                            path, where);
+		}
+		if (e.partition_stop <= e.partition_start) {
+			throw InvalidInputException("read_howard_manifest: catalog parse error: '%s' %s partition "
+			                            "[%lld, %lld) is empty or inverted (stop must be > start, §6)",
+			                            path, where, (long long)e.partition_start, (long long)e.partition_stop);
+		}
+
+		// Optional range {CHROM:[...], POS:{min,max}} — the genomic prune stat (§10).
+		yyjson_val *range = yyjson_obj_get(fd, "range");
+		if (yyjson_is_obj(range)) {
+			e.has_range = true;
+			yyjson_val *chrom = yyjson_obj_get(range, "CHROM");
+			if (yyjson_is_arr(chrom)) {
+				size_t ci, cmax;
+				yyjson_val *cv;
+				yyjson_arr_foreach(chrom, ci, cmax, cv) {
+					if (yyjson_is_str(cv)) {
+						e.chrom.emplace_back(yyjson_get_str(cv));
+					}
+				}
+			}
+			yyjson_val *pos = yyjson_obj_get(range, "POS");
+			if (yyjson_is_obj(pos)) {
+				int64_t pmin, pmax;
+				if (JsonGetInt64(yyjson_obj_get(pos, "min"), pmin) && JsonGetInt64(yyjson_obj_get(pos, "max"), pmax)) {
+					e.has_pos = true;
+					e.pos_min = pmin;
+					e.pos_max = pmax;
+				}
+			}
+		}
+
+		cat.files.push_back(std::move(e));
+	}
+
+	return cat;
+}
+
+// ---- verification (spec §8/§10.1) -----------------------------------------
+
+//! Count verify: force read_pfile's bind-time `.pgen`-header-vs-companion check with a zero-row
+//! probe and re-raise as a count-mismatch (same discipline as howard's `_verify_header`). Existence
+//! is checked first so a surviving error is unambiguously a count lie, not a missing file.
+void VerifyCounts(ClientContext &context, FileSystem &fs, const ShardEntry &e) {
+	string pgen = e.prefix + ".pgen";
+	if (!fs.FileExists(pgen)) {
+		throw IOException("read_howard_manifest: file not found: .pgen '%s'", pgen);
+	}
+	if (!e.pvar.empty() && !fs.FileExists(e.pvar)) {
+		throw IOException("read_howard_manifest: file not found: .pvar '%s'", e.pvar);
+	}
+	if (!e.psam.empty() && !fs.FileExists(e.psam)) {
+		throw IOException("read_howard_manifest: file not found: .psam '%s'", e.psam);
+	}
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	string probe = "SELECT 1 FROM read_pfile(" + SqlStr(e.prefix);
+	if (!e.pvar.empty()) {
+		probe += ", pvar := " + SqlStr(e.pvar);
+	}
+	if (!e.psam.empty()) {
+		probe += ", psam := " + SqlStr(e.psam);
+	}
+	probe += ") LIMIT 0";
+	auto res = conn.Query(probe);
+	if (res->HasError()) {
+		// Discriminate the two failure classes the probe can surface, so the caller is not sent down
+		// the wrong branch: a header-vs-companion COUNT mismatch (the §8 trust check) vs an unreadable
+		// / wrong-format companion (a corrupt .pgen header, an unparseable .pvar). read_pfile reports a
+		// count mismatch with the literal "count mismatch"; anything else is a companion-readability
+		// failure.
+		string err = res->GetError();
+		if (StringUtil::Contains(err, "count mismatch")) {
+			throw InvalidInputException("read_howard_manifest: verification failed (count mismatch): shard "
+			                            "'%s': %s",
+			                            e.prefix, err);
+		}
+		throw InvalidInputException("read_howard_manifest: verification failed (companion unreadable): "
+		                            "shard '%s': %s",
+		                            e.prefix, err);
+	}
+}
+
+//! Range verify (concat_dim='variants' only): the declared `range` must COVER the shard's real
+//! `.pvar` extent (declared ⊇ actual). An UNDER-claim (a contig/POS the shard holds but `range`
+//! omits) would wrongly drop the shard, so it raises; an over-claim is harmless and passes. A
+//! shard with no `range` is skipped (nothing declared to be stale).
+void VerifyRange(ClientContext &context, const ShardEntry &e, const string &concat_dim) {
+	if (concat_dim != "variants" || !e.has_range) {
+		return;
+	}
+	string pvar = e.pvar.empty() ? (e.prefix + ".pvar") : e.pvar;
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+
+	if (!e.chrom.empty()) {
+		auto res = conn.Query("SELECT DISTINCT CHROM::VARCHAR FROM read_pvar(" + SqlStr(pvar) + ")");
+		if (res->HasError()) {
+			throw InvalidInputException("read_howard_manifest: verification failed (range under-claim): "
+			                            "shard '%s': cannot read .pvar for range check: %s",
+			                            e.prefix, res->GetError());
+		}
+		for (auto &row : *res) {
+			string actual = row.GetValue<string>(0);
+			bool declared = false;
+			for (auto &c : e.chrom) {
+				if (c == actual) {
+					declared = true;
+					break;
+				}
+			}
+			if (!declared) {
+				throw InvalidInputException(
+				    "read_howard_manifest: verification failed (range under-claim): shard '%s': declared "
+				    "range.CHROM does not cover contig '%s' the .pvar actually holds — a stale/under-claiming "
+				    "range would wrongly drop this shard (spec §10)",
+				    e.prefix, actual);
+			}
+		}
+	}
+
+	if (e.has_pos) {
+		auto res = conn.Query("SELECT min(POS), max(POS) FROM read_pvar(" + SqlStr(pvar) + ")");
+		if (res->HasError()) {
+			throw InvalidInputException("read_howard_manifest: verification failed (range under-claim): "
+			                            "shard '%s': cannot read .pvar POS extent: %s",
+			                            e.prefix, res->GetError());
+		}
+		auto row = res->Fetch();
+		if (row && row->size() != 0 && !row->GetValue(0, 0).IsNull()) {
+			int64_t real_min = row->GetValue(0, 0).GetValue<int64_t>();
+			int64_t real_max = row->GetValue(1, 0).GetValue<int64_t>();
+			if (real_min < e.pos_min || real_max > e.pos_max) {
+				throw InvalidInputException(
+				    "read_howard_manifest: verification failed (range under-claim): shard '%s': declared "
+				    "range.POS [%lld, %lld] does not cover the real POS extent [%lld, %lld] — an "
+				    "under-claiming range would wrongly drop this shard (spec §10)",
+				    e.prefix, (long long)e.pos_min, (long long)e.pos_max, (long long)real_min, (long long)real_max);
+			}
+		}
+	}
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Bind / scan
+// ---------------------------------------------------------------------------
+
+struct HowardManifestBindData : public TableFunctionData {
+	vector<ShardEntry> survivors;
+	string dataset;
+	string concat_dim;
+};
+
+struct HowardManifestGlobalState : public GlobalTableFunctionState {
+	idx_t row_idx = 0;
+};
+
+static unique_ptr<FunctionData> HowardManifestBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<HowardManifestBindData>();
+	auto &fs = FileSystem::GetFileSystem(context);
+
+	string path = input.inputs[0].GetValue<string>();
+	if (!fs.FileExists(path)) {
+		throw IOException("read_howard_manifest: file not found: catalog '%s'", path);
+	}
+	string content;
+	{
+		auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+		idx_t size = handle->GetFileSize();
+		content.resize(size);
+		if (size > 0) {
+			handle->Read(reinterpret_cast<void *>(&content[0]), size);
+		}
+	}
+
+	HowardCatalog cat = ParseCatalog(fs, path, content);
+	result->dataset = cat.dataset;
+	result->concat_dim = cat.concat_dim;
+
+	// ---- predicates ----
+	bool has_region = false, has_variant_range = false, has_sample_index = false, verify_all = false;
+	RegionPredicate region;
+	int64_t idx_lo = 0, idx_hi = 0;
+	bool use_index_prune = false;
+
+	auto np_region = input.named_parameters.find("region");
+	if (np_region != input.named_parameters.end() && !np_region->second.IsNull()) {
+		has_region = true;
+		region = ParseRegionString(np_region->second.GetValue<string>());
+	}
+	auto np_vr = input.named_parameters.find("variant_range");
+	if (np_vr != input.named_parameters.end() && !np_vr->second.IsNull()) {
+		has_variant_range = true;
+	}
+	auto np_si = input.named_parameters.find("sample_index");
+	if (np_si != input.named_parameters.end() && !np_si->second.IsNull()) {
+		has_sample_index = true;
+	}
+	auto np_va = input.named_parameters.find("verify_all");
+	if (np_va != input.named_parameters.end() && !np_va->second.IsNull()) {
+		verify_all = np_va->second.GetValue<bool>();
+	}
+
+	// Wrong-axis coherence (a silently-ignored off-axis predicate would quietly return the whole
+	// cohort — the unsafe failure mode, spec §10.1). Each predicate is valid on exactly one axis.
+	bool is_variants = cat.concat_dim == "variants";
+	if (has_variant_range && !is_variants) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: variant_range requires "
+		                            "concat_dim='variants', but this catalog is sharded on '%s'",
+		                            cat.concat_dim);
+	}
+	if (has_region && !is_variants) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: region (genomic) requires "
+		                            "concat_dim='variants', but this catalog is sharded on '%s' (variants "
+		                            "are identical across sample-shards, so a genomic predicate prunes "
+		                            "nothing, spec §10)",
+		                            cat.concat_dim);
+	}
+	if (has_sample_index && is_variants) {
+		throw InvalidInputException("read_howard_manifest: invalid predicate: sample_index requires "
+		                            "concat_dim='samples', but this catalog is sharded on '%s'",
+		                            cat.concat_dim);
+	}
+	if (has_variant_range) {
+		ParseIndexPredicate(np_vr->second, "variant_range", idx_lo, idx_hi);
+		use_index_prune = true;
+	}
+	if (has_sample_index) {
+		ParseIndexPredicate(np_si->second, "sample_index", idx_lo, idx_hi);
+		use_index_prune = true;
+	}
+
+	// ---- verify_all: verify EVERY shard before pruning (closes the dropped-shard hole, §10.1) ----
+	if (verify_all) {
+		for (auto &e : cat.files) {
+			VerifyCounts(context, fs, e);
+			VerifyRange(context, e, cat.concat_dim);
+		}
+	}
+
+	// ---- prune (pure, in C++, via the shared overlap predicates) ----
+	for (auto &e : cat.files) {
+		if (use_index_prune && !e.IndexOverlaps(idx_lo, idx_hi)) {
+			continue;
+		}
+		if (has_region && !e.RangeOverlaps(region.contig, region.pos_lo, region.pos_hi)) {
+			continue;
+		}
+		result->survivors.push_back(e);
+	}
+
+	// ---- verify survivors (default) ----
+	if (!verify_all) {
+		for (auto &e : result->survivors) {
+			VerifyCounts(context, fs, e);
+			VerifyRange(context, e, cat.concat_dim);
+		}
+	}
+
+	names = {"dataset",        "concat_dim",     "prefix", "pvar",    "psam",    "partition_start",
+	         "partition_stop", "source_ordinal", "chrom",  "pos_min", "pos_max", "verified"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::LIST(LogicalType::VARCHAR),
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> HowardManifestInitGlobal(ClientContext &context,
+                                                                     TableFunctionInitInput &input) {
+	return make_uniq<HowardManifestGlobalState>();
+}
+
+static void HowardManifestScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<HowardManifestBindData>();
+	auto &gstate = data_p.global_state->Cast<HowardManifestGlobalState>();
+
+	idx_t remaining = bind.survivors.size() - gstate.row_idx;
+	idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+	for (idx_t i = 0; i < count; i++) {
+		auto &e = bind.survivors[gstate.row_idx + i];
+		output.data[0].SetValue(i, Value(bind.dataset));
+		output.data[1].SetValue(i, Value(bind.concat_dim));
+		output.data[2].SetValue(i, Value(e.prefix));
+		output.data[3].SetValue(i, e.pvar.empty() ? Value(LogicalType::VARCHAR) : Value(e.pvar));
+		output.data[4].SetValue(i, e.psam.empty() ? Value(LogicalType::VARCHAR) : Value(e.psam));
+		output.data[5].SetValue(i, Value::BIGINT(e.partition_start));
+		output.data[6].SetValue(i, Value::BIGINT(e.partition_stop));
+		output.data[7].SetValue(i, Value::BIGINT(e.source_ordinal));
+		if (e.has_range) {
+			vector<Value> contigs;
+			for (auto &c : e.chrom) {
+				contigs.push_back(Value(c));
+			}
+			output.data[8].SetValue(i, Value::LIST(LogicalType::VARCHAR, std::move(contigs)));
+		} else {
+			output.data[8].SetValue(i, Value(LogicalType::LIST(LogicalType::VARCHAR)));
+		}
+		output.data[9].SetValue(i, e.has_pos ? Value::BIGINT(e.pos_min) : Value(LogicalType::BIGINT));
+		output.data[10].SetValue(i, e.has_pos ? Value::BIGINT(e.pos_max) : Value(LogicalType::BIGINT));
+		// Every returned row has been verified during this call (survivors, or all shards when
+		// verify_all); a verification failure throws, so this is currently always true. The column
+		// exists for a future degrade-gracefully mode that returns unverified shards.
+		output.data[11].SetValue(i, Value::BOOLEAN(true));
+	}
+	gstate.row_idx += count;
+	output.SetCardinality(count);
+}
+
+void RegisterHowardReader(ExtensionLoader &loader) {
+	TableFunction fn("read_howard_manifest", {LogicalType::VARCHAR}, HowardManifestScan, HowardManifestBind,
+	                 HowardManifestInitGlobal);
+	fn.named_parameters["region"] = LogicalType::VARCHAR;
+	fn.named_parameters["variant_range"] = LogicalType::ANY;
+	fn.named_parameters["sample_index"] = LogicalType::ANY;
+	fn.named_parameters["verify_all"] = LogicalType::BOOLEAN;
+	RegisterTableWithDesc(
+	    loader, fn, {"path", "region", "variant_range", "sample_index", "verify_all"},
+	    "Parse, verify, and prune a .howard.json shard catalog, returning one row per surviving shard. "
+	    "The parse+verify+prune surface plinking_duck owns for .howard reading (write side = the sharded "
+	    "pfile writer).",
+	    {"SELECT * FROM read_howard_manifest('cohort.howard.json')",
+	     "SELECT prefix FROM read_howard_manifest('cohort.howard.json', region := '2:1-5000000')"});
+}
+
+} // namespace duckdb

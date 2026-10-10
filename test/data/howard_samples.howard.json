@@ -1,0 +1,18 @@
+{
+  "howard": 1,
+  "dataset": "sampleshards",
+  "concat_dim": "samples",
+  "shared": { "pvar": "large_example.pvar" },
+  "files": [
+    {
+      "prefix": "large_example",
+      "psam": "large_example.psam",
+      "partition": { "start": 0, "stop": 8, "source_ordinal": 0 }
+    },
+    {
+      "prefix": "large_example",
+      "psam": "large_example.psam",
+      "partition": { "start": 8, "stop": 16, "source_ordinal": 1 }
+    }
+  ]
+}
