@@ -362,6 +362,8 @@ HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &con
 					                            "chunks.chunk_size must be a positive integer",
 					                            path);
 				}
+				cat.has_chunk_size = true;
+				cat.chunk_size = cs; // surfaced in the row for howard's _register_single
 			}
 		}
 
@@ -730,7 +732,9 @@ struct HowardManifestBindData : public TableFunctionData {
 	vector<ShardEntry> survivors;
 	string dataset;
 	string concat_dim;
-	bool is_single = false; //! single-fileset catalog → emit NULL concat_dim (the signal howard routes on)
+	bool is_single = false;      //! single-fileset catalog → emit NULL concat_dim (the signal howard routes on)
+	bool has_chunk_size = false; //! surface chunks.chunk_size (single-fileset only; multi-shard → NULL)
+	int64_t chunk_size = 0;
 };
 
 struct HowardManifestGlobalState : public GlobalTableFunctionState {
@@ -760,6 +764,8 @@ static unique_ptr<FunctionData> HowardManifestBind(ClientContext &context, Table
 	result->dataset = cat.dataset;
 	result->concat_dim = cat.concat_dim;
 	result->is_single = cat.is_single;
+	result->has_chunk_size = cat.has_chunk_size;
+	result->chunk_size = cat.chunk_size;
 
 	// ---- single-fileset: one fileset, always the whole candidate (catalog.py prune_files returns
 	// [pfile] for ANY predicate — no pruning, no wrong-axis check). Verify + enrich the one row. ----
@@ -850,12 +856,13 @@ static unique_ptr<FunctionData> HowardManifestBind(ClientContext &context, Table
 		}
 	}
 
-	names = {"dataset",        "concat_dim",     "prefix", "pvar",    "psam",    "partition_start",
-	         "partition_stop", "source_ordinal", "chrom",  "pos_min", "pos_max", "verified"};
+	names = {"dataset",        "concat_dim", "prefix",  "pvar",    "psam",     "partition_start", "partition_stop",
+	         "source_ordinal", "chrom",      "pos_min", "pos_max", "verified", "chunk_size"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::LIST(LogicalType::VARCHAR),
-	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN};
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
+	                LogicalType::BIGINT};
 	return std::move(result);
 }
 
@@ -897,6 +904,10 @@ static void HowardManifestScan(ClientContext &context, TableFunctionInput &data_
 		// verify_all); a verification failure throws, so this is currently always true. The column
 		// exists for a future degrade-gracefully mode that returns unverified shards.
 		output.data[11].SetValue(i, Value::BOOLEAN(true));
+		// chunk_size: a single-fileset catalog's declared chunks.chunk_size (consumed by howard's
+		// _register_single); NULL for multi-shard rows (the shards ARE the chunks — attach_chunks,
+		// registered with chunks=False — so there is no chunk_size).
+		output.data[12].SetValue(i, bind.has_chunk_size ? Value::BIGINT(bind.chunk_size) : Value(LogicalType::BIGINT));
 	}
 	gstate.row_idx += count;
 	output.SetCardinality(count);

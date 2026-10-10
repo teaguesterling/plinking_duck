@@ -81,10 +81,12 @@ struct HowardCatalog {
 	int64_t version = 0;
 	string dataset;
 	string base_dir;
-	bool is_single = false; //! single-fileset ('pfile') catalog — `concat_dim` is empty / NULL downstream
-	string concat_dim;      //! "variants" | "samples" (empty for a single-fileset catalog)
-	string shared_pvar;     //! resolved (set when concat_dim == "samples")
-	string shared_psam;     //! resolved (set when concat_dim == "variants")
+	bool is_single = false;      //! single-fileset ('pfile') catalog — `concat_dim` is empty / NULL downstream
+	bool has_chunk_size = false; //! single-fileset `chunks.chunk_size` present (→ surfaced; multi-file: never)
+	int64_t chunk_size = 0;      //! the declared single-fileset chunk size (consumed by howard's _register_single)
+	string concat_dim;           //! "variants" | "samples" (empty for a single-fileset catalog)
+	string shared_pvar;          //! resolved (set when concat_dim == "samples")
+	string shared_psam;          //! resolved (set when concat_dim == "variants")
 	vector<ShardEntry> files;
 };
 

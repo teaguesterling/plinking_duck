@@ -49,6 +49,13 @@ SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json') WHERE 
 ----
 3
 
+# Multi-shard rows carry NO chunk_size: the shards ARE the chunks (attach_chunks, registered with
+# chunks=False), so chunk_size is always NULL here.
+query I
+SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json') WHERE chunk_size IS NOT NULL;
+----
+0
+
 # ===========================================================================
 # GENOMIC PRUNE (region, variants axis) — contig membership + inclusive [POS.min, POS.max].
 # ===========================================================================
@@ -220,6 +227,13 @@ query TT
 SELECT pvar, psam FROM read_howard_manifest('test/data/howard_single.pfile.json');
 ----
 NULL	NULL
+
+# chunk_size surfaces the single-fileset catalog's chunks.chunk_size (1000) so howard's
+# _register_single can pass it to register_pgen without re-reading the JSON.
+query I
+SELECT chunk_size FROM read_howard_manifest('test/data/howard_single.pfile.json');
+----
+1000
 
 # Single-fileset 'chunks' is validated like the multi-file schema: a non-variants chunk dim is a
 # parse error (catalog.py _parse_single), even though chunk_size itself is not a manifest column.

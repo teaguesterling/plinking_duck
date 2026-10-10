@@ -59,8 +59,8 @@ whole fileset: `concat_dim` is `NULL`, `partition_start = 0`, `partition_stop = 
 count>`, `source_ordinal = 0`, resolved `prefix`/`pvar`/`psam`, and `chrom`/`pos_min`/`pos_max` read
 from the single `.pvar`. A single fileset is always the whole candidate, so a prune predicate is
 accepted and ignored (whole-load) rather than raising a wrong-axis error. A `chunks` object, if
-present, is validated (`dim` must be `variants`; `chunk_size` a positive integer) but is not itself
-surfaced as a column.
+present, is validated (`dim` must be `variants`; `chunk_size` a positive integer); its `chunk_size`
+is surfaced in the `chunk_size` column (NULL on multi-shard rows).
 
 An **omitted** companion (`pvar`/`psam` not declared, on any catalog form) resolves to `NULL` in the
 output column, and verification lets `read_pfile`'s own discovery find it — including a
@@ -102,6 +102,7 @@ writer-constructed.
 | `pos_min` | `BIGINT` | Inclusive `range.POS.min`; `NULL` when absent. |
 | `pos_max` | `BIGINT` | Inclusive `range.POS.max`; `NULL` when absent. |
 | `verified` | `BOOLEAN` | Whether this shard's companions were checked during this call. Currently always `true` on every returned row (a verification failure raises); the column exists for a future degrade-gracefully mode. |
+| `chunk_size` | `BIGINT` | A **single-fileset** catalog's declared `chunks.chunk_size` (consumed by howard's single-file loader). `NULL` for multi-shard rows — there the shards themselves are the chunks. |
 
 ## Error taxonomy
 
