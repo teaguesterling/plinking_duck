@@ -1,0 +1,279 @@
+# name: test/sql/read_howard_manifest.test
+# description: read_howard_manifest — parse + verify + prune a .howard.json shard catalog,
+# group: [sql]
+
+#   returning one row per surviving shard. plinking_duck owns .howard READING here (it already
+#   owns the WRITE via the sharded pfile writer). These boundary cases mirror howard's phase-3
+#   conformance targets: inclusive index prune vs half-open partition (§6/§10.1), inclusive-POS
+#   genomic prune, conservative keep of a range-less shard, and the verify-first trust model (§8).
+
+require plinking_duck
+
+# ===========================================================================
+# FIXTURE — shard large_example (CHROM 1/2/3, 1000 variants each, POS 100..100000, 8 samples)
+# by CHROM. shard_by 'CHROM' → 3 variant-shards over one shared .psam, tiling the variants axis
+# [0,1000) [1000,2000) [2000,3000), with one out.howard.json catalog emitted LAST.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/out' (FORMAT pfile, shard_by 'CHROM');
+
+# ---------------------------------------------------------------------------
+# ALL shards present: prefix (resolved against the catalog dir), partition tiling, chrom, POS
+# extent, source_ordinal, and verified. Assert the resolved prefix via ends_with (path
+# normalization is not guaranteed to reproduce __TEST_DIR__ byte-for-byte).
+# ---------------------------------------------------------------------------
+
+query TTIIIIIT
+SELECT ends_with(prefix, 'out/CHROM=' || chrom[1] || '/data'), chrom[1],
+       partition_start, partition_stop, source_ordinal, pos_min, pos_max, verified
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json')
+ORDER BY source_ordinal;
+----
+true	1	0	1000	0	100	100000	true
+true	2	1000	2000	1	100	100000	true
+true	3	2000	3000	2	100	100000	true
+
+# dataset name + concat axis + shared-psam folded into every shard's psam (resolved to the root).
+query TTITT
+SELECT DISTINCT dataset, concat_dim, ends_with(pvar, 'data.pvar'),
+       ends_with(psam, 'out.psam'), (pvar IS NOT NULL AND psam IS NOT NULL)
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json');
+----
+out	variants	1	true	true
+
+# Every returned shard was verified during the call (count check against companions).
+query I
+SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json') WHERE verified;
+----
+3
+
+# Multi-shard rows carry NO chunk_size: the shards ARE the chunks (attach_chunks, registered with
+# chunks=False), so chunk_size is always NULL here.
+query I
+SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json') WHERE chunk_size IS NOT NULL;
+----
+0
+
+# ===========================================================================
+# GENOMIC PRUNE (region, variants axis) — contig membership + inclusive [POS.min, POS.max].
+# ===========================================================================
+
+# region on CHROM 2 keeps only the CHROM=2 shard (1/3 are provably wrong-contig → dropped).
+query I
+SELECT source_ordinal
+FROM read_howard_manifest('__TEST_DIR__/out.howard.json', region := '2:1-300000000');
+----
+1
+
+# Inclusive POS boundaries at the shard's EXACT min (100) and max (100000): both keep the shard.
+query II
+SELECT (SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json', region := '2:100-100')),
+       (SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json', region := '2:100000-100000'));
+----
+1	1
+
+# One past each end (99 < min, 100001 > max): the POS window is disjoint → shard dropped.
+query II
+SELECT (SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json', region := '2:1-99')),
+       (SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json', region := '2:100001-200000'));
+----
+0	0
+
+# A bare contig (whole-contig window) keeps the matching shard regardless of POS.
+query I
+SELECT source_ordinal FROM read_howard_manifest('__TEST_DIR__/out.howard.json', region := '3');
+----
+2
+
+# ===========================================================================
+# INDEX PRUNE (variant_index, variants axis) — INCLUSIVE [lo, hi] vs HALF-OPEN [start, stop).
+# A shard holds ordinals start..stop-1, so it survives iff start <= hi AND stop > lo (spec §10.1).
+# (The param is named variant_index — inclusive — NOT read_pfile's half-open variant_range.)
+# ===========================================================================
+
+# [1000, 1000] lands exactly on the start of shard 1's partition [1000, 2000) — ordinal 1000 is
+# in shard 1, NOT in shard 0's [0, 1000). So it selects ONLY shard 1.
+query I
+SELECT source_ordinal FROM read_howard_manifest('__TEST_DIR__/out.howard.json', variant_index := [1000, 1000]);
+----
+1
+
+# [999, 1000] straddles the boundary: 999 ∈ shard 0, 1000 ∈ shard 1 → both.
+query I
+SELECT source_ordinal FROM read_howard_manifest('__TEST_DIR__/out.howard.json', variant_index := [999, 1000])
+ORDER BY source_ordinal;
+----
+0
+1
+
+# [3000, 3000] is one past the last ordinal (shard 2 is [2000, 3000), holding up to 2999) → none
+# (empty prune returns 0 rows — it does NOT crash; howard maps 0 rows to its CatalogError).
+query I
+SELECT count(*) FROM read_howard_manifest('__TEST_DIR__/out.howard.json', variant_index := [3000, 3000]);
+----
+0
+
+# ===========================================================================
+# WRONG-AXIS predicate → error (a silently-ignored off-axis predicate would quietly return the
+# whole cohort — the unsafe failure mode, §10.1). This catalog is variants-sharded.
+# ===========================================================================
+
+statement error
+SELECT * FROM read_howard_manifest('__TEST_DIR__/out.howard.json', sample_index := [0, 100]);
+----
+invalid predicate: sample_index requires concat_dim='samples'
+
+# ===========================================================================
+# RANGE-LESS SHARD is ALWAYS a candidate (never wrongly dropped, §10); the genomic prune can only
+# DROP a shard whose declared range PROVES disjointness. howard_missing_range.howard.json: shard 0
+# declares range.CHROM ["1"] (and under-claims — it really holds 1,2,3); shard 1 has NO range.
+# ===========================================================================
+
+# region on CHROM 2 by default drops the range-bearing shard 0 (contig '2' ∉ ["1"]) and KEEPS the
+# range-less shard 1. The dropped shard is never opened, so its under-claim is not seen (default
+# verifies survivors only).
+query II
+SELECT source_ordinal, (chrom IS NULL)
+FROM read_howard_manifest('test/data/howard_missing_range.howard.json', region := '2:1-300000000');
+----
+1	true
+
+# verify_all := true verifies EVERY shard's declared range against its real .pvar BEFORE pruning,
+# so the under-claim on the would-be-DROPPED shard 0 (declares ["1"], holds 1,2,3) is caught even
+# though the region predicate drops it — the dropped-shard hole the survivor-only default cannot
+# close (§10.1). Without verify_all (the default assertion above) the same predicate returns shard 1
+# with no error; WITH it the dropped liar is still inspected and raises.
+statement error
+SELECT count(*) FROM read_howard_manifest('test/data/howard_missing_range.howard.json', region := '2:1-300000000', verify_all := true);
+----
+verification failed (range under-claim)
+
+# ===========================================================================
+# UNDER-CLAIMED range on a SURVIVING shard → caught by default verification. The declared
+# range.POS [100, 50000] does not cover the real extent [100, 100000] (declared ⊉ actual).
+# ===========================================================================
+
+statement error
+SELECT count(*) FROM read_howard_manifest('test/data/howard_underclaim_pos.howard.json');
+----
+verification failed (range under-claim)
+
+# ===========================================================================
+# COUNT MISMATCH (verification) — distinct taxonomy from a stale range. Both the sample-count and
+# variant-count branches of the eager .pgen-header-vs-companion check (spec §8) are exercised, plus
+# the per-shard WIDTH check and the "companion unreadable" classification.
+# ===========================================================================
+
+# SAMPLE count: shared .psam (pfile_example.psam, 4 samples) ≠ shard .pgen header (large_example, 8).
+statement error
+SELECT count(*) FROM read_howard_manifest('test/data/howard_count_mismatch.howard.json');
+----
+verification failed (count mismatch)
+
+# VARIANT count: declared pvar (pfile_example.pvar, 4 variants) ≠ shard .pgen header (large_example,
+# 3000 variants). A distinct branch of the probe from the sample-count case above.
+statement error
+SELECT count(*) FROM read_howard_manifest('test/data/howard_variant_count_mismatch.howard.json');
+----
+verification failed (count mismatch)
+
+# WIDTH check: a declared partition width that disagrees with the real .pvar row count is a count
+# mismatch, so `verified` cannot silently lie (catalog.py _verify_partition_tiling). This shard
+# declares [0, 2999) (2999 variants) over large_example (really 3000).
+statement error
+SELECT count(*) FROM read_howard_manifest('test/data/howard_width_mismatch.howard.json');
+----
+verification failed (count mismatch)
+
+# COMPANION UNREADABLE: a companion that exists but is the wrong format (a .psam handed in as the
+# shard's .pvar) is classified distinctly from a count lie, so the caller is not misrouted.
+statement error
+SELECT count(*) FROM read_howard_manifest('test/data/howard_unreadable.howard.json');
+----
+verification failed (companion unreadable)
+
+# ===========================================================================
+# PARSE + FILE-NOT-FOUND taxonomy branches (each a distinct, classifiable message prefix).
+# ===========================================================================
+
+statement error
+SELECT * FROM read_howard_manifest('test/data/does_not_exist.howard.json');
+----
+file not found: catalog
+
+# A single-fileset 'pfile' catalog returns ONE row for the whole fileset: concat_dim is NULL (the
+# signal howard routes a whole-fileset load on), partition is [0, probed-variant-count), and
+# chrom/pos come from the single .pvar. howard_single.pfile.json points at large_example (3000
+# variants, CHROM 1/2/3, POS 100..100000).
+query TIIITII
+SELECT concat_dim, partition_start, partition_stop, source_ordinal,
+       array_to_string(chrom, ','), pos_min, pos_max
+FROM read_howard_manifest('test/data/howard_single.pfile.json');
+----
+NULL	0	3000	0	1,2,3	100	100000
+
+# The single fileset is always the whole candidate: a predicate is accepted and ignored (whole-load,
+# catalog.py prune_files returns [pfile] for any predicate), not a wrong-axis error.
+query I
+SELECT partition_stop FROM read_howard_manifest('test/data/howard_single.pfile.json', region := '2:1-100');
+----
+3000
+
+# An omitted companion stays NULL (matching catalog.py's None), and the .pgen's own discovery
+# resolves it — howard_single.pfile.json declares no pvar/psam, so both columns are NULL.
+query TT
+SELECT pvar, psam FROM read_howard_manifest('test/data/howard_single.pfile.json');
+----
+NULL	NULL
+
+# chunk_size surfaces the single-fileset catalog's chunks.chunk_size (1000) so howard's
+# _register_single can pass it to register_pgen without re-reading the JSON.
+query I
+SELECT chunk_size FROM read_howard_manifest('test/data/howard_single.pfile.json');
+----
+1000
+
+# Single-fileset 'chunks' is validated like the multi-file schema: a non-variants chunk dim is a
+# parse error (catalog.py _parse_single), even though chunk_size itself is not a manifest column.
+statement error
+SELECT * FROM read_howard_manifest('test/data/howard_bad_chunks.pfile.json');
+----
+chunks.dim must be 'variants'
+
+# ===========================================================================
+# SAMPLE-SHARDED catalog (concat_dim='samples', shared .pvar, per-shard .psam). The mirror axis:
+# the index prune is sample_index via partition, and the genomic / variant_range predicates are
+# the wrong axis here (variants are identical across sample-shards). howard_samples.howard.json
+# tiles the samples axis [0,8) [8,16).
+# ===========================================================================
+
+# Both shards parse: shared .pvar folded into each shard's pvar, each shard's own .psam resolved.
+query TTITT
+SELECT DISTINCT dataset, concat_dim, source_ordinal >= 0,
+       ends_with(pvar, 'large_example.pvar'), ends_with(psam, 'large_example.psam')
+FROM read_howard_manifest('test/data/howard_samples.howard.json')
+ORDER BY 1;
+----
+sampleshards	samples	true	true	true
+
+# sample_index prune via partition (inclusive [lo, hi] vs half-open [start, stop)): [0, 3] touches
+# only shard 0 ([0, 8)); [8, 8] touches only shard 1 ([8, 16)).
+query II
+SELECT (SELECT list(source_ordinal) FROM read_howard_manifest('test/data/howard_samples.howard.json', sample_index := [0, 3])),
+       (SELECT list(source_ordinal) FROM read_howard_manifest('test/data/howard_samples.howard.json', sample_index := [8, 8]));
+----
+[0]	[1]
+
+# A genomic (region) predicate is the wrong axis for a sample-sharded catalog.
+statement error
+SELECT * FROM read_howard_manifest('test/data/howard_samples.howard.json', region := '1:1-1000');
+----
+invalid predicate: region (genomic) requires concat_dim='variants'
+
+# variant_index is likewise the wrong axis here.
+statement error
+SELECT * FROM read_howard_manifest('test/data/howard_samples.howard.json', variant_index := [0, 10]);
+----
+invalid predicate: variant_index requires concat_dim='variants'

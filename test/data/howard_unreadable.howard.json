@@ -1,0 +1,13 @@
+{
+  "howard": 1,
+  "dataset": "unreadable",
+  "concat_dim": "variants",
+  "shared": { "psam": "large_example.psam" },
+  "files": [
+    {
+      "prefix": "large_example",
+      "pvar": "large_example.psam",
+      "partition": { "start": 0, "stop": 3000, "source_ordinal": 0 }
+    }
+  ]
+}

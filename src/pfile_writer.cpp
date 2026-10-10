@@ -1,5 +1,6 @@
 #include "pfile_writer.hpp"
-#include "plink_common.hpp" // AlignedBuffer + pgenlib read/misc headers
+#include "plink_common.hpp"   // AlignedBuffer + pgenlib read/misc headers
+#include "howard_catalog.hpp" // shared ShardEntry (the .howard catalog model, also used by the reader)
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -1499,19 +1500,10 @@ string PfileBaseName(const string &p) {
 //                     set without a catalog is incomplete-by-construction).
 // ===========================================================================
 
-// One finalized shard's catalog facts → one `files[]` entry in the .howard.json.
-struct ShardCatalogEntry {
-	string rel_prefix; //! shard fileset path, NO extension, RELATIVE to the catalog dir
-	string rel_pvar;   //! the shard's own .pvar, relative to the catalog dir
-	uint64_t variant_count = 0;
-	uint64_t start = 0; //! global half-open [start, stop) variant ordinal (concat axis, §6)
-	uint64_t stop = 0;
-	uint64_t source_ordinal = 0;
-	vector<string> chroms; //! sorted CHROM values the shard covers (range.CHROM membership)
-	bool has_pos = false;
-	int64_t pos_min = 0; //! inclusive range.POS [min, max]
-	int64_t pos_max = 0;
-};
+// One finalized shard's catalog facts → one `files[]` entry in the .howard.json. The struct is
+// shared with the reader (src/include/howard_catalog.hpp, `ShardEntry`): the writer fills relative
+// paths and leaves `psam` empty (the shared companion lives at the catalog root), and the reader
+// parses the same shape back and resolves the paths. See that header for the field + boundary law.
 
 // JSON-escape a string for the catalog (RFC 8259: quote, backslash, control chars).
 string JsonEscape(const string &s) {
@@ -1573,7 +1565,7 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 	// cross-shard
 	std::set<string> seen_keys;
 	uint64_t running_start = 0;
-	vector<ShardCatalogEntry> entries;
+	vector<ShardEntry> entries;
 
 	// Close the open shard's staging (handles + pgenlib + the .staging siblings), WITHOUT
 	// promoting. Leaves already-promoted shards untouched.
@@ -1704,15 +1696,17 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 		g.cur_pvar->handle->Sync();
 		g.cur_pvar->handle.reset();
 	}
-	ShardCatalogEntry e;
-	e.rel_prefix = g.cur_rel_prefix;
-	e.rel_pvar = g.cur_rel_pvar;
-	e.variant_count = g.cur_pgen->appended;
-	e.start = g.running_start;
-	e.stop = g.running_start + e.variant_count;
-	e.source_ordinal = g.entries.size();
+	ShardEntry e;
+	uint64_t variant_count = g.cur_pgen->appended;
+	e.prefix = g.cur_rel_prefix;
+	e.pvar = g.cur_rel_pvar;
+	// psam stays empty: variant-shards reuse the one shared .psam at the catalog root, not a per-shard one.
+	e.partition_start = static_cast<int64_t>(g.running_start);
+	e.partition_stop = static_cast<int64_t>(g.running_start + variant_count);
+	e.source_ordinal = static_cast<int64_t>(g.entries.size());
+	e.has_range = true; // the writer always emits a `range` block (constructive true-min/max, §9)
 	for (auto &c : g.cur_pvar->seen_chroms) {
-		e.chroms.push_back(c); // std::set → already sorted ascending
+		e.chrom.push_back(c); // std::set → already sorted ascending
 	}
 	e.has_pos = g.cur_pvar->has_pos_extent;
 	e.pos_min = g.cur_pvar->first_pos;
@@ -1726,7 +1720,7 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 	fs.MoveFile(g.cur_pvar_staging, g.cur_pvar_final);
 	fs.MoveFile(g.cur_pgen_staging, g.cur_pgen_final); // LAST
 
-	g.running_start = e.stop;
+	g.running_start = static_cast<uint64_t>(e.partition_stop);
 	g.entries.push_back(std::move(e));
 	g.has_active = false;
 	g.cur_pvar.reset();
@@ -1747,16 +1741,17 @@ void PfileWriteCatalog(PfileShardedGlobalState &g, FileSystem &fs) {
 	for (idx_t i = 0; i < g.entries.size(); i++) {
 		auto &e = g.entries[i];
 		j += "    {\n";
-		j += "      \"prefix\": \"" + JsonEscape(e.rel_prefix) + "\",\n";
-		j += "      \"pvar\": \"" + JsonEscape(e.rel_pvar) + "\",\n";
-		j += "      \"partition\": { \"start\": " + std::to_string(e.start) + ", \"stop\": " + std::to_string(e.stop) +
+		j += "      \"prefix\": \"" + JsonEscape(e.prefix) + "\",\n";
+		j += "      \"pvar\": \"" + JsonEscape(e.pvar) + "\",\n";
+		j += "      \"partition\": { \"start\": " + std::to_string(e.partition_start) +
+		     ", \"stop\": " + std::to_string(e.partition_stop) +
 		     ", \"source_ordinal\": " + std::to_string(e.source_ordinal) + " },\n";
 		j += "      \"range\": { \"CHROM\": [";
-		for (idx_t c = 0; c < e.chroms.size(); c++) {
+		for (idx_t c = 0; c < e.chrom.size(); c++) {
 			if (c != 0) {
 				j += ", ";
 			}
-			j += "\"" + JsonEscape(e.chroms[c]) + "\"";
+			j += "\"" + JsonEscape(e.chrom[c]) + "\"";
 		}
 		j += "]";
 		if (e.has_pos) {

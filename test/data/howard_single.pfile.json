@@ -1,0 +1,6 @@
+{
+  "howard": 1,
+  "dataset": "wes_single",
+  "pfile": { "prefix": "large_example" },
+  "chunks": { "dim": "variants", "chunk_size": 1000 }
+}
