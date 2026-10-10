@@ -269,7 +269,7 @@ endif()
 # yyjson. This is what makes plinking_duck the owner of .howard READING.
 set(PLINKING_YYJSON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson)
 add_library(plinking_yyjson STATIC ${PLINKING_YYJSON_DIR}/yyjson.cpp)
-target_include_directories(plinking_yyjson PUBLIC ${PLINKING_YYJSON_DIR}/include)
+target_include_directories(plinking_yyjson PUBLIC $<BUILD_INTERFACE:${PLINKING_YYJSON_DIR}/include>)
 set_target_properties(plinking_yyjson PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     C_VISIBILITY_PRESET hidden
