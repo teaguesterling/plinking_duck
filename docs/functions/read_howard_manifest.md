@@ -73,9 +73,18 @@ accepted and ignored (whole-load) rather than raising a wrong-axis error. A `chu
 present, is validated (`dim` must be `variants`; `chunk_size` a positive integer); its `chunk_size`
 is surfaced in the `chunk_size` column (NULL on multi-shard rows).
 
-An **omitted** companion (`pvar`/`psam` not declared, on any catalog form) resolves to `NULL` in the
-output column, and verification lets `read_pfile`'s own discovery find it — including a
-`.pvar.parquet` / `.psam.parquet` sidecar or a legacy `.bim` / `.fam`.
+A companion may be **declared** (an explicit `pvar`/`psam` path — which can itself be a parquet file,
+e.g. `foo.pvar.parquet`) or **omitted**. An **omitted** companion (on any catalog form) is **resolved
+the way `read_pfile` discovers it** — the `.pvar.parquet` / `.psam.parquet` sidecar **first** (when
+parquet companions are enabled), then the native text `.pvar` / `.bim` (or `.psam` / `.fam`) — and the
+**resolved path is emitted** in the output column (it is **no longer `NULL`**), so a consumer reads the
+exact file the manifest verified rather than re-discovering it. **Parquet companions are supported**
+throughout: both as a declared `.pvar.parquet` / `.psam.parquet` path and via sidecar discovery, and
+the manifest **verifies** them — the count check (through `read_pfile`) and the width/extent checks
+(`read_pvar` for the `.pvar` extent, `read_psam` for the `.psam` count, on the resolved path) read a
+parquet companion natively. A declared companion
+that is missing, or an omitted companion whose default file is **truly absent**, still raises
+`file not found` (see [Error taxonomy](#error-taxonomy)).
 
 ## Verification (the trust model)
 
@@ -104,8 +113,8 @@ writer-constructed.
 | `dataset` | `VARCHAR` | The catalog's `dataset` name. |
 | `concat_dim` | `VARCHAR` | `'variants'` or `'samples'` — the axis the shards concatenate on; **`NULL` for a single-fileset catalog** (the signal a consumer routes a whole-fileset load on). |
 | `prefix` | `VARCHAR` | Resolved fileset path (no extension). |
-| `pvar` | `VARCHAR` | Resolved `.pvar` (the shard's own for variant-shards; the shared one for sample-shards). |
-| `psam` | `VARCHAR` | Resolved `.psam` (the shared one for variant-shards; the shard's own for sample-shards). |
+| `pvar` | `VARCHAR` | **Resolved** `.pvar` path — the exact file `read_pfile` would open: the shard's own for variant-shards, the shared one for sample-shards, or, when omitted, the discovered text `.pvar` **or `.pvar.parquet` sidecar**. Never `NULL` for a verified shard. |
+| `psam` | `VARCHAR` | **Resolved** `.psam` path — the shared one for variant-shards, the shard's own for sample-shards, or, when omitted, the discovered text `.psam` **or `.psam.parquet` sidecar**. Never `NULL` for a verified shard. |
 | `partition_start` | `BIGINT` | Global half-open `[start, stop)` ordinal on the concat axis — included. |
 | `partition_stop` | `BIGINT` | Global half-open ordinal — excluded. |
 | `source_ordinal` | `BIGINT` | The shard's descriptive source ordinal. |

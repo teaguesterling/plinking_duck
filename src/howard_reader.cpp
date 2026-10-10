@@ -1,5 +1,6 @@
 #include "howard_reader.hpp"
 #include "howard_catalog.hpp"
+#include "plink_common.hpp"
 #include "register_helper.hpp"
 
 #include "duckdb/common/file_system.hpp"
@@ -546,6 +547,30 @@ HowardCatalog ParseCatalog(FileSystem &fs, const string &path, const string &con
 
 // ---- verification (spec §8/§10.1) -----------------------------------------
 
+//! A shard's non-shared companion is either DECLARED (explicit path) or OMITTED (read_pfile then
+//! discovers it at bind). This resolves an omitted companion EXACTLY the way read_pfile does
+//! (src/pfile_reader.cpp, "Discover .pvar/.bim" / ".psam/.fam"): the declared path wins
+//! unconditionally; otherwise FindCompanionFileWithParquet returns the first existing default in
+//! read_pfile's order — the `.pvar.parquet` / `.psam.parquet` sidecar FIRST when
+//! `plinking_use_parquet_companions` is on, then the native text `.pvar`/`.bim` (or `.psam`/`.fam`).
+//! Returns "" when nothing exists, so a caller can raise the correct (missing-file) error class.
+//! Mirroring read_pfile's exact order keeps the manifest from ever disagreeing with what read_pfile
+//! would actually open. (NB: read_pfile's extension lists are {".pvar",".bim"} / {".psam",".fam"} —
+//! deliberately NO `.zst`, even though IsNativePlinkFormat recognizes `.pvar.zst`; we mirror that.)
+enum class CompanionKind { PVAR, PSAM };
+
+string ResolveExistingCompanion(ClientContext &context, FileSystem &fs, const string &prefix, const string &declared,
+                                CompanionKind kind) {
+	if (!declared.empty()) {
+		return declared;
+	}
+	const vector<string> exts =
+	    kind == CompanionKind::PVAR ? vector<string> {".pvar", ".bim"} : vector<string> {".psam", ".fam"};
+	// `prefix + ".pgen"` is read_pfile's `eff_prefix + ".pgen"` base (FindCompanionFileWithParquet
+	// strips the `.pgen` via ReplaceExtension before appending each candidate extension).
+	return FindCompanionFileWithParquet(context, fs, prefix + ".pgen", exts);
+}
+
 //! Count verify: force read_pfile's bind-time `.pgen`-header-vs-companion check with a zero-row
 //! probe and re-raise as a count-mismatch (same discipline as howard's `_verify_header`). Existence
 //! is checked first so a surviving error is unambiguously a count lie, not a missing file.
@@ -559,6 +584,18 @@ void VerifyCounts(ClientContext &context, FileSystem &fs, const ShardEntry &e) {
 	}
 	if (!e.psam.empty() && !fs.FileExists(e.psam)) {
 		throw IOException("read_howard_manifest: file not found: .psam '%s'", e.psam);
+	}
+	// An OMITTED companion whose default file is simply ABSENT is a MISSING FILE (howard's reference
+	// loader existence-checks the default companion → CatalogError), NOT an unreadable one. Left
+	// unguarded, read_pfile's discovery fails with "cannot find .pvar" — a message WITHOUT "count
+	// mismatch" — so the probe below misclassifies it as "companion unreadable" (→ AlignmentError in
+	// the Python consumer). Resolve it the way read_pfile would and raise file-not-found (→ CatalogError)
+	// when nothing exists at all.
+	if (e.pvar.empty() && ResolveExistingCompanion(context, fs, e.prefix, "", CompanionKind::PVAR).empty()) {
+		throw IOException("read_howard_manifest: file not found: .pvar '%s'", e.prefix + ".pvar");
+	}
+	if (e.psam.empty() && ResolveExistingCompanion(context, fs, e.prefix, "", CompanionKind::PSAM).empty()) {
+		throw IOException("read_howard_manifest: file not found: .psam '%s'", e.prefix + ".psam");
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
@@ -655,8 +692,16 @@ int64_t QueryPsamCount(ClientContext &context, const string &psam, const string 
 //!  * RANGE under-claim (spec §10): declared `range` must COVER the real `.pvar` extent (⊇). An
 //!    under-claim raises; an over-claim is harmless. A shard with no `range` is skipped.
 void VerifyWidthAndRange(ClientContext &context, ShardEntry &e, const string &concat_dim, bool is_single) {
+	auto &fs = FileSystem::GetFileSystem(context);
 	if (concat_dim == "samples") {
-		int64_t real = QueryPsamCount(context, e.psam.empty() ? (e.prefix + ".psam") : e.psam, e.prefix);
+		// Read the SAME file read_pfile would: a declared path, else the discovered default — which may
+		// be a `.psam.parquet` sidecar, not the hardcoded text `.psam`. read_psam reads parquet natively.
+		// (VerifyCounts has already guaranteed something exists; the fallback is just belt-and-braces.)
+		string psam = ResolveExistingCompanion(context, fs, e.prefix, e.psam, CompanionKind::PSAM);
+		if (psam.empty()) {
+			psam = e.prefix + ".psam";
+		}
+		int64_t real = QueryPsamCount(context, psam, e.prefix);
 		int64_t width = e.partition_stop - e.partition_start;
 		if (width != real) {
 			throw InvalidInputException("read_howard_manifest: verification failed (count mismatch): shard "
@@ -669,7 +714,15 @@ void VerifyWidthAndRange(ClientContext &context, ShardEntry &e, const string &co
 	}
 
 	// variants axis (or single-fileset, counted on the variants axis).
-	PvarStats st = QueryPvarStats(context, e.pvar.empty() ? (e.prefix + ".pvar") : e.pvar, e.prefix);
+	// Read the SAME file read_pfile would: a declared path, else the discovered default — which may be
+	// a `.pvar.parquet` sidecar (read_pvar reads a non-native source natively), NOT the hardcoded text
+	// `.pvar`. So a shard whose only variant companion is `<prefix>.pvar.parquet` passes the extent check
+	// instead of failing to open a text `.pvar` that was never written. (VerifyCounts guards all-absent.)
+	string pvar = ResolveExistingCompanion(context, fs, e.prefix, e.pvar, CompanionKind::PVAR);
+	if (pvar.empty()) {
+		pvar = e.prefix + ".pvar";
+	}
+	PvarStats st = QueryPvarStats(context, pvar, e.prefix);
 
 	if (is_single) {
 		// One fileset: the partition/range are not declared — derive them from the real .pvar.
@@ -854,6 +907,20 @@ static unique_ptr<FunctionData> HowardManifestBind(ClientContext &context, Table
 				VerifyWidthAndRange(context, e, cat.concat_dim, /*is_single=*/false);
 			}
 		}
+	}
+
+	// ---- emit the RESOLVED companion path (output only) ----------------------------------------
+	// For each survivor, replace an OMITTED companion's empty value with the exact file read_pfile
+	// would open (ResolveExistingCompanion: a `<prefix>.pvar` text file, or a `<prefix>.pvar.parquet`
+	// sidecar — whatever read_pfile's discovery picks), so a consumer can read the companion straight
+	// from the column value instead of re-discovering it (and howard's `read_pvar('<prefix>.pvar')`,
+	// which only finds the text form, would miss a bare `.pvar.parquet` sidecar). A declared companion
+	// is returned unchanged; an omitted-and-absent one has already raised `file not found` in verify, so
+	// this never re-introduces an empty value for a shard that got this far. Verify + prune are untouched
+	// — only the output column VALUE changes (NULL → resolved path) for omitted companions.
+	for (auto &e : result->survivors) {
+		e.pvar = ResolveExistingCompanion(context, fs, e.prefix, e.pvar, CompanionKind::PVAR);
+		e.psam = ResolveExistingCompanion(context, fs, e.prefix, e.psam, CompanionKind::PSAM);
 	}
 
 	names = {"dataset",        "concat_dim", "prefix",  "pvar",    "psam",     "partition_start", "partition_stop",
