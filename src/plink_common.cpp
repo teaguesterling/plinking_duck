@@ -2185,6 +2185,71 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 }
 
 // ---------------------------------------------------------------------------
+// Unified axis selection handler (variant × sample axes)
+// ---------------------------------------------------------------------------
+
+Selection ParseSelection(const named_parameter_map_t &params) {
+	Selection sel;
+
+	// Sample axis. Capture the raw Value (ANY); presence is tracked separately
+	// from null-ness so an explicit `samples := NULL` still reaches
+	// ResolveSampleIndices and throws "samples list must not be empty".
+	auto samples_it = params.find("samples");
+	if (samples_it != params.end()) {
+		sel.has_samples = true;
+		sel.samples = samples_it->second;
+	}
+
+	// Variant axis. Keep the region SYMBOLIC (raw Value) — do not parse or resolve
+	// it here, so the string-format validation and ordinal resolution both stay in
+	// ResolveSelection at the same logical point the inline code ran them.
+	auto region_it = params.find("region");
+	if (region_it != params.end()) {
+		sel.has_region = true;
+		sel.region = region_it->second;
+	}
+
+	// `variants` / `variant_range` are part of the variant axis but have no consumer
+	// in increment 1 (plink_freq does not accept them). Deliberately left empty here
+	// until a stat function that uses them is migrated.
+
+	return sel;
+}
+
+ResolvedSelection ResolveSelection(const Selection &selection, const VariantMetadataIndex &variants,
+                                   const SampleInfo *sample_info, uint32_t raw_sample_ct, uint32_t raw_variant_ct,
+                                   const string &func_name) {
+	(void)raw_variant_ct; // reserved for the `variants` / `variant_range` axis (later increment)
+
+	ResolvedSelection resolved;
+	resolved.effective_sample_ct = raw_sample_ct;
+
+	// --- sample axis (resolved BEFORE the variant axis to preserve error ordering) ---
+	if (selection.has_samples) {
+		auto indices = ResolveSampleIndices(selection.samples, raw_sample_ct, sample_info, func_name);
+
+		// Sorted-unique original indices matching pgenlib PgrGet subset ordering,
+		// used downstream to align a sex array to effective sample order.
+		resolved.subset_sorted = indices;
+		std::sort(resolved.subset_sorted.begin(), resolved.subset_sorted.end());
+		resolved.subset_sorted.erase(std::unique(resolved.subset_sorted.begin(), resolved.subset_sorted.end()),
+		                             resolved.subset_sorted.end());
+		resolved.has_subset = true;
+
+		resolved.sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(raw_sample_ct, indices));
+		resolved.has_sample_subset = true;
+		resolved.effective_sample_ct = resolved.sample_subset->subset_sample_ct;
+	}
+
+	// --- variant axis: region ---
+	if (selection.has_region) {
+		resolved.variant_range = ParseRegion(selection.region.GetValue<string>(), variants, func_name);
+	}
+
+	return resolved;
+}
+
+// ---------------------------------------------------------------------------
 // Max threads config helper
 // ---------------------------------------------------------------------------
 
