@@ -948,11 +948,15 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	// plink_ld routes only the sample axis through the shared handler. Its region
 	// semantics are deliberately NOT unified: windowed/genomic mode parses the
 	// region via ParseLdRegionSpec (a different grammar than plink_common's strict
-	// chr:start-end) and resolves the ordinal range below. So clear the region axis
-	// before ResolveSelection — otherwise a valid LD region string that isn't strict
-	// chr:start-end would throw in plink_common::ParseRegion.
+	// chr:start-end) and resolves the ordinal range below. A variant-axis field in
+	// the `selection` struct is rejected here (not silently dropped); the individual
+	// `region :=` param — handled above via ParseLdRegionSpec — is untouched.
+	RejectSelectionVariantAxis(input.named_parameters, "plink_ld");
 	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
 
+	// The struct's variant-axis fields were rejected above, so only the sample axis
+	// remains; still clear any region seeded from the individual `region :=` param so
+	// it stays on ld's own ParseLdRegionSpec path rather than plink_common::ParseRegion.
 	Selection selection = ParseSelection(input.named_parameters);
 	selection.has_region = false;
 	selection.region = Value();
@@ -1429,10 +1433,10 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	plink_ld.named_parameters["region"] = LogicalType::VARCHAR;
 	plink_ld.named_parameters["samples"] = LogicalType::ANY;
 	// Composable selection: a STRUCT seeding the SAMPLE axis only. plink_ld routes
-	// just its sample axis through the handler, so a `region` field inside `select`
-	// is IGNORED by plink_ld (its region stays on ParseLdRegionSpec); use the
-	// individual `region :=` param for LD region selection.
-	plink_ld.named_parameters["select"] = LogicalType::ANY;
+	// just its sample axis through the handler; a variant-axis field (region /
+	// variants / variant_range) inside `selection` is REJECTED (its region grammar
+	// differs). Use the individual `region :=` param for LD region selection.
+	plink_ld.named_parameters["selection"] = LogicalType::ANY;
 	plink_ld.named_parameters["inter_chr"] = LogicalType::BOOLEAN;
 	plink_ld.named_parameters["cache_genotypes"] = LogicalType::BOOLEAN;
 	plink_ld.named_parameters["population_column"] = LogicalType::VARCHAR;

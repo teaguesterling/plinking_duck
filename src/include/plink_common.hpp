@@ -693,11 +693,15 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 //     pgenlib's PgrGet subset ordering).
 //   * Composition of two selections on the same axis is INTERSECTION.
 //
-// Increment 1 populates only the `samples` (sample axis) and `region` (variant
-// axis) fields — the named parameters `plink_freq` accepts. `variants` and
-// `variant_range` are declared so the struct already covers the variant axis for
-// the later migration of the other stat functions; `ParseSelection` leaves them
-// empty until a consumer wires them.
+// The routed functions expose `samples` + `region` as individual params; the full
+// variant axis (`variants` / `variant_range`) arrives only through the composable
+// `selection := <STRUCT>` surface (see ParseSelection). ResolveSelection consumes
+// the variant axis as follows for the contiguous-scan stat functions: `region` →
+// ordinal range via ParseRegion; `variant_range [lo, hi)` → the scanned interval
+// directly (clamped to the variant count); `variants` (arbitrary set) → rejected
+// with a clear error, since a single contiguous scan cannot express it. plink_ld
+// takes NO variant axis from `selection` (its region grammar differs) — those
+// fields are rejected up front by RejectSelectionVariantAxis.
 
 //! PURE, SYMBOLIC description of an axis selection, captured straight from a table
 //! function's named parameters with NO file IO and NO resolution. Every field is
@@ -743,15 +747,24 @@ struct ResolvedSelection {
 //! (unresolved), preserving the exact presence / NULL / empty-list / ANY-dispatch
 //! deferral the inline bind code does.
 //!
-//! Composable `select :=` surface: when a `select` STRUCT param is present (and
-//! non-NULL), its fields seed the axes and the individual named params override
-//! per-field (MOST-SPECIFIC-WINS), so a shared `select` can be reused and tweaked
-//! on one axis. Recognized `select` fields (EXACT names, matching the struct's
-//! own field names): `samples`, `variants`, `region`, `variant_range`; a NULL
-//! field is "unset" for that axis, and any other field name is rejected (catches
-//! e.g. `sample` vs `samples`). A non-STRUCT `select` is a type error. With no
-//! `select` param the behavior is byte-identical to the individual-param path.
+//! Composable `selection :=` surface: when a `selection` STRUCT param is present
+//! (and non-NULL), its fields seed the axes and the individual named params
+//! override per-field (MOST-SPECIFIC-WINS), so a shared `selection` can be reused
+//! and tweaked on one axis. Recognized `selection` fields (EXACT names, matching
+//! the struct's own field names): `samples`, `variants`, `region`,
+//! `variant_range`; a NULL field is "unset" for that axis, and any other field
+//! name is rejected (catches e.g. `sample` vs `samples`). A non-STRUCT `selection`
+//! is a type error. With no `selection` param the behavior is byte-identical to the
+//! individual-param path.
 Selection ParseSelection(const named_parameter_map_t &params);
+
+//! Reject any VARIANT-axis field (`region` / `variants` / `variant_range`) carried
+//! by a `selection` STRUCT, for a function that does not take the variant axis from
+//! `selection` (currently only plink_ld, whose region grammar differs). Prevents a
+//! supplied field from being silently dropped. The individual `region :=` param is
+//! not inspected. No-op when there is no `selection` struct (or it is NULL / not a
+//! STRUCT — the latter is reported by ParseSelection).
+void RejectSelectionVariantAxis(const named_parameter_map_t &params, const string &func_name);
 
 //! Resolve a `Selection` against loaded metadata — pure GLUE over the existing
 //! primitives, NOT new logic. Resolves the SAMPLE axis BEFORE the VARIANT axis,

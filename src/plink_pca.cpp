@@ -1096,7 +1096,7 @@ void RegisterPlinkPca(ExtensionLoader &loader) {
 	plink_pca.named_parameters["region"] = LogicalType::VARCHAR;
 	// Composable selection: a STRUCT whose samples/region fields seed the axes,
 	// overridden per-field by the individual params above (see ParseSelection).
-	plink_pca.named_parameters["select"] = LogicalType::ANY;
+	plink_pca.named_parameters["selection"] = LogicalType::ANY;
 
 	RegisterTableWithDesc(loader, plink_pca, {}, "Compute principal components analysis from PLINK files.",
 	                      {"SELECT * FROM plink_pca('data/cohort.pgen', n_pcs := 10)"});

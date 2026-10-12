@@ -89,6 +89,59 @@ Both `start` and `end` must be specified (chromosome-only filtering is not suppo
 !!! note
     `read_pgen` and `read_pvar` do not have a `region` parameter. Use a SQL `WHERE` clause to filter their output by position.
 
+## `selection`
+
+| Type | Default |
+|------|---------|
+| `STRUCT` | None |
+
+A single, reusable selection struct that bundles the per-axis selection fields so
+one `selection` can be defined once and passed to many functions. Recognized
+fields: [`samples`](#samples), [`region`](#region), and `variant_range` (a
+half-open `[lo, hi)` range in 0-based variant ordinal space). Build it with a
+struct literal or `struct_pack(...)`.
+
+Any individual parameter supplied alongside `selection` **overrides** the matching
+field (most-specific-wins), so a shared selection can be reused and tweaked on one
+axis:
+
+```sql
+-- Define once, reuse across functions
+SELECT * FROM plink_freq('data.pgen',
+    selection := struct_pack(samples := ['S1', 'S2', 'S3'], region := '1:1-500000'));
+
+-- Reuse the same selection but override just the samples on this call
+SELECT * FROM plink_hardy('data.pgen',
+    selection := struct_pack(samples := ['S1', 'S2', 'S3'], region := '1:1-500000'),
+    samples := ['S1']);          -- region '1:1-500000' still applies
+
+-- Contiguous ordinal slice of variants
+SELECT * FROM plink_freq('data.pgen', selection := struct_pack(variant_range := [0, 1000]));
+```
+
+Field rules:
+
+- Unknown field names are an error (so `sample` is rejected rather than silently
+  dropped as a typo for `samples`); a non-STRUCT `selection` is a type error.
+- A `NULL` field is treated as "unset" for that axis.
+- `variant_range` is clamped to the available variant count and cannot be combined
+  with `region` (they both target the variant axis).
+- `variants` (an **arbitrary** variant set, e.g. by rsID/CPRA) is **not** accepted
+  here: these functions scan a single contiguous interval, so an arbitrary set is
+  rejected with a clear error — use `region` or `variant_range` for a contiguous
+  range.
+
+!!! note "`plink_ld`"
+    `plink_ld` takes **only the sample axis** from `selection`. Its `region`
+    grammar differs (windowed mode) and is read solely from the individual
+    `region :=` parameter, so a `region`/`variants`/`variant_range` field inside a
+    `selection` struct passed to `plink_ld` is **rejected** (never silently
+    ignored). Pass `region :=` directly to `plink_ld`.
+
+Because `select` is a reserved SQL keyword, the parameter is spelled `selection`.
+
+**Used by:** `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld` (sample axis only), `plink_score`, `plink_glm`, `plink_pca`
+
 ## `af_range`
 
 | Type | Default |
@@ -218,6 +271,8 @@ SELECT __ordinal, CHROM, POS, ID FROM read_pvar('data.pvar', with_ordinal := tru
 
 **Used by:** `read_pvar`, `read_pfile`
 
-> `variant_range := [lo, hi)` (an ordinal-space range) is `read_pfile`-only and
-> is documented on its [page](functions/read_pfile.md#variant-range-ordinal-space),
-> not here — it is not shared across functions.
+> The standalone `variant_range := [lo, hi)` **parameter** (an ordinal-space range)
+> is `read_pfile`-only and is documented on its
+> [page](functions/read_pfile.md#variant-range-ordinal-space). The same ordinal
+> range is also available on the stat functions as the `variant_range` **field** of
+> the [`selection`](#selection) struct (not as a standalone parameter).

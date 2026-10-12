@@ -823,7 +823,7 @@ void RegisterPlinkMissing(ExtensionLoader &loader) {
 	plink_missing.named_parameters["region"] = LogicalType::VARCHAR;
 	// Composable selection: a STRUCT whose samples/region fields seed the axes,
 	// overridden per-field by the individual params above (see ParseSelection).
-	plink_missing.named_parameters["select"] = LogicalType::ANY;
+	plink_missing.named_parameters["selection"] = LogicalType::ANY;
 
 	RegisterTableWithDesc(loader, plink_missing, {}, "Compute missingness rates per variant or per sample.",
 	                      {"SELECT * FROM plink_missing('data/cohort.pgen', mode := 'variant')"});

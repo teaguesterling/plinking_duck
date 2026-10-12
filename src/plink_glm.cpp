@@ -1502,7 +1502,7 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 	plink_glm.named_parameters["region"] = LogicalType::VARCHAR;
 	// Composable selection: a STRUCT whose samples/region fields seed the axes,
 	// overridden per-field by the individual params above (see ParseSelection).
-	plink_glm.named_parameters["select"] = LogicalType::ANY;
+	plink_glm.named_parameters["selection"] = LogicalType::ANY;
 	plink_glm.named_parameters["model"] = LogicalType::VARCHAR;
 	plink_glm.named_parameters["firth"] = LogicalType::BOOLEAN;
 	plink_glm.named_parameters["p_threshold"] = LogicalType::DOUBLE;
