@@ -1,0 +1,201 @@
+# name: test/sql/plink_select.test
+# description: Composable `selection :=` STRUCT surface on the routed functions
+# group: [sql]
+
+require plinking_duck
+
+# Genotype matrix (pgen_example, 4 samples × 4 variants, file order = ordinals 0..3):
+#   rs1 [0, 1, 2, NULL]  chr1:10000   ordinal 0
+#   rs2 [1, 1, 0, 2]     chr1:20000   ordinal 1
+#   rs3 [2, NULL, 1, 0]  chr1:30000   ordinal 2
+#   rs4 [0, 0, 1, 2]     chr2:15000   ordinal 3
+
+# --- Equivalence: a `selection` struct == the same options as individual params ---
+
+# region via selection == region via individual param (identical row sets, both ways)
+query I
+SELECT COUNT(*) FROM (
+  (SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(region := '1:10000-20000'))
+   EXCEPT
+   SELECT * FROM plink_freq('test/data/pgen_example.pgen', region := '1:10000-20000'))
+  UNION ALL
+  (SELECT * FROM plink_freq('test/data/pgen_example.pgen', region := '1:10000-20000')
+   EXCEPT
+   SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(region := '1:10000-20000')))
+);
+----
+0
+
+# samples via selection == samples via individual param
+query I
+SELECT COUNT(*) FROM (
+  (SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(samples := [0, 1]), counts := true)
+   EXCEPT
+   SELECT * FROM plink_freq('test/data/pgen_example.pgen', samples := [0, 1], counts := true))
+  UNION ALL
+  (SELECT * FROM plink_freq('test/data/pgen_example.pgen', samples := [0, 1], counts := true)
+   EXCEPT
+   SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(samples := [0, 1]), counts := true))
+);
+----
+0
+
+# --- Merge / override precedence: individual param wins per-field, selection's other field survives ---
+
+# selection alone: samples [0,1] on rs1 → alt=1, obs=2*2=4, freq=0.25
+query TRI
+SELECT ID, ALT_FREQ, OBS_CT FROM plink_freq('test/data/pgen_example.pgen',
+    selection := struct_pack(samples := [0, 1], region := '1:10000-10000'));
+----
+rs1	0.25	4
+
+# override: individual samples [2,3] WINS (freq 1.0/obs 2, not 0.25/4), AND the
+# region '1:10000-10000' from selection SURVIVES (still only rs1).
+query TRI
+SELECT ID, ALT_FREQ, OBS_CT FROM plink_freq('test/data/pgen_example.pgen',
+    selection := struct_pack(samples := [0, 1], region := '1:10000-10000'),
+    samples := [2, 3]);
+----
+rs1	1.0	2
+
+# the overridden form is identical to passing both as individual params
+query I
+SELECT COUNT(*) FROM (
+  (SELECT * FROM plink_freq('test/data/pgen_example.pgen',
+       selection := struct_pack(samples := [0, 1], region := '1:10000-10000'), samples := [2, 3])
+   EXCEPT
+   SELECT * FROM plink_freq('test/data/pgen_example.pgen', samples := [2, 3], region := '1:10000-10000'))
+  UNION ALL
+  (SELECT * FROM plink_freq('test/data/pgen_example.pgen', samples := [2, 3], region := '1:10000-10000')
+   EXCEPT
+   SELECT * FROM plink_freq('test/data/pgen_example.pgen',
+       selection := struct_pack(samples := [0, 1], region := '1:10000-10000'), samples := [2, 3]))
+);
+----
+0
+
+# --- selection is wired on the other routed functions too (region field applies) ---
+
+query I
+SELECT COUNT(*) FROM plink_hardy('test/data/pgen_example.pgen', selection := struct_pack(region := '1:10000-20000'));
+----
+2
+
+# --- variant_range: WIRED onto the contiguous scan interval (not a silent no-op) ---
+
+# [0, 2) half-open ordinal range → the first two file-order variants (rs1, rs2)
+query TI
+SELECT ID, POS FROM plink_freq('test/data/pgen_example.pgen',
+    selection := struct_pack(variant_range := [0, 2])) ORDER BY POS;
+----
+rs1	10000
+rs2	20000
+
+# variant_range and region cannot both target the variant axis
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen',
+    selection := struct_pack(region := '1:10000-20000', variant_range := [0, 2]));
+----
+not both
+
+# --- Field validation ---
+
+# unknown field (catches sample vs samples)
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(sample := [0, 1]));
+----
+unknown field 'sample'
+
+# non-STRUCT selection
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := 'oops');
+----
+must be a STRUCT
+
+# variant_range is validated at parse time (hi < lo rejected)
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(variant_range := [5, 2]));
+----
+variant_range
+
+# arbitrary variant SET (`variants`, Tier C) is rejected, not silently ignored
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(variants := [0, 1]));
+----
+arbitrary variant selection
+
+# --- plink_ld: SAMPLE axis only; a variant-axis field in `selection` is REJECTED ---
+
+# selection.samples applies on plink_ld (identical to the individual samples param)
+query I
+SELECT COUNT(*) FROM (
+  (SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1', variant2 := 'rs2',
+       selection := struct_pack(samples := [0, 1, 2]))
+   EXCEPT
+   SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1', variant2 := 'rs2',
+       samples := [0, 1, 2]))
+  UNION ALL
+  (SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1', variant2 := 'rs2',
+       samples := [0, 1, 2])
+   EXCEPT
+   SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1', variant2 := 'rs2',
+       selection := struct_pack(samples := [0, 1, 2])))
+);
+----
+0
+
+# a `region` field in selection is REJECTED by plink_ld (its region grammar differs)
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1', variant2 := 'rs2',
+    selection := struct_pack(region := '1:1-100'));
+----
+not taken from
+
+# a `variant_range` field in selection is likewise rejected by plink_ld
+statement error
+SELECT * FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1', variant2 := 'rs2',
+    selection := struct_pack(variant_range := [0, 2]));
+----
+not supported here
+
+# the individual `region :=` param still works alongside a selection samples struct
+query TTI
+SELECT ID_A, ID_B, OBS_CT
+FROM plink_ld('test/data/pgen_example.pgen', variant1 := 'rs1', variant2 := 'rs2',
+    region := '1:1-100000', selection := struct_pack(samples := [0, 1, 2]));
+----
+rs1	rs2	3
+
+# the SAME region string, routed through plink_freq's live variant axis, IS parsed
+statement error
+SELECT * FROM plink_freq('test/data/pgen_example.pgen', selection := struct_pack(region := 'bogus-region'));
+----
+region
+
+# --- plink_glm: the one function-specific path (samples-require-psam gate + lazy
+# psam load fire off a selection-provided `samples`, not just the individual param) ---
+
+# selection.samples == individual samples (phenotype is length raw_sample_ct either way)
+query I
+SELECT COUNT(*) FROM (
+  (SELECT * FROM plink_glm('test/data/pgen_example', phenotype := [1.5, 2.3, 3.7, 0.8],
+       selection := struct_pack(samples := [0, 1, 2]))
+   EXCEPT
+   SELECT * FROM plink_glm('test/data/pgen_example', phenotype := [1.5, 2.3, 3.7, 0.8],
+       samples := [0, 1, 2]))
+  UNION ALL
+  (SELECT * FROM plink_glm('test/data/pgen_example', phenotype := [1.5, 2.3, 3.7, 0.8],
+       samples := [0, 1, 2])
+   EXCEPT
+   SELECT * FROM plink_glm('test/data/pgen_example', phenotype := [1.5, 2.3, 3.7, 0.8],
+       selection := struct_pack(samples := [0, 1, 2])))
+);
+----
+0
+
+# a selection-provided `samples` with no psam trips plink_glm's psam-required gate
+statement error
+SELECT * FROM plink_glm('test/data/pgen_orphan', phenotype := [1.0, 2.0],
+    selection := struct_pack(samples := [0, 1]));
+----
+requires .psam/.fam file

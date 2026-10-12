@@ -498,26 +498,30 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 		                            static_cast<unsigned long long>(bind_data->variants.variant_ct));
 	}
 
-	// --- Process samples parameter ---
-	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
-
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
+	// --- Resolve the axis selection (samples + region) via the shared handler ---
+	// Byte-identical to the former inline parse. plink_glm keeps its own
+	// samples-require-psam pre-check and its lazy, samples-only psam load (the
+	// handler stays IO-free); that local sample_info only needs to outlive the
+	// ResolveSelection call, which is the only consumer of it.
+	Selection selection = ParseSelection(input.named_parameters);
+	SampleInfo sample_info;
+	const SampleInfo *sample_info_ptr = nullptr;
+	if (selection.has_samples) {
 		if (bind_data->psam_path.empty()) {
 			throw InvalidInputException("plink_glm: samples parameter requires .psam/.fam file");
 		}
-		auto sample_info = LoadSampleMetadata(context, bind_data->psam_path);
-		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &sample_info, "plink_glm");
-		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
-		bind_data->has_sample_subset = true;
-		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
+		sample_info = LoadSampleMetadata(context, bind_data->psam_path);
+		sample_info_ptr = &sample_info;
 	}
+	ResolvedSelection resolved = ResolveSelection(selection, bind_data->variants, sample_info_ptr,
+	                                              bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_glm");
 
-	// --- Process region parameter ---
-	auto region_it = input.named_parameters.find("region");
-	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_glm");
+	bind_data->effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_sample_subset) {
+		bind_data->sample_subset = std::move(resolved.sample_subset);
+		bind_data->has_sample_subset = true;
 	}
+	bind_data->variant_range = resolved.variant_range;
 
 	// --- Process phenotype parameter ---
 	auto pheno_it = input.named_parameters.find("phenotype");
@@ -1496,6 +1500,9 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 	plink_glm.named_parameters["covariates"] = LogicalType::ANY;
 	plink_glm.named_parameters["samples"] = LogicalType::ANY;
 	plink_glm.named_parameters["region"] = LogicalType::VARCHAR;
+	// Composable selection: a STRUCT whose samples/region fields seed the axes,
+	// overridden per-field by the individual params above (see ParseSelection).
+	plink_glm.named_parameters["selection"] = LogicalType::ANY;
 	plink_glm.named_parameters["model"] = LogicalType::VARCHAR;
 	plink_glm.named_parameters["firth"] = LogicalType::BOOLEAN;
 	plink_glm.named_parameters["p_threshold"] = LogicalType::DOUBLE;

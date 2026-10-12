@@ -944,17 +944,30 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 		}
 	}
 
-	// --- Process samples parameter ---
+	// --- Process samples parameter (SAMPLE AXIS ONLY) ---
+	// plink_ld routes only the sample axis through the shared handler. Its region
+	// semantics are deliberately NOT unified: windowed/genomic mode parses the
+	// region via ParseLdRegionSpec (a different grammar than plink_common's strict
+	// chr:start-end) and resolves the ordinal range below. A variant-axis field in
+	// the `selection` struct is rejected here (not silently dropped); the individual
+	// `region :=` param — handled above via ParseLdRegionSpec — is untouched.
+	RejectSelectionVariantAxis(input.named_parameters, "plink_ld");
 	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
 
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
-		                                    bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_ld");
+	// The struct's variant-axis fields were rejected above, so only the sample axis
+	// remains; still clear any region seeded from the individual `region :=` param so
+	// it stays on ld's own ParseLdRegionSpec path rather than plink_common::ParseRegion.
+	Selection selection = ParseSelection(input.named_parameters);
+	selection.has_region = false;
+	selection.region = Value();
+	ResolvedSelection resolved =
+	    ResolveSelection(selection, bind_data->variants, bind_data->has_sample_info ? &bind_data->sample_info : nullptr,
+	                     bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_ld");
 
-		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
+	bind_data->effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_sample_subset) {
+		bind_data->sample_subset = std::move(resolved.sample_subset);
 		bind_data->has_sample_subset = true;
-		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
 	}
 
 	// --- Process GAUSS-like population weights ---
@@ -1419,6 +1432,11 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	plink_ld.named_parameters["r2_threshold"] = LogicalType::DOUBLE;
 	plink_ld.named_parameters["region"] = LogicalType::VARCHAR;
 	plink_ld.named_parameters["samples"] = LogicalType::ANY;
+	// Composable selection: a STRUCT seeding the SAMPLE axis only. plink_ld routes
+	// just its sample axis through the handler; a variant-axis field (region /
+	// variants / variant_range) inside `selection` is REJECTED (its region grammar
+	// differs). Use the individual `region :=` param for LD region selection.
+	plink_ld.named_parameters["selection"] = LogicalType::ANY;
 	plink_ld.named_parameters["inter_chr"] = LogicalType::BOOLEAN;
 	plink_ld.named_parameters["cache_genotypes"] = LogicalType::BOOLEAN;
 	plink_ld.named_parameters["population_column"] = LogicalType::VARCHAR;

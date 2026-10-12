@@ -326,33 +326,27 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 		                            static_cast<unsigned long long>(bind_data->sample_info.sample_ct));
 	}
 
-	// --- Process samples parameter ---
-	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
+	// --- Resolve the axis selection (samples + region) via the shared handler ---
+	// Byte-identical to the former inline parse. plink_pca keeps its own
+	// sample_output_order (sorted subset, or identity when unsubset).
+	// resolved.subset_sorted equals the former sort-only sorted_indices (no
+	// duplicates survive ResolveSampleIndices).
+	Selection selection = ParseSelection(input.named_parameters);
+	ResolvedSelection resolved = ResolveSelection(selection, bind_data->variants, &bind_data->sample_info,
+	                                              bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_pca");
 
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto indices =
-		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &bind_data->sample_info, "plink_pca");
-
-		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
+	bind_data->effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_sample_subset) {
+		bind_data->sample_subset = std::move(resolved.sample_subset);
 		bind_data->has_sample_subset = true;
-		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
-
-		auto sorted_indices = indices;
-		std::sort(sorted_indices.begin(), sorted_indices.end());
-		bind_data->sample_output_order = std::move(sorted_indices);
+		bind_data->sample_output_order = resolved.subset_sorted;
 	} else {
 		bind_data->sample_output_order.resize(bind_data->raw_sample_ct);
 		for (uint32_t i = 0; i < bind_data->raw_sample_ct; i++) {
 			bind_data->sample_output_order[i] = i;
 		}
 	}
-
-	// --- Process region parameter ---
-	auto region_it = input.named_parameters.find("region");
-	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range = ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_pca");
-	}
+	bind_data->variant_range = resolved.variant_range;
 
 	// --- Compute per-variant allele frequencies and build effective variant list ---
 	// Need a full PgenReader for PgrGetCounts
@@ -1100,6 +1094,9 @@ void RegisterPlinkPca(ExtensionLoader &loader) {
 	plink_pca.named_parameters["n_pcs"] = LogicalType::INTEGER;
 	plink_pca.named_parameters["samples"] = LogicalType::ANY;
 	plink_pca.named_parameters["region"] = LogicalType::VARCHAR;
+	// Composable selection: a STRUCT whose samples/region fields seed the axes,
+	// overridden per-field by the individual params above (see ParseSelection).
+	plink_pca.named_parameters["selection"] = LogicalType::ANY;
 
 	RegisterTableWithDesc(loader, plink_pca, {}, "Compute principal components analysis from PLINK files.",
 	                      {"SELECT * FROM plink_pca('data/cohort.pgen', n_pcs := 10)"});

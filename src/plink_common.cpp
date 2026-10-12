@@ -2185,6 +2185,209 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 }
 
 // ---------------------------------------------------------------------------
+// Unified axis selection handler (variant × sample axes)
+// ---------------------------------------------------------------------------
+
+//! Destructure a `selection := <STRUCT>` value's fields into a Selection. PURE:
+//! reads the struct, no IO, no ordinal resolution. Fields are matched by EXACT name
+//! (matching the struct's own field names, as ResolveCpraStruct does) so a typo
+//! like `sample` is rejected as unknown rather than silently dropped. A NULL field
+//! is treated as "unset" for that axis. These seed the lowest precedence; the
+//! individual named params override them afterwards.
+static void MergeSelectionStruct(const Value &select_val, Selection &sel) {
+	if (select_val.type().id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException("selection: must be a STRUCT of selection fields "
+		                            "(samples, variants, region, variant_range), got %s",
+		                            select_val.type().ToString());
+	}
+	auto &child_types = StructType::GetChildTypes(select_val.type());
+	auto &children = StructValue::GetChildren(select_val);
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		const string &field = child_types[i].first;
+		const Value &fv = children[i];
+		if (field == "samples") {
+			if (!fv.IsNull()) {
+				sel.has_samples = true;
+				sel.samples = fv;
+			}
+		} else if (field == "region") {
+			if (!fv.IsNull()) {
+				sel.has_region = true;
+				sel.region = fv;
+			}
+		} else if (field == "variants") {
+			if (!fv.IsNull()) {
+				sel.has_variants = true;
+				sel.variants = fv;
+			}
+		} else if (field == "variant_range") {
+			if (!fv.IsNull()) {
+				// Half-open [lo, hi) in variant ordinal space; validated at parse time.
+				// ResolveSelection wires this into the scanned interval (for ld, the
+				// field is rejected up front — see RejectSelectionVariantAxis).
+				if (fv.type().id() != LogicalTypeId::LIST) {
+					throw InvalidInputException(
+					    "selection: variant_range must be a 2-element list [lo, hi) in variant ordinal space (got %s)",
+					    fv.type().ToString());
+				}
+				auto &vr_children = ListValue::GetChildren(fv);
+				if (vr_children.size() != 2) {
+					throw InvalidInputException(
+					    "selection: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
+					    static_cast<unsigned long long>(vr_children.size()));
+				}
+				if (vr_children[0].IsNull() || vr_children[1].IsNull()) {
+					throw InvalidInputException("selection: variant_range bounds must not be NULL");
+				}
+				if (!vr_children[0].type().IsIntegral() || !vr_children[1].type().IsIntegral()) {
+					throw InvalidInputException("selection: variant_range bounds must be integers");
+				}
+				int64_t lo = vr_children[0].GetValue<int64_t>();
+				int64_t hi = vr_children[1].GetValue<int64_t>();
+				if (lo < 0 || hi < lo) {
+					throw InvalidInputException(
+					    "selection: variant_range must be a half-open [lo, hi) with 0 <= lo <= hi (got [%lld, %lld))",
+					    static_cast<long long>(lo), static_cast<long long>(hi));
+				}
+				sel.has_variant_range = true;
+				sel.variant_range_lo = lo;
+				sel.variant_range_hi = hi;
+			}
+		} else {
+			throw InvalidInputException(
+			    "selection: unknown field '%s' (expected samples, variants, region, or variant_range)", field);
+		}
+	}
+}
+
+Selection ParseSelection(const named_parameter_map_t &params) {
+	Selection sel;
+
+	// --- Lowest precedence: a shared `selection := <STRUCT>` seeds the axes ---
+	// A NULL selection means "no selection". Fields are merged below; individual
+	// named params then override per-field (most-specific-wins).
+	auto selection_it = params.find("selection");
+	if (selection_it != params.end() && !selection_it->second.IsNull()) {
+		MergeSelectionStruct(selection_it->second, sel);
+	}
+
+	// --- Highest precedence: individual named params override per-field ---
+	// Unconditional overwrite (not guarded on has_*) so that a present individual
+	// param always wins, including an explicit `samples := NULL` (which keeps
+	// presence true with a NULL value, so ResolveSampleIndices throws "samples list
+	// must not be empty" rather than falling back to the selection's samples).
+	//
+	// Sample axis: capture the raw Value (ANY); presence is tracked separately from
+	// null-ness. Variant axis: keep the region SYMBOLIC (raw Value) — do not parse
+	// or resolve it here, so string-format validation and ordinal resolution stay in
+	// ResolveSelection at the same logical point the inline code ran them.
+	auto samples_it = params.find("samples");
+	if (samples_it != params.end()) {
+		sel.has_samples = true;
+		sel.samples = samples_it->second;
+	}
+
+	auto region_it = params.find("region");
+	if (region_it != params.end()) {
+		sel.has_region = true;
+		sel.region = region_it->second;
+	}
+
+	// `variants` / `variant_range` have no individual-param surface on the routed
+	// functions; they arrive only via the `selection` struct. ResolveSelection then
+	// rejects `variants` (arbitrary set, unsupported by a contiguous scan) and wires
+	// `variant_range` into the scanned interval.
+
+	return sel;
+}
+
+ResolvedSelection ResolveSelection(const Selection &selection, const VariantMetadataIndex &variants,
+                                   const SampleInfo *sample_info, uint32_t raw_sample_ct, uint32_t raw_variant_ct,
+                                   const string &func_name) {
+	ResolvedSelection resolved;
+	resolved.effective_sample_ct = raw_sample_ct;
+
+	// --- sample axis (resolved BEFORE the variant axis to preserve error ordering) ---
+	if (selection.has_samples) {
+		auto indices = ResolveSampleIndices(selection.samples, raw_sample_ct, sample_info, func_name);
+
+		// Sorted-unique original indices matching pgenlib PgrGet subset ordering,
+		// used downstream to align a sex array to effective sample order.
+		resolved.subset_sorted = indices;
+		std::sort(resolved.subset_sorted.begin(), resolved.subset_sorted.end());
+		resolved.subset_sorted.erase(std::unique(resolved.subset_sorted.begin(), resolved.subset_sorted.end()),
+		                             resolved.subset_sorted.end());
+		resolved.has_subset = true;
+
+		resolved.sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(raw_sample_ct, indices));
+		resolved.has_sample_subset = true;
+		resolved.effective_sample_ct = resolved.sample_subset->subset_sample_ct;
+	}
+
+	// --- variant axis ---
+	// These callers scan a single contiguous [start, end) interval, so they support
+	// only the contiguous forms of the variant axis. An arbitrary variant SET
+	// (`variants` — Tier C) cannot map onto one interval: reject it rather than
+	// silently ignore (no false affordance).
+	if (selection.has_variants) {
+		throw InvalidInputException("%s: arbitrary variant selection (`variants`) is not supported here; "
+		                            "use `region` or `variant_range` for a contiguous range",
+		                            func_name);
+	}
+	if (selection.has_variant_range) {
+		// `variant_range := [lo, hi)` is already the contiguous ordinal interval the
+		// scan consumes, so wire it straight into VariantRange, clamped to the
+		// available variant count (mirrors read_pfile's variant_range handling).
+		if (selection.has_region) {
+			throw InvalidInputException("%s: specify either `region` or `variant_range`, not both", func_name);
+		}
+		uint32_t start = static_cast<uint32_t>(std::min<int64_t>(selection.variant_range_lo, raw_variant_ct));
+		uint32_t end = static_cast<uint32_t>(std::min<int64_t>(selection.variant_range_hi, raw_variant_ct));
+		resolved.variant_range.has_filter = true;
+		resolved.variant_range.start_idx = start;
+		resolved.variant_range.end_idx = end;
+	} else if (selection.has_region) {
+		resolved.variant_range = ParseRegion(selection.region.GetValue<string>(), variants, func_name);
+	}
+
+	return resolved;
+}
+
+void RejectSelectionVariantAxis(const named_parameter_map_t &params, const string &func_name) {
+	// For a function that does NOT take the variant axis from the `selection` struct
+	// (currently only plink_ld, whose region grammar differs and which does not
+	// support arbitrary/ordinal variant selection): a variant-axis FIELD inside the
+	// struct would otherwise be silently dropped. Reject it with a clear error. The
+	// individual `region :=` param is untouched — this inspects only the struct.
+	auto it = params.find("selection");
+	if (it == params.end() || it->second.IsNull()) {
+		return;
+	}
+	const Value &sv = it->second;
+	if (sv.type().id() != LogicalTypeId::STRUCT) {
+		return; // MergeSelectionStruct (via ParseSelection) reports the type error
+	}
+	auto &child_types = StructType::GetChildTypes(sv.type());
+	auto &children = StructValue::GetChildren(sv);
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		const string &field = child_types[i].first;
+		if (children[i].IsNull()) {
+			continue;
+		}
+		if (field == "region") {
+			throw InvalidInputException("%s: pass `region :=` directly; its region grammar differs and is not "
+			                            "taken from the `selection` struct",
+			                            func_name);
+		}
+		if (field == "variants" || field == "variant_range") {
+			throw InvalidInputException("%s: `%s` in the `selection` struct is not supported here; "
+			                            "use `region :=` directly",
+			                            func_name, field);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Max threads config helper
 // ---------------------------------------------------------------------------
 

@@ -285,41 +285,27 @@ static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunc
 		}
 	}
 
-	// --- Process samples parameter ---
-	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
+	// --- Resolve the axis selection (samples + region) via the shared handler ---
+	// Byte-identical to the former inline parse: samples resolve before region, psam
+	// optional (sample_info may be null), count-mismatch checks remain above, and
+	// BuildAlignedSex still runs here with the resolved subset (nullptr when none).
+	Selection selection = ParseSelection(input.named_parameters);
+	ResolvedSelection resolved =
+	    ResolveSelection(selection, bind_data->variants, bind_data->has_sample_info ? &bind_data->sample_info : nullptr,
+	                     bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_hardy");
 
-	// Sorted-unique original indices matching pgenlib PgrGet subset ordering,
-	// used to align the sex array to effective sample order.
-	vector<uint32_t> subset_sorted;
-	bool has_subset = false;
-
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto indices =
-		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
-		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_hardy");
-
-		subset_sorted = indices;
-		std::sort(subset_sorted.begin(), subset_sorted.end());
-		subset_sorted.erase(std::unique(subset_sorted.begin(), subset_sorted.end()), subset_sorted.end());
-		has_subset = true;
-
-		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
+	bind_data->effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_sample_subset) {
+		bind_data->sample_subset = std::move(resolved.sample_subset);
 		bind_data->has_sample_subset = true;
-		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
 	}
+	bind_data->variant_range = resolved.variant_range;
 
 	// --- Build ploidy-aware sex array (aligned to effective sample order) ---
 	if (bind_data->has_sample_info && !bind_data->sample_info.sexes.empty()) {
-		bind_data->aligned_sex = BuildAlignedSex(bind_data->sample_info, has_subset ? &subset_sorted : nullptr);
+		bind_data->aligned_sex =
+		    BuildAlignedSex(bind_data->sample_info, resolved.has_subset ? &resolved.subset_sorted : nullptr);
 		bind_data->have_sex = !bind_data->aligned_sex.empty();
-	}
-
-	// --- Process region parameter ---
-	auto region_it = input.named_parameters.find("region");
-	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range =
-		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_hardy");
 	}
 
 	// --- Register output columns ---
@@ -719,6 +705,9 @@ void RegisterPlinkHardy(ExtensionLoader &loader) {
 	plink_hardy.named_parameters["psam"] = LogicalType::VARCHAR;
 	plink_hardy.named_parameters["samples"] = LogicalType::ANY;
 	plink_hardy.named_parameters["region"] = LogicalType::VARCHAR;
+	// Composable selection: a STRUCT whose samples/region fields seed the axes,
+	// overridden per-field by the individual params above (see ParseSelection).
+	plink_hardy.named_parameters["selection"] = LogicalType::ANY;
 	plink_hardy.named_parameters["midp"] = LogicalType::BOOLEAN;
 	plink_hardy.named_parameters["build"] = LogicalType::VARCHAR;
 

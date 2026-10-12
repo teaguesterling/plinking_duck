@@ -306,22 +306,21 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 		                            static_cast<unsigned long long>(bind_data->sample_info.sample_ct));
 	}
 
-	// --- Process samples parameter ---
-	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
+	// --- Resolve the axis selection (samples + region) via the shared handler ---
+	// Byte-identical to the former inline parse. plink_score keeps its own
+	// sample_output_order (sorted subset, or identity when unsubset) and its own
+	// unconditional BuildAlignedSex. resolved.subset_sorted equals the former
+	// sort-only sorted_indices (no duplicates survive ResolveSampleIndices).
+	Selection selection = ParseSelection(input.named_parameters);
+	ResolvedSelection resolved = ResolveSelection(selection, bind_data->variants, &bind_data->sample_info,
+	                                              bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_score");
 
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto indices =
-		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct, &bind_data->sample_info, "plink_score");
-
-		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
+	bind_data->effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_sample_subset) {
+		bind_data->sample_subset = std::move(resolved.sample_subset);
 		bind_data->has_sample_subset = true;
-		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
-
 		// Build sample_output_order: sorted indices matching sample_include bit order
-		auto sorted_indices = indices;
-		std::sort(sorted_indices.begin(), sorted_indices.end());
-		bind_data->sample_output_order = std::move(sorted_indices);
+		bind_data->sample_output_order = resolved.subset_sorted;
 	} else {
 		// No subsetting: identity mapping
 		bind_data->sample_output_order.resize(bind_data->raw_sample_ct);
@@ -329,19 +328,13 @@ static unique_ptr<FunctionData> PlinkScoreBind(ClientContext &context, TableFunc
 			bind_data->sample_output_order[i] = i;
 		}
 	}
+	bind_data->variant_range = resolved.variant_range;
 
 	// Sex, aligned to effective (post-subset) sample order. Only chrY scoring
 	// consults it; chrX is diploid under plink2's default --xchr-model 2.
 	bind_data->aligned_sex = BuildAlignedSex(bind_data->sample_info,
 	                                         bind_data->has_sample_subset ? &bind_data->sample_output_order : nullptr);
 	bind_data->have_sex = !bind_data->aligned_sex.empty();
-
-	// --- Process region parameter ---
-	auto region_it = input.named_parameters.find("region");
-	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range =
-		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_score");
-	}
 
 	// --- Process weights parameter ---
 	auto weights_it = input.named_parameters.find("weights");
@@ -860,6 +853,9 @@ void RegisterPlinkScore(ExtensionLoader &loader) {
 	plink_score.named_parameters["weights"] = LogicalType::ANY;
 	plink_score.named_parameters["samples"] = LogicalType::ANY;
 	plink_score.named_parameters["region"] = LogicalType::VARCHAR;
+	// Composable selection: a STRUCT whose samples/region fields seed the axes,
+	// overridden per-field by the individual params above (see ParseSelection).
+	plink_score.named_parameters["selection"] = LogicalType::ANY;
 	plink_score.named_parameters["center"] = LogicalType::BOOLEAN;
 	plink_score.named_parameters["no_mean_imputation"] = LogicalType::BOOLEAN;
 

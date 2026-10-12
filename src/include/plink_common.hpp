@@ -673,6 +673,112 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
                                           uint32_t raw_variant_ct, const string &func_name);
 
 // ---------------------------------------------------------------------------
+// Unified axis selection handler (variant × sample axes)
+// ---------------------------------------------------------------------------
+//
+// `Selection` models ONLY per-axis ordinal selection — "which rows along an
+// axis", never "which cell values". It is the piece that maps 1:1 onto diar's
+// `(axis, ordinal)` selection model and is a candidate to become a vendored,
+// cross-extension primitive, so its surface stays free of plinking-specific
+// (genotype/dosage) concepts. Value predicates over cells (af_range / ac_range /
+// genotype_range / include_genotypes → `CountFilter` / `GenotypeRangeFilter`)
+// have no ordinal and are therefore NOT part of a selection: a stat function
+// parses them separately and composes them alongside a `Selection`.
+//
+// Ordinal semantics law (stated explicitly so nothing is left to convention —
+// mirrors diar's `isel` rules):
+//   * All ordinals are 0-based (sample index, variant file-row vidx).
+//   * `variant_range [lo, hi)` is HALF-OPEN — lo included, hi excluded.
+//   * A resolved sample subset is SORTED-UNIQUE in original-index order (matching
+//     pgenlib's PgrGet subset ordering).
+//   * Composition of two selections on the same axis is INTERSECTION.
+//
+// The routed functions expose `samples` + `region` as individual params; the full
+// variant axis (`variants` / `variant_range`) arrives only through the composable
+// `selection := <STRUCT>` surface (see ParseSelection). ResolveSelection consumes
+// the variant axis as follows for the contiguous-scan stat functions: `region` →
+// ordinal range via ParseRegion; `variant_range [lo, hi)` → the scanned interval
+// directly (clamped to the variant count); `variants` (arbitrary set) → rejected
+// with a clear error, since a single contiguous scan cannot express it. plink_ld
+// takes NO variant axis from `selection` (its region grammar differs) — those
+// fields are rejected up front by RejectSelectionVariantAxis.
+
+//! PURE, SYMBOLIC description of an axis selection, captured straight from a table
+//! function's named parameters with NO file IO and NO resolution. Every field is
+//! held in the rawest form that still defers all validation + ordinal resolution
+//! to `ResolveSelection` (so error timing is unchanged from inline parsing).
+struct Selection {
+	// --- variant axis (all unresolved) ---
+	bool has_region = false; //!< true iff a `region` param was supplied
+	Value region;            //!< symbolic region (raw VARCHAR Value); parsed+resolved in ResolveSelection
+	bool has_variants = false;
+	Value variants; //!< `variants` param (ANY: index/rsID/CPRA/range/list); unresolved
+	bool has_variant_range = false;
+	int64_t variant_range_lo = 0; //!< [lo, hi) half-open ordinal range
+	int64_t variant_range_hi = 0;
+
+	// --- sample axis (unresolved) ---
+	bool has_samples = false;
+	Value samples; //!< `samples` param (ANY: LIST(INTEGER) | LIST(VARCHAR)); unresolved
+};
+
+//! Fully resolved axis selection: the product of `ResolveSelection` over the
+//! shared primitives (ResolveSampleIndices / BuildSampleSubset / ParseRegion).
+//! Holds exactly the resolved ordinals a stat function's bind consumes. Move-only
+//! (owns the SampleSubset via unique_ptr).
+struct ResolvedSelection {
+	// --- sample axis resolved ---
+	bool has_sample_subset = false;
+	unique_ptr<SampleSubset> sample_subset;
+	uint32_t effective_sample_ct = 0; //!< subset_sample_ct, or raw_sample_ct when no subset
+
+	//! Sorted-unique ORIGINAL sample indices (ascending; matches pgenlib PgrGet
+	//! subset ordering). Only meaningful when `has_subset` is true — used to align a
+	//! sex array via BuildAlignedSex (pass &subset_sorted only when has_subset).
+	bool has_subset = false;
+	vector<uint32_t> subset_sorted;
+
+	// --- variant axis resolved ---
+	VariantRange variant_range; //!< contiguous [start_idx, end_idx) in file-row vidx
+};
+
+//! PURE parse of a table function's named parameters into a `Selection`. No file
+//! IO, no count-mismatch checks. Captures each axis field symbolically
+//! (unresolved), preserving the exact presence / NULL / empty-list / ANY-dispatch
+//! deferral the inline bind code does.
+//!
+//! Composable `selection :=` surface: when a `selection` STRUCT param is present
+//! (and non-NULL), its fields seed the axes and the individual named params
+//! override per-field (MOST-SPECIFIC-WINS), so a shared `selection` can be reused
+//! and tweaked on one axis. Recognized `selection` fields (EXACT names, matching
+//! the struct's own field names): `samples`, `variants`, `region`,
+//! `variant_range`; a NULL field is "unset" for that axis, and any other field
+//! name is rejected (catches e.g. `sample` vs `samples`). A non-STRUCT `selection`
+//! is a type error. With no `selection` param the behavior is byte-identical to the
+//! individual-param path.
+Selection ParseSelection(const named_parameter_map_t &params);
+
+//! Reject any VARIANT-axis field (`region` / `variants` / `variant_range`) carried
+//! by a `selection` STRUCT, for a function that does not take the variant axis from
+//! `selection` (currently only plink_ld, whose region grammar differs). Prevents a
+//! supplied field from being silently dropped. The individual `region :=` param is
+//! not inspected. No-op when there is no `selection` struct (or it is NULL / not a
+//! STRUCT — the latter is reported by ParseSelection).
+void RejectSelectionVariantAxis(const named_parameter_map_t &params, const string &func_name);
+
+//! Resolve a `Selection` against loaded metadata — pure GLUE over the existing
+//! primitives, NOT new logic. Resolves the SAMPLE axis BEFORE the VARIANT axis,
+//! matching the order the inline bind code validated them in (preserves error
+//! ordering when both are malformed). Count-mismatch validation stays OUT (callers
+//! keep their own checks). `sample_info` may be null (psam optional): an INTEGER
+//! samples list resolves; a VARCHAR list is rejected with the existing message.
+//! The region is passed through `ParseRegion` verbatim (a region that matches no
+//! variants legitimately yields has_filter=true with start==end).
+ResolvedSelection ResolveSelection(const Selection &selection, const VariantMetadataIndex &variants,
+                                   const SampleInfo *sample_info, uint32_t raw_sample_ct, uint32_t raw_variant_ct,
+                                   const string &func_name);
+
+// ---------------------------------------------------------------------------
 // Ploidy- and sex-aware statistics for sex/organelle chromosomes (chrX/Y/MT)
 // ---------------------------------------------------------------------------
 
