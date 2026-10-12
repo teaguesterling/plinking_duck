@@ -2188,30 +2188,113 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 // Unified axis selection handler (variant × sample axes)
 // ---------------------------------------------------------------------------
 
+//! Destructure a `select := <STRUCT>` value's fields into a Selection. PURE: reads
+//! the struct, no IO, no ordinal resolution. Fields are matched by EXACT name
+//! (matching the struct's own field names, as ResolveCpraStruct does) so a typo
+//! like `sample` is rejected as unknown rather than silently dropped. A NULL field
+//! is treated as "unset" for that axis. These seed the lowest precedence; the
+//! individual named params override them afterwards.
+static void MergeSelectStruct(const Value &select_val, Selection &sel) {
+	if (select_val.type().id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException("select: must be a STRUCT of selection fields "
+		                            "(samples, variants, region, variant_range), got %s",
+		                            select_val.type().ToString());
+	}
+	auto &child_types = StructType::GetChildTypes(select_val.type());
+	auto &children = StructValue::GetChildren(select_val);
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		const string &field = child_types[i].first;
+		const Value &fv = children[i];
+		if (field == "samples") {
+			if (!fv.IsNull()) {
+				sel.has_samples = true;
+				sel.samples = fv;
+			}
+		} else if (field == "region") {
+			if (!fv.IsNull()) {
+				sel.has_region = true;
+				sel.region = fv;
+			}
+		} else if (field == "variants") {
+			if (!fv.IsNull()) {
+				sel.has_variants = true;
+				sel.variants = fv;
+			}
+		} else if (field == "variant_range") {
+			if (!fv.IsNull()) {
+				// Half-open [lo, hi) in variant ordinal space; validated at parse time
+				// even though the stat functions do not yet consume this axis.
+				if (fv.type().id() != LogicalTypeId::LIST) {
+					throw InvalidInputException(
+					    "select: variant_range must be a 2-element list [lo, hi) in variant ordinal space (got %s)",
+					    fv.type().ToString());
+				}
+				auto &vr_children = ListValue::GetChildren(fv);
+				if (vr_children.size() != 2) {
+					throw InvalidInputException(
+					    "select: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
+					    static_cast<unsigned long long>(vr_children.size()));
+				}
+				if (vr_children[0].IsNull() || vr_children[1].IsNull()) {
+					throw InvalidInputException("select: variant_range bounds must not be NULL");
+				}
+				if (!vr_children[0].type().IsIntegral() || !vr_children[1].type().IsIntegral()) {
+					throw InvalidInputException("select: variant_range bounds must be integers");
+				}
+				int64_t lo = vr_children[0].GetValue<int64_t>();
+				int64_t hi = vr_children[1].GetValue<int64_t>();
+				if (lo < 0 || hi < lo) {
+					throw InvalidInputException(
+					    "select: variant_range must be a half-open [lo, hi) with 0 <= lo <= hi (got [%lld, %lld))",
+					    static_cast<long long>(lo), static_cast<long long>(hi));
+				}
+				sel.has_variant_range = true;
+				sel.variant_range_lo = lo;
+				sel.variant_range_hi = hi;
+			}
+		} else {
+			throw InvalidInputException(
+			    "select: unknown field '%s' (expected samples, variants, region, or variant_range)", field);
+		}
+	}
+}
+
 Selection ParseSelection(const named_parameter_map_t &params) {
 	Selection sel;
 
-	// Sample axis. Capture the raw Value (ANY); presence is tracked separately
-	// from null-ness so an explicit `samples := NULL` still reaches
-	// ResolveSampleIndices and throws "samples list must not be empty".
+	// --- Lowest precedence: a shared `select := <STRUCT>` seeds the axes ---
+	// A NULL select means "no select". Fields are merged below; individual named
+	// params then override per-field (most-specific-wins).
+	auto select_it = params.find("select");
+	if (select_it != params.end() && !select_it->second.IsNull()) {
+		MergeSelectStruct(select_it->second, sel);
+	}
+
+	// --- Highest precedence: individual named params override per-field ---
+	// Unconditional overwrite (not guarded on has_*) so that a present individual
+	// param always wins, including an explicit `samples := NULL` (which keeps
+	// presence true with a NULL value, so ResolveSampleIndices throws "samples list
+	// must not be empty" rather than falling back to the select's samples).
+	//
+	// Sample axis: capture the raw Value (ANY); presence is tracked separately from
+	// null-ness. Variant axis: keep the region SYMBOLIC (raw Value) — do not parse
+	// or resolve it here, so string-format validation and ordinal resolution stay in
+	// ResolveSelection at the same logical point the inline code ran them.
 	auto samples_it = params.find("samples");
 	if (samples_it != params.end()) {
 		sel.has_samples = true;
 		sel.samples = samples_it->second;
 	}
 
-	// Variant axis. Keep the region SYMBOLIC (raw Value) — do not parse or resolve
-	// it here, so the string-format validation and ordinal resolution both stay in
-	// ResolveSelection at the same logical point the inline code ran them.
 	auto region_it = params.find("region");
 	if (region_it != params.end()) {
 		sel.has_region = true;
 		sel.region = region_it->second;
 	}
 
-	// `variants` / `variant_range` are part of the variant axis but have no consumer
-	// in increment 1 (plink_freq does not accept them). Deliberately left empty here
-	// until a stat function that uses them is migrated.
+	// `variants` / `variant_range` have no individual-param surface on the routed
+	// stat functions; they arrive only via `select` and, like plink_ld's region, are
+	// captured but not yet consumed by ResolveSelection (wired in a later increment).
 
 	return sel;
 }

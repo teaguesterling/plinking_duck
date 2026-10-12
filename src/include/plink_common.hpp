@@ -739,9 +739,18 @@ struct ResolvedSelection {
 };
 
 //! PURE parse of a table function's named parameters into a `Selection`. No file
-//! IO, no count-mismatch checks, no `select:=` struct merge (a later increment).
-//! Captures each axis field symbolically (unresolved), preserving the exact
-//! presence / NULL / empty-list / ANY-dispatch deferral the inline bind code does.
+//! IO, no count-mismatch checks. Captures each axis field symbolically
+//! (unresolved), preserving the exact presence / NULL / empty-list / ANY-dispatch
+//! deferral the inline bind code does.
+//!
+//! Composable `select :=` surface: when a `select` STRUCT param is present (and
+//! non-NULL), its fields seed the axes and the individual named params override
+//! per-field (MOST-SPECIFIC-WINS), so a shared `select` can be reused and tweaked
+//! on one axis. Recognized `select` fields (EXACT names, matching the struct's
+//! own field names): `samples`, `variants`, `region`, `variant_range`; a NULL
+//! field is "unset" for that axis, and any other field name is rejected (catches
+//! e.g. `sample` vs `samples`). A non-STRUCT `select` is a type error. With no
+//! `select` param the behavior is byte-identical to the individual-param path.
 Selection ParseSelection(const named_parameter_map_t &params);
 
 //! Resolve a `Selection` against loaded metadata — pure GLUE over the existing

@@ -705,6 +705,9 @@ void RegisterPlinkHardy(ExtensionLoader &loader) {
 	plink_hardy.named_parameters["psam"] = LogicalType::VARCHAR;
 	plink_hardy.named_parameters["samples"] = LogicalType::ANY;
 	plink_hardy.named_parameters["region"] = LogicalType::VARCHAR;
+	// Composable selection: a STRUCT whose samples/region fields seed the axes,
+	// overridden per-field by the individual params above (see ParseSelection).
+	plink_hardy.named_parameters["select"] = LogicalType::ANY;
 	plink_hardy.named_parameters["midp"] = LogicalType::BOOLEAN;
 	plink_hardy.named_parameters["build"] = LogicalType::VARCHAR;
 

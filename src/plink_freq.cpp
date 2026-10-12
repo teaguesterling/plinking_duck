@@ -670,6 +670,9 @@ void RegisterPlinkFreq(ExtensionLoader &loader) {
 	plink_freq.named_parameters["psam"] = LogicalType::VARCHAR;
 	plink_freq.named_parameters["samples"] = LogicalType::ANY;
 	plink_freq.named_parameters["region"] = LogicalType::VARCHAR;
+	// Composable selection: a STRUCT whose samples/region fields seed the axes,
+	// overridden per-field by the individual params above (see ParseSelection).
+	plink_freq.named_parameters["select"] = LogicalType::ANY;
 	plink_freq.named_parameters["counts"] = LogicalType::BOOLEAN;
 	plink_freq.named_parameters["dosage"] = LogicalType::BOOLEAN;
 	plink_freq.named_parameters["build"] = LogicalType::VARCHAR;

@@ -853,6 +853,9 @@ void RegisterPlinkScore(ExtensionLoader &loader) {
 	plink_score.named_parameters["weights"] = LogicalType::ANY;
 	plink_score.named_parameters["samples"] = LogicalType::ANY;
 	plink_score.named_parameters["region"] = LogicalType::VARCHAR;
+	// Composable selection: a STRUCT whose samples/region fields seed the axes,
+	// overridden per-field by the individual params above (see ParseSelection).
+	plink_score.named_parameters["select"] = LogicalType::ANY;
 	plink_score.named_parameters["center"] = LogicalType::BOOLEAN;
 	plink_score.named_parameters["no_mean_imputation"] = LogicalType::BOOLEAN;
 

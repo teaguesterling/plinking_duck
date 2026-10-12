@@ -1428,6 +1428,11 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	plink_ld.named_parameters["r2_threshold"] = LogicalType::DOUBLE;
 	plink_ld.named_parameters["region"] = LogicalType::VARCHAR;
 	plink_ld.named_parameters["samples"] = LogicalType::ANY;
+	// Composable selection: a STRUCT seeding the SAMPLE axis only. plink_ld routes
+	// just its sample axis through the handler, so a `region` field inside `select`
+	// is IGNORED by plink_ld (its region stays on ParseLdRegionSpec); use the
+	// individual `region :=` param for LD region selection.
+	plink_ld.named_parameters["select"] = LogicalType::ANY;
 	plink_ld.named_parameters["inter_chr"] = LogicalType::BOOLEAN;
 	plink_ld.named_parameters["cache_genotypes"] = LogicalType::BOOLEAN;
 	plink_ld.named_parameters["population_column"] = LogicalType::VARCHAR;
