@@ -266,23 +266,23 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 		}
 	}
 
-	// --- Process samples parameter ---
-	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
+	// --- Resolve the axis selection (samples + region) via the shared handler ---
+	// Byte-identical to the former inline parse. resolved.subset_sorted is the
+	// sorted-unique original index list; ResolveSampleIndices already rejects
+	// duplicates, so it equals the former sort-only `subset_original_indices`.
+	Selection selection = ParseSelection(input.named_parameters);
+	ResolvedSelection resolved =
+	    ResolveSelection(selection, bind_data->variants, bind_data->has_sample_info ? &bind_data->sample_info : nullptr,
+	                     bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_missing");
 
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto indices =
-		    ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
-		                         bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_missing");
-
+	bind_data->effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_sample_subset) {
 		// Store sorted indices for sample mode output mapping
-		bind_data->subset_original_indices = indices;
-		std::sort(bind_data->subset_original_indices.begin(), bind_data->subset_original_indices.end());
-
-		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
+		bind_data->subset_original_indices = resolved.subset_sorted;
+		bind_data->sample_subset = std::move(resolved.sample_subset);
 		bind_data->has_sample_subset = true;
-		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
 	}
+	bind_data->variant_range = resolved.variant_range;
 
 	// --- Sex (chrY only) ---
 	// Missingness counts SAMPLES, not alleles, so chrX and chrMT need no ploidy
@@ -302,13 +302,6 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 				bind_data->male_ct++;
 			}
 		}
-	}
-
-	// --- Process region parameter ---
-	auto region_it = input.named_parameters.find("region");
-	if (region_it != input.named_parameters.end()) {
-		bind_data->variant_range =
-		    ParseRegion(region_it->second.GetValue<string>(), bind_data->variants, "plink_missing");
 	}
 
 	// --- Register output columns based on mode ---

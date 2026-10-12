@@ -944,17 +944,26 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 		}
 	}
 
-	// --- Process samples parameter ---
+	// --- Process samples parameter (SAMPLE AXIS ONLY) ---
+	// plink_ld routes only the sample axis through the shared handler. Its region
+	// semantics are deliberately NOT unified: windowed/genomic mode parses the
+	// region via ParseLdRegionSpec (a different grammar than plink_common's strict
+	// chr:start-end) and resolves the ordinal range below. So clear the region axis
+	// before ResolveSelection — otherwise a valid LD region string that isn't strict
+	// chr:start-end would throw in plink_common::ParseRegion.
 	bind_data->effective_sample_ct = bind_data->raw_sample_ct;
 
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto indices = ResolveSampleIndices(samples_it->second, bind_data->raw_sample_ct,
-		                                    bind_data->has_sample_info ? &bind_data->sample_info : nullptr, "plink_ld");
+	Selection selection = ParseSelection(input.named_parameters);
+	selection.has_region = false;
+	selection.region = Value();
+	ResolvedSelection resolved =
+	    ResolveSelection(selection, bind_data->variants, bind_data->has_sample_info ? &bind_data->sample_info : nullptr,
+	                     bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_ld");
 
-		bind_data->sample_subset = make_uniq<SampleSubset>(BuildSampleSubset(bind_data->raw_sample_ct, indices));
+	bind_data->effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_sample_subset) {
+		bind_data->sample_subset = std::move(resolved.sample_subset);
 		bind_data->has_sample_subset = true;
-		bind_data->effective_sample_ct = bind_data->sample_subset->subset_sample_ct;
 	}
 
 	// --- Process GAUSS-like population weights ---
