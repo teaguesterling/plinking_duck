@@ -1,6 +1,6 @@
 # Function Reference
 
-PlinkingDuck provides 12 core SQL table functions: 5 file readers and 7 analysis functions. Eleven of them are always present. `plink_pca` is the exception — it is registered only when the build found Eigen3. In addition there is a utility table function ([`pfile_partitions`](pfile_partitions.md)) and a scalar feature-detection function ([`plinking_duck_capabilities`](plinking_duck_capabilities.md)).
+PlinkingDuck provides 13 core SQL table functions: 6 file readers and 7 analysis functions. Twelve of them are always present. `plink_pca` is the exception — it is registered only when the build found Eigen3. In addition there is a utility table function ([`pfile_partitions`](pfile_partitions.md)) and a scalar feature-detection function ([`plinking_duck_capabilities`](plinking_duck_capabilities.md)).
 
 ## File Readers
 
@@ -11,6 +11,7 @@ PlinkingDuck provides 12 core SQL table functions: 5 file readers and 7 analysis
 | [`read_pgen(path)`](read_pgen.md) | `.pgen` | Binary genotypes as `ARRAY(TINYINT, N)` |
 | [`read_pfile(prefix)`](read_pfile.md) | `.pgen` + `.pvar` + `.psam` (single or list) | Complete fileset with orient mode support |
 | [`read_plink_vcf(path)`](read_plink_vcf.md) | `.vcf` / `.vcf.gz` | Fast biallelic genotype extraction from VCF |
+| [`read_howard_manifest(path)`](read_howard_manifest.md) | `.howard.json` catalog | One row per surviving shard of a sharded pfile set (verify + prune) |
 
 ## Analysis Functions
 
@@ -22,7 +23,7 @@ PlinkingDuck provides 12 core SQL table functions: 5 file readers and 7 analysis
 | [`plink_ld(path)`](plink_ld.md) | `.pgen` | Pairwise linkage disequilibrium (r², D') |
 | [`plink_score(path)`](plink_score.md) | `.pgen` | Polygenic risk scoring |
 | [`plink_glm(prefix)`](plink_glm.md) | pfile prefix | Per-variant GWAS regression (linear, logistic, Firth) |
-| `plink_pca(path)` ⚠️ | `.pgen` | Principal component analysis. **Conditional — see below.** |
+| [`plink_pca(path)`](plink_pca.md) ⚠️ | `.pgen` | Principal component analysis. **Conditional — see below.** |
 
 ## Utility Functions
 
@@ -36,27 +37,10 @@ PlinkingDuck provides 12 core SQL table functions: 5 file readers and 7 analysis
 |----------|---------|-------------|
 | [`plinking_duck_capabilities()`](plinking_duck_capabilities.md) | `VARCHAR[]` | Capability tokens this build supports, for SQL feature detection |
 
-### `plink_pca` is conditional on Eigen3
-
-`plink_pca` is the only function that is not always there. It needs
-[Eigen3](../development.md#optional-dependency-eigen3), and CMake compiles it
-out (with a configure-time warning) when Eigen3 is not found. Binaries released
-from this repo are built through vcpkg, which supplies Eigen3, so they always
-have it; a local `make` on a machine without `libeigen3-dev` does not.
-
-Calling it on a build that lacks it raises:
-
-```
-Catalog Error: Table Function with name plink_pca does not exist!
-```
-
-To check a build before relying on it:
-
-```sql
-SELECT count(*) > 0 AS has_pca
-FROM duckdb_functions()
-WHERE function_name = 'plink_pca';
-```
+!!! note "`plink_pca` is conditional on Eigen3"
+    `plink_pca` is the only function not always present — CMake compiles it
+    out when Eigen3 is missing (released binaries always have it). See
+    [its page](plink_pca.md) for how to detect this and the full explanation.
 
 ## Writing filesets
 
@@ -74,8 +58,13 @@ COPY (SELECT * FROM read_pfile('in', genotypes := 'struct')) TO 'out' (FORMAT pf
 local-only / atomic-overwrite behavior, and the current limitations (biallelic
 hardcalls only).
 
+The writer can also **shard** a cohort into one fileset per key with `shard_by`,
+emitting a [`.howard.json` catalog](../formats/howard.md) that
+[`read_howard_manifest`](read_howard_manifest.md) reads back as a single logical
+dataset — see [Writing filesets](write_pfile.md#sharded-output-shard_by).
+
 ## Common Features
 
 All functions support **projection pushdown**: columns not referenced in the query are not computed. For genotype-based functions, this means metadata-only queries skip genotype decoding entirely.
 
-Analysis functions (except `plink_ld`) share a common set of named parameters documented in [Common Parameters](../common-parameters.md): `pvar`, `psam`, `samples`, and `region`.
+Analysis functions share a common set of named parameters documented in [Common Parameters](../common-parameters.md): `pvar`, `psam`, `samples`, `region`, and the composable `selection` struct. (`plink_ld` takes only the sample axis from `selection`, and reads its region from the `region` parameter directly.)

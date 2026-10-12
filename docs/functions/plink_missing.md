@@ -6,7 +6,7 @@ Compute per-variant or per-sample missingness rates.
 
 ```sql
 plink_missing(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
-              region := ..., mode := ...]) -> TABLE
+              region := ..., selection := ..., mode := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -18,9 +18,10 @@ plink_missing(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` file |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
+| `selection` | `STRUCT` | None | Composable per-axis [selection](../common-parameters.md#selection) struct (`samples`/`region`/`variant_range`) |
 | `mode` | `VARCHAR` | `'variant'` | `'variant'` for per-variant or `'sample'` for per-sample |
 
-See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
+See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, `region`, and the composable `selection` struct.
 
 ## Output Columns
 

@@ -6,7 +6,7 @@ Compute per-variant allele frequencies using pgenlib's fast counting path.
 
 ```sql
 plink_freq(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
-           region := ..., counts := ...]) -> TABLE
+           region := ..., selection := ..., counts := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -18,9 +18,10 @@ plink_freq(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` file |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
+| `selection` | `STRUCT` | None | Composable per-axis [selection](../common-parameters.md#selection) struct (`samples`/`region`/`variant_range`) |
 | `counts` | `BOOLEAN` | `false` | Include genotype count columns |
 
-See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
+See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, `region`, and the composable `selection` struct.
 
 ### Reserved Parameters (Not Yet Implemented)
 
