@@ -3911,8 +3911,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 						lstate.batch_variant_loaded = true;
 					}
 
-					while (lstate.current_sample_in_variant < output_sample_ct &&
-					       rows_emitted < STANDARD_VECTOR_SIZE) {
+					while (lstate.current_sample_in_variant < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
 						if (emit_sample_row(source, vidx, lstate.current_sample_in_variant)) {
 							rows_emitted++;
 						}
@@ -4154,213 +4153,251 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 			}
 			uint32_t batch_end = std::min(batch_start + claim_size, phase2_total);
 
-		for (uint32_t claim_idx = batch_start; claim_idx < batch_end; claim_idx++) {
-			// When a genotype_range row filter is active, the claimed index addresses
-			// the surviving-sample list; otherwise it is the output sample position directly.
-			uint32_t sample_pos = streaming_keep              ? gstate.smp_sample_keep[claim_idx]
-			                      : bind_data.has_sample_keep ? bind_data.sample_keep[claim_idx]
-			                                                  : claim_idx;
-			// Map output sample position to file-order sample index
-			uint32_t sample_file_idx = bind_data.has_sample_subset ? bind_data.sample_indices[sample_pos] : sample_pos;
+			for (uint32_t claim_idx = batch_start; claim_idx < batch_end; claim_idx++) {
+				// When a genotype_range row filter is active, the claimed index addresses
+				// the surviving-sample list; otherwise it is the output sample position directly.
+				uint32_t sample_pos = streaming_keep              ? gstate.smp_sample_keep[claim_idx]
+				                      : bind_data.has_sample_keep ? bind_data.sample_keep[claim_idx]
+				                                                  : claim_idx;
+				// Map output sample position to file-order sample index
+				uint32_t sample_file_idx =
+				    bind_data.has_sample_subset ? bind_data.sample_indices[sample_pos] : sample_pos;
 
-			for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
-				auto file_col = column_ids[out_col];
-				if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
-					continue;
-				}
-
-				auto &vec = output.data[out_col];
-
-				if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
-				    file_col >= bind_data.columns_mode_first_geno_col &&
-				    file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
-					// Columns mode: individual variant genotype columns
-					if (gstate.need_genotypes) {
-						idx_t variant_pos = file_col - bind_data.columns_mode_first_geno_col;
-						if (bind_data.include_dosages) {
-							double dosage = bind_data.dosage_matrix[variant_pos][sample_pos];
-							if (dosage == -9.0) {
-								FlatVector::SetNull(vec, rows_emitted, true);
-							} else {
-								CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
-							}
-						} else {
-							int8_t geno = bind_data.genotype_matrix[variant_pos][sample_pos];
-							if (geno == -9) {
-								FlatVector::SetNull(vec, rows_emitted, true);
-							} else {
-								CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
-							}
-						}
-					} else {
-						FlatVector::SetNull(vec, rows_emitted, true);
+				for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
+					auto file_col = column_ids[out_col];
+					if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+						continue;
 					}
-				} else if (bind_data.genotype_mode != GenotypeMode::COLUMNS &&
-				           file_col == bind_data.sample_orient_genotypes_col) {
-					// Genotypes column
-					if (!gstate.need_genotypes) {
-						FlatVector::SetNull(vec, rows_emitted, true);
-					} else if (bind_data.genotype_mode == GenotypeMode::STRUCT) {
-						// STRUCT mode: one field per variant, values from genotype_matrix
-						auto &entries = StructVector::GetEntries(vec);
-						for (idx_t v = 0; v < effective_variant_ct; v++) {
-							auto &child_vec = CompatStructEntry(entries[v]);
-							if (bind_data.include_phased) {
-								auto &allele_vec = ArrayVector::GetEntry(child_vec);
-								auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-								auto &pair_validity = CompatFlatValidityMutable(child_vec);
-								idx_t allele_base = rows_emitted * 2;
-								int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
-								if (a1 == -9) {
-									pair_validity.SetInvalid(rows_emitted);
-									allele_data[allele_base] = 0;
-									allele_data[allele_base + 1] = 0;
-								} else {
-									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
-								}
-							} else if (bind_data.include_dosages) {
-								double dosage = bind_data.dosage_matrix[v][sample_pos];
+
+					auto &vec = output.data[out_col];
+
+					if (bind_data.genotype_mode == GenotypeMode::COLUMNS &&
+					    file_col >= bind_data.columns_mode_first_geno_col &&
+					    file_col < bind_data.columns_mode_first_geno_col + bind_data.columns_mode_geno_col_count) {
+						// Columns mode: individual variant genotype columns
+						if (gstate.need_genotypes) {
+							idx_t variant_pos = file_col - bind_data.columns_mode_first_geno_col;
+							if (bind_data.include_dosages) {
+								double dosage = bind_data.dosage_matrix[variant_pos][sample_pos];
 								if (dosage == -9.0) {
-									FlatVector::SetNull(child_vec, rows_emitted, true);
+									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
-									CompatFlatDataMutable<double>(child_vec)[rows_emitted] = dosage;
+									CompatFlatDataMutable<double>(vec)[rows_emitted] = dosage;
 								}
 							} else {
-								int8_t geno = bind_data.genotype_matrix[v][sample_pos];
+								int8_t geno = bind_data.genotype_matrix[variant_pos][sample_pos];
 								if (geno == -9) {
-									FlatVector::SetNull(child_vec, rows_emitted, true);
+									FlatVector::SetNull(vec, rows_emitted, true);
 								} else {
-									CompatFlatDataMutable<int8_t>(child_vec)[rows_emitted] = geno;
-								}
-							}
-						}
-					} else if (IsAggregateGenotypeMode(bind_data.genotype_mode)) {
-						// COUNTS/STATS: read the per-sample counts accumulated in Phase 1
-						// (streaming — no genotype_matrix). hom_ref is derived: every kept
-						// sample sees every effective variant, so
-						// hom_ref = total_eff_variants − het − hom_alt − missing.
-						uint32_t het = gstate.smp_het[sample_pos];
-						uint32_t hom_alt = gstate.smp_hom_alt[sample_pos];
-						uint32_t missing = gstate.smp_missing[sample_pos];
-						uint32_t hom_ref = gstate.smp_total_eff_variants - het - hom_alt - missing;
-						auto &entries = StructVector::GetEntries(vec);
-						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[0]))[rows_emitted] = hom_ref;
-						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[1]))[rows_emitted] = het;
-						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[2]))[rows_emitted] = hom_alt;
-						CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[3]))[rows_emitted] = missing;
-
-						if (bind_data.genotype_mode == GenotypeMode::STATS) {
-							uint32_t n = hom_ref + het + hom_alt;
-							uint32_t total = n + missing;
-							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[4]))[rows_emitted] = n;
-							if (n == 0) {
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] =
-								    std::numeric_limits<double>::quiet_NaN();
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
-								    std::numeric_limits<double>::quiet_NaN();
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
-								    std::numeric_limits<double>::quiet_NaN();
-							} else {
-								double af = (static_cast<double>(het) + 2.0 * hom_alt) / (2.0 * n);
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] = af;
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
-								    std::min(af, 1.0 - af);
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
-								    static_cast<double>(het) / static_cast<double>(n);
-							}
-							if (total == 0) {
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
-								    std::numeric_limits<double>::quiet_NaN();
-							} else {
-								CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
-								    static_cast<double>(missing) / static_cast<double>(total);
-							}
-							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[8]))[rows_emitted] =
-							    het + hom_alt;
-						}
-					} else if (bind_data.include_phased) {
-						// Phased sample-orient: each variant has stride-2 layout in genotype_matrix
-						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
-							auto &pair_vec = ArrayVector::GetEntry(vec);
-							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
-
-							idx_t pair_base = rows_emitted * static_cast<idx_t>(effective_variant_ct);
-							for (idx_t v = 0; v < effective_variant_ct; v++) {
-								idx_t pair_idx = pair_base + v;
-								idx_t allele_base = pair_idx * 2;
-								int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
-								if (a1 == -9) {
-									pair_validity.SetInvalid(pair_idx);
-									allele_data[allele_base] = 0;
-									allele_data[allele_base + 1] = 0;
-								} else {
-									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
+									CompatFlatDataMutable<int8_t>(vec)[rows_emitted] = geno;
 								}
 							}
 						} else {
-							// LIST(ARRAY(TINYINT, 2))
-							auto list_offset = ListVector::GetListSize(vec);
-							ListVector::Reserve(vec, list_offset + effective_variant_ct);
-							auto &pair_vec = ListVector::GetEntry(vec);
-							auto &allele_vec = ArrayVector::GetEntry(pair_vec);
-							auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
-							auto &pair_validity = CompatFlatValidityMutable(pair_vec);
-
+							FlatVector::SetNull(vec, rows_emitted, true);
+						}
+					} else if (bind_data.genotype_mode != GenotypeMode::COLUMNS &&
+					           file_col == bind_data.sample_orient_genotypes_col) {
+						// Genotypes column
+						if (!gstate.need_genotypes) {
+							FlatVector::SetNull(vec, rows_emitted, true);
+						} else if (bind_data.genotype_mode == GenotypeMode::STRUCT) {
+							// STRUCT mode: one field per variant, values from genotype_matrix
+							auto &entries = StructVector::GetEntries(vec);
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
-								idx_t pair_idx = list_offset + v;
-								idx_t allele_base = pair_idx * 2;
-								int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
-								if (a1 == -9) {
-									pair_validity.SetInvalid(pair_idx);
-									allele_data[allele_base] = 0;
-									allele_data[allele_base + 1] = 0;
+								auto &child_vec = CompatStructEntry(entries[v]);
+								if (bind_data.include_phased) {
+									auto &allele_vec = ArrayVector::GetEntry(child_vec);
+									auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+									auto &pair_validity = CompatFlatValidityMutable(child_vec);
+									idx_t allele_base = rows_emitted * 2;
+									int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
+									if (a1 == -9) {
+										pair_validity.SetInvalid(rows_emitted);
+										allele_data[allele_base] = 0;
+										allele_data[allele_base + 1] = 0;
+									} else {
+										allele_data[allele_base] = a1;
+										allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
+									}
+								} else if (bind_data.include_dosages) {
+									double dosage = bind_data.dosage_matrix[v][sample_pos];
+									if (dosage == -9.0) {
+										FlatVector::SetNull(child_vec, rows_emitted, true);
+									} else {
+										CompatFlatDataMutable<double>(child_vec)[rows_emitted] = dosage;
+									}
 								} else {
-									allele_data[allele_base] = a1;
-									allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
+									int8_t geno = bind_data.genotype_matrix[v][sample_pos];
+									if (geno == -9) {
+										FlatVector::SetNull(child_vec, rows_emitted, true);
+									} else {
+										CompatFlatDataMutable<int8_t>(child_vec)[rows_emitted] = geno;
+									}
 								}
 							}
+						} else if (IsAggregateGenotypeMode(bind_data.genotype_mode)) {
+							// COUNTS/STATS: read the per-sample counts accumulated in Phase 1
+							// (streaming — no genotype_matrix). hom_ref is derived: every kept
+							// sample sees every effective variant, so
+							// hom_ref = total_eff_variants − het − hom_alt − missing.
+							uint32_t het = gstate.smp_het[sample_pos];
+							uint32_t hom_alt = gstate.smp_hom_alt[sample_pos];
+							uint32_t missing = gstate.smp_missing[sample_pos];
+							uint32_t hom_ref = gstate.smp_total_eff_variants - het - hom_alt - missing;
+							auto &entries = StructVector::GetEntries(vec);
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[0]))[rows_emitted] = hom_ref;
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[1]))[rows_emitted] = het;
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[2]))[rows_emitted] = hom_alt;
+							CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[3]))[rows_emitted] = missing;
 
-							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
-							list_data[rows_emitted].offset = list_offset;
-							list_data[rows_emitted].length = effective_variant_ct;
-							ListVector::SetListSize(vec, list_offset + effective_variant_ct);
-						}
-					} else if (bind_data.include_dosages) {
-						// Dosage sample-orient: ARRAY(DOUBLE, M) or LIST(DOUBLE)
-						if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
+							if (bind_data.genotype_mode == GenotypeMode::STATS) {
+								uint32_t n = hom_ref + het + hom_alt;
+								uint32_t total = n + missing;
+								CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[4]))[rows_emitted] = n;
+								if (n == 0) {
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] =
+									    std::numeric_limits<double>::quiet_NaN();
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
+									    std::numeric_limits<double>::quiet_NaN();
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
+									    std::numeric_limits<double>::quiet_NaN();
+								} else {
+									double af = (static_cast<double>(het) + 2.0 * hom_alt) / (2.0 * n);
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[5]))[rows_emitted] = af;
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[6]))[rows_emitted] =
+									    std::min(af, 1.0 - af);
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[9]))[rows_emitted] =
+									    static_cast<double>(het) / static_cast<double>(n);
+								}
+								if (total == 0) {
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
+									    std::numeric_limits<double>::quiet_NaN();
+								} else {
+									CompatFlatDataMutable<double>(CompatStructEntry(entries[7]))[rows_emitted] =
+									    static_cast<double>(missing) / static_cast<double>(total);
+								}
+								CompatFlatDataMutable<uint32_t>(CompatStructEntry(entries[8]))[rows_emitted] =
+								    het + hom_alt;
+							}
+						} else if (bind_data.include_phased) {
+							// Phased sample-orient: each variant has stride-2 layout in genotype_matrix
+							if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
+								auto &pair_vec = ArrayVector::GetEntry(vec);
+								auto &allele_vec = ArrayVector::GetEntry(pair_vec);
+								auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+								auto &pair_validity = CompatFlatValidityMutable(pair_vec);
+
+								idx_t pair_base = rows_emitted * static_cast<idx_t>(effective_variant_ct);
+								for (idx_t v = 0; v < effective_variant_ct; v++) {
+									idx_t pair_idx = pair_base + v;
+									idx_t allele_base = pair_idx * 2;
+									int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
+									if (a1 == -9) {
+										pair_validity.SetInvalid(pair_idx);
+										allele_data[allele_base] = 0;
+										allele_data[allele_base + 1] = 0;
+									} else {
+										allele_data[allele_base] = a1;
+										allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
+									}
+								}
+							} else {
+								// LIST(ARRAY(TINYINT, 2))
+								auto list_offset = ListVector::GetListSize(vec);
+								ListVector::Reserve(vec, list_offset + effective_variant_ct);
+								auto &pair_vec = ListVector::GetEntry(vec);
+								auto &allele_vec = ArrayVector::GetEntry(pair_vec);
+								auto *allele_data = CompatFlatDataMutable<int8_t>(allele_vec);
+								auto &pair_validity = CompatFlatValidityMutable(pair_vec);
+
+								for (idx_t v = 0; v < effective_variant_ct; v++) {
+									idx_t pair_idx = list_offset + v;
+									idx_t allele_base = pair_idx * 2;
+									int8_t a1 = bind_data.genotype_matrix[v][sample_pos * 2];
+									if (a1 == -9) {
+										pair_validity.SetInvalid(pair_idx);
+										allele_data[allele_base] = 0;
+										allele_data[allele_base + 1] = 0;
+									} else {
+										allele_data[allele_base] = a1;
+										allele_data[allele_base + 1] = bind_data.genotype_matrix[v][sample_pos * 2 + 1];
+									}
+								}
+
+								auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
+								list_data[rows_emitted].offset = list_offset;
+								list_data[rows_emitted].length = effective_variant_ct;
+								ListVector::SetListSize(vec, list_offset + effective_variant_ct);
+							}
+						} else if (bind_data.include_dosages) {
+							// Dosage sample-orient: ARRAY(DOUBLE, M) or LIST(DOUBLE)
+							if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
+								auto array_size = static_cast<idx_t>(effective_variant_ct);
+								auto &child = ArrayVector::GetEntry(vec);
+								auto *child_data = CompatFlatDataMutable<double>(child);
+								auto &child_validity = CompatFlatValidityMutable(child);
+
+								idx_t base = rows_emitted * array_size;
+								for (idx_t v = 0; v < array_size; v++) {
+									double dosage = bind_data.dosage_matrix[v][sample_pos];
+									if (dosage == -9.0) {
+										child_validity.SetInvalid(base + v);
+										child_data[base + v] = 0.0;
+									} else {
+										child_data[base + v] = dosage;
+									}
+								}
+							} else {
+								// LIST(DOUBLE)
+								auto list_offset = ListVector::GetListSize(vec);
+								ListVector::Reserve(vec, list_offset + effective_variant_ct);
+								auto &child = ListVector::GetEntry(vec);
+								auto *child_data = CompatFlatDataMutable<double>(child);
+								auto &child_validity = CompatFlatValidityMutable(child);
+								for (idx_t v = 0; v < effective_variant_ct; v++) {
+									double dosage = bind_data.dosage_matrix[v][sample_pos];
+									if (dosage == -9.0) {
+										child_validity.SetInvalid(list_offset + v);
+										child_data[list_offset + v] = 0.0;
+									} else {
+										child_data[list_offset + v] = dosage;
+									}
+								}
+								auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
+								list_data[rows_emitted].offset = list_offset;
+								list_data[rows_emitted].length = effective_variant_ct;
+								ListVector::SetListSize(vec, list_offset + effective_variant_ct);
+							}
+						} else if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
 							auto array_size = static_cast<idx_t>(effective_variant_ct);
 							auto &child = ArrayVector::GetEntry(vec);
-							auto *child_data = CompatFlatDataMutable<double>(child);
+							auto *child_data = CompatFlatDataMutable<int8_t>(child);
 							auto &child_validity = CompatFlatValidityMutable(child);
 
 							idx_t base = rows_emitted * array_size;
 							for (idx_t v = 0; v < array_size; v++) {
-								double dosage = bind_data.dosage_matrix[v][sample_pos];
-								if (dosage == -9.0) {
+								int8_t geno = bind_data.genotype_matrix[v][sample_pos];
+								if (geno == -9) {
 									child_validity.SetInvalid(base + v);
-									child_data[base + v] = 0.0;
+									child_data[base + v] = 0;
 								} else {
-									child_data[base + v] = dosage;
+									child_data[base + v] = geno;
 								}
 							}
 						} else {
-							// LIST(DOUBLE)
+							// LIST path
 							auto list_offset = ListVector::GetListSize(vec);
 							ListVector::Reserve(vec, list_offset + effective_variant_ct);
 							auto &child = ListVector::GetEntry(vec);
-							auto *child_data = CompatFlatDataMutable<double>(child);
+							auto *child_data = CompatFlatDataMutable<int8_t>(child);
 							auto &child_validity = CompatFlatValidityMutable(child);
 							for (idx_t v = 0; v < effective_variant_ct; v++) {
-								double dosage = bind_data.dosage_matrix[v][sample_pos];
-								if (dosage == -9.0) {
+								int8_t geno = bind_data.genotype_matrix[v][sample_pos];
+								if (geno == -9) {
 									child_validity.SetInvalid(list_offset + v);
-									child_data[list_offset + v] = 0.0;
+									child_data[list_offset + v] = 0;
 								} else {
-									child_data[list_offset + v] = dosage;
+									child_data[list_offset + v] = geno;
 								}
 							}
 							auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
@@ -4368,55 +4405,18 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 							list_data[rows_emitted].length = effective_variant_ct;
 							ListVector::SetListSize(vec, list_offset + effective_variant_ct);
 						}
-					} else if (bind_data.genotype_mode == GenotypeMode::ARRAY) {
-						auto array_size = static_cast<idx_t>(effective_variant_ct);
-						auto &child = ArrayVector::GetEntry(vec);
-						auto *child_data = CompatFlatDataMutable<int8_t>(child);
-						auto &child_validity = CompatFlatValidityMutable(child);
-
-						idx_t base = rows_emitted * array_size;
-						for (idx_t v = 0; v < array_size; v++) {
-							int8_t geno = bind_data.genotype_matrix[v][sample_pos];
-							if (geno == -9) {
-								child_validity.SetInvalid(base + v);
-								child_data[base + v] = 0;
-							} else {
-								child_data[base + v] = geno;
-							}
-						}
 					} else {
-						// LIST path
-						auto list_offset = ListVector::GetListSize(vec);
-						ListVector::Reserve(vec, list_offset + effective_variant_ct);
-						auto &child = ListVector::GetEntry(vec);
-						auto *child_data = CompatFlatDataMutable<int8_t>(child);
-						auto &child_validity = CompatFlatValidityMutable(child);
-						for (idx_t v = 0; v < effective_variant_ct; v++) {
-							int8_t geno = bind_data.genotype_matrix[v][sample_pos];
-							if (geno == -9) {
-								child_validity.SetInvalid(list_offset + v);
-								child_data[list_offset + v] = 0;
-							} else {
-								child_data[list_offset + v] = geno;
-							}
-						}
-						auto *list_data = CompatFlatDataMutable<list_entry_t>(vec);
-						list_data[rows_emitted].offset = list_offset;
-						list_data[rows_emitted].length = effective_variant_ct;
-						ListVector::SetListSize(vec, list_offset + effective_variant_ct);
+						// Sample metadata column
+						idx_t psam_col_idx = bind_data.sample_orient_col_to_psam_col[file_col];
+
+						EmitSampleMetadataColumn(bind_data, gstate, lstate, vec, rows_emitted, sample_file_idx,
+						                         psam_col_idx);
 					}
-				} else {
-					// Sample metadata column
-					idx_t psam_col_idx = bind_data.sample_orient_col_to_psam_col[file_col];
-
-					EmitSampleMetadataColumn(bind_data, gstate, lstate, vec, rows_emitted, sample_file_idx,
-					                         psam_col_idx);
 				}
-			}
 
-			rows_emitted++;
+				rows_emitted++;
+			}
 		}
-	}
 
 		CompatSetOutputCardinality(output, rows_emitted);
 		// Correctness: sample orient does NOT prune (schema is fixed from the variant set at

@@ -1,10 +1,11 @@
 # name: test/sql/read_pfile_pushdown.test
 # description: Native filter pushdown (Step C) — conservative variant-set pruning + a
+# group: [sql]
+
 #              generic residual applicator. Proves parity with a pushdown-DEFEATED scan,
 #              residual correctness for non-pruned/struct filters, composition with the
 #              named-param selection, the EXPLAIN Filters: entry, nested-column slicing,
 #              and multi-file behavior.
-# group: [sql]
 
 require plinking_duck
 
