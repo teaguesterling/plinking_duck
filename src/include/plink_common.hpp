@@ -702,6 +702,19 @@ vector<uint32_t> ResolveVariantsParameter(const Value &val, const VariantMetadat
 // with a clear error, since a single contiguous scan cannot express it. plink_ld
 // takes NO variant axis from `selection` (its region grammar differs) — those
 // fields are rejected up front by RejectSelectionVariantAxis.
+//
+// Extended variant-axis law (the `allow_variant_set` opt-in):
+//   The resolved variant axis yields EITHER a contiguous `VariantRange`
+//   (`variant_range`) OR an arbitrary sorted set (`variant_set_sorted`), never both:
+//     * allow_variant_set=false (DEFAULT; the 7 analysis functions): an arbitrary
+//       `variants` field is REJECTED (above) because a single contiguous scan cannot
+//       express a set; only `region` / `variant_range` resolve, into `variant_range`.
+//     * allow_variant_set=true (ONLY read_pfile, which scans a materialized ordinal
+//       list and CAN express an arbitrary set): the `variants` field resolves via
+//       ResolveVariantsParameter into `variant_set_sorted` (sorted-unique ordinals).
+//       read_pfile passes a `variants`-only Selection here and composes `region` /
+//       `variant_range` with that set itself (their type + resolution timing differ
+//       from the shared handler), so `variant_range` stays inactive in this case.
 
 //! PURE, SYMBOLIC description of an axis selection, captured straight from a table
 //! function's named parameters with NO file IO and NO resolution. Every field is
@@ -740,6 +753,16 @@ struct ResolvedSelection {
 
 	// --- variant axis resolved ---
 	VariantRange variant_range; //!< contiguous [start_idx, end_idx) in file-row vidx
+
+	//! Arbitrary (non-contiguous) variant SET, produced ONLY when ResolveSelection is
+	//! called with `allow_variant_set = true` (read_pfile). Sorted-unique 0-based file-row
+	//! ordinals, exactly as ResolveVariantsParameter yields them (then sorted). When
+	//! `has_variant_set` is false the variant axis is described solely by `variant_range`
+	//! (the contiguous form the analysis functions consume). The two forms are mutually
+	//! exclusive here: `allow_variant_set=true` resolves only the arbitrary `variants`
+	//! field into this set; it does not populate `variant_range` (see the law block above).
+	bool has_variant_set = false;
+	vector<uint32_t> variant_set_sorted;
 };
 
 //! PURE parse of a table function's named parameters into a `Selection`. No file
@@ -774,9 +797,17 @@ void RejectSelectionVariantAxis(const named_parameter_map_t &params, const strin
 //! samples list resolves; a VARCHAR list is rejected with the existing message.
 //! The region is passed through `ParseRegion` verbatim (a region that matches no
 //! variants legitimately yields has_filter=true with start==end).
+//! `allow_variant_set` (DEFAULT FALSE) is the opt-in for the arbitrary variant SET. With
+//! it false (the 7 analysis functions), an arbitrary `variants` field is REJECTED with the
+//! same error as before — those callers scan a single contiguous interval and cannot express
+//! a set. With it true (only read_pfile), the `variants` field is resolved via
+//! ResolveVariantsParameter into `resolved.variant_set_sorted` (sorted-unique ordinals) and
+//! `resolved.has_variant_set` is set; `variant_range` is left inactive in that case. region /
+//! variant_range composition over the set stays with read_pfile (its region type + timing
+//! differ), so a `selection` passed here with `allow_variant_set=true` carries only `variants`.
 ResolvedSelection ResolveSelection(const Selection &selection, const VariantMetadataIndex &variants,
                                    const SampleInfo *sample_info, uint32_t raw_sample_ct, uint32_t raw_variant_ct,
-                                   const string &func_name);
+                                   const string &func_name, bool allow_variant_set = false);
 
 // ---------------------------------------------------------------------------
 // Ploidy- and sex-aware statistics for sex/organelle chromosomes (chrX/Y/MT)

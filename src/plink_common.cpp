@@ -2303,7 +2303,7 @@ Selection ParseSelection(const named_parameter_map_t &params) {
 
 ResolvedSelection ResolveSelection(const Selection &selection, const VariantMetadataIndex &variants,
                                    const SampleInfo *sample_info, uint32_t raw_sample_ct, uint32_t raw_variant_ct,
-                                   const string &func_name) {
+                                   const string &func_name, bool allow_variant_set) {
 	ResolvedSelection resolved;
 	resolved.effective_sample_ct = raw_sample_ct;
 
@@ -2329,10 +2329,28 @@ ResolvedSelection ResolveSelection(const Selection &selection, const VariantMeta
 	// only the contiguous forms of the variant axis. An arbitrary variant SET
 	// (`variants` — Tier C) cannot map onto one interval: reject it rather than
 	// silently ignore (no false affordance).
+	//
+	// `allow_variant_set` is the opt-in for a caller that scans a materialized ordinal
+	// list and CAN express an arbitrary set (only read_pfile). When it is true, the
+	// `variants` field is resolved via the shared ResolveVariantsParameter into a
+	// sorted-unique ordinal set, centralizing the arbitrary-SET resolution that used to
+	// live inline in read_pfile's bind. `variant_range` is left inactive in this case —
+	// read_pfile composes region/variant_range with the set itself (see the law block in
+	// plink_common.hpp). The DEFAULT-FALSE throw below is load-bearing: it preserves the
+	// analysis functions' rejection + exact error string unchanged.
 	if (selection.has_variants) {
-		throw InvalidInputException("%s: arbitrary variant selection (`variants`) is not supported here; "
-		                            "use `region` or `variant_range` for a contiguous range",
-		                            func_name);
+		if (!allow_variant_set) {
+			throw InvalidInputException("%s: arbitrary variant selection (`variants`) is not supported here; "
+			                            "use `region` or `variant_range` for a contiguous range",
+			                            func_name);
+		}
+		resolved.variant_set_sorted = ResolveVariantsParameter(selection.variants, variants, raw_variant_ct, func_name);
+		std::sort(resolved.variant_set_sorted.begin(), resolved.variant_set_sorted.end());
+		// ResolveVariantsParameter already rejects duplicates, so the sort alone yields a
+		// sorted-unique list (no std::unique needed); this matches read_pfile's former
+		// per-source variant_set membership exactly.
+		resolved.has_variant_set = true;
+		return resolved; // variant_range stays inactive; caller owns region/variant_range composition
 	}
 	if (selection.has_variant_range) {
 		// `variant_range := [lo, hi)` is already the contiguous ordinal interval the

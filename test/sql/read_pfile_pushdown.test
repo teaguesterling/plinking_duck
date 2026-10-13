@@ -1,0 +1,364 @@
+# name: test/sql/read_pfile_pushdown.test
+# description: Native filter pushdown (Step C) — conservative variant-set pruning + a
+#              generic residual applicator. Proves parity with a pushdown-DEFEATED scan,
+#              residual correctness for non-pruned/struct filters, composition with the
+#              named-param selection, the EXPLAIN Filters: entry, nested-column slicing,
+#              and multi-file behavior.
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# (1) PARITY — each pushable predicate equals the same predicate over a
+#     pushdown-DEFEATED scan (wrapped in `(... OFFSET 0)` so DuckDB cannot push
+#     the WHERE into the scan). Proven via a SYMMETRIC set difference that must
+#     be empty (0) in BOTH directions.
+# ===========================================================================
+
+# CHROM equality
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE CHROM='1')
+                         EXCEPT (SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE CHROM='1')))
++ (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE CHROM='1')
+                         EXCEPT (SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE CHROM='1')));
+----
+0
+
+# POS BETWEEN
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE POS BETWEEN 15000 AND 30000)
+                         EXCEPT (SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE POS BETWEEN 15000 AND 30000)))
++ (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE POS BETWEEN 15000 AND 30000)
+                         EXCEPT (SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE POS BETWEEN 15000 AND 30000)));
+----
+0
+
+# POS compare (>)
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE POS > 15000)
+                         EXCEPT (SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE POS > 15000)))
++ (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE POS > 15000)
+                         EXCEPT (SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE POS > 15000)));
+----
+0
+
+# ID IN (...)
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT ID FROM read_pfile('test/data/pfile_example') WHERE ID IN ('rs1','rs4'))
+                         EXCEPT (SELECT ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE ID IN ('rs1','rs4'))))
++ (SELECT COUNT(*) FROM ((SELECT ID FROM (SELECT * FROM read_pfile('test/data/pfile_example') OFFSET 0) WHERE ID IN ('rs1','rs4'))
+                         EXCEPT (SELECT ID FROM read_pfile('test/data/pfile_example') WHERE ID IN ('rs1','rs4'))));
+----
+0
+
+# __ordinal compare (< k); __ordinal is the TRUE pgen vidx, so pushdown-safe
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT ID,__ordinal FROM read_pfile('test/data/pfile_example', with_ordinal:=true) WHERE __ordinal < 2)
+                         EXCEPT (SELECT ID,__ordinal FROM (SELECT * FROM read_pfile('test/data/pfile_example', with_ordinal:=true) OFFSET 0) WHERE __ordinal < 2)))
++ (SELECT COUNT(*) FROM ((SELECT ID,__ordinal FROM (SELECT * FROM read_pfile('test/data/pfile_example', with_ordinal:=true) OFFSET 0) WHERE __ordinal < 2)
+                         EXCEPT (SELECT ID,__ordinal FROM read_pfile('test/data/pfile_example', with_ordinal:=true) WHERE __ordinal < 2)));
+----
+0
+
+# Hardcoded expected values for the pushed predicates (independent of the parity check).
+query TIT
+SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE CHROM='1' ORDER BY POS;
+----
+1	10000	rs1
+1	20000	rs2
+1	30000	rs3
+
+query TIT
+SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE POS BETWEEN 15000 AND 30000 ORDER BY CHROM,POS;
+----
+1	20000	rs2
+1	30000	rs3
+2	15000	rs4
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example') WHERE ID IN ('rs1','rs4') ORDER BY ID;
+----
+rs1
+rs4
+
+query TI
+SELECT ID,__ordinal FROM read_pfile('test/data/pfile_example', with_ordinal:=true) WHERE __ordinal < 2 ORDER BY __ordinal;
+----
+rs1	0
+rs2	1
+
+# ===========================================================================
+# (2) RESIDUAL correctness — filters that are NOT pruned must still be applied
+#     by the generic applicator.
+# ===========================================================================
+
+# REF is intentionally NOT pruned (left residual); the applicator must still filter.
+query TIT
+SELECT CHROM,POS,ID FROM read_pfile('test/data/pfile_example') WHERE REF='A' ORDER BY POS;
+----
+1	10000	rs1
+
+# Residual column filtered but NOT projected (only CHROM selected). The applicator must
+# still apply REF='A' over the scanned output vector even though REF is not in the user's
+# SELECT list — DuckDB keeps it in column_ids (filter_prune is off), so output.data[key]
+# is the REF vector. Only rs1 (REF=A) survives → CHROM '1'.
+query T
+SELECT CHROM FROM read_pfile('test/data/pfile_example') WHERE REF='A';
+----
+1
+
+# Pushable column (POS) filtered but not projected, nested genotypes still correct count.
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example') WHERE POS > 15000;
+----
+2
+
+# genotypes.af (STRUCT field) pushes as a STRUCT_EXTRACT table filter — the sharpest
+# test of the ToExpression-based applicator's generality. Parity vs defeated scan:
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT ID FROM read_pfile('test/data/pfile_example', genotypes:='stats') WHERE genotypes.af > 0.4)
+                         EXCEPT (SELECT ID FROM (SELECT * FROM read_pfile('test/data/pfile_example', genotypes:='stats') OFFSET 0) WHERE genotypes.af > 0.4)))
++ (SELECT COUNT(*) FROM ((SELECT ID FROM (SELECT * FROM read_pfile('test/data/pfile_example', genotypes:='stats') OFFSET 0) WHERE genotypes.af > 0.4)
+                         EXCEPT (SELECT ID FROM read_pfile('test/data/pfile_example', genotypes:='stats') WHERE genotypes.af > 0.4)));
+----
+0
+
+query T
+SELECT ID FROM read_pfile('test/data/pfile_example', genotypes:='stats') WHERE genotypes.af > 0.4 ORDER BY ID;
+----
+rs1
+rs2
+rs3
+
+# ===========================================================================
+# (3) COMPOSITION — pushed filters INTERSECT the named-param selection.
+# ===========================================================================
+
+# region := '1:100-200' (POS 100..200 inclusive) ∩ WHERE POS < 150 → POS 100..149.
+query III
+SELECT COUNT(*), min(POS), max(POS) FROM read_pfile('test/data/rare_small', region:='1:100-200') WHERE POS < 150;
+----
+50	100	149
+
+# variants := [5,6,7] ∩ WHERE __ordinal >= 6 → ordinals 6,7.
+query TI
+SELECT ID,__ordinal FROM read_pfile('test/data/rare_small', variants:=[5,6,7], with_ordinal:=true) WHERE __ordinal >= 6 ORDER BY __ordinal;
+----
+v6	6
+v7	7
+
+# ===========================================================================
+# (4) EXPLAIN — the scan carries a Filters: entry for a pushed predicate and
+#     NOT for a non-pushable (volatile) one.
+# ===========================================================================
+
+query II
+EXPLAIN SELECT CHROM,POS FROM read_pfile('test/data/pfile_example') WHERE CHROM='1';
+----
+physical_plan	<REGEX>:.*Filters:.*CHROM.*
+
+# A volatile predicate cannot be converted to a table filter: no Filters: on the scan
+# (it stays as a FILTER operator above the scan). Result is still correct.
+query II
+EXPLAIN SELECT CHROM,POS FROM read_pfile('test/data/pfile_example') WHERE POS > 100*random();
+----
+physical_plan	<!REGEX>:.*Filters:.*
+
+# ===========================================================================
+# (5) MULTI-FILE — CHROM/POS pushed per-source; variants/variant_range still rejected.
+# ===========================================================================
+
+# CHROM pushed across a 3-shard list equals the defeated scan.
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) WHERE CHROM='3')
+                         EXCEPT (SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) OFFSET 0) WHERE CHROM='3')))
++ (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) OFFSET 0) WHERE CHROM='3')
+                         EXCEPT (SELECT CHROM,POS,ID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) WHERE CHROM='3')));
+----
+0
+
+query I
+SELECT COUNT(*) FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) WHERE CHROM='3';
+----
+1000
+
+# POS pushed per-source across a multi-file list.
+query I
+SELECT
+  (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) WHERE POS < 500)
+                         EXCEPT (SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) OFFSET 0) WHERE POS < 500)))
++ (SELECT COUNT(*) FROM ((SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) OFFSET 0) WHERE POS < 500)
+                         EXCEPT (SELECT CHROM,POS,ID FROM read_pfile(['test/data/shard1','test/data/shard2','test/data/shard3']) WHERE POS < 500)));
+----
+0
+
+# Multi-file `variants` / `variant_range` remain rejected (pushdown does not change this).
+statement error
+SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2'], variants := [1,2,3]);
+----
+multi-file list is not yet supported
+
+statement error
+SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2'], variant_range := [0,10]);
+----
+multi-file list is not yet supported
+
+# ===========================================================================
+# (6) NESTED-COLUMN SLICING — a pushed scalar filter (POS) while a LIST / ARRAY /
+#     STRUCT genotype column is projected. Exercises output.Slice() over nested
+#     vectors (where a wrong slice would corrupt or crash).
+# ===========================================================================
+
+# ARRAY(TINYINT, N) genotypes (default).
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example') WHERE POS > 15000 ORDER BY POS;
+----
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+
+# LIST(TINYINT) genotypes.
+query TT
+SELECT ID, genotypes FROM read_pfile('test/data/pfile_example', genotypes:='list') WHERE POS > 15000 ORDER BY POS;
+----
+rs2	[1, 1, 0, 2]
+rs3	[2, NULL, 1, 0]
+
+# STRUCT genotypes — the per-sample struct must survive the slice intact.
+query TT
+SELECT ID, genotypes.sample1 FROM read_pfile('test/data/pfile_example', genotypes:='struct') WHERE POS > 15000 ORDER BY POS;
+----
+rs2	1
+rs3	2
+
+# ===========================================================================
+# (7) with_ordinal + genotype ARRAY projected: prune on __ordinal while a nested
+#     column is projected (single-file ordinal pruning path + nested slice).
+# ===========================================================================
+
+query TIT
+SELECT ID, __ordinal, genotypes FROM read_pfile('test/data/pfile_example', with_ordinal:=true) WHERE __ordinal >= 2 ORDER BY __ordinal;
+----
+rs3	2	[2, NULL, 1, 0]
+rs4	3	[0, 0, 1, 2]
+
+# ===========================================================================
+# (8) ORIENT COVERAGE — genotype (tidy) pruning narrows whole variant fans; sample
+#     orient is residual-applicator-only (schema fixed at bind). Parity vs defeated.
+# ===========================================================================
+
+# Genotype orient, single-file: CHROM='1' prunes variant fans (3 variants × 4 samples = 12).
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/pfile_example', orient:='genotype') WHERE CHROM='1';
+----
+12
+
+query I
+WITH p AS (SELECT CHROM,POS,ID,IID FROM read_pfile('test/data/pfile_example', orient:='genotype') WHERE CHROM='1'),
+     d AS (SELECT CHROM,POS,ID,IID FROM (SELECT * FROM read_pfile('test/data/pfile_example', orient:='genotype') OFFSET 0) WHERE CHROM='1')
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM d)) + (SELECT COUNT(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM p));
+----
+0
+
+# Genotype orient, multi-file: per-source CHROM pruning in the tidy multi-file loop.
+query I
+WITH p AS (SELECT CHROM,POS,ID,IID FROM read_pfile(['test/data/shard1','test/data/shard2'], orient:='genotype') WHERE CHROM='3'),
+     d AS (SELECT CHROM,POS,ID,IID FROM (SELECT * FROM read_pfile(['test/data/shard1','test/data/shard2'], orient:='genotype') OFFSET 0) WHERE CHROM='3')
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM d)) + (SELECT COUNT(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM p));
+----
+0
+
+# Sample orient: filter on a psam column. No pruning (schema fixed at bind) — the residual
+# applicator is the only mechanism. Exercises output.Slice() over the sample-orient
+# ARRAY(elem, n_variants) genotypes column (positional array children under a selection).
+query TT
+SELECT IID, genotypes FROM read_pfile('test/data/pfile_example', orient:='sample') WHERE IID='SAMPLE1';
+----
+SAMPLE1	[0, 1, 2, 0]
+
+query T
+SELECT IID FROM read_pfile('test/data/pfile_example', orient:='sample') WHERE SEX=1 ORDER BY IID;
+----
+SAMPLE1
+SAMPLE4
+
+query I
+WITH p AS (SELECT IID, genotypes::VARCHAR g FROM read_pfile('test/data/pfile_example', orient:='sample') WHERE SEX=1),
+     d AS (SELECT IID, genotypes::VARCHAR g FROM (SELECT * FROM read_pfile('test/data/pfile_example', orient:='sample') OFFSET 0) WHERE SEX=1)
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM d)) + (SELECT COUNT(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM p));
+----
+0
+
+# ===========================================================================
+# (9) MULTI-CHUNK MID-SCAN EMPTY-CHUNK REGRESSION (the under-return bug).
+#     A residual-only predicate whose matches live ONLY past the first chunk must
+#     NOT make the scan terminate early. streaming_example has 50000 variants
+#     (chrom 1→2→3), ~25 output chunks of 2048; POS IN (1499700,1500000) matches
+#     only variants far past chunk 0. `POS IN (x,y)` (2+ elements) stays an
+#     IN_FILTER the pruner does NOT narrow (POS-IN is residual-only), so this
+#     exercises the residual applicator across chunk boundaries — the exact bug.
+# ===========================================================================
+
+# Variant orient: exact count + parity vs defeated, single-threaded and threads=4.
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/streaming_example') WHERE POS IN (1499700, 1500000);
+----
+6
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/streaming_example') WHERE POS IN (100, 1499700, 1500000);
+----
+9
+
+query I
+WITH p AS (SELECT CHROM,POS,ID FROM read_pfile('test/data/streaming_example') WHERE POS IN (1499700, 1500000)),
+     d AS (SELECT CHROM,POS,ID FROM (SELECT * FROM read_pfile('test/data/streaming_example') OFFSET 0) WHERE POS IN (1499700, 1500000))
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM d)) + (SELECT COUNT(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM p));
+----
+0
+
+statement ok
+PRAGMA threads=4;
+
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/streaming_example') WHERE POS IN (1499700, 1500000);
+----
+6
+
+# Genotype orient: each surviving variant fans to all samples; matches live past chunk 0.
+query I
+SELECT COUNT(*) FROM read_pfile('test/data/streaming_example', orient:='genotype') WHERE POS IN (1499700, 1500000);
+----
+48
+
+query I
+WITH p AS (SELECT CHROM,POS,ID,IID FROM read_pfile('test/data/streaming_example', orient:='genotype') WHERE POS IN (1499700, 1500000)),
+     d AS (SELECT CHROM,POS,ID,IID FROM (SELECT * FROM read_pfile('test/data/streaming_example', orient:='genotype') OFFSET 0) WHERE POS IN (1499700, 1500000))
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM d)) + (SELECT COUNT(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM p));
+----
+0
+
+statement ok
+PRAGMA threads=1;
+
+# Sample orient: >2048 samples (wes_chr10 has 10000) → multiple per-sample chunks. A
+# residual on IID that matches only a LATE sample must survive the early rejected chunks.
+# variant_range:=[0,1] keeps the pre-read matrix to a single variant (cheap). S09999 lives
+# in the last chunk, so pre-fix this returned 0 (first chunk rejected → scan FINISHED).
+query T
+SELECT IID FROM read_pfile('test/data/wes_chr10', orient:='sample', variant_range:=[0,1]) WHERE IID='S09999';
+----
+S09999
+
+query I
+WITH p AS (SELECT IID FROM read_pfile('test/data/wes_chr10', orient:='sample', variant_range:=[0,1]) WHERE IID IN ('S00001','S05000','S09999')),
+     d AS (SELECT IID FROM (SELECT * FROM read_pfile('test/data/wes_chr10', orient:='sample', variant_range:=[0,1]) OFFSET 0) WHERE IID IN ('S00001','S05000','S09999'))
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM d)) + (SELECT COUNT(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM p));
+----
+0

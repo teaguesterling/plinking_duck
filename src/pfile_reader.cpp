@@ -15,6 +15,16 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
+// --- Native filter pushdown (Step C) ---
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
 
@@ -562,6 +572,37 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	OrientMode orient_mode = OrientMode::VARIANT;
 	uint32_t max_threads_config = 0;
 
+	// --- Native filter pushdown (Step C) ---
+	// The FULL set of filters DuckDB pushed into this scan, keyed by position in
+	// `column_ids`. Lives in TableScanGlobalSourceState (constructed before and torn
+	// down after this global state — see physical_table_scan.cpp), so the pointer is
+	// safe to hold for the scan's lifetime. Re-applied to every emitted DataChunk by
+	// ApplyResidualFilters — the CORRECTNESS half: results are correct even though the
+	// physical scan applies no residual itself and the optimizer may have dropped a
+	// fully-pushed WHERE node (pushdown_get.cpp erases PUSHED_DOWN_FULLY filters).
+	optional_ptr<TableFilterSet> residual_filters;
+	// Conservative variant-set pruning (the OPTIMIZATION half, variant/genotype orient
+	// only). When active, pruned_by_source[src] is the narrowed list of per-source
+	// effective positions to scan (a subset of [0, sources[src].EffectiveVariantCt()),
+	// ascending). Only ever shrinks the scanned set; the applicator still re-applies the
+	// full filter, so an imperfect prune cannot produce a wrong answer (only lost speed).
+	bool prune_active = false;
+	vector<vector<uint32_t>> pruned_by_source;
+
+	// Number of effective positions the scan iterates for source `src` (pruned count
+	// when pruning is active, else the source's full effective-variant count).
+	uint32_t ScanCount(const PfileBindData &bind_data, uint32_t src) const {
+		if (prune_active) {
+			return static_cast<uint32_t>(pruned_by_source[src].size());
+		}
+		return bind_data.sources[src].EffectiveVariantCt();
+	}
+	// Map an iteration index `idx` (into [0, ScanCount(src))) to the source's effective
+	// position. Identity when not pruning; a lookup into the pruned list when pruning.
+	uint32_t ScanLocal(uint32_t src, uint32_t idx) const {
+		return prune_active ? pruned_by_source[src][idx] : idx;
+	}
+
 	// --- Sample-orient AGGREGATE streaming (genotypes := 'counts'|'stats') ---
 	// Instead of materializing the variants×samples matrix, a variant-parallel
 	// Phase 1 accumulates per-sample category counts, then Phase 2 emits per-sample
@@ -923,6 +964,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	BindPhaseTimer bind_timer("PfileBind(total)");
 	auto bind_data = make_uniq<PfileBindData>();
 
+	// --- Parse the composable axis selection (samples/region/variants/variant_range) ---
+	// ParseSelection captures `samples` + `region` symbolically, applying most-specific-wins
+	// between an optional `selection := <STRUCT>` and the individual params (byte-identical to
+	// the routed analysis functions), and validates the STRUCT's own `variants`/`variant_range`
+	// fields. read_pfile ALSO exposes `variants` and `variant_range` as INDIVIDUAL params (the
+	// analysis functions take those only via the struct); their override + validation is layered
+	// on below at the SAME bind location as before (preserving error ordering vs the multi-file
+	// and dosages/phased checks). The variant axis stays bespoke; only the SAMPLE axis is routed
+	// through ResolveSelection (the shared handler).
+	Selection sel = ParseSelection(input.named_parameters);
+
 	// --- Resolve file path(s) ---
 	// First positional argument is a prefix (VARCHAR) or a list of prefixes
 	// (LIST(VARCHAR), row-concatenated in order). Empty inputs → only named params.
@@ -956,8 +1008,6 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			bind_data->include_dosages = kv.second.GetValue<bool>();
 		} else if (kv.first == "phased") {
 			bind_data->include_phased = kv.second.GetValue<bool>();
-		} else if (kv.first == "region") {
-			bind_data->region = ParseRegion(kv.second.GetValue<string>());
 		} else if (kv.first == "combine_samples") {
 			bind_data->combine_samples = ResolveCombineSamplesMode(kv.second.GetValue<string>());
 		} else if (kv.first == "with_ordinal") {
@@ -966,6 +1016,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 		}
 		// samples, variants, genotypes, af_range, ac_range handled after pgenlib init
+	}
+
+	// `region` (from the `selection` struct or the individual param, most-specific-wins via
+	// ParseSelection) is parsed by read_pfile's file-local ParseRegion into a 1-based-inclusive
+	// RegionFilter consumed by LoadPfileSource BEFORE metadata loads — kept bespoke (not routed
+	// through ResolveSelection's variant axis, whose region grammar/timing differ).
+	if (sel.has_region) {
+		bind_data->region = ParseRegion(sel.region.GetValue<string>());
 	}
 
 	bind_data->orient_mode = ResolveOrientMode(orient_str, "read_pfile");
@@ -1009,7 +1067,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// (indices are per-shard, not global) resolves correctly yet. Guard it rather
 		// than throw-on-missing or return per-shard duplicates. Use `region :=` for
 		// range selection across files. Global `variants` resolution is a follow-up.
-		if (input.named_parameters.find("variants") != input.named_parameters.end()) {
+		// Presence via the struct (sel.has_variants) OR the individual param (not yet merged
+		// into sel at this point — the override is applied below, after this guard).
+		if (sel.has_variants || input.named_parameters.find("variants") != input.named_parameters.end()) {
 			throw InvalidInputException("read_pfile: variants := [...] with a multi-file list is not yet supported; "
 			                            "use region := for selection across files");
 		}
@@ -1018,58 +1078,80 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// range is ambiguous (which shard's ordinals?), so reject it, mirroring
 		// `variants`. The partition consumer calls pfile_partitions per shard and
 		// reads each resolved `source` separately with its own variant_range.
+		// Presence via the struct (sel.has_variant_range) OR a non-NULL individual param
+		// (not yet merged into sel — see the override below). Mirrors the original
+		// `vr != end && !vr->second.IsNull()` presence test.
 		auto vr_mf = input.named_parameters.find("variant_range");
-		if (vr_mf != input.named_parameters.end() && !vr_mf->second.IsNull()) {
+		bool individual_vr_present = vr_mf != input.named_parameters.end() && !vr_mf->second.IsNull();
+		if (sel.has_variant_range || individual_vr_present) {
 			throw InvalidInputException(
 			    "read_pfile: variant_range with a multi-file list is not yet supported (it is per-source ordinal "
 			    "space); read each shard separately (see pfile_partitions' per-source `source` column)");
 		}
 	}
 
-	// Resolve the `variants` param against the variant index below. Multi-file +
-	// `variants` is rejected above, so here it only ever applies to a single source.
-	auto variants_it = input.named_parameters.find("variants");
-	bind_data->has_variant_filter = variants_it != input.named_parameters.end();
-
-	// Parse `variant_range := [lo, hi)` — a half-open range in variant ordinal space.
-	// Multi-file is rejected above, so this only ever applies to a single source.
-	auto vr_it = input.named_parameters.find("variant_range");
-	bind_data->has_variant_range = vr_it != input.named_parameters.end() && !vr_it->second.IsNull();
-	if (bind_data->has_variant_range) {
-		const Value &vr = vr_it->second;
-		if (vr.type().id() != LogicalTypeId::LIST) {
-			throw InvalidInputException(
-			    "read_pfile: variant_range must be a 2-element list [lo, hi) in variant ordinal space (got %s)",
-			    vr.type().ToString());
+	// --- Layer the INDIVIDUAL `variants` / `variant_range` params onto the Selection ---
+	// Kept at the ORIGINAL bind location (after the multi-file + dosages/phased guards) so
+	// error ordering on doubly-invalid input is unchanged. A present individual param
+	// overrides the struct field (most-specific-wins); an explicit NULL individual
+	// variant_range clears it to "unset" (matching read_pfile's former has_* logic).
+	{
+		auto variants_it = input.named_parameters.find("variants");
+		if (variants_it != input.named_parameters.end()) {
+			sel.has_variants = true;
+			sel.variants = variants_it->second;
 		}
-		auto &children = ListValue::GetChildren(vr);
-		if (children.size() != 2) {
-			throw InvalidInputException("read_pfile: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
-			                            static_cast<unsigned long long>(children.size()));
-		}
-		if (children[0].IsNull() || children[1].IsNull()) {
-			throw InvalidInputException("read_pfile: variant_range bounds must not be NULL");
-		}
-		// Reject non-integer bounds explicitly rather than silently rounding them
-		// (GetValue<int64_t> would round 10.5 -> 10). Every other malformed-input
-		// path on this param errors cleanly, so an out-of-type bound should too.
-		if (!children[0].type().IsIntegral()) {
-			throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
-			                            children[0].ToString());
-		}
-		if (!children[1].type().IsIntegral()) {
-			throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
-			                            children[1].ToString());
-		}
-		bind_data->variant_range_lo = children[0].GetValue<int64_t>();
-		bind_data->variant_range_hi = children[1].GetValue<int64_t>();
-		if (bind_data->variant_range_lo < 0 || bind_data->variant_range_hi < bind_data->variant_range_lo) {
-			throw InvalidInputException(
-			    "read_pfile: variant_range must be a half-open [lo, hi) with 0 <= lo <= hi (got [%lld, %lld))",
-			    static_cast<long long>(bind_data->variant_range_lo),
-			    static_cast<long long>(bind_data->variant_range_hi));
+		auto vr_it = input.named_parameters.find("variant_range");
+		if (vr_it != input.named_parameters.end()) {
+			if (vr_it->second.IsNull()) {
+				sel.has_variant_range = false;
+			} else {
+				const Value &vr = vr_it->second;
+				if (vr.type().id() != LogicalTypeId::LIST) {
+					throw InvalidInputException(
+					    "read_pfile: variant_range must be a 2-element list [lo, hi) in variant ordinal space (got %s)",
+					    vr.type().ToString());
+				}
+				auto &children = ListValue::GetChildren(vr);
+				if (children.size() != 2) {
+					throw InvalidInputException(
+					    "read_pfile: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
+					    static_cast<unsigned long long>(children.size()));
+				}
+				if (children[0].IsNull() || children[1].IsNull()) {
+					throw InvalidInputException("read_pfile: variant_range bounds must not be NULL");
+				}
+				// Reject non-integer bounds explicitly rather than silently rounding them
+				// (GetValue<int64_t> would round 10.5 -> 10).
+				if (!children[0].type().IsIntegral()) {
+					throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
+					                            children[0].ToString());
+				}
+				if (!children[1].type().IsIntegral()) {
+					throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
+					                            children[1].ToString());
+				}
+				int64_t lo = children[0].GetValue<int64_t>();
+				int64_t hi = children[1].GetValue<int64_t>();
+				if (lo < 0 || hi < lo) {
+					throw InvalidInputException(
+					    "read_pfile: variant_range must be a half-open [lo, hi) with 0 <= lo <= hi (got [%lld, %lld))",
+					    static_cast<long long>(lo), static_cast<long long>(hi));
+				}
+				sel.has_variant_range = true;
+				sel.variant_range_lo = lo;
+				sel.variant_range_hi = hi;
+			}
 		}
 	}
+
+	// Variant axis presence/bounds taken from the parsed Selection (struct-seeded, with the
+	// individual overrides applied above). Multi-file + `variants`/`variant_range` is rejected
+	// above, so each only ever applies to a single source.
+	bind_data->has_variant_filter = sel.has_variants;
+	bind_data->has_variant_range = sel.has_variant_range;
+	bind_data->variant_range_lo = sel.variant_range_lo;
+	bind_data->variant_range_hi = sel.variant_range_hi;
 
 	// --- Build sources (one per prefix) ---
 	bind_timer.Note("resolving %llu source(s)", (unsigned long long)prefixes.size());
@@ -1097,14 +1179,24 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			    src.pgen_path, src_sample_ct, bind_data->raw_sample_ct, bind_data->sources[0].pgen_path);
 		}
 
-		// Per-source effective variant list (region ∩ variants param, resolved per shard)
+		// Per-source effective variant list (region ∩ variants param, resolved per shard).
+		// The arbitrary-SET resolution of `variants` is centralized in the shared handler:
+		// ResolveSelection(allow_variant_set=true) runs the same ResolveVariantsParameter
+		// read_pfile used inline and returns a sorted-unique ordinal set. `has_variant_filter`
+		// implies single-file here — the multi-file guard above throws on ANY `variants`
+		// presence before this loop — so this is read_pfile's single-source variant path. A
+		// `variants`-ONLY Selection is handed over (sample_info=nullptr, no region/variant_range):
+		// read_pfile still owns the region ∩ set (BuildEffectiveVariantList) and the
+		// variant_range post-filter below, since their type + timing differ from the handler.
 		std::unordered_set<uint32_t> variant_set;
 		if (bind_data->has_variant_filter) {
-			auto resolved =
-			    ResolveVariantsParameter(variants_it->second, src.variants, src.raw_variant_ct, "read_pfile");
-			for (auto idx : resolved) {
-				variant_set.insert(idx);
-			}
+			Selection variants_sel;
+			variants_sel.has_variants = true;
+			variants_sel.variants = sel.variants;
+			ResolvedSelection vres = ResolveSelection(variants_sel, src.variants, /*sample_info=*/nullptr,
+			                                          bind_data->raw_sample_ct, src.raw_variant_ct, "read_pfile",
+			                                          /*allow_variant_set=*/true);
+			variant_set.insert(vres.variant_set_sorted.begin(), vres.variant_set_sorted.end());
 		}
 		BuildEffectiveVariantList(src, bind_data->region, variant_set, bind_data->has_variant_filter);
 
@@ -1177,13 +1269,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		needs_iids = true;
 	}
 	{
-		auto it = input.named_parameters.find("samples");
-		// Only probe the child type for a real LIST value. A NULL (bare, or a
-		// LIST-typed NULL) has no child type — GetChildType would crash; the samples
-		// block below raises the proper "must not be empty" error.
-		if (it != input.named_parameters.end() && !it->second.IsNull() &&
-		    it->second.type().id() == LogicalTypeId::LIST) {
-			auto &child_type = ListType::GetChildType(it->second.type());
+		// Probe the resolved Selection's sample axis (struct- or individual-supplied).
+		// Only probe the child type for a real LIST value. A NULL (bare, or a LIST-typed
+		// NULL) has no child type — GetChildType would crash; the sample-axis resolution
+		// below raises the proper "must not be empty" error.
+		if (sel.has_samples && !sel.samples.IsNull() && sel.samples.type().id() == LogicalTypeId::LIST) {
+			auto &child_type = ListType::GetChildType(sel.samples.type());
 			if (child_type.id() == LogicalTypeId::VARCHAR) {
 				needs_iids = true;
 			}
@@ -1252,69 +1343,39 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
-	// --- Process samples parameter ---
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto &samples_val = samples_it->second;
-		// NULL value (bare, or a LIST-typed NULL from list(x) over zero rows) has no
-		// child type/children — guard before ListType/ListValue access.
-		if (samples_val.IsNull()) {
-			throw InvalidInputException("read_pfile: samples list must not be empty");
-		}
-		auto &child_type = ListType::GetChildType(samples_val.type());
-
-		auto &children_check = ListValue::GetChildren(samples_val);
-		if (children_check.empty()) {
-			throw InvalidInputException("read_pfile: samples list must not be empty");
-		}
-
-		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
-			auto &children = ListValue::GetChildren(samples_val);
-			for (auto &child : children) {
-				int64_t idx = child.GetValue<int64_t>();
-				if (idx < 0 || static_cast<uint32_t>(idx) >= bind_data->raw_sample_ct) {
-					throw InvalidInputException("read_pfile: sample index %lld out of range (sample count: %u)",
-					                            static_cast<long long>(idx), bind_data->raw_sample_ct);
-				}
-				bind_data->sample_indices.push_back(static_cast<uint32_t>(idx));
-			}
-		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
-			// Lazily build iid_to_idx only when a VARCHAR sample filter is used. On the
-			// parquet path the IID strings are not materialized at load, so pull just the
-			// IID/FID columns from the source first (no-op on the text path).
+	// --- Resolve the SAMPLE axis via the shared handler ---
+	// Mirrors the routed analysis functions: ParseSelection captured `samples` symbolically;
+	// ResolveSampleIndices (via ResolveSelection) validates + resolves it to SORTED-UNIQUE
+	// original indices — byte-identical to the former inline block (same range/duplicate/
+	// empty checks and "read_pfile:"-prefixed messages). Only the SAMPLE axis is routed:
+	// a SAMPLE-ONLY Selection is passed so ResolveSelection's variant axis is a no-op, and
+	// the returned variant_range is ignored (read_pfile's variant axis stays bespoke above).
+	// read_pfile needs the ORDERED index list for genotype column names + per-row file-index
+	// mapping, so resolved.subset_sorted is copied into sample_indices (it already equals the
+	// former sorted sample_indices).
+	{
+		// Parquet-source psam materializes IID strings lazily; a non-empty VARCHAR samples
+		// filter needs them (+ the IID→index map) before ResolveSampleIndices runs. Pre-build
+		// here — preserving read_pfile's own map-error context — so ResolveSampleIndices'
+		// EnsureIidMap(func_name) then no-ops (idempotent).
+		if (sel.has_samples && !sel.samples.IsNull() && sel.samples.type().id() == LogicalTypeId::LIST &&
+		    ListType::GetChildType(sel.samples.type()).id() == LogicalTypeId::VARCHAR &&
+		    !ListValue::GetChildren(sel.samples).empty()) {
 			EnsureSourceIids(context, bind_data->sample_metadata, bind_data->sample_info);
 			bind_data->sample_info.EnsureIidMap("read_pfile: " + psam_path);
-			auto &children = ListValue::GetChildren(samples_val);
-			for (auto &child : children) {
-				auto iid = child.GetValue<string>();
-				auto it = bind_data->sample_info.iid_to_idx.find(iid);
-				if (it == bind_data->sample_info.iid_to_idx.end()) {
-					throw InvalidInputException("read_pfile: sample '%s' not found in .psam", iid);
-				}
-				bind_data->sample_indices.push_back(static_cast<uint32_t>(it->second));
-			}
-		} else {
-			throw InvalidInputException("read_pfile: samples parameter must be LIST(VARCHAR) or LIST(INTEGER)");
 		}
 
-		// Validate no duplicates
-		{
-			std::unordered_set<uint32_t> seen;
-			for (auto idx : bind_data->sample_indices) {
-				if (!seen.insert(idx).second) {
-					throw InvalidInputException("read_pfile: duplicate sample index %u in samples list", idx);
-				}
-			}
+		Selection sample_sel;
+		sample_sel.has_samples = sel.has_samples;
+		sample_sel.samples = sel.samples;
+		ResolvedSelection resolved =
+		    ResolveSelection(sample_sel, bind_data->Primary().variants, &bind_data->sample_info,
+		                     bind_data->raw_sample_ct, bind_data->Primary().raw_variant_ct, "read_pfile");
+		if (resolved.has_sample_subset) {
+			bind_data->sample_indices = std::move(resolved.subset_sorted);
+			bind_data->has_sample_subset = true;
+			bind_data->subset_sample_ct = resolved.effective_sample_ct;
 		}
-
-		// Sort sample_indices to match pgenlib output order.
-		// PgrGet with sample_include returns genotypes in ascending bit order
-		// regardless of the order indices were added. Sorting ensures that
-		// genotype_bytes[i] corresponds to sample_indices[i] in genotype orient mode.
-		std::sort(bind_data->sample_indices.begin(), bind_data->sample_indices.end());
-
-		bind_data->has_sample_subset = true;
-		bind_data->subset_sample_ct = static_cast<uint32_t>(bind_data->sample_indices.size());
 	}
 
 	// (variants param + effective variant list were resolved per-source above.)
@@ -2150,6 +2211,355 @@ static void BuildProjectedPsamCdc(ClientContext &context, const PfileBindData &b
 // Init global
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Native filter pushdown (Step C)
+//
+// Enabling filter_pushdown transfers a correctness obligation: the physical table
+// scan applies NO residual filter itself (physical_table_scan.cpp calls the table
+// function and returns its chunk verbatim) and the optimizer may drop a WHERE node
+// whose filter was pushed in full (pushdown_get.cpp erases PUSHED_DOWN_FULLY
+// filters). So the scan MUST re-apply the pushed filters to stay correct. We split
+// that into two independent pieces:
+//
+//   (1) ApplyResidualFilters  — CORRECTNESS. A generic applicator that re-applies the
+//       FULL pushed TableFilterSet to every emitted DataChunk via each filter's own
+//       ToExpression() lowering + an ExpressionExecutor selection. Because ToExpression
+//       is pure-virtual on TableFilter, this covers EVERY filter type — including
+//       EXPRESSION_FILTER / STRUCT_EXTRACT / BLOOM_FILTER / DYNAMIC_FILTER — with no
+//       per-type code, so a filter we cannot (or choose not to) prune on is still
+//       applied correctly. Re-applying a filter we also pruned on is idempotent.
+//
+//   (2) BuildPrunePlan / VariantPassesPrunePlan — OPTIMIZATION. A conservative
+//       narrowing of the scanned variant set for the filter shapes we recognize on
+//       the variant-axis columns (CHROM / POS / ID / __ordinal). It may only EVER
+//       shrink the scanned set relative to the named-param selection; an unrecognized
+//       shape contributes nothing and is left entirely to the applicator. Because the
+//       applicator re-applies everything, an imperfect prune costs speed, never
+//       correctness — but a prune that dropped a kept row WOULD be a bug, so every
+//       recognizer below is exact and conservative.
+//
+// All version-sensitive TableFilterSet inspection is centralized here, following the
+// duckdb_compat.hpp convention of touching the DuckDB filter API in one place.
+// ---------------------------------------------------------------------------
+
+//! Recognized variant-axis constraints extracted from the pushed TableFilterSet.
+//! Each is a lower bound on what the predicate keeps: a variant is pruned only when a
+//! recognized constraint definitively excludes it.
+struct PfilePrunePlan {
+	bool any = false; //! any recognized constraint present
+
+	//! CHROM: kept only if its chrom is in this set (equality / IN / OR-of-equalities).
+	bool has_chrom = false;
+	unordered_set<string> chrom_allowed;
+
+	//! POS: inclusive bounds accumulated from >, >=, <, <=, =, BETWEEN (AND-composed).
+	bool has_pos = false;
+	int64_t pos_lo = std::numeric_limits<int64_t>::min();
+	int64_t pos_hi = std::numeric_limits<int64_t>::max();
+
+	//! ID: kept only if its id is in this set. Gated per-source on has_ids at eval time.
+	bool has_id = false;
+	unordered_set<string> id_allowed;
+
+	//! __ordinal: read_pfile emits __ordinal as the TRUE pgen variant index (vidx), not
+	//! an emission counter (unlike read_pvar — see pvar_reader.cpp), so it is a stable
+	//! property of the variant and PUSHDOWN-SAFE to prune on. Inclusive vidx bounds +
+	//! optional explicit set. Applied only for single-file reads (a per-source vidx is
+	//! not the global ordinal across a multi-file list).
+	bool has_ord = false;
+	int64_t ord_lo = std::numeric_limits<int64_t>::min();
+	int64_t ord_hi = std::numeric_limits<int64_t>::max();
+	bool has_ord_set = false;
+	unordered_set<int64_t> ord_allowed;
+};
+
+//! True iff `v` is an integer-category Value we can read as int64 for POS/__ordinal.
+static bool PruneTryGetInt(const Value &v, int64_t &out) {
+	if (v.IsNull()) {
+		return false;
+	}
+	switch (v.type().id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+		break;
+	default:
+		return false;
+	}
+	try {
+		out = v.GetValue<int64_t>();
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+//! True iff `v` is a non-NULL VARCHAR we can read for CHROM/ID.
+static bool PruneTryGetStr(const Value &v, string &out) {
+	if (v.IsNull() || v.type().id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	out = v.GetValue<string>();
+	return true;
+}
+
+//! Accumulate a string-set (CHROM/ID) constraint from one filter. Returns false if the
+//! filter shape is not an exact equality/IN/OR-of-equalities (caller then leaves it to
+//! the applicator). On true, `out` holds the complete allowed set for this column.
+static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<string> &out) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &cf = filter.Cast<ConstantFilter>();
+		if (cf.comparison_type != ExpressionType::COMPARE_EQUAL) {
+			return false;
+		}
+		string s;
+		if (!PruneTryGetStr(cf.constant, s)) {
+			return false;
+		}
+		out.insert(std::move(s));
+		return true;
+	}
+	case TableFilterType::IN_FILTER: {
+		auto &inf = filter.Cast<InFilter>();
+		for (auto &v : inf.values) {
+			string s;
+			if (!PruneTryGetStr(v, s)) {
+				return false; // a non-varchar member → cannot prune exactly
+			}
+			out.insert(std::move(s));
+		}
+		return !inf.values.empty();
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		// OR is kept only if EVERY branch is a recognized equality/IN (union of sets);
+		// a single unrecognized branch could keep rows the union omits → bail.
+		auto &conj = filter.Cast<ConjunctionOrFilter>();
+		for (auto &child : conj.child_filters) {
+			if (!PruneCollectStringSet(*child, out)) {
+				return false;
+			}
+		}
+		return !conj.child_filters.empty();
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &opt = filter.Cast<OptionalFilter>();
+		return opt.child_filter ? PruneCollectStringSet(*opt.child_filter, out) : false;
+	}
+	default:
+		return false;
+	}
+}
+
+//! Accumulate inclusive integer bounds (POS/__ordinal) from one filter into [lo, hi].
+//! Recognizes CONSTANT_COMPARISON (>, >=, <, <=, =), AND-composed children (intersect),
+//! and OPTIONAL (unwrap). It does NOT handle IN here — IN is handled separately and
+//! EXACTLY (__ordinal as an ord_allowed set in BuildPrunePlan; POS-IN is left to the
+//! applicator). Unrecognized shapes leave the bounds untouched. Returns true if it
+//! tightened at least one bound. (Do not add an IN→[min,max] widening case here: an
+//! inexact bounds widening on POS would still be conservative, but keeping all IN
+//! handling exact-or-residual avoids a future refactor silently introducing a gap.)
+static bool PruneCollectIntBounds(const TableFilter &filter, int64_t &lo, int64_t &hi) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &cf = filter.Cast<ConstantFilter>();
+		int64_t c;
+		if (!PruneTryGetInt(cf.constant, c)) {
+			return false;
+		}
+		switch (cf.comparison_type) {
+		case ExpressionType::COMPARE_GREATERTHAN:
+			if (c != std::numeric_limits<int64_t>::max()) {
+				lo = std::max(lo, c + 1);
+			}
+			return true;
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			lo = std::max(lo, c);
+			return true;
+		case ExpressionType::COMPARE_LESSTHAN:
+			if (c != std::numeric_limits<int64_t>::min()) {
+				hi = std::min(hi, c - 1);
+			}
+			return true;
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+			hi = std::min(hi, c);
+			return true;
+		case ExpressionType::COMPARE_EQUAL:
+			lo = std::max(lo, c);
+			hi = std::min(hi, c);
+			return true;
+		default:
+			return false;
+		}
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conj = filter.Cast<ConjunctionAndFilter>();
+		bool any = false;
+		for (auto &child : conj.child_filters) {
+			any |= PruneCollectIntBounds(*child, lo, hi); // AND → keep intersecting
+		}
+		return any;
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &opt = filter.Cast<OptionalFilter>();
+		return opt.child_filter ? PruneCollectIntBounds(*opt.child_filter, lo, hi) : false;
+	}
+	default:
+		return false;
+	}
+}
+
+//! Build the conservative prune plan from the pushed filters. `column_ids` maps each
+//! filter's key (its position in the projection) to an output column id.
+static PfilePrunePlan BuildPrunePlan(const TableFilterSet &fs, const vector<column_t> &column_ids,
+                                     const PfileBindData &bind_data) {
+	PfilePrunePlan plan;
+	for (auto &kv : fs.filters) {
+		idx_t proj_idx = kv.first;
+		if (proj_idx >= column_ids.size()) {
+			continue;
+		}
+		column_t file_col = column_ids[proj_idx];
+		const TableFilter &filter = *kv.second;
+
+		if (file_col == PfileBindData::CHROM_COL) {
+			unordered_set<string> s;
+			if (PruneCollectStringSet(filter, s)) {
+				plan.chrom_allowed = std::move(s);
+				plan.has_chrom = true;
+				plan.any = true;
+			}
+		} else if (file_col == PfileBindData::POS_COL) {
+			int64_t lo = std::numeric_limits<int64_t>::min(), hi = std::numeric_limits<int64_t>::max();
+			if (PruneCollectIntBounds(filter, lo, hi)) {
+				plan.pos_lo = std::max(plan.pos_lo, lo);
+				plan.pos_hi = std::min(plan.pos_hi, hi);
+				plan.has_pos = true;
+				plan.any = true;
+			}
+		} else if (file_col == PfileBindData::ID_COL) {
+			unordered_set<string> s;
+			if (PruneCollectStringSet(filter, s)) {
+				plan.id_allowed = std::move(s);
+				plan.has_id = true;
+				plan.any = true;
+			}
+		} else if (bind_data.with_ordinal && file_col == static_cast<column_t>(bind_data.ordinal_col_idx)) {
+			// __ordinal: try an exact IN-set first, else inclusive bounds.
+			if (filter.filter_type == TableFilterType::IN_FILTER) {
+				auto &inf = filter.Cast<InFilter>();
+				bool ok = !inf.values.empty();
+				unordered_set<int64_t> s;
+				for (auto &v : inf.values) {
+					int64_t c;
+					if (!PruneTryGetInt(v, c)) {
+						ok = false;
+						break;
+					}
+					s.insert(c);
+				}
+				if (ok) {
+					plan.ord_allowed = std::move(s);
+					plan.has_ord_set = true;
+					plan.any = true;
+				}
+			} else {
+				int64_t lo = std::numeric_limits<int64_t>::min(), hi = std::numeric_limits<int64_t>::max();
+				if (PruneCollectIntBounds(filter, lo, hi)) {
+					plan.ord_lo = std::max(plan.ord_lo, lo);
+					plan.ord_hi = std::min(plan.ord_hi, hi);
+					plan.has_ord = true;
+					plan.any = true;
+				}
+			}
+		}
+		// REF/ALT and genotype/derived columns are intentionally NOT pruned (left to the
+		// applicator): REF/ALT need has_alleles and buy little; genotype columns need a
+		// decode. Unrecognized shapes on CHROM/POS/ID fall through here untouched too.
+	}
+	return plan;
+}
+
+//! Does variant `vidx` survive the prune plan? `apply_id`/`apply_ord` gate the id/ordinal
+//! checks (id requires the source to have loaded ids; ordinal requires a single-file read).
+static bool VariantPassesPrunePlan(const PfilePrunePlan &plan, const VariantMetadataIndex &variants, uint32_t vidx,
+                                   bool apply_id, bool apply_ord) {
+	if (plan.has_chrom && plan.chrom_allowed.find(variants.GetChrom(vidx)) == plan.chrom_allowed.end()) {
+		return false;
+	}
+	if (plan.has_pos) {
+		int64_t pos = variants.GetPos(vidx);
+		if (pos < plan.pos_lo || pos > plan.pos_hi) {
+			return false;
+		}
+	}
+	if (apply_id && plan.has_id && plan.id_allowed.find(variants.GetId(vidx)) == plan.id_allowed.end()) {
+		return false;
+	}
+	if (apply_ord) {
+		int64_t ord = static_cast<int64_t>(vidx);
+		if (plan.has_ord && (ord < plan.ord_lo || ord > plan.ord_hi)) {
+			return false;
+		}
+		if (plan.has_ord_set && plan.ord_allowed.find(ord) == plan.ord_allowed.end()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Generic residual applicator (correctness). Re-applies the full pushed TableFilterSet
+//! to `output` by lowering each filter through its own ToExpression() and running an
+//! ExpressionExecutor selection over the projected output vectors. The filter key is a
+//! position in column_ids, which is exactly the output vector index (physical_table_scan
+//! maps filters by column_ids[key]). `output`'s cardinality must already be set to the
+//! emitted row count before calling. Covers every filter type with no per-type code.
+static void ApplyResidualFilters(ClientContext &context, optional_ptr<TableFilterSet> filters, DataChunk &output) {
+	if (!filters || filters->filters.empty() || output.size() == 0) {
+		return;
+	}
+	vector<unique_ptr<Expression>> conds;
+	conds.reserve(filters->filters.size());
+	for (auto &kv : filters->filters) {
+		idx_t proj_idx = kv.first;
+		if (proj_idx >= output.ColumnCount()) {
+			continue; // defensive — DuckDB guarantees filtered columns are projected
+		}
+		auto &vec = output.data[proj_idx];
+		BoundReferenceExpression colref(vec.GetType(), proj_idx);
+		conds.push_back(kv.second->ToExpression(colref));
+	}
+	if (conds.empty()) {
+		return;
+	}
+	unique_ptr<Expression> pred;
+	if (conds.size() == 1) {
+		pred = std::move(conds[0]);
+	} else {
+		auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+		for (auto &c : conds) {
+			conj->children.push_back(std::move(c));
+		}
+		pred = std::move(conj);
+	}
+	ExpressionExecutor executor(context, *pred);
+	SelectionVector sel(STANDARD_VECTOR_SIZE);
+	idx_t count = executor.SelectExpression(output, sel);
+	if (count == output.size()) {
+		return; // every row passes — nothing to slice
+	}
+	output.Slice(sel, count);
+}
+
+// ---------------------------------------------------------------------------
+// Init global
+// ---------------------------------------------------------------------------
+
 // Multi-file sub-batch sizes (each batch bounded to one source). Genotype orient
 // fans each variant out to N sample rows, so it uses a smaller sub-batch.
 static constexpr uint32_t MULTI_VARIANT_SUBBATCH = 1000;
@@ -2162,6 +2572,12 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	state->column_ids = input.column_ids;
 	state->orient_mode = bind_data.orient_mode;
 	state->max_threads_config = GetPlinkingMaxThreads(context);
+
+	// Store the pushed filters for the generic residual applicator (correctness). Safe
+	// to hold: input.filters points into TableScanGlobalSourceState, which outlives this
+	// global state (physical_table_scan.cpp). Consumed by ApplyResidualFilters in EVERY
+	// scan path — this is what makes filter_pushdown := true correct across all orients.
+	state->residual_filters = input.filters;
 
 	if (bind_data.orient_mode == OrientMode::GENOTYPE) {
 		state->total_count = bind_data.EffectiveVariantCt();
@@ -2268,6 +2684,52 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	state->need_pgen_reader = state->need_genotypes || bind_data.count_filter.HasFilter() ||
 	                          bind_data.genotype_filter.active || need_aggregate_pgen;
 
+	// --- Native filter pushdown: conservative variant-set pruning (variant/genotype
+	// orient only). Narrows the scanned set for recognized CHROM/POS/ID/__ordinal
+	// predicates; the applicator still re-applies the full filter, so this is PURE
+	// optimization. Sample orient is excluded by necessity, not scope: its output schema
+	// (and, in columns/struct mode, its column NAMES) is fixed from the variant set at
+	// bind, so pruning the scan would contradict the declared schema — it is
+	// residual-applicator-only. Pruning is a conservative INTERSECTION with the existing
+	// named-param selection (region ∩ variant_range ∩ variants): it only ever shrinks.
+	if (state->residual_filters && !state->residual_filters->filters.empty() &&
+	    (bind_data.orient_mode == OrientMode::VARIANT || bind_data.orient_mode == OrientMode::GENOTYPE)) {
+		PfilePrunePlan plan = BuildPrunePlan(*state->residual_filters, input.column_ids, bind_data);
+		if (plan.any) {
+			const bool single_file = bind_data.sources.size() == 1;
+			// __ordinal pruning only for single-file: a per-source vidx is not the global
+			// ordinal across a multi-file list, so leave it entirely to the applicator there.
+			const bool apply_ord = single_file;
+			state->pruned_by_source.resize(bind_data.sources.size());
+			uint64_t total_eff = 0, total_kept = 0;
+			for (uint32_t s = 0; s < bind_data.sources.size(); s++) {
+				const auto &src = bind_data.sources[s];
+				const bool apply_id = src.variants.has_ids; // only prune on ID when ids are loaded
+				uint32_t n = src.EffectiveVariantCt();
+				total_eff += n;
+				auto &keep = state->pruned_by_source[s];
+				keep.reserve(n);
+				for (uint32_t ev = 0; ev < n; ev++) {
+					uint32_t vidx = src.ResolveVariantIdx(ev);
+					if (VariantPassesPrunePlan(plan, src.variants, vidx, apply_id, apply_ord)) {
+						keep.push_back(ev);
+					}
+				}
+				total_kept += keep.size();
+			}
+			// Only activate pruning when it actually removes work; otherwise fall back to the
+			// verbatim unpruned path (keeps the baseline behavior and avoids per-row indirection).
+			if (total_kept < total_eff) {
+				state->prune_active = true;
+				if (single_file) {
+					state->total_count = state->ScanCount(bind_data, 0);
+				}
+			} else {
+				state->pruned_by_source.clear();
+			}
+		}
+	}
+
 	// Precompute source-bounded scan batches (a batch never spans a file boundary,
 	// so a thread reopens its reader at most once per claimed batch). Used by:
 	//  - multi-file variant/genotype orient (claimed via next_idx), and
@@ -2281,7 +2743,12 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 		const uint32_t sub =
 		    (bind_data.orient_mode == OrientMode::GENOTYPE) ? MULTI_GENOTYPE_SUBBATCH : MULTI_VARIANT_SUBBATCH;
 		for (uint32_t s = 0; s < bind_data.sources.size(); s++) {
-			uint32_t n = bind_data.sources[s].EffectiveVariantCt();
+			// ScanCount is the PRUNED per-source count when pushdown pruning is active
+			// (variant/genotype orient), else the full effective-variant count. Batch
+			// [local_start,local_end) therefore index into the pruned list, and the scan
+			// maps them back via ScanLocal. Sample-orient streaming never prunes, so this
+			// equals EffectiveVariantCt there.
+			uint32_t n = state->ScanCount(bind_data, s);
 			for (uint32_t start = 0; start < n; start += sub) {
 				state->batches.push_back(ScanBatch {s, start, std::min(start + sub, n)});
 			}
@@ -2936,54 +3403,78 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 		return true;
 	};
 
-	if (bind_data.sources.size() == 1) {
-		// Single-file: original dynamic fetch_add claim loop over sources[0] (byte-for-byte
-		// identical to the pre-multi-file behavior).
-		const PfileSource &source = bind_data.Primary();
-		while (rows_emitted < STANDARD_VECTOR_SIZE) {
-			uint32_t remaining_capacity = static_cast<uint32_t>(STANDARD_VECTOR_SIZE - rows_emitted);
-			uint32_t claim_size = std::min(PFILE_BATCH_SIZE, remaining_capacity);
-			uint32_t batch_start = gstate.next_idx.fetch_add(claim_size);
-			if (batch_start >= total_variants) {
-				break;
-			}
-			uint32_t batch_end = std::min(batch_start + claim_size, total_variants);
-			for (uint32_t effective_pos = batch_start; effective_pos < batch_end; effective_pos++) {
-				if (emit_variant_row(source, effective_pos)) {
-					rows_emitted++;
-				}
-			}
+	// Residual filtering can reject an ENTIRE filled chunk. Returning that empty chunk
+	// mid-scan would make DuckDB's physical table scan treat the whole scan as FINISHED
+	// and silently drop every later matching row (and, under threads, finish each thread
+	// early → flaky partial results). So when a residual is present, loop: fill a chunk,
+	// apply the residual, and if the result is empty WHILE the producer still has batches,
+	// reset and refill — returning empty ONLY when the producer is genuinely exhausted.
+	// output.Reset() restores flat, writable vectors even after a prior Slice (via the
+	// chunk's vector cache). The retry is gated on has_residual so the no-pushdown path is
+	// byte-for-byte identical to before.
+	const bool has_residual = gstate.residual_filters && !gstate.residual_filters->filters.empty();
+	bool producer_exhausted = false;
+	do {
+		if (has_residual) {
+			output.Reset();
 		}
-	} else {
-		// Multi-file: claim precomputed batches (each bounded to one source), reopening the
-		// per-thread reader only at a source boundary (OpenSourceReader is a no-op otherwise).
-		while (rows_emitted < STANDARD_VECTOR_SIZE) {
-			if (lstate.mf_need_claim) {
-				lstate.mf_batch = gstate.next_idx.fetch_add(1);
-				if (lstate.mf_batch >= gstate.batches.size()) {
+		rows_emitted = 0;
+		if (bind_data.sources.size() == 1) {
+			// Single-file: original dynamic fetch_add claim loop over sources[0].
+			const PfileSource &source = bind_data.Primary();
+			while (rows_emitted < STANDARD_VECTOR_SIZE) {
+				uint32_t remaining_capacity = static_cast<uint32_t>(STANDARD_VECTOR_SIZE - rows_emitted);
+				uint32_t claim_size = std::min(PFILE_BATCH_SIZE, remaining_capacity);
+				uint32_t batch_start = gstate.next_idx.fetch_add(claim_size);
+				if (batch_start >= total_variants) {
+					producer_exhausted = true;
 					break;
 				}
-				lstate.mf_local = gstate.batches[lstate.mf_batch].local_start;
-				lstate.mf_need_claim = false;
-			}
-			const ScanBatch &batch = gstate.batches[lstate.mf_batch];
-			const PfileSource &source = bind_data.sources[batch.source_idx];
-			if (gstate.need_pgen_reader) {
-				OpenSourceReader(context, lstate, bind_data, batch.source_idx);
-			}
-			while (lstate.mf_local < batch.local_end && rows_emitted < STANDARD_VECTOR_SIZE) {
-				if (emit_variant_row(source, lstate.mf_local)) {
-					rows_emitted++;
+				uint32_t batch_end = std::min(batch_start + claim_size, total_variants);
+				for (uint32_t effective_pos = batch_start; effective_pos < batch_end; effective_pos++) {
+					// ScanLocal maps the claimed index to the source's effective position:
+					// identity normally, a pruned-list lookup under pushdown pruning.
+					if (emit_variant_row(source, gstate.ScanLocal(0, effective_pos))) {
+						rows_emitted++;
+					}
 				}
-				lstate.mf_local++;
 			}
-			if (lstate.mf_local >= batch.local_end) {
-				lstate.mf_need_claim = true;
+		} else {
+			// Multi-file: claim precomputed batches (each bounded to one source), reopening the
+			// per-thread reader only at a source boundary (OpenSourceReader is a no-op otherwise).
+			while (rows_emitted < STANDARD_VECTOR_SIZE) {
+				if (lstate.mf_need_claim) {
+					lstate.mf_batch = gstate.next_idx.fetch_add(1);
+					if (lstate.mf_batch >= gstate.batches.size()) {
+						producer_exhausted = true;
+						break;
+					}
+					lstate.mf_local = gstate.batches[lstate.mf_batch].local_start;
+					lstate.mf_need_claim = false;
+				}
+				const ScanBatch &batch = gstate.batches[lstate.mf_batch];
+				const PfileSource &source = bind_data.sources[batch.source_idx];
+				if (gstate.need_pgen_reader) {
+					OpenSourceReader(context, lstate, bind_data, batch.source_idx);
+				}
+				while (lstate.mf_local < batch.local_end && rows_emitted < STANDARD_VECTOR_SIZE) {
+					if (emit_variant_row(source, gstate.ScanLocal(batch.source_idx, lstate.mf_local))) {
+						rows_emitted++;
+					}
+					lstate.mf_local++;
+				}
+				if (lstate.mf_local >= batch.local_end) {
+					lstate.mf_need_claim = true;
+				}
 			}
 		}
-	}
 
-	CompatSetOutputCardinality(output, rows_emitted);
+		CompatSetOutputCardinality(output, rows_emitted);
+		// Correctness: re-apply the full pushed filter set over the emitted chunk. Required
+		// because the physical scan applies no residual and a fully-pushed WHERE node may be
+		// gone from the plan. Idempotent with any pruning above.
+		ApplyResidualFilters(context, gstate.residual_filters, output);
+	} while (has_residual && output.size() == 0 && !producer_exhausted);
 }
 
 // ---------------------------------------------------------------------------
@@ -3324,88 +3815,54 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 		return true;
 	};
 
-	if (bind_data.sources.size() == 1) {
-		// Single-file: original 64-variant fetch_add batch claim over sources[0].
-		const PfileSource &source = bind_data.Primary();
-		while (rows_emitted < STANDARD_VECTOR_SIZE) {
-			// Claim a new batch if current batch is exhausted
-			if (lstate.batch_exhausted) {
-				lstate.batch_start = gstate.next_idx.fetch_add(PFILE_GENOTYPE_BATCH_SIZE);
-				if (lstate.batch_start >= total_effective_variants) {
-					break; // no more work
-				}
-				lstate.batch_end = std::min(lstate.batch_start + PFILE_GENOTYPE_BATCH_SIZE, total_effective_variants);
-				lstate.current_variant_in_batch = lstate.batch_start;
-				lstate.current_sample_in_variant = 0;
-				lstate.batch_variant_loaded = false;
-				lstate.batch_exhausted = false;
-			}
-
-			// Check if we've exhausted the current batch
-			if (lstate.current_variant_in_batch >= lstate.batch_end) {
-				lstate.batch_exhausted = true;
-				continue;
-			}
-
-			uint32_t vidx = source.ResolveVariantIdx(lstate.current_variant_in_batch);
-
-			if (!lstate.batch_variant_loaded) {
-				if (!load_variant(source, vidx)) {
-					lstate.current_variant_in_batch++;
+	// See PfileDefaultScan: a residual that rejects an entire fanned chunk mid-scan must
+	// not return empty (DuckDB would treat it as end-of-scan). Retry across batches until
+	// the chunk is non-empty or the producer is exhausted. Gated on has_residual so the
+	// no-pushdown path is unchanged.
+	const bool has_residual = gstate.residual_filters && !gstate.residual_filters->filters.empty();
+	bool producer_exhausted = false;
+	do {
+		if (has_residual) {
+			output.Reset();
+		}
+		rows_emitted = 0;
+		if (bind_data.sources.size() == 1) {
+			// Single-file: original 64-variant fetch_add batch claim over sources[0].
+			const PfileSource &source = bind_data.Primary();
+			while (rows_emitted < STANDARD_VECTOR_SIZE) {
+				// Claim a new batch if current batch is exhausted
+				if (lstate.batch_exhausted) {
+					lstate.batch_start = gstate.next_idx.fetch_add(PFILE_GENOTYPE_BATCH_SIZE);
+					if (lstate.batch_start >= total_effective_variants) {
+						producer_exhausted = true;
+						break; // no more work
+					}
+					lstate.batch_end =
+					    std::min(lstate.batch_start + PFILE_GENOTYPE_BATCH_SIZE, total_effective_variants);
+					lstate.current_variant_in_batch = lstate.batch_start;
 					lstate.current_sample_in_variant = 0;
+					lstate.batch_variant_loaded = false;
+					lstate.batch_exhausted = false;
+				}
+
+				// Check if we've exhausted the current batch
+				if (lstate.current_variant_in_batch >= lstate.batch_end) {
+					lstate.batch_exhausted = true;
 					continue;
 				}
-				lstate.batch_variant_loaded = true;
-			}
 
-			// Emit rows for samples within current variant
-			while (lstate.current_sample_in_variant < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
-				if (emit_sample_row(source, vidx, lstate.current_sample_in_variant)) {
-					rows_emitted++;
-				}
-				lstate.current_sample_in_variant++;
-			}
-
-			// Advance to next variant if all samples emitted
-			if (lstate.current_sample_in_variant >= output_sample_ct) {
-				lstate.current_variant_in_batch++;
-				lstate.current_sample_in_variant = 0;
-				lstate.batch_variant_loaded = false;
-			}
-		}
-	} else {
-		// Multi-file: claim precomputed batches (each bounded to one source), reopening the
-		// per-thread reader only at a source boundary. mf_local is the current variant's
-		// effective position within the batch; current_sample_in_variant persists mid-variant.
-		while (rows_emitted < STANDARD_VECTOR_SIZE) {
-			if (lstate.mf_need_claim) {
-				lstate.mf_batch = gstate.next_idx.fetch_add(1);
-				if (lstate.mf_batch >= gstate.batches.size()) {
-					break;
-				}
-				lstate.mf_local = gstate.batches[lstate.mf_batch].local_start;
-				lstate.current_sample_in_variant = 0;
-				lstate.batch_variant_loaded = false;
-				lstate.mf_need_claim = false;
-			}
-			const ScanBatch &batch = gstate.batches[lstate.mf_batch];
-			const PfileSource &source = bind_data.sources[batch.source_idx];
-			if (gstate.need_pgen_reader) {
-				OpenSourceReader(context, lstate, bind_data, batch.source_idx);
-			}
-
-			while (lstate.mf_local < batch.local_end && rows_emitted < STANDARD_VECTOR_SIZE) {
-				uint32_t vidx = source.ResolveVariantIdx(lstate.mf_local);
+				uint32_t vidx = source.ResolveVariantIdx(gstate.ScanLocal(0, lstate.current_variant_in_batch));
 
 				if (!lstate.batch_variant_loaded) {
 					if (!load_variant(source, vidx)) {
-						lstate.mf_local++;
+						lstate.current_variant_in_batch++;
 						lstate.current_sample_in_variant = 0;
 						continue;
 					}
 					lstate.batch_variant_loaded = true;
 				}
 
+				// Emit rows for samples within current variant
 				while (lstate.current_sample_in_variant < output_sample_ct && rows_emitted < STANDARD_VECTOR_SIZE) {
 					if (emit_sample_row(source, vidx, lstate.current_sample_in_variant)) {
 						rows_emitted++;
@@ -3413,20 +3870,74 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					lstate.current_sample_in_variant++;
 				}
 
+				// Advance to next variant if all samples emitted
 				if (lstate.current_sample_in_variant >= output_sample_ct) {
-					lstate.mf_local++;
+					lstate.current_variant_in_batch++;
 					lstate.current_sample_in_variant = 0;
 					lstate.batch_variant_loaded = false;
 				}
 			}
+		} else {
+			// Multi-file: claim precomputed batches (each bounded to one source), reopening the
+			// per-thread reader only at a source boundary. mf_local is the current variant's
+			// effective position within the batch; current_sample_in_variant persists mid-variant.
+			while (rows_emitted < STANDARD_VECTOR_SIZE) {
+				if (lstate.mf_need_claim) {
+					lstate.mf_batch = gstate.next_idx.fetch_add(1);
+					if (lstate.mf_batch >= gstate.batches.size()) {
+						producer_exhausted = true;
+						break;
+					}
+					lstate.mf_local = gstate.batches[lstate.mf_batch].local_start;
+					lstate.current_sample_in_variant = 0;
+					lstate.batch_variant_loaded = false;
+					lstate.mf_need_claim = false;
+				}
+				const ScanBatch &batch = gstate.batches[lstate.mf_batch];
+				const PfileSource &source = bind_data.sources[batch.source_idx];
+				if (gstate.need_pgen_reader) {
+					OpenSourceReader(context, lstate, bind_data, batch.source_idx);
+				}
 
-			if (lstate.mf_local >= batch.local_end) {
-				lstate.mf_need_claim = true;
+				while (lstate.mf_local < batch.local_end && rows_emitted < STANDARD_VECTOR_SIZE) {
+					uint32_t vidx = source.ResolveVariantIdx(gstate.ScanLocal(batch.source_idx, lstate.mf_local));
+
+					if (!lstate.batch_variant_loaded) {
+						if (!load_variant(source, vidx)) {
+							lstate.mf_local++;
+							lstate.current_sample_in_variant = 0;
+							continue;
+						}
+						lstate.batch_variant_loaded = true;
+					}
+
+					while (lstate.current_sample_in_variant < output_sample_ct &&
+					       rows_emitted < STANDARD_VECTOR_SIZE) {
+						if (emit_sample_row(source, vidx, lstate.current_sample_in_variant)) {
+							rows_emitted++;
+						}
+						lstate.current_sample_in_variant++;
+					}
+
+					if (lstate.current_sample_in_variant >= output_sample_ct) {
+						lstate.mf_local++;
+						lstate.current_sample_in_variant = 0;
+						lstate.batch_variant_loaded = false;
+					}
+				}
+
+				if (lstate.mf_local >= batch.local_end) {
+					lstate.mf_need_claim = true;
+				}
 			}
 		}
-	}
 
-	CompatSetOutputCardinality(output, rows_emitted);
+		CompatSetOutputCardinality(output, rows_emitted);
+		// Correctness: re-apply the full pushed filter set to the fanned (variant × sample)
+		// rows. Variant-axis filters (CHROM/POS/ID/__ordinal) also drove the prune above;
+		// re-applying here is idempotent and also covers any non-pruned pushed filter.
+		ApplyResidualFilters(context, gstate.residual_filters, output);
+	} while (has_residual && output.size() == 0 && !producer_exhausted);
 }
 
 // ---------------------------------------------------------------------------
@@ -3622,14 +4133,26 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 
 	idx_t rows_emitted = 0;
 
-	while (rows_emitted < STANDARD_VECTOR_SIZE) {
-		uint32_t remaining_capacity = static_cast<uint32_t>(STANDARD_VECTOR_SIZE - rows_emitted);
-		uint32_t claim_size = std::min(PFILE_BATCH_SIZE, remaining_capacity);
-		uint32_t batch_start = gstate.next_idx.fetch_add(claim_size);
-		if (batch_start >= phase2_total) {
-			break;
+	// See PfileDefaultScan: a residual that rejects an entire per-sample chunk mid-scan
+	// must not return empty (DuckDB would end the scan early). Retry across sample batches
+	// until the chunk is non-empty or every sample has been emitted. Gated on has_residual.
+	// The one-time Phase 1 accumulation above is OUTSIDE this loop (guarded + already done).
+	const bool has_residual = gstate.residual_filters && !gstate.residual_filters->filters.empty();
+	bool producer_exhausted = false;
+	do {
+		if (has_residual) {
+			output.Reset();
 		}
-		uint32_t batch_end = std::min(batch_start + claim_size, phase2_total);
+		rows_emitted = 0;
+		while (rows_emitted < STANDARD_VECTOR_SIZE) {
+			uint32_t remaining_capacity = static_cast<uint32_t>(STANDARD_VECTOR_SIZE - rows_emitted);
+			uint32_t claim_size = std::min(PFILE_BATCH_SIZE, remaining_capacity);
+			uint32_t batch_start = gstate.next_idx.fetch_add(claim_size);
+			if (batch_start >= phase2_total) {
+				producer_exhausted = true;
+				break;
+			}
+			uint32_t batch_end = std::min(batch_start + claim_size, phase2_total);
 
 		for (uint32_t claim_idx = batch_start; claim_idx < batch_end; claim_idx++) {
 			// When a genotype_range row filter is active, the claimed index addresses
@@ -3895,7 +4418,12 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		}
 	}
 
-	CompatSetOutputCardinality(output, rows_emitted);
+		CompatSetOutputCardinality(output, rows_emitted);
+		// Correctness: sample orient does NOT prune (schema is fixed from the variant set at
+		// bind), so the residual applicator is the ONLY pushdown mechanism here — it keeps
+		// WHERE over the per-sample output columns correct.
+		ApplyResidualFilters(context, gstate.residual_filters, output);
+	} while (has_residual && output.size() == 0 && !producer_exhausted);
 }
 
 // ---------------------------------------------------------------------------
@@ -4111,6 +4639,10 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	// callbacks; bind detects the list via ResolvePathList.
 	auto add_named_params = [](TableFunction &fn) {
 		fn.projection_pushdown = true;
+		// Native filter pushdown (Step C): DuckDB hands pushed WHERE filters to InitGlobal
+		// (input.filters). The scan prunes the variant set where it safely can and ALWAYS
+		// re-applies the full set per chunk (ApplyResidualFilters) for correctness.
+		fn.filter_pushdown = true;
 		fn.named_parameters["pgen"] = LogicalType::VARCHAR;
 		fn.named_parameters["pvar"] = LogicalType::VARCHAR;
 		fn.named_parameters["psam"] = LogicalType::VARCHAR;
@@ -4121,6 +4653,10 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		// Accept ANY for samples and variants — type dispatch handled in bind
 		fn.named_parameters["samples"] = LogicalType::ANY;
 		fn.named_parameters["variants"] = LogicalType::ANY;
+		// Composable selection: a STRUCT whose samples/region/variants/variant_range
+		// fields seed the axes; the individual params above override per-field
+		// (most-specific-wins). Parsed via the shared ParseSelection handler in bind.
+		fn.named_parameters["selection"] = LogicalType::ANY;
 		fn.named_parameters["genotypes"] = LogicalType::VARCHAR;
 		fn.named_parameters["af_range"] = LogicalType::ANY;
 		fn.named_parameters["ac_range"] = LogicalType::ANY;
