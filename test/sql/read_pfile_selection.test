@@ -1,0 +1,281 @@
+# name: test/sql/read_pfile_selection.test
+# description: Composable `selection :=` STRUCT surface on read_pfile (Step A: behavior-preserving)
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# pgen_example — 4 samples (SAMPLE1..SAMPLE4) × 4 variants (file order = ordinals 0..3):
+#   rs1 [0, 1, 2, NULL]  chr1:10000   ordinal 0
+#   rs2 [1, 1, 0, 2]     chr1:20000   ordinal 1
+#   rs3 [2, NULL, 1, 0]  chr1:30000   ordinal 2
+#   rs4 [0, 0, 1, 2]     chr2:15000   ordinal 3
+
+# ===========================================================================
+# Equivalence: a `selection` struct field == the same individual param
+# ===========================================================================
+
+# --- samples ---
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', selection := struct_pack(samples := [0, 1]))
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', samples := [0, 1]))
+  UNION ALL
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', samples := [0, 1])
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', selection := struct_pack(samples := [0, 1])))
+);
+----
+0
+
+# --- region ---
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', selection := struct_pack(region := '1:10000-20000'))
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', region := '1:10000-20000'))
+  UNION ALL
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', region := '1:10000-20000')
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', selection := struct_pack(region := '1:10000-20000')))
+);
+----
+0
+
+# --- variants (arbitrary set — read_pfile supports this via its own bespoke path,
+#     unlike the contiguous-scan analysis functions that reject it) ---
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID FROM read_pfile('test/data/pgen_example', selection := struct_pack(variants := [0, 2]))
+   EXCEPT
+   SELECT ID FROM read_pfile('test/data/pgen_example', variants := [0, 2]))
+  UNION ALL
+  (SELECT ID FROM read_pfile('test/data/pgen_example', variants := [0, 2])
+   EXCEPT
+   SELECT ID FROM read_pfile('test/data/pgen_example', selection := struct_pack(variants := [0, 2])))
+);
+----
+0
+
+# --- variants as an rsID list (arbitrary-set by string, same bespoke path) ---
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID FROM read_pfile('test/data/pgen_example', selection := struct_pack(variants := ['rs1', 'rs4']))
+   EXCEPT
+   SELECT ID FROM read_pfile('test/data/pgen_example', variants := ['rs1', 'rs4']))
+  UNION ALL
+  (SELECT ID FROM read_pfile('test/data/pgen_example', variants := ['rs1', 'rs4'])
+   EXCEPT
+   SELECT ID FROM read_pfile('test/data/pgen_example', selection := struct_pack(variants := ['rs1', 'rs4'])))
+);
+----
+0
+
+# --- variant_range (rare_small, ~400 variants) ---
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', selection := struct_pack(variant_range := [250, 260]), with_ordinal := true)
+   EXCEPT
+   SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', variant_range := [250, 260], with_ordinal := true))
+  UNION ALL
+  (SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', variant_range := [250, 260], with_ordinal := true)
+   EXCEPT
+   SELECT ID, __ordinal FROM read_pfile('test/data/rare_small', selection := struct_pack(variant_range := [250, 260]), with_ordinal := true))
+);
+----
+0
+
+# ===========================================================================
+# Direct value checks (selection struct drives each axis)
+# ===========================================================================
+
+# region → rs1, rs2
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', selection := struct_pack(region := '1:10000-20000')) ORDER BY ID;
+----
+rs1
+rs2
+
+# arbitrary variants [0, 2] → rs1, rs3
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', selection := struct_pack(variants := [0, 2])) ORDER BY ID;
+----
+rs1
+rs3
+
+# variant_range [0, 2) → rs1, rs2
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example', selection := struct_pack(variant_range := [0, 2])) ORDER BY ID;
+----
+rs1
+rs2
+
+# samples [0, 1] → genotypes narrowed to the first two samples
+query TT
+SELECT ID, genotypes::VARCHAR FROM read_pfile('test/data/pgen_example', selection := struct_pack(samples := [0, 1])) ORDER BY ID;
+----
+rs1	[0, 1]
+rs2	[1, 1]
+rs3	[2, NULL]
+rs4	[0, 0]
+
+# VARCHAR samples via selection (exercises needs_iids detection off the Selection
+# + the parquet-safe EnsureSourceIids pre-build before ResolveSampleIndices)
+query T
+SELECT genotypes::VARCHAR FROM read_pfile('test/data/pgen_example', selection := struct_pack(samples := ['SAMPLE1', 'SAMPLE2'])) WHERE ID = 'rs1';
+----
+[0, 1]
+
+# --- VARCHAR samples via selection over a PARQUET psam ---
+# IID strings are not materialized at load for a parquet psam, so this exercises the
+# struct-driven `needs_iids` probe AND the lazy EnsureSourceIids pre-build feeding the
+# IID map before ResolveSampleIndices runs (the one read_pfile-specific step kept out of
+# the shared handler). Must be byte-identical to the individual `samples` param.
+statement ok
+COPY (SELECT FID, IID, SEX, CAST(SUBSTR(IID, 7, 1) AS INTEGER) AS AGE
+      FROM read_psam('test/data/pfile_example.psam'))
+TO '/tmp/plinking_duck_selection_typed.psam.parquet' (FORMAT parquet);
+
+query TI
+SELECT IID, AGE
+FROM read_pfile('test/data/pfile_example', orient := 'sample',
+                psam := '/tmp/plinking_duck_selection_typed.psam.parquet', genotypes := 'counts',
+                selection := struct_pack(samples := ['SAMPLE3', 'SAMPLE1']))
+ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE3	3
+
+query I
+SELECT COUNT(*) FROM (
+  (SELECT IID, AGE FROM read_pfile('test/data/pfile_example', orient := 'sample',
+       psam := '/tmp/plinking_duck_selection_typed.psam.parquet', genotypes := 'counts',
+       selection := struct_pack(samples := ['SAMPLE3', 'SAMPLE1']))
+   EXCEPT
+   SELECT IID, AGE FROM read_pfile('test/data/pfile_example', orient := 'sample',
+       psam := '/tmp/plinking_duck_selection_typed.psam.parquet', genotypes := 'counts',
+       samples := ['SAMPLE3', 'SAMPLE1']))
+  UNION ALL
+  (SELECT IID, AGE FROM read_pfile('test/data/pfile_example', orient := 'sample',
+       psam := '/tmp/plinking_duck_selection_typed.psam.parquet', genotypes := 'counts',
+       samples := ['SAMPLE3', 'SAMPLE1'])
+   EXCEPT
+   SELECT IID, AGE FROM read_pfile('test/data/pfile_example', orient := 'sample',
+       psam := '/tmp/plinking_duck_selection_typed.psam.parquet', genotypes := 'counts',
+       selection := struct_pack(samples := ['SAMPLE3', 'SAMPLE1'])))
+);
+----
+0
+
+# ===========================================================================
+# Most-specific-wins: an individual param overrides the matching struct field,
+# while the struct's OTHER fields survive.
+# ===========================================================================
+
+# struct provides samples [0,1] AND region '1:10000-10000'; individual samples [2,3]
+# WINS (rs1 genotypes become [2, NULL]), and the struct's region still restricts to rs1.
+query TT
+SELECT ID, genotypes::VARCHAR FROM read_pfile('test/data/pgen_example',
+    selection := struct_pack(samples := [0, 1], region := '1:10000-10000'), samples := [2, 3]) ORDER BY ID;
+----
+rs1	[2, NULL]
+
+# the overridden form is identical to passing both as individual params
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example',
+       selection := struct_pack(samples := [0, 1], region := '1:10000-10000'), samples := [2, 3])
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', samples := [2, 3], region := '1:10000-10000'))
+  UNION ALL
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example', samples := [2, 3], region := '1:10000-10000')
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile('test/data/pgen_example',
+       selection := struct_pack(samples := [0, 1], region := '1:10000-10000'), samples := [2, 3]))
+);
+----
+0
+
+# individual variant_range [2,4) overrides the struct's [0,2) → rs3, rs4
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example',
+    selection := struct_pack(variant_range := [0, 2]), variant_range := [2, 4]) ORDER BY ID;
+----
+rs3
+rs4
+
+# individual variants := [3] overrides the struct's [0,1] → rs4
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example',
+    selection := struct_pack(variants := [0, 1]), variants := [3]) ORDER BY ID;
+----
+rs4
+
+# ===========================================================================
+# read_pfile composes region + variant_range (both from one struct). Unlike the
+# contiguous-scan analysis functions, read_pfile's bespoke variant path intersects
+# them rather than rejecting the pair.
+# ===========================================================================
+
+# region 1:10000-30000 (rs1,rs2,rs3) ∩ variant_range [0,2) (rs1,rs2) → rs1, rs2
+query T
+SELECT ID FROM read_pfile('test/data/pgen_example',
+    selection := struct_pack(region := '1:10000-30000', variant_range := [0, 2])) ORDER BY ID;
+----
+rs1
+rs2
+
+# ===========================================================================
+# Multi-file: selection.region composes across shards; variants / variant_range
+# via the struct hit the same per-source rejections as the individual params.
+# ===========================================================================
+
+# region via selection == region via individual param across a shard list
+query I
+SELECT COUNT(*) FROM (
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], selection := struct_pack(region := '1:100-1000'))
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], region := '1:100-1000'))
+  UNION ALL
+  (SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], region := '1:100-1000')
+   EXCEPT
+   SELECT ID, genotypes::VARCHAR g FROM read_pfile(['test/data/shard1', 'test/data/shard2', 'test/data/shard3'], selection := struct_pack(region := '1:100-1000')))
+);
+----
+0
+
+# struct-supplied `variants` on a multi-file list is rejected (same guard as the param)
+statement error
+SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], selection := struct_pack(variants := [0]));
+----
+not yet supported
+
+# struct-supplied `variant_range` on a multi-file list is rejected too
+statement error
+SELECT * FROM read_pfile(['test/data/shard1', 'test/data/shard2'], selection := struct_pack(variant_range := [0, 2]));
+----
+not yet supported
+
+# ===========================================================================
+# Field validation / rejections (mirror plink_select.test)
+# ===========================================================================
+
+# unknown field (catches sample vs samples)
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', selection := struct_pack(sample := [0, 1]));
+----
+unknown field 'sample'
+
+# non-STRUCT selection
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', selection := 'oops');
+----
+must be a STRUCT
+
+# variant_range in the struct is validated at parse time (hi < lo rejected)
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', selection := struct_pack(variant_range := [5, 2]));
+----
+variant_range

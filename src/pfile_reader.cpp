@@ -923,6 +923,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	BindPhaseTimer bind_timer("PfileBind(total)");
 	auto bind_data = make_uniq<PfileBindData>();
 
+	// --- Parse the composable axis selection (samples/region/variants/variant_range) ---
+	// ParseSelection captures `samples` + `region` symbolically, applying most-specific-wins
+	// between an optional `selection := <STRUCT>` and the individual params (byte-identical to
+	// the routed analysis functions), and validates the STRUCT's own `variants`/`variant_range`
+	// fields. read_pfile ALSO exposes `variants` and `variant_range` as INDIVIDUAL params (the
+	// analysis functions take those only via the struct); their override + validation is layered
+	// on below at the SAME bind location as before (preserving error ordering vs the multi-file
+	// and dosages/phased checks). The variant axis stays bespoke; only the SAMPLE axis is routed
+	// through ResolveSelection (the shared handler).
+	Selection sel = ParseSelection(input.named_parameters);
+
 	// --- Resolve file path(s) ---
 	// First positional argument is a prefix (VARCHAR) or a list of prefixes
 	// (LIST(VARCHAR), row-concatenated in order). Empty inputs → only named params.
@@ -956,8 +967,6 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			bind_data->include_dosages = kv.second.GetValue<bool>();
 		} else if (kv.first == "phased") {
 			bind_data->include_phased = kv.second.GetValue<bool>();
-		} else if (kv.first == "region") {
-			bind_data->region = ParseRegion(kv.second.GetValue<string>());
 		} else if (kv.first == "combine_samples") {
 			bind_data->combine_samples = ResolveCombineSamplesMode(kv.second.GetValue<string>());
 		} else if (kv.first == "with_ordinal") {
@@ -966,6 +975,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			}
 		}
 		// samples, variants, genotypes, af_range, ac_range handled after pgenlib init
+	}
+
+	// `region` (from the `selection` struct or the individual param, most-specific-wins via
+	// ParseSelection) is parsed by read_pfile's file-local ParseRegion into a 1-based-inclusive
+	// RegionFilter consumed by LoadPfileSource BEFORE metadata loads — kept bespoke (not routed
+	// through ResolveSelection's variant axis, whose region grammar/timing differ).
+	if (sel.has_region) {
+		bind_data->region = ParseRegion(sel.region.GetValue<string>());
 	}
 
 	bind_data->orient_mode = ResolveOrientMode(orient_str, "read_pfile");
@@ -1009,7 +1026,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// (indices are per-shard, not global) resolves correctly yet. Guard it rather
 		// than throw-on-missing or return per-shard duplicates. Use `region :=` for
 		// range selection across files. Global `variants` resolution is a follow-up.
-		if (input.named_parameters.find("variants") != input.named_parameters.end()) {
+		// Presence via the struct (sel.has_variants) OR the individual param (not yet merged
+		// into sel at this point — the override is applied below, after this guard).
+		if (sel.has_variants || input.named_parameters.find("variants") != input.named_parameters.end()) {
 			throw InvalidInputException("read_pfile: variants := [...] with a multi-file list is not yet supported; "
 			                            "use region := for selection across files");
 		}
@@ -1018,58 +1037,80 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// range is ambiguous (which shard's ordinals?), so reject it, mirroring
 		// `variants`. The partition consumer calls pfile_partitions per shard and
 		// reads each resolved `source` separately with its own variant_range.
+		// Presence via the struct (sel.has_variant_range) OR a non-NULL individual param
+		// (not yet merged into sel — see the override below). Mirrors the original
+		// `vr != end && !vr->second.IsNull()` presence test.
 		auto vr_mf = input.named_parameters.find("variant_range");
-		if (vr_mf != input.named_parameters.end() && !vr_mf->second.IsNull()) {
+		bool individual_vr_present = vr_mf != input.named_parameters.end() && !vr_mf->second.IsNull();
+		if (sel.has_variant_range || individual_vr_present) {
 			throw InvalidInputException(
 			    "read_pfile: variant_range with a multi-file list is not yet supported (it is per-source ordinal "
 			    "space); read each shard separately (see pfile_partitions' per-source `source` column)");
 		}
 	}
 
-	// Resolve the `variants` param against the variant index below. Multi-file +
-	// `variants` is rejected above, so here it only ever applies to a single source.
-	auto variants_it = input.named_parameters.find("variants");
-	bind_data->has_variant_filter = variants_it != input.named_parameters.end();
-
-	// Parse `variant_range := [lo, hi)` — a half-open range in variant ordinal space.
-	// Multi-file is rejected above, so this only ever applies to a single source.
-	auto vr_it = input.named_parameters.find("variant_range");
-	bind_data->has_variant_range = vr_it != input.named_parameters.end() && !vr_it->second.IsNull();
-	if (bind_data->has_variant_range) {
-		const Value &vr = vr_it->second;
-		if (vr.type().id() != LogicalTypeId::LIST) {
-			throw InvalidInputException(
-			    "read_pfile: variant_range must be a 2-element list [lo, hi) in variant ordinal space (got %s)",
-			    vr.type().ToString());
+	// --- Layer the INDIVIDUAL `variants` / `variant_range` params onto the Selection ---
+	// Kept at the ORIGINAL bind location (after the multi-file + dosages/phased guards) so
+	// error ordering on doubly-invalid input is unchanged. A present individual param
+	// overrides the struct field (most-specific-wins); an explicit NULL individual
+	// variant_range clears it to "unset" (matching read_pfile's former has_* logic).
+	{
+		auto variants_it = input.named_parameters.find("variants");
+		if (variants_it != input.named_parameters.end()) {
+			sel.has_variants = true;
+			sel.variants = variants_it->second;
 		}
-		auto &children = ListValue::GetChildren(vr);
-		if (children.size() != 2) {
-			throw InvalidInputException("read_pfile: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
-			                            static_cast<unsigned long long>(children.size()));
-		}
-		if (children[0].IsNull() || children[1].IsNull()) {
-			throw InvalidInputException("read_pfile: variant_range bounds must not be NULL");
-		}
-		// Reject non-integer bounds explicitly rather than silently rounding them
-		// (GetValue<int64_t> would round 10.5 -> 10). Every other malformed-input
-		// path on this param errors cleanly, so an out-of-type bound should too.
-		if (!children[0].type().IsIntegral()) {
-			throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
-			                            children[0].ToString());
-		}
-		if (!children[1].type().IsIntegral()) {
-			throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
-			                            children[1].ToString());
-		}
-		bind_data->variant_range_lo = children[0].GetValue<int64_t>();
-		bind_data->variant_range_hi = children[1].GetValue<int64_t>();
-		if (bind_data->variant_range_lo < 0 || bind_data->variant_range_hi < bind_data->variant_range_lo) {
-			throw InvalidInputException(
-			    "read_pfile: variant_range must be a half-open [lo, hi) with 0 <= lo <= hi (got [%lld, %lld))",
-			    static_cast<long long>(bind_data->variant_range_lo),
-			    static_cast<long long>(bind_data->variant_range_hi));
+		auto vr_it = input.named_parameters.find("variant_range");
+		if (vr_it != input.named_parameters.end()) {
+			if (vr_it->second.IsNull()) {
+				sel.has_variant_range = false;
+			} else {
+				const Value &vr = vr_it->second;
+				if (vr.type().id() != LogicalTypeId::LIST) {
+					throw InvalidInputException(
+					    "read_pfile: variant_range must be a 2-element list [lo, hi) in variant ordinal space (got %s)",
+					    vr.type().ToString());
+				}
+				auto &children = ListValue::GetChildren(vr);
+				if (children.size() != 2) {
+					throw InvalidInputException(
+					    "read_pfile: variant_range must have exactly 2 elements [lo, hi) (got %llu)",
+					    static_cast<unsigned long long>(children.size()));
+				}
+				if (children[0].IsNull() || children[1].IsNull()) {
+					throw InvalidInputException("read_pfile: variant_range bounds must not be NULL");
+				}
+				// Reject non-integer bounds explicitly rather than silently rounding them
+				// (GetValue<int64_t> would round 10.5 -> 10).
+				if (!children[0].type().IsIntegral()) {
+					throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
+					                            children[0].ToString());
+				}
+				if (!children[1].type().IsIntegral()) {
+					throw InvalidInputException("read_pfile: variant_range bounds must be integers, got %s",
+					                            children[1].ToString());
+				}
+				int64_t lo = children[0].GetValue<int64_t>();
+				int64_t hi = children[1].GetValue<int64_t>();
+				if (lo < 0 || hi < lo) {
+					throw InvalidInputException(
+					    "read_pfile: variant_range must be a half-open [lo, hi) with 0 <= lo <= hi (got [%lld, %lld))",
+					    static_cast<long long>(lo), static_cast<long long>(hi));
+				}
+				sel.has_variant_range = true;
+				sel.variant_range_lo = lo;
+				sel.variant_range_hi = hi;
+			}
 		}
 	}
+
+	// Variant axis presence/bounds taken from the parsed Selection (struct-seeded, with the
+	// individual overrides applied above). Multi-file + `variants`/`variant_range` is rejected
+	// above, so each only ever applies to a single source.
+	bind_data->has_variant_filter = sel.has_variants;
+	bind_data->has_variant_range = sel.has_variant_range;
+	bind_data->variant_range_lo = sel.variant_range_lo;
+	bind_data->variant_range_hi = sel.variant_range_hi;
 
 	// --- Build sources (one per prefix) ---
 	bind_timer.Note("resolving %llu source(s)", (unsigned long long)prefixes.size());
@@ -1100,8 +1141,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// Per-source effective variant list (region ∩ variants param, resolved per shard)
 		std::unordered_set<uint32_t> variant_set;
 		if (bind_data->has_variant_filter) {
-			auto resolved =
-			    ResolveVariantsParameter(variants_it->second, src.variants, src.raw_variant_ct, "read_pfile");
+			auto resolved = ResolveVariantsParameter(sel.variants, src.variants, src.raw_variant_ct, "read_pfile");
 			for (auto idx : resolved) {
 				variant_set.insert(idx);
 			}
@@ -1177,13 +1217,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		needs_iids = true;
 	}
 	{
-		auto it = input.named_parameters.find("samples");
-		// Only probe the child type for a real LIST value. A NULL (bare, or a
-		// LIST-typed NULL) has no child type — GetChildType would crash; the samples
-		// block below raises the proper "must not be empty" error.
-		if (it != input.named_parameters.end() && !it->second.IsNull() &&
-		    it->second.type().id() == LogicalTypeId::LIST) {
-			auto &child_type = ListType::GetChildType(it->second.type());
+		// Probe the resolved Selection's sample axis (struct- or individual-supplied).
+		// Only probe the child type for a real LIST value. A NULL (bare, or a LIST-typed
+		// NULL) has no child type — GetChildType would crash; the sample-axis resolution
+		// below raises the proper "must not be empty" error.
+		if (sel.has_samples && !sel.samples.IsNull() && sel.samples.type().id() == LogicalTypeId::LIST) {
+			auto &child_type = ListType::GetChildType(sel.samples.type());
 			if (child_type.id() == LogicalTypeId::VARCHAR) {
 				needs_iids = true;
 			}
@@ -1252,69 +1291,39 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
-	// --- Process samples parameter ---
-	auto samples_it = input.named_parameters.find("samples");
-	if (samples_it != input.named_parameters.end()) {
-		auto &samples_val = samples_it->second;
-		// NULL value (bare, or a LIST-typed NULL from list(x) over zero rows) has no
-		// child type/children — guard before ListType/ListValue access.
-		if (samples_val.IsNull()) {
-			throw InvalidInputException("read_pfile: samples list must not be empty");
-		}
-		auto &child_type = ListType::GetChildType(samples_val.type());
-
-		auto &children_check = ListValue::GetChildren(samples_val);
-		if (children_check.empty()) {
-			throw InvalidInputException("read_pfile: samples list must not be empty");
-		}
-
-		if (child_type.id() == LogicalTypeId::INTEGER || child_type.id() == LogicalTypeId::BIGINT) {
-			auto &children = ListValue::GetChildren(samples_val);
-			for (auto &child : children) {
-				int64_t idx = child.GetValue<int64_t>();
-				if (idx < 0 || static_cast<uint32_t>(idx) >= bind_data->raw_sample_ct) {
-					throw InvalidInputException("read_pfile: sample index %lld out of range (sample count: %u)",
-					                            static_cast<long long>(idx), bind_data->raw_sample_ct);
-				}
-				bind_data->sample_indices.push_back(static_cast<uint32_t>(idx));
-			}
-		} else if (child_type.id() == LogicalTypeId::VARCHAR) {
-			// Lazily build iid_to_idx only when a VARCHAR sample filter is used. On the
-			// parquet path the IID strings are not materialized at load, so pull just the
-			// IID/FID columns from the source first (no-op on the text path).
+	// --- Resolve the SAMPLE axis via the shared handler ---
+	// Mirrors the routed analysis functions: ParseSelection captured `samples` symbolically;
+	// ResolveSampleIndices (via ResolveSelection) validates + resolves it to SORTED-UNIQUE
+	// original indices — byte-identical to the former inline block (same range/duplicate/
+	// empty checks and "read_pfile:"-prefixed messages). Only the SAMPLE axis is routed:
+	// a SAMPLE-ONLY Selection is passed so ResolveSelection's variant axis is a no-op, and
+	// the returned variant_range is ignored (read_pfile's variant axis stays bespoke above).
+	// read_pfile needs the ORDERED index list for genotype column names + per-row file-index
+	// mapping, so resolved.subset_sorted is copied into sample_indices (it already equals the
+	// former sorted sample_indices).
+	{
+		// Parquet-source psam materializes IID strings lazily; a non-empty VARCHAR samples
+		// filter needs them (+ the IID→index map) before ResolveSampleIndices runs. Pre-build
+		// here — preserving read_pfile's own map-error context — so ResolveSampleIndices'
+		// EnsureIidMap(func_name) then no-ops (idempotent).
+		if (sel.has_samples && !sel.samples.IsNull() && sel.samples.type().id() == LogicalTypeId::LIST &&
+		    ListType::GetChildType(sel.samples.type()).id() == LogicalTypeId::VARCHAR &&
+		    !ListValue::GetChildren(sel.samples).empty()) {
 			EnsureSourceIids(context, bind_data->sample_metadata, bind_data->sample_info);
 			bind_data->sample_info.EnsureIidMap("read_pfile: " + psam_path);
-			auto &children = ListValue::GetChildren(samples_val);
-			for (auto &child : children) {
-				auto iid = child.GetValue<string>();
-				auto it = bind_data->sample_info.iid_to_idx.find(iid);
-				if (it == bind_data->sample_info.iid_to_idx.end()) {
-					throw InvalidInputException("read_pfile: sample '%s' not found in .psam", iid);
-				}
-				bind_data->sample_indices.push_back(static_cast<uint32_t>(it->second));
-			}
-		} else {
-			throw InvalidInputException("read_pfile: samples parameter must be LIST(VARCHAR) or LIST(INTEGER)");
 		}
 
-		// Validate no duplicates
-		{
-			std::unordered_set<uint32_t> seen;
-			for (auto idx : bind_data->sample_indices) {
-				if (!seen.insert(idx).second) {
-					throw InvalidInputException("read_pfile: duplicate sample index %u in samples list", idx);
-				}
-			}
+		Selection sample_sel;
+		sample_sel.has_samples = sel.has_samples;
+		sample_sel.samples = sel.samples;
+		ResolvedSelection resolved =
+		    ResolveSelection(sample_sel, bind_data->Primary().variants, &bind_data->sample_info,
+		                     bind_data->raw_sample_ct, bind_data->Primary().raw_variant_ct, "read_pfile");
+		if (resolved.has_sample_subset) {
+			bind_data->sample_indices = std::move(resolved.subset_sorted);
+			bind_data->has_sample_subset = true;
+			bind_data->subset_sample_ct = resolved.effective_sample_ct;
 		}
-
-		// Sort sample_indices to match pgenlib output order.
-		// PgrGet with sample_include returns genotypes in ascending bit order
-		// regardless of the order indices were added. Sorting ensures that
-		// genotype_bytes[i] corresponds to sample_indices[i] in genotype orient mode.
-		std::sort(bind_data->sample_indices.begin(), bind_data->sample_indices.end());
-
-		bind_data->has_sample_subset = true;
-		bind_data->subset_sample_ct = static_cast<uint32_t>(bind_data->sample_indices.size());
 	}
 
 	// (variants param + effective variant list were resolved per-source above.)
@@ -4121,6 +4130,10 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		// Accept ANY for samples and variants — type dispatch handled in bind
 		fn.named_parameters["samples"] = LogicalType::ANY;
 		fn.named_parameters["variants"] = LogicalType::ANY;
+		// Composable selection: a STRUCT whose samples/region/variants/variant_range
+		// fields seed the axes; the individual params above override per-field
+		// (most-specific-wins). Parsed via the shared ParseSelection handler in bind.
+		fn.named_parameters["selection"] = LogicalType::ANY;
 		fn.named_parameters["genotypes"] = LogicalType::VARCHAR;
 		fn.named_parameters["af_range"] = LogicalType::ANY;
 		fn.named_parameters["ac_range"] = LogicalType::ANY;
