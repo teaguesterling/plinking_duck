@@ -225,7 +225,18 @@ if(NOT Eigen3_FOUND)
     endif()
 endif()
 if(NOT Eigen3_FOUND)
-    message(WARNING "Eigen3 not found — plink_pca will not be built. Install via vcpkg or libeigen3-dev.")
+    # Hard requirement (issue #53): plink_pca is a headline analysis function and
+    # Eigen3 is declared in vcpkg.json, so every standard vcpkg-based build (incl.
+    # the community-extension CI) supplies it automatically. Previously a missing
+    # Eigen3 only warned and silently compiled plink_pca out, which surfaced as two
+    # mysterious test failures on a clean non-vcpkg checkout and let CI go green
+    # exactly when the feature vanished. Fail configuration loudly instead.
+    message(FATAL_ERROR
+        "Eigen3 not found. It is a required build dependency of plinking_duck "
+        "(needed by plink_pca) and is declared in vcpkg.json, so a standard "
+        "vcpkg-based build supplies it automatically. For a non-vcpkg build, "
+        "install it first — e.g. 'apt install libeigen3-dev', 'brew install eigen', "
+        "or 'vcpkg install eigen3'.")
 endif()
 target_link_libraries(pgenlib PRIVATE ZLIB::ZLIB Threads::Threads)
 set_target_properties(pgenlib PROPERTIES
