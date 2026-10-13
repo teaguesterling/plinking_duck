@@ -1179,13 +1179,24 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			    src.pgen_path, src_sample_ct, bind_data->raw_sample_ct, bind_data->sources[0].pgen_path);
 		}
 
-		// Per-source effective variant list (region ∩ variants param, resolved per shard)
+		// Per-source effective variant list (region ∩ variants param, resolved per shard).
+		// The arbitrary-SET resolution of `variants` is centralized in the shared handler:
+		// ResolveSelection(allow_variant_set=true) runs the same ResolveVariantsParameter
+		// read_pfile used inline and returns a sorted-unique ordinal set. `has_variant_filter`
+		// implies single-file here — the multi-file guard above throws on ANY `variants`
+		// presence before this loop — so this is read_pfile's single-source variant path. A
+		// `variants`-ONLY Selection is handed over (sample_info=nullptr, no region/variant_range):
+		// read_pfile still owns the region ∩ set (BuildEffectiveVariantList) and the
+		// variant_range post-filter below, since their type + timing differ from the handler.
 		std::unordered_set<uint32_t> variant_set;
 		if (bind_data->has_variant_filter) {
-			auto resolved = ResolveVariantsParameter(sel.variants, src.variants, src.raw_variant_ct, "read_pfile");
-			for (auto idx : resolved) {
-				variant_set.insert(idx);
-			}
+			Selection variants_sel;
+			variants_sel.has_variants = true;
+			variants_sel.variants = sel.variants;
+			ResolvedSelection vres = ResolveSelection(variants_sel, src.variants, /*sample_info=*/nullptr,
+			                                          bind_data->raw_sample_ct, src.raw_variant_ct, "read_pfile",
+			                                          /*allow_variant_set=*/true);
+			variant_set.insert(vres.variant_set_sorted.begin(), vres.variant_set_sorted.end());
 		}
 		BuildEffectiveVariantList(src, bind_data->region, variant_set, bind_data->has_variant_filter);
 
