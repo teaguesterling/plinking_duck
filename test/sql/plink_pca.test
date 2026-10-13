@@ -147,6 +147,25 @@ SELECT ROUND(EIGENVALUE, 10) FROM plink_pca('test/data/pca_example.pgen', n_pcs 
 4.8015826961
 4.6826320378
 
+# Regression (MergePass partial reset): both-mode EIGENVAL must equal the
+# pcs-mode spectrum under multithreading. Before the fix, a thread that ran an
+# earlier pass but not the phase-3 scan left stale accumulation in its partial,
+# which the phase-3 merge summed into bb and inflated pcs-mode EIGENVALUE in a
+# thread-count-dependent way (both-mode and single-thread stayed correct). This
+# pins cross-mode agreement at threads = 4.
+query R
+SELECT ROUND(ev, 10) FROM (
+    SELECT UNNEST(EIGENVAL) AS ev
+    FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'both')
+);
+----
+5.3246437702
+4.8015826961
+4.6826320378
+
+statement ok
+SET threads = 1;
+
 # --- Projection pushdown ---
 
 # Select only PC1 and IID

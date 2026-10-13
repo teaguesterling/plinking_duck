@@ -932,28 +932,48 @@ static void MergePass(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs
 		}
 		RunFinalSVD(gs, bb);
 		gs.algorithm_done.store(true, std::memory_order_release);
-		return;
-	}
-
-	// Merge thread partials → G2, compute G1 = G2 / M
-	std::fill(gs.G1.begin(), gs.G1.end(), 0.0);
-	for (uint32_t t = 0; t < gs.thread_count; t++) {
-		auto &partial = gs.thread_partials[t];
-		for (uint32_t s = 0; s < N; s++) {
-			for (uint32_t c = 0; c < gs.pc_ct_x2; c++) {
-				gs.G1[static_cast<size_t>(s) * gs.pc_ct_x2 + c] +=
-				    partial[static_cast<size_t>(s) * gs.qq_col_ct + col_offset + c];
+	} else {
+		// Merge thread partials → G2, compute G1 = G2 / M
+		std::fill(gs.G1.begin(), gs.G1.end(), 0.0);
+		for (uint32_t t = 0; t < gs.thread_count; t++) {
+			auto &partial = gs.thread_partials[t];
+			for (uint32_t s = 0; s < N; s++) {
+				for (uint32_t c = 0; c < gs.pc_ct_x2; c++) {
+					gs.G1[static_cast<size_t>(s) * gs.pc_ct_x2 + c] +=
+					    partial[static_cast<size_t>(s) * gs.qq_col_ct + col_offset + c];
+				}
 			}
+		}
+
+		double inv_M = 1.0 / static_cast<double>(gs.M);
+		for (auto &val : gs.G1) {
+			val *= inv_M;
+		}
+
+		if (pass == bind_data.n_pcs) {
+			RunKrylovSVD(gs);
 		}
 	}
 
-	double inv_M = 1.0 / static_cast<double>(gs.M);
-	for (auto &val : gs.G1) {
-		val *= inv_M;
-	}
-
-	if (pass == bind_data.n_pcs) {
-		RunKrylovSVD(gs);
+	// Zero ALL thread partials so the next pass starts from a clean slate,
+	// regardless of which threads participate in it. A thread that ran an
+	// earlier pass but is not scheduled for the next one would otherwise carry
+	// its stale accumulation into that pass's merge — phase 3 especially, whose
+	// merge sums every thread's full buffer into `bb`. That stale content is
+	// additive, so it perturbs the singular values and inflates the reported
+	// eigenvalues (S²/M) in a thread-count-dependent way, while leaving the
+	// scale-robust eigenvectors largely intact (this was the pcs-vs-both /
+	// multithread eigenvalue-inflation bug). Each participating thread also
+	// zeroes its own buffer on entry, but a non-participating thread never
+	// would. This reset assumes a single merger per pass — the common case,
+	// where MergePass runs on the thread that drove pass_active_threads to zero
+	// while the others are parked on pass_generation. That is not strictly
+	// guaranteed: pass_active_threads is a running counter, not a true barrier,
+	// so a late-joining thread that skipped this pass can momentarily re-drive
+	// it to zero. That barrier fragility is pre-existing (neither introduced nor
+	// repaired here) and is tracked separately.
+	for (auto &partial : gs.thread_partials) {
+		std::fill(partial.begin(), partial.end(), 0.0);
 	}
 }
 
