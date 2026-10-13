@@ -6,7 +6,7 @@ Compute polygenic risk scores (PRS) from genotype data and variant weights.
 
 ```sql
 plink_score(path VARCHAR, weights := ...,
-            [, pvar := ..., psam := ..., samples := ..., region := ...,
+            [, pvar := ..., psam := ..., samples := ..., region := ..., selection := ...,
             center := ..., no_mean_imputation := ...]) -> TABLE
 ```
 
@@ -20,10 +20,11 @@ plink_score(path VARCHAR, weights := ...,
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` file (required) |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
+| `selection` | `STRUCT` | None | Composable per-axis [selection](../common-parameters.md#selection) struct (`samples`/`region`/`variant_range`) |
 | `center` | `BOOLEAN` | `false` | Variance-standardized scoring |
 | `no_mean_imputation` | `BOOLEAN` | `false` | Skip mean imputation for missing genotypes |
 
-See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
+See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, `region`, and the composable `selection` struct.
 
 ### Weights Parameter
 

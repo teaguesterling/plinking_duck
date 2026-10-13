@@ -28,12 +28,13 @@ plink_ld(path VARCHAR [, window_kb := ..., r2_threshold := ...,
 | `r2_threshold` | `DOUBLE` | `0.2` | Minimum r² to report (windowed mode) |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
+| `selection` | `STRUCT` | None | Composable [selection](../common-parameters.md#selection) struct — **sample axis only** for `plink_ld` |
 | `inter_chr` | `BOOLEAN` | `false` | Include cross-chromosome pairs (windowed mode) |
 | `cache_genotypes` | `BOOLEAN` | `true` | Cache the active region's packed genotypes per worker when the bounded cache is small enough; enables a faster popcount LD path for no-missing variants and falls back to streaming when the estimated total cache would be too large. |
 | `population_column` | `VARCHAR` | *(none)* | Optional `.psam`/`.fam` metadata column containing population/ancestry labels for GAUSS-like population-weighted LD. Must be supplied with `population_weights`. |
 | `population_weights` | `VARCHAR` | *(none)* | Comma-separated population weights, e.g. `'AFR=0.20,EUR=0.80'`. Weights are normalized, matched case-insensitively to `population_column`, and each population contributes its total requested weight regardless of sample count. |
 
-See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
+See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`. `plink_ld` also accepts the composable `selection` struct, but takes **only the sample axis** from it (a `region`/`variants`/`variant_range` field inside `selection` is rejected) — pass `region :=` directly. See [the `plink_ld` note](../common-parameters.md#selection).
 
 ## Modes
 

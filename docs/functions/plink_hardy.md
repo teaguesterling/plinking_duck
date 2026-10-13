@@ -6,7 +6,7 @@ Compute per-variant Hardy-Weinberg equilibrium exact test p-values.
 
 ```sql
 plink_hardy(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
-            region := ..., midp := ...]) -> TABLE
+            region := ..., selection := ..., midp := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -18,9 +18,10 @@ plink_hardy(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` file |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
+| `selection` | `STRUCT` | None | Composable per-axis [selection](../common-parameters.md#selection) struct (`samples`/`region`/`variant_range`) |
 | `midp` | `BOOLEAN` | `false` | Use mid-p correction for the exact test |
 
-See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
+See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, `region`, and the composable `selection` struct.
 
 ## Output Columns
 

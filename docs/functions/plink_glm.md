@@ -7,7 +7,7 @@ Run per-variant genome-wide association (GWAS) regression using plink2's proven 
 ```sql
 plink_glm(prefix VARCHAR, phenotype := ...,
           [, covariates := ..., model := ..., firth := ...,
-          pvar := ..., psam := ..., samples := ..., region := ...]) -> TABLE
+          pvar := ..., psam := ..., samples := ..., region := ..., selection := ...]) -> TABLE
 ```
 
 ## Parameters
@@ -23,8 +23,9 @@ plink_glm(prefix VARCHAR, phenotype := ...,
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` file |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) |
+| `selection` | `STRUCT` | None | Composable per-axis [selection](../common-parameters.md#selection) struct (`samples`/`region`/`variant_range`) |
 
-See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, and `region`.
+See [Common Parameters](../common-parameters.md) for details on `pvar`, `psam`, `samples`, `region`, and the composable `selection` struct.
 
 ### Prefix Resolution
 
