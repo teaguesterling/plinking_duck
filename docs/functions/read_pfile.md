@@ -30,13 +30,14 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | `variants` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific variants |
 | `region` | `VARCHAR` | All | Filter to genomic region (`chr:start-end`) — base-pair space (distinct from `variant_range`) |
 | `variant_range` | `LIST` `[lo, hi]` | All | Filter to a **half-open** `[lo, hi)` range in variant **ordinal** space (see [Variant-Range](#variant-range-ordinal-space)) |
+| `selection` | `STRUCT` | None | Composable per-axis [selection](../common-parameters.md#selection) struct bundling `samples`/`region`/`variants`/`variant_range`; an individual param supplied alongside it overrides the matching field (most-specific-wins) |
 | `af_range` | `STRUCT(min DOUBLE, max DOUBLE)` | All | Filter variants by allele frequency range |
 | `ac_range` | `STRUCT(min INTEGER, max INTEGER)` | All | Filter variants by allele count range |
 | `include_genotypes` | `LIST(VARCHAR)` | All | Filter by hardcall category: `'hom_ref'`, `'het'`, `'hom_alt'`, `'missing'` (any subset; canonical genotype filter) |
 | `genotype_range` | `STRUCT(min TINYINT, max TINYINT [, include_missing BOOLEAN])` | All | Numeric alias of `include_genotypes` for contiguous ranges over [0, 2] |
 | `with_ordinal` | `BOOLEAN` | `false` | Append a `__ordinal` `BIGINT` column of each variant's natural (original) index; **requires `orient := 'variant'`** (see [Variant Ordinal](#variant-ordinal-with_ordinal)) |
 
-See [Common Parameters](../common-parameters.md) for details on `samples`, `region`, `with_ordinal`, and filter parameters.
+See [Common Parameters](../common-parameters.md) for details on `samples`, `region`, the composable `selection` struct, `with_ordinal`, and the filter parameters.
 
 ### Variant Filtering
 
@@ -192,7 +193,19 @@ The `genotypes` parameter controls how genotype data is structured:
 
 With `phased := true`, genotype elements change from `TINYINT` to `ARRAY(TINYINT, 2)` representing `[allele1, allele2]` haplotype pairs. `[0, 0]` = hom ref, `[0, 1]` = REF|ALT, `[1, 0]` = ALT|REF, `[1, 1]` = hom alt, NULL = missing. Incompatible with `dosages := true`. See [Genotype Encoding](../genotype-encoding.md).
 
-### Filter Pushdown
+### Filter Pushdown (SQL `WHERE`)
+
+`read_pfile` supports DuckDB **filter pushdown**: a `WHERE` predicate on `CHROM`,
+`POS`, `ID`, or the synthetic `__ordinal` column is pushed into the scan and used
+to **skip non-matching variants without decoding their genotypes** — so
+`... WHERE CHROM = '1' AND POS BETWEEN 1 AND 1000000` or `WHERE ID IN (...)` reads
+only the matching slice. Pushed predicates compose (intersect) with the `region`,
+`variants`, and `variant_range` parameters. Predicates on computed columns
+(`ALT_FREQ`, genotype-derived values) can't be pushed into the scan; they are
+applied as a normal residual filter on the output, so results are always correct
+regardless of what the optimizer pushes.
+
+### Value Filters
 
 `af_range` and `ac_range` filter variants by allele frequency or count using fast genotype counting (no decompression). `include_genotypes` (and its numeric alias `genotype_range`) filters by hardcall category — in `variant` orient it sets non-matching values to NULL; in `genotype` and `sample` orient it drops non-matching rows, so a carrier query in `sample` orient materializes only the matching subjects. See [Common Parameters](../common-parameters.md).
 

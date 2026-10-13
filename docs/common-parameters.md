@@ -127,9 +127,11 @@ Field rules:
 - `variant_range` is clamped to the available variant count and cannot be combined
   with `region` (they both target the variant axis).
 - `variants` (an **arbitrary** variant set, e.g. by rsID/CPRA) is **not** accepted
-  here: these functions scan a single contiguous interval, so an arbitrary set is
-  rejected with a clear error — use `region` or `variant_range` for a contiguous
-  range.
+  by the **analysis functions**: they scan a single contiguous interval, so an
+  arbitrary set is rejected with a clear error — use `region` or `variant_range`
+  for a contiguous range. **`read_pfile` is the exception**: it accepts an
+  arbitrary `variants` set in the struct (rsID/CPRA/ordinal/mixed), the same set
+  it accepts as the individual `variants` param.
 
 !!! note "`plink_ld`"
     `plink_ld` takes **only the sample axis** from `selection`. Its `region`
@@ -140,7 +142,7 @@ Field rules:
 
 Because `select` is a reserved SQL keyword, the parameter is spelled `selection`.
 
-**Used by:** `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld` (sample axis only), `plink_score`, `plink_glm`, `plink_pca`
+**Used by:** `read_pfile` (full axis, incl. arbitrary `variants`), `plink_freq`, `plink_hardy`, `plink_missing`, `plink_ld` (sample axis only), `plink_score`, `plink_glm`, `plink_pca`
 
 ## `af_range`
 

@@ -74,7 +74,7 @@ PlinkingDuck provides **5 file readers** and **6 analysis functions**:
 - **Parallel scan** -- multi-threaded variant processing for large files
 - **Sample subsetting** -- filter to specific samples by IID or index
 - **Region filtering** -- restrict to genomic regions (`chr:start-end`)
-- **Filter pushdown** -- pre-filter variants by allele frequency, count, or genotype value
+- **Filter pushdown** -- SQL `WHERE` on `CHROM`/`POS`/`ID`/ordinal is pruned into the scan (skips decoding non-matching variants); plus value pre-filters by allele frequency, count, or genotype
 - **GWAS regression** -- per-variant association testing with covariates and Firth correction
 - **Legacy format support** -- read PLINK 1 `.bim` and `.fam` files
 - **VCF import** -- fast biallelic genotype extraction from VCF files via plink-ng
