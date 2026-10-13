@@ -4,21 +4,14 @@ Principal component analysis of the sample genetic relationship matrix (GRM) —
 the standard tool for inferring population structure and deriving ancestry
 covariates for GWAS.
 
-!!! warning "Conditional on Eigen3"
-    `plink_pca` is the **only** function that is not always present. It needs
-    [Eigen3](../development.md#optional-dependency-eigen3), and CMake compiles it
-    out (with a configure-time warning) when Eigen3 is not found. Binaries
-    released from this repo are built through vcpkg, which supplies Eigen3, so
-    they always have it; a local `make` on a machine without `libeigen3-dev` does
-    not. Calling it on a build that lacks it raises
-    `Catalog Error: Table Function with name plink_pca does not exist!`. To check
-    a build before relying on it:
-
-    ```sql
-    SELECT count(*) > 0 AS has_pca
-    FROM duckdb_functions()
-    WHERE function_name = 'plink_pca';
-    ```
+!!! note "Requires Eigen3 at build time"
+    `plink_pca` is implemented with
+    [Eigen3](../development.md#build-dependency-eigen3), which is declared in
+    `vcpkg.json` — so the released binaries and any build through the vcpkg
+    toolchain always include it. Eigen3 is a **hard build requirement**: a build
+    that cannot find it (for example a non-vcpkg checkout without `libeigen3-dev`)
+    fails at **configure time** with a clear message, rather than silently
+    omitting `plink_pca`.
 
 ## Synopsis
 
@@ -135,5 +128,5 @@ SELECT * FROM plink_pca('data/cohort.pgen',
 ## See Also
 
 - [Common Parameters](../common-parameters.md) — `samples`, `region`, `selection`
-- [Function Reference](index.md) — why `plink_pca` is conditional on Eigen3
-- [Development](../development.md#optional-dependency-eigen3) — building with Eigen3
+- [Function Reference](index.md) — `plink_pca`'s Eigen3 build requirement
+- [Development](../development.md#build-dependency-eigen3) — building with Eigen3

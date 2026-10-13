@@ -10,9 +10,9 @@ PlinkingDuck is built as a DuckDB extension using the standard extension build s
 - CMake 3.12+
 - Make
 - Git (with submodule support)
-- **Eigen3** (`libeigen3-dev` / `brew install eigen`) — optional. Without it the
-  build still succeeds, but `plink_pca` is left out and two tests fail. See
-  [Optional dependency: Eigen3](development.md#optional-dependency-eigen3).
+- **Eigen3** (`libeigen3-dev` / `brew install eigen`) — required by `plink_pca`
+  and supplied by vcpkg; a non-vcpkg build without it fails at configure time.
+  See [Build dependency: Eigen3](development.md#build-dependency-eigen3).
 
 ### Build
 

@@ -8,8 +8,8 @@
 - CMake 3.12+
 - Make
 - Git (with submodule support)
-- **Eigen3** — optional, but `plink_pca` is not built without it. See
-  [Optional dependency: Eigen3](#optional-dependency-eigen3).
+- **Eigen3** — required (header-only); `plink_pca` needs it, and it is supplied
+  by vcpkg. See [Build dependency: Eigen3](#build-dependency-eigen3).
 
 ### Build
 
@@ -27,42 +27,31 @@ Build outputs:
 | `build/release/test/unittest` | Test runner |
 | `build/release/extension/plinking_duck/plinking_duck.duckdb_extension` | Loadable extension binary |
 
-### Optional dependency: Eigen3
+### Build dependency: Eigen3
 
-`plink_pca` is the only function with a third-party dependency: **Eigen3**
-(header-only).
+`plink_pca` is implemented with **Eigen3** (header-only), which is a **required**
+build dependency. It is listed in `vcpkg.json`, so the released binaries and any
+build through the vcpkg toolchain always include `plink_pca`.
 
 ```sh
 sudo apt install libeigen3-dev   # Debian/Ubuntu
 brew install eigen               # macOS
+vcpkg install eigen3             # vcpkg
 ```
 
-Released binaries always include `plink_pca` — `vcpkg.json` lists `eigen3` and
-the distribution pipeline builds through vcpkg. A plain local `make` does not
-use vcpkg, so this is the case that bites developers.
-
-When Eigen3 is not found, CMake prints a **configure-time warning** and then
-builds everything else successfully:
+A plain local `make` that does **not** use the vcpkg toolchain, on a machine
+without a system Eigen3, fails at **configure time** with a clear message
+(issue #53) rather than silently omitting `plink_pca`:
 
 ```
-CMake Warning at /path/to/plinking_duck/CMakeLists.txt:223 (message):
-  Eigen3 not found — plink_pca will not be built.  Install via vcpkg or
-  libeigen3-dev.
+CMake Error at /path/to/plinking_duck/CMakeLists.txt:223 (message):
+  Eigen3 not found. It is a required build dependency of plinking_duck
+  (needed by plink_pca) and is declared in vcpkg.json ...
 ```
 
-`plink_pca` is then absent from the catalog. To tell which kind of build you
-have, ask the catalog rather than scrolling the log:
-
-```sql
-SELECT count(*) > 0 AS has_pca
-FROM duckdb_functions()
-WHERE function_name = 'plink_pca';
-```
-
-Whether this should be a hard requirement instead of a warning is an open
-question — see the
-[README](https://github.com/teaguesterling/plinking_duck#optional-dependency-eigen3-for-plink_pca)
-for the argument on both sides.
+Install Eigen3 (above) or build through vcpkg to resolve it. CMake looks for a
+vcpkg/CONFIG package first, then falls back to a system install under
+`/usr/include/eigen3` or `/usr/local/include/eigen3`.
 
 ### Clean Build
 
@@ -78,16 +67,14 @@ make test
 
 Tests use DuckDB's [sqllogictest](https://duckdb.org/docs/dev/sqllogictest/intro.html) framework. Test files are in `test/sql/` and test data in `test/data/`.
 
-!!! warning "Two expected failures without Eigen3"
+!!! note "`plink_pca` tests always run"
 
-    On a build where Eigen3 was not found, `make test` reports exactly two
-    failures — `test/sql/plink_pca.test` and `test/sql/plink_pca_negative.test`
-    — both with `Catalog Error: Table Function with name plink_pca does not
-    exist!`. That is the missing dependency, not a regression.
-
-    These tests are intentionally **not** guarded with `require`. A skip would
-    turn the suite green precisely when `plink_pca` stopped being built, making
-    a real regression indistinguishable from a healthy run.
+    Because Eigen3 is a hard build dependency (issue #53), a build either
+    configures with `plink_pca` present or fails at configure time — there is no
+    successfully-built suite missing `plink_pca`. So `test/sql/plink_pca.test`
+    and `test/sql/plink_pca_negative.test` always run and are **not** guarded
+    with `require`: a skip would turn the suite green precisely when `plink_pca`
+    stopped being built, hiding a real regression.
 
 ### Test Data Files
 
@@ -166,7 +153,7 @@ Key pgenlib patterns:
 | libdeflate | plink-ng submodule | DuckDB doesn't include it |
 | zlib | System | |
 | simde | plink-ng submodule | Header-only SIMD emulation |
-| Eigen3 | vcpkg, or system `libeigen3-dev` | **Optional.** Header-only. Required by `plink_pca` only; absent ⇒ that one function is not registered (see [above](#optional-dependency-eigen3)) |
+| Eigen3 | vcpkg, or system `libeigen3-dev` | **Required** (header-only) by `plink_pca`; a build that cannot find it fails at configure time (see [above](#build-dependency-eigen3)) |
 
 ## CI / Platform Support
 
