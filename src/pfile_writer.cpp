@@ -1,6 +1,7 @@
 #include "pfile_writer.hpp"
 #include "plink_common.hpp"   // AlignedBuffer + pgenlib read/misc headers
 #include "howard_catalog.hpp" // shared ShardEntry (the .howard catalog model, also used by the reader)
+#include "duckdb_compat.hpp"  // CompatName / CompatNameStr(ings) — Identifier boundaries on DuckDB v2.0
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -187,7 +188,7 @@ unique_ptr<PvarWriteBindData> BuildPvarBind(CopyFunctionBindInput &input, const 
 	}
 
 	for (auto &opt : input.info.options) {
-		auto key = StringUtil::Lower(opt.first);
+		auto key = StringUtil::Lower(CompatNameStr(opt.first));
 		if (key == "variant_fields") {
 			if (opt.second.empty()) {
 				continue;
@@ -200,7 +201,7 @@ unique_ptr<PvarWriteBindData> BuildPvarBind(CopyFunctionBindInput &input, const 
 			auto &child_types = StructType::GetChildTypes(val.type());
 			auto &children = StructValue::GetChildren(val);
 			for (idx_t c = 0; c < child_types.size(); c++) {
-				auto role = StringUtil::Lower(child_types[c].first);
+				auto role = StringUtil::Lower(CompatNameStr(child_types[c].first));
 				idx_t r = kRoleCount;
 				for (idx_t i = 0; i < kRoleCount; i++) {
 					if (role == kRoleKeys[i]) {
@@ -211,7 +212,7 @@ unique_ptr<PvarWriteBindData> BuildPvarBind(CopyFunctionBindInput &input, const 
 				if (r == kRoleCount) {
 					throw BinderException("write pvar: unknown variant_fields role '%s' (expected one of "
 					                      "chrom, pos, id, ref, alt)",
-					                      child_types[c].first);
+					                      CompatNameStr(child_types[c].first));
 				}
 				if (children[c].IsNull()) {
 					throw BinderException("write pvar: variant_fields role '%s' has a NULL column name", role);
@@ -280,8 +281,11 @@ unique_ptr<PvarWriteBindData> BuildPvarBind(CopyFunctionBindInput &input, const 
 	return std::move(bind);
 }
 
-unique_ptr<FunctionData> PvarCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<string> &names,
+unique_ptr<FunctionData> PvarCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<CompatName> &names_in,
                                       const vector<LogicalType> &sql_types) {
+	// DuckDB v2.0 retyped copy_to_bind_t's names to vector<Identifier>; convert
+	// once here so the vector<string>-based helpers below stay unchanged.
+	const vector<string> names = CompatNameStrings(names_in);
 	return BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
 }
 
@@ -662,7 +666,7 @@ unique_ptr<PgenWriteBindData> BuildPgenBind(CopyFunctionBindInput &input, const 
 	string geno_col = "genotypes"; // reader-aligned default
 
 	for (auto &opt : input.info.options) {
-		auto key = StringUtil::Lower(opt.first);
+		auto key = StringUtil::Lower(CompatNameStr(opt.first));
 		if (key == "genotype_fields") {
 			if (opt.second.empty() || opt.second[0].IsNull()) {
 				continue;
@@ -735,7 +739,7 @@ unique_ptr<PgenWriteBindData> BuildPgenBind(CopyFunctionBindInput &input, const 
 		// struct fields reject with the same actionable messages as the LIST path.
 		for (auto &ct : child_types) {
 			ValidateHardcallElem(ct.second, names[gidx]);
-			bind->struct_iids.push_back(ct.first); // field name = IID
+			bind->struct_iids.push_back(CompatNameStr(ct.first)); // field name = IID
 		}
 		bind->geno_is_struct = true;
 		bind->sample_ct = static_cast<uint32_t>(child_types.size());
@@ -776,8 +780,9 @@ unique_ptr<PgenWriteBindData> BuildPgenBind(CopyFunctionBindInput &input, const 
 	return std::move(bind);
 }
 
-unique_ptr<FunctionData> PgenCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<string> &names,
+unique_ptr<FunctionData> PgenCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<CompatName> &names_in,
                                       const vector<LogicalType> &sql_types) {
+	const vector<string> names = CompatNameStrings(names_in);
 	return BuildPgenBind(input, names, sql_types);
 }
 
@@ -1042,7 +1047,7 @@ void WritePsamFromIids(FileSystem &fs, const string &path, const vector<string> 
 bool TryParseSamplesOption(CopyFunctionBindInput &input, vector<string> &out, bool &present) {
 	present = false;
 	for (auto &opt : input.info.options) {
-		if (StringUtil::Lower(opt.first) != "samples") {
+		if (StringUtil::Lower(CompatNameStr(opt.first)) != "samples") {
 			continue;
 		}
 		present = true;
@@ -1075,7 +1080,7 @@ bool TryParseSamplesOption(CopyFunctionBindInput &input, vector<string> &out, bo
 // deferred — never silently dropped). No option present leaves outputs untouched.
 void CheckSampleFieldsIid(CopyFunctionBindInput &input, string &iid_col, bool &has_iid) {
 	for (auto &opt : input.info.options) {
-		if (StringUtil::Lower(opt.first) != "sample_fields") {
+		if (StringUtil::Lower(CompatNameStr(opt.first)) != "sample_fields") {
 			continue;
 		}
 		if (opt.second.empty() || opt.second[0].IsNull()) {
@@ -1088,7 +1093,7 @@ void CheckSampleFieldsIid(CopyFunctionBindInput &input, string &iid_col, bool &h
 		auto &child_types = StructType::GetChildTypes(val.type());
 		auto &children = StructValue::GetChildren(val);
 		for (idx_t c = 0; c < child_types.size(); c++) {
-			auto role = StringUtil::Lower(child_types[c].first);
+			auto role = StringUtil::Lower(CompatNameStr(child_types[c].first));
 			if (role == "iid") {
 				if (children[c].IsNull()) {
 					throw BinderException("write: sample_fields role 'iid' has a NULL column name");
@@ -1098,7 +1103,7 @@ void CheckSampleFieldsIid(CopyFunctionBindInput &input, string &iid_col, bool &h
 			} else {
 				throw BinderException("write: sample metadata beyond IID is not yet supported (follow-on): "
 				                      "sample_fields role '%s'. For now .psam is IID-only.",
-				                      child_types[c].first);
+				                      CompatNameStr(child_types[c].first));
 			}
 		}
 	}
@@ -1112,7 +1117,7 @@ bool TryStructIidsFromSchema(CopyFunctionBindInput &input, const vector<string> 
                              const vector<LogicalType> &sql_types, vector<string> &out) {
 	string geno_col = "genotypes";
 	for (auto &opt : input.info.options) {
-		if (StringUtil::Lower(opt.first) == "genotype_fields" && !opt.second.empty() && !opt.second[0].IsNull() &&
+		if (StringUtil::Lower(CompatNameStr(opt.first)) == "genotype_fields" && !opt.second.empty() && !opt.second[0].IsNull() &&
 		    opt.second[0].type().id() != LogicalTypeId::STRUCT) {
 			geno_col = opt.second[0].ToString();
 		}
@@ -1120,7 +1125,7 @@ bool TryStructIidsFromSchema(CopyFunctionBindInput &input, const vector<string> 
 	for (idx_t i = 0; i < names.size(); i++) {
 		if (StringUtil::CIEquals(names[i], geno_col) && sql_types[i].id() == LogicalTypeId::STRUCT) {
 			for (auto &ct : StructType::GetChildTypes(sql_types[i])) {
-				out.push_back(ct.first);
+				out.push_back(CompatNameStr(ct.first));
 			}
 			return true;
 		}
@@ -1211,12 +1216,13 @@ struct PsamWriteGlobalState : public GlobalFunctionData {
 
 struct PsamWriteLocalState : public LocalFunctionData {};
 
-unique_ptr<FunctionData> PsamCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<string> &names,
+unique_ptr<FunctionData> PsamCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<CompatName> &names_in,
                                       const vector<LogicalType> &sql_types) {
+	const vector<string> names = CompatNameStrings(names_in);
 	auto bind = make_uniq<PsamWriteBindData>();
 
 	for (auto &opt : input.info.options) {
-		if (StringUtil::Lower(opt.first) == "psam" && !opt.second.empty() && !opt.second[0].IsNull()) {
+		if (StringUtil::Lower(CompatNameStr(opt.first)) == "psam" && !opt.second.empty() && !opt.second[0].IsNull()) {
 			bind->path_override = opt.second[0].ToString();
 		}
 	}
@@ -1861,13 +1867,14 @@ void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
 }
 
 unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindInput &input,
-                                       const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                       const vector<CompatName> &names_in, const vector<LogicalType> &sql_types) {
+	const vector<string> names = CompatNameStrings(names_in);
 	auto bind = make_uniq<PfileWriteBindData>();
 
 	// --- path overrides (reader symmetry), parsed first so the local-only check
 	//     below sees the EFFECTIVE target of each of the three files. ---
 	for (auto &opt : input.info.options) {
-		auto key = StringUtil::Lower(opt.first);
+		auto key = StringUtil::Lower(CompatNameStr(opt.first));
 		if (key == "pvar" && !opt.second.empty() && !opt.second[0].IsNull()) {
 			bind->pvar_override = opt.second[0].ToString();
 		} else if (key == "psam" && !opt.second.empty() && !opt.second[0].IsNull()) {

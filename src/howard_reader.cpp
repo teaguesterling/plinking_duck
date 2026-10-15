@@ -2,6 +2,7 @@
 #include "howard_catalog.hpp"
 #include "plink_common.hpp"
 #include "register_helper.hpp"
+#include "duckdb_compat.hpp" // CompatName — bind-signature name type on DuckDB v2.0
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -795,7 +796,7 @@ struct HowardManifestGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> HowardManifestBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto result = make_uniq<HowardManifestBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
 
