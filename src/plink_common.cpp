@@ -2255,7 +2255,8 @@ static void MergeSelectionStruct(const Value &select_val, Selection &sel) {
 			}
 		} else {
 			throw InvalidInputException(
-			    "selection: unknown field '%s' (expected samples, variants, region, or variant_range)", field);
+			    "selection: unknown field '%s' (expected samples, variants, region, or variant_range)",
+			    CompatNameStr(field));
 		}
 	}
 }
