@@ -786,14 +786,13 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 
 void RegisterPlinkVcfReader(ExtensionLoader &loader) {
 	TableFunction func("read_plink_vcf", {LogicalType::VARCHAR}, VcfScan, VcfBind, VcfInitGlobal, VcfInitLocal);
-	DeclareNamedParameters(func, {
-	                       {"genotypes", LogicalType::VARCHAR},
-	                       {"phased", LogicalType::BOOLEAN},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"min_gq", LogicalType::INTEGER},
-	                       {"min_dp", LogicalType::INTEGER},
-	                       {"max_dp", LogicalType::INTEGER},
-	                       {"halfcall", LogicalType::VARCHAR}});
+	DeclareNamedParameters(func, {{"genotypes", LogicalType::VARCHAR},
+	                              {"phased", LogicalType::BOOLEAN},
+	                              {"region", LogicalType::VARCHAR},
+	                              {"min_gq", LogicalType::INTEGER},
+	                              {"min_dp", LogicalType::INTEGER},
+	                              {"max_dp", LogicalType::INTEGER},
+	                              {"halfcall", LogicalType::VARCHAR}});
 	CompatSetCaptureArgumentAliases(func);
 	func.projection_pushdown = true;
 	RegisterTableWithDesc(loader, func, {}, "Read VCF files using PLINK engine into tabular format.",

@@ -1425,20 +1425,19 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	TableFunction plink_ld("plink_ld", {LogicalType::VARCHAR}, PlinkLdScan, PlinkLdBind, PlinkLdInitGlobal,
 	                       PlinkLdInitLocal);
 
-	DeclareNamedParameters(plink_ld, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"variant1", LogicalType::VARCHAR},
-	                       {"variant2", LogicalType::VARCHAR},
-	                       {"window_kb", LogicalType::INTEGER},
-	                       {"r2_threshold", LogicalType::DOUBLE},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"samples", LogicalType::ANY},
-	                       {"selection", LogicalType::ANY},
-	                       {"inter_chr", LogicalType::BOOLEAN},
-	                       {"cache_genotypes", LogicalType::BOOLEAN},
-	                       {"population_column", LogicalType::VARCHAR},
-	                       {"population_weights", LogicalType::VARCHAR}});
+	DeclareNamedParameters(plink_ld, {{"pvar", LogicalType::VARCHAR},
+	                                  {"psam", LogicalType::VARCHAR},
+	                                  {"variant1", LogicalType::VARCHAR},
+	                                  {"variant2", LogicalType::VARCHAR},
+	                                  {"window_kb", LogicalType::INTEGER},
+	                                  {"r2_threshold", LogicalType::DOUBLE},
+	                                  {"region", LogicalType::VARCHAR},
+	                                  {"samples", LogicalType::ANY},
+	                                  {"selection", LogicalType::ANY},
+	                                  {"inter_chr", LogicalType::BOOLEAN},
+	                                  {"cache_genotypes", LogicalType::BOOLEAN},
+	                                  {"population_column", LogicalType::VARCHAR},
+	                                  {"population_weights", LogicalType::VARCHAR}});
 	CompatSetCaptureArgumentAliases(plink_ld);
 	plink_ld.projection_pushdown = true;
 	RegisterTableWithDesc(loader, plink_ld, {}, "Compute pairwise linkage disequilibrium metrics.",

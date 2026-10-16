@@ -3,7 +3,7 @@
 #include "plink_common.hpp"
 #include "register_helper.hpp"
 #include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
-#include "duckdb_compat.hpp" // CompatName — bind-signature name type on DuckDB v2.0
+#include "duckdb_compat.hpp"          // CompatName — bind-signature name type on DuckDB v2.0
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -985,11 +985,10 @@ static void HowardManifestScan(ClientContext &context, TableFunctionInput &data_
 void RegisterHowardReader(ExtensionLoader &loader) {
 	TableFunction fn("read_howard_manifest", {LogicalType::VARCHAR}, HowardManifestScan, HowardManifestBind,
 	                 HowardManifestInitGlobal);
-	DeclareNamedParameters(fn, {
-	                       {"region", LogicalType::VARCHAR},
-	                       {"variant_index", LogicalType::ANY},
-	                       {"sample_index", LogicalType::ANY},
-	                       {"verify_all", LogicalType::BOOLEAN}});
+	DeclareNamedParameters(fn, {{"region", LogicalType::VARCHAR},
+	                            {"variant_index", LogicalType::ANY},
+	                            {"sample_index", LogicalType::ANY},
+	                            {"verify_all", LogicalType::BOOLEAN}});
 	CompatSetCaptureArgumentAliases(fn);
 	RegisterTableWithDesc(
 	    loader, fn, {"path", "region", "variant_index", "sample_index", "verify_all"},

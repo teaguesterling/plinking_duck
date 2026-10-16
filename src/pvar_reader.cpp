@@ -645,16 +645,14 @@ void RegisterPvarReader(ExtensionLoader &loader) {
 	// Single path
 	TableFunction one("read_pvar", {LogicalType::VARCHAR}, PvarScan, PvarBind, PvarInitGlobal, PvarInitLocal);
 	one.projection_pushdown = true;
-	DeclareNamedParameters(one, {
-	                       {"with_ordinal", LogicalType::BOOLEAN}});
+	DeclareNamedParameters(one, {{"with_ordinal", LogicalType::BOOLEAN}});
 	CompatSetCaptureArgumentAliases(one);
 	set.AddFunction(one);
 	// List of paths (row-concatenated in order)
 	TableFunction many("read_pvar", {LogicalType::LIST(LogicalType::VARCHAR)}, PvarScan, PvarBind, PvarInitGlobal,
 	                   PvarInitLocal);
 	many.projection_pushdown = true;
-	DeclareNamedParameters(many, {
-	                       {"with_ordinal", LogicalType::BOOLEAN}});
+	DeclareNamedParameters(many, {{"with_ordinal", LogicalType::BOOLEAN}});
 	CompatSetCaptureArgumentAliases(many);
 	set.AddFunction(many);
 	RegisterTableSetWithDesc(loader, set, {}, "Read PLINK .pvar or .bim variant files into tabular format.",

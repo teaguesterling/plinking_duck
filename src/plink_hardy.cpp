@@ -702,14 +702,13 @@ void RegisterPlinkHardy(ExtensionLoader &loader) {
 
 	plink_hardy.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_hardy, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"samples", LogicalType::ANY},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"selection", LogicalType::ANY},
-	                       {"midp", LogicalType::BOOLEAN},
-	                       {"build", LogicalType::VARCHAR}});
+	DeclareNamedParameters(plink_hardy, {{"pvar", LogicalType::VARCHAR},
+	                                     {"psam", LogicalType::VARCHAR},
+	                                     {"samples", LogicalType::ANY},
+	                                     {"region", LogicalType::VARCHAR},
+	                                     {"selection", LogicalType::ANY},
+	                                     {"midp", LogicalType::BOOLEAN},
+	                                     {"build", LogicalType::VARCHAR}});
 	CompatSetCaptureArgumentAliases(plink_hardy);
 
 	RegisterTableWithDesc(loader, plink_hardy, {}, "Compute Hardy-Weinberg equilibrium exact test statistics.",

@@ -1103,19 +1103,18 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 
 	read_pgen.projection_pushdown = true;
 
-	DeclareNamedParameters(read_pgen, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"dosages", LogicalType::BOOLEAN},
-	                       {"phased", LogicalType::BOOLEAN},
-	                       {"samples", LogicalType::ANY},
-	                       {"genotypes", LogicalType::VARCHAR},
-	                       {"orient", LogicalType::VARCHAR},
-	                       {"af_range", LogicalType::ANY},
-	                       {"ac_range", LogicalType::ANY},
-	                       {"genotype_range", LogicalType::ANY},
-	                       {"include_genotypes", LogicalType::LIST(LogicalType::VARCHAR)},
-	                       {"variants", LogicalType::ANY}});
+	DeclareNamedParameters(read_pgen, {{"pvar", LogicalType::VARCHAR},
+	                                   {"psam", LogicalType::VARCHAR},
+	                                   {"dosages", LogicalType::BOOLEAN},
+	                                   {"phased", LogicalType::BOOLEAN},
+	                                   {"samples", LogicalType::ANY},
+	                                   {"genotypes", LogicalType::VARCHAR},
+	                                   {"orient", LogicalType::VARCHAR},
+	                                   {"af_range", LogicalType::ANY},
+	                                   {"ac_range", LogicalType::ANY},
+	                                   {"genotype_range", LogicalType::ANY},
+	                                   {"include_genotypes", LogicalType::LIST(LogicalType::VARCHAR)},
+	                                   {"variants", LogicalType::ANY}});
 	CompatSetCaptureArgumentAliases(read_pgen);
 
 	RegisterTableWithDesc(loader, read_pgen, {}, "Read PLINK .pgen or .bed genotype files into tabular format.",

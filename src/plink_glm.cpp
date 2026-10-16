@@ -1495,17 +1495,16 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 
 	plink_glm.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_glm, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"phenotype", LogicalType::ANY},
-	                       {"covariates", LogicalType::ANY},
-	                       {"samples", LogicalType::ANY},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"selection", LogicalType::ANY},
-	                       {"model", LogicalType::VARCHAR},
-	                       {"firth", LogicalType::BOOLEAN},
-	                       {"p_threshold", LogicalType::DOUBLE}});
+	DeclareNamedParameters(plink_glm, {{"pvar", LogicalType::VARCHAR},
+	                                   {"psam", LogicalType::VARCHAR},
+	                                   {"phenotype", LogicalType::ANY},
+	                                   {"covariates", LogicalType::ANY},
+	                                   {"samples", LogicalType::ANY},
+	                                   {"region", LogicalType::VARCHAR},
+	                                   {"selection", LogicalType::ANY},
+	                                   {"model", LogicalType::VARCHAR},
+	                                   {"firth", LogicalType::BOOLEAN},
+	                                   {"p_threshold", LogicalType::DOUBLE}});
 	CompatSetCaptureArgumentAliases(plink_glm);
 
 	RegisterTableWithDesc(loader, plink_glm, {},
