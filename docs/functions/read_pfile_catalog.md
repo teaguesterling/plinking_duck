@@ -1,22 +1,22 @@
-# read_howard_manifest
+# read_pfile_catalog
 
-Parse, verify, and prune a `.howard.json` shard catalog, returning **one row per surviving shard**.
+Parse, verify, and prune a `.pfile.json` shard catalog, returning **one row per surviving shard**.
 
-This is the parse + verify + prune surface plinking_duck owns for `.howard` **reading**. The **write**
+This is the parse + verify + prune surface plinking_duck owns for `pfile_catalog` **reading**. The **write**
 side is the sharded pfile writer (`COPY (…) TO 'out' (FORMAT pfile, shard_by '<col>')`, see
-[Writing filesets](write_pfile.md)), which emits exactly the `out.howard.json` this function reads —
-closing the write→read loop. The format is howard's `.howard` catalog design (variant-shards over a
+[Writing filesets](write_pfile.md)), which emits exactly the `out.pfile.json` this function reads —
+closing the write→read loop. The format is howard's `pfile_catalog` catalog design (variant-shards over a
 shared `.psam`, or sample-shards over a shared `.pvar`); this function is Phase A of consuming it and
 does **not** itself scan genotypes or `ATTACH` — it resolves which shards a query needs and vouches
 for them.
 
 For the catalog format itself — the JSON schema, the boundary law, and the trust model — see the
-[**`.howard` catalog format reference**](../formats/howard.md).
+[**`pfile_catalog` catalog format reference**](../formats/pfile_catalog.md).
 
 ## Synopsis
 
 ```sql
-read_howard_manifest(path VARCHAR
+read_pfile_catalog(path VARCHAR
     [, region := VARCHAR,
        variant_index := ANY,
        sample_index := ANY,
@@ -27,7 +27,7 @@ read_howard_manifest(path VARCHAR
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `path` | `VARCHAR` | *(required)* | Path to a multi-file `.howard.json` catalog. Every path inside it resolves **relative to the catalog's own directory** (an absolute path is honored as-is). |
+| `path` | `VARCHAR` | *(required)* | Path to a multi-file `.pfile.json` catalog. Every path inside it resolves **relative to the catalog's own directory** (an absolute path is honored as-is). |
 | `region` | `VARCHAR` | *(none)* | Genomic prune, `'contig:lo-hi'` or a bare `'contig'`. Keeps only shards whose declared `range` could overlap. Valid **only** when `concat_dim = 'variants'`. POS bounds are **inclusive** `[lo, hi]`. |
 | `variant_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the variants axis. Keeps shards whose `partition` overlaps the **inclusive** index predicate `[lo, hi]`. Valid **only** when `concat_dim = 'variants'`. |
 | `sample_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the samples axis, inclusive `[lo, hi]`. Valid **only** when `concat_dim = 'samples'`. |
@@ -59,7 +59,7 @@ off-axis predicate is an error, never a silent whole-cohort return):
 
     When a prune drops shards, the surviving rows keep their **original global**
     `partition_start` / `partition_stop` and `source_ordinal` — this function does **not** rebase the
-    subset to `[0, subset_total)`. (The Python `howard` loader rebases a pruned sub-cohort to a
+    subset to `[0, subset_total)`. (The Python `pfile_catalog` loader rebases a pruned sub-cohort to a
     self-contained `[0, …)` index and warns when it does; the SQL manifest does not.) So after a prune
     the returned ordinals are still positions in the *full* catalog, not a renumbered subset.
 
@@ -88,7 +88,7 @@ that is missing, or an omitted companion whose default file is **truly absent**,
 
 ## Verification (the trust model)
 
-`.howard` bounds are *assertions about foreign files plinking_duck did not write*, so they are checked
+`pfile_catalog` bounds are *assertions about foreign files plinking_duck did not write*, so they are checked
 eagerly at open rather than trusted:
 
 - **Count check** — each surviving shard's `.pgen` header `raw_variant_ct` / `raw_sample_ct` is
@@ -130,31 +130,31 @@ Errors carry distinct, classifiable message prefixes so a caller can tell failur
 
 | Prefix | Class | Exception |
 |--------|-------|-----------|
-| `read_howard_manifest: catalog parse error: …` | Malformed JSON or schema (bad version, missing field, both `pfile` and multi-file keys, duplicate `partition.start`, out-of-range integer) | `InvalidInputException` |
-| `read_howard_manifest: file not found: …` | A referenced catalog / `.pgen` / `.pvar` / `.psam` is missing | `IOException` |
-| `read_howard_manifest: verification failed (count mismatch): …` | A `.pgen` header count disagrees with its companion | `InvalidInputException` |
-| `read_howard_manifest: verification failed (companion unreadable): …` | A companion exists but could not be read (corrupt `.pgen` header, wrong-format `.pvar`/`.psam`) | `InvalidInputException` |
-| `read_howard_manifest: verification failed (range under-claim): …` | A declared `range` does not cover the real `.pvar` extent | `InvalidInputException` |
-| `read_howard_manifest: invalid predicate: …` | Wrong-axis or malformed prune argument | `InvalidInputException` |
+| `read_pfile_catalog: catalog parse error: …` | Malformed JSON or schema (bad version, missing field, both `pfile` and multi-file keys, duplicate `partition.start`, out-of-range integer) | `InvalidInputException` |
+| `read_pfile_catalog: file not found: …` | A referenced catalog / `.pgen` / `.pvar` / `.psam` is missing | `IOException` |
+| `read_pfile_catalog: verification failed (count mismatch): …` | A `.pgen` header count disagrees with its companion | `InvalidInputException` |
+| `read_pfile_catalog: verification failed (companion unreadable): …` | A companion exists but could not be read (corrupt `.pgen` header, wrong-format `.pvar`/`.psam`) | `InvalidInputException` |
+| `read_pfile_catalog: verification failed (range under-claim): …` | A declared `range` does not cover the real `.pvar` extent | `InvalidInputException` |
+| `read_pfile_catalog: invalid predicate: …` | Wrong-axis or malformed prune argument | `InvalidInputException` |
 
 ## Examples
 
 ```sql
 -- One row per shard, with each shard's resolved paths, partition tiling, and range extent.
-SELECT * FROM read_howard_manifest('cohort.howard.json');
+SELECT * FROM read_pfile_catalog('cohort.pfile.json');
 
 -- Genomic prune: only the shards whose range overlaps chr2:1-5Mb survive (and are verified).
-SELECT prefix, pvar FROM read_howard_manifest('cohort.howard.json', region := '2:1-5000000');
+SELECT prefix, pvar FROM read_pfile_catalog('cohort.pfile.json', region := '2:1-5000000');
 
 -- Index prune on the variants axis (inclusive): shards touching variant ordinals 1000..2000.
-SELECT prefix FROM read_howard_manifest('cohort.howard.json', variant_index := [1000, 2000]);
+SELECT prefix FROM read_pfile_catalog('cohort.pfile.json', variant_index := [1000, 2000]);
 
 -- Strict mode for a hand-written catalog: verify every shard's range before pruning.
-SELECT count(*) FROM read_howard_manifest('cohort.howard.json', region := '7:1-1000000', verify_all := true);
+SELECT count(*) FROM read_pfile_catalog('cohort.pfile.json', region := '7:1-1000000', verify_all := true);
 ```
 
 ## See Also
 
-- [`.howard` catalog format](../formats/howard.md) — the format this function reads (schema, boundary law, trust model)
-- [Writing filesets (`COPY … TO`)](write_pfile.md#sharded-output-shard_by) — the sharded writer that emits the `.howard.json` (the write→read partner)
+- [`pfile_catalog` catalog format](../formats/pfile_catalog.md) — the format this function reads (schema, boundary law, trust model)
+- [Writing filesets (`COPY … TO`)](write_pfile.md#sharded-output-shard_by) — the sharded writer that emits the `.pfile.json` (the write→read partner)
 - [`read_pfile`](read_pfile.md) — read a surviving shard's genotypes back

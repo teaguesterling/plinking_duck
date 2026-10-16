@@ -1,7 +1,7 @@
 #include "pfile_writer.hpp"
-#include "plink_common.hpp"   // AlignedBuffer + pgenlib read/misc headers
-#include "howard_catalog.hpp" // shared ShardEntry (the .howard catalog model, also used by the reader)
-#include "duckdb_compat.hpp"  // CompatName / CompatNameStr(ings) — Identifier boundaries on DuckDB v2.0
+#include "plink_common.hpp"  // AlignedBuffer + pgenlib read/misc headers
+#include "pfile_catalog.hpp" // shared ShardEntry (the pfile_catalog catalog model, also used by the reader)
+#include "duckdb_compat.hpp" // CompatName / CompatNameStr(ings) — Identifier boundaries on DuckDB v2.0
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -121,7 +121,7 @@ struct PvarWriteGlobalState : public GlobalFunctionData {
 	int64_t last_pos = 0;
 	std::set<string> seen_chroms;
 
-	// Per-shard POS extent, for the sharded writer's `.howard.json` `range.POS` (§7.4).
+	// Per-shard POS extent, for the sharded writer's `.pfile.json` `range.POS` (§7.4).
 	// `first_pos` is the running MINIMUM POS and `pos_max` the running MAXIMUM, over the
 	// non-null POS values in this shard. These are TRUE min/max (not first-/last-seen), so a
 	// shard that happens to span more than one CHROM still reports a correct — never
@@ -1362,7 +1362,7 @@ struct PfileWriteBindData : public FunctionData {
 
 	//! `shard_by '<col>'` — empty means the plain (single-fileset) bundle. When set, the one
 	//! ordered COPY fans out one pfile per contiguous key value under a hive layout, a single
-	//! shared root `.psam`, and a `.howard.json` catalog (see the sharded block below).
+	//! shared root `.psam`, and a `.pfile.json` catalog (see the sharded block below).
 	string shard_by;
 	idx_t shard_key_input_idx = 0; //! input chunk column index of the shard key
 	string shard_key_header;       //! the key column's name, used as the hive dir label (`<col>=<value>`)
@@ -1485,7 +1485,7 @@ string PfileBaseName(const string &p) {
 
 // ===========================================================================
 // FORMAT pfile + shard_by — the sharded bundle (Phase D): one ordered COPY fans
-// out one pfile per contiguous key value + one shared root .psam + a .howard.json.
+// out one pfile per contiguous key value + one shared root .psam + a .pfile.json.
 //
 //   COPY (SELECT … ORDER BY <col>, POS) TO 'out' (FORMAT pfile, shard_by '<col>');
 //
@@ -1502,12 +1502,12 @@ string PfileBaseName(const string &p) {
 // genome-wide). Layout (the catalog records it, so the reader never parses paths):
 //   out/<col>=<value>/data.pgen   out/<col>=<value>/data.pvar   (per shard)
 //   out.psam        — one shared copy (supersedes "a .psam per shard")
-//   out.howard.json — the catalog, emitted LAST (the completion marker: a shard
+//   out.pfile.json — the catalog, emitted LAST (the completion marker: a shard
 //                     set without a catalog is incomplete-by-construction).
 // ===========================================================================
 
-// One finalized shard's catalog facts → one `files[]` entry in the .howard.json. The struct is
-// shared with the reader (src/include/howard_catalog.hpp, `ShardEntry`): the writer fills relative
+// One finalized shard's catalog facts → one `files[]` entry in the .pfile.json. The struct is
+// shared with the reader (src/include/pfile_catalog.hpp, `ShardEntry`): the writer fills relative
 // paths and leaves `psam` empty (the shared companion lives at the catalog root), and the reader
 // parses the same shape back and resolves the paths. See that header for the field + boundary law.
 
@@ -1553,7 +1553,7 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 	string psam_final;         //! "<dir>/out.psam"
 	string psam_staging;       //! "<dir>/out.psam.staging"
 	string psam_rel;           //! "out.psam", relative to the catalog dir
-	string catalog_path;       //! "<dir>/out.howard.json"
+	string catalog_path;       //! "<dir>/out.pfile.json"
 	string dataset_name;       //! diar dataset name (= shard_dir_basename)
 	FileSystem *fs = nullptr;
 	bool finished = false; //! catalog emitted — destructor must not clean
@@ -1721,7 +1721,7 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 	// The two renames are not atomic as a pair: if the second (.pgen) MoveFile threw, a promoted
 	// .pvar with no .pgen would be left in the shard dir. It is effectively impossible (a same-dir
 	// rename of a just-created .staging file on a local fs) and harmless — PfileShardClose running
-	// at all means we are mid-COPY, so the .howard.json (written only at finalize, after every shard)
+	// at all means we are mid-COPY, so the .pfile.json (written only at finalize, after every shard)
 	// never lands, and the loader keys off the catalog, so it never sees the orphaned .pvar.
 	fs.MoveFile(g.cur_pvar_staging, g.cur_pvar_final);
 	fs.MoveFile(g.cur_pgen_staging, g.cur_pgen_final); // LAST
@@ -1733,13 +1733,13 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 	g.cur_pgen.reset();
 }
 
-// Emit the .howard.json catalog (variant-shards over a shared .psam: concat_dim "variants",
+// Emit the .pfile.json catalog (variant-shards over a shared .psam: concat_dim "variants",
 // shared.psam at the root, one files[] entry per shard). Matches the howard loader's parse_catalog
 // schema (howard/src/howard/core/catalog.py): global half-open partition ordinals tiling [0,total),
 // per-file `pvar` (never a per-file `psam` — that is the shared one), optional `range`.
 void PfileWriteCatalog(PfileShardedGlobalState &g, FileSystem &fs) {
 	string j = "{\n";
-	j += "  \"howard\": 1,\n";
+	j += "  \"pfile_catalog\": 1,\n";
 	j += "  \"dataset\": \"" + JsonEscape(g.dataset_name) + "\",\n";
 	j += "  \"concat_dim\": \"variants\",\n";
 	j += "  \"shared\": { \"psam\": \"" + JsonEscape(g.psam_rel) + "\" },\n";
@@ -1789,7 +1789,7 @@ unique_ptr<GlobalFunctionData> PfileShardedInitGlobal(FileSystem &fs, const Pfil
 	g->psam_final = base + ".psam";
 	g->psam_staging = g->psam_final + ".staging";
 	g->psam_rel = g->shard_dir_basename + ".psam";
-	g->catalog_path = base + ".howard.json";
+	g->catalog_path = base + ".pfile.json";
 	g->dataset_name = g->shard_dir_basename;
 	g->fs = &fs;
 

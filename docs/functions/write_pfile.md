@@ -134,8 +134,8 @@ COPY (SELECT … ORDER BY CHROM, POS) TO 'out' (FORMAT pfile, shard_by 'CHROM');
 
 `shard_by '<col>'` writes **one pfile per contiguous value of `<col>`** — the
 common case is sharding a cohort by chromosome — plus **one shared `.psam`** and a
-**[`.howard.json` catalog](../formats/howard.md)** that
-[`read_howard_manifest`](read_howard_manifest.md) and the Python
+**[`.pfile.json` catalog](../formats/pfile_catalog.md)** that
+[`read_pfile_catalog`](read_pfile_catalog.md) and the Python
 [howard](https://github.com/teaguesterling/howard) loader read back as a single
 concatenated dataset. The layout is:
 
@@ -143,7 +143,7 @@ concatenated dataset. The layout is:
 out/<col>=<value>/data.pgen      # one fileset per shard (hive-style dir)
 out/<col>=<value>/data.pvar
 out.psam                         # ONE shared .psam (same samples across all shards)
-out.howard.json                  # the catalog — written LAST, the completion marker
+out.pfile.json                  # the catalog — written LAST, the completion marker
 ```
 
 The single ordered `COPY` rolls shards in the sink: on a `<col>` transition it
@@ -164,7 +164,7 @@ partition column).
   not genome-wide), so the default is almost always enough even for whole-genome
   input.
 - **The catalog is the completion marker.** It is emitted only after every shard
-  and the shared `.psam` are durable. A mid-run failure leaves no `.howard.json`
+  and the shared `.psam` are durable. A mid-run failure leaves no `.pfile.json`
   and no `.staging` residue; shards that already closed before the failure remain
   on disk, but without the catalog the set reads as incomplete-by-construction.
 - **`shard_by` cannot be combined with `pvar`/`pgen`/`psam` path overrides** (the
@@ -172,7 +172,7 @@ partition column).
   variant column (not the genotypes column). The whole tree is **local-only**, as
   with the non-sharded bundle.
 
-The emitted `.howard.json` records, per shard, the global half-open `[start, stop)`
+The emitted `.pfile.json` records, per shard, the global half-open `[start, stop)`
 variant-ordinal `partition` (tiling `[0, total)`), the shard's own `pvar`, and a
 `range` of the covered `CHROM`(s) + `POS` min/max (a pruning stat the writer fills
 for free as it streams). The shared `.psam` is referenced once under `shared.psam`.
@@ -188,7 +188,7 @@ for free as it streams). The shared `.psam` is referenced once under `shared.psa
     **different** set of keys leaves the prior run's orphaned shard directories on
     disk — the writer deliberately does **not** delete directories on the target
     (auto-deletion on a target is exactly where data-loss bugs live). The
-    `.howard.json` catalog governs what is loaded (the loader never globs), so this
+    `.pfile.json` catalog governs what is loaded (the loader never globs), so this
     is **not** a correctness issue for catalog-driven reads. But a consumer that
     globs `out/<col>=*/…` *outside* the catalog would see the stale filesets, and a
     stale shard could pair with a changed shared `.psam`. If you rely on globbing
@@ -325,8 +325,8 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
 
 ## See Also
 
-- [`.howard` catalog format](../formats/howard.md) — the catalog the sharded writer emits (schema, boundary law, trust model)
-- [read_howard_manifest](read_howard_manifest.md) — read the emitted `.howard.json` back in SQL
+- [`pfile_catalog` catalog format](../formats/pfile_catalog.md) — the catalog the sharded writer emits (schema, boundary law, trust model)
+- [read_pfile_catalog](read_pfile_catalog.md) — read the emitted `.pfile.json` back in SQL
 - [read_pfile](read_pfile.md) — read a fileset back (the round-trip partner)
 - [read_pvar](read_pvar.md) · [read_pgen](read_pgen.md) · [read_psam](read_psam.md)
 - [File Handling](../guides/file-handling.md#writing-filesets) — where writing fits

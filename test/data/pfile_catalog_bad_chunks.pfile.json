@@ -1,5 +1,5 @@
 {
-  "howard": 1,
+  "pfile_catalog": 1,
   "dataset": "bc",
   "pfile": { "prefix": "large_example" },
   "chunks": { "dim": "samples" }

@@ -1,5 +1,5 @@
-# name: test/sql/read_howard_manifest_companions.test
-# description: read_howard_manifest — OMITTED-companion verify: a missing default companion is a
+# name: test/sql/read_pfile_catalog_companions.test
+# description: read_pfile_catalog — OMITTED-companion verify: a missing default companion is a
 # group: [sql]
 
 #   MISSING FILE (file not found → CatalogError), not an unreadable one (→ AlignmentError); and an
@@ -26,17 +26,17 @@ COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct')
 TO '__TEST_DIR__/missing_pvar' (FORMAT pfile, pvar '__TEST_DIR__/missing_pvar_throwaway.pvar');
 
 statement ok
-COPY (SELECT '{"howard": 1, "dataset": "wes_missing_pvar", "pfile": {"prefix": "missing_pvar"}}' AS j)
-TO '__TEST_DIR__/missing_pvar.howard.json' (FORMAT csv, HEADER false, QUOTE '');
+COPY (SELECT '{"pfile_catalog": 1, "dataset": "wes_missing_pvar", "pfile": {"prefix": "missing_pvar"}}' AS j)
+TO '__TEST_DIR__/missing_pvar.pfile.json' (FORMAT csv, HEADER false, QUOTE '');
 
 statement error
-SELECT * FROM read_howard_manifest('__TEST_DIR__/missing_pvar.howard.json');
+SELECT * FROM read_pfile_catalog('__TEST_DIR__/missing_pvar.pfile.json');
 ----
 file not found
 
 # The same must NOT regress into a count-mismatch or companion-unreadable message.
 statement error
-SELECT * FROM read_howard_manifest('__TEST_DIR__/missing_pvar.howard.json');
+SELECT * FROM read_pfile_catalog('__TEST_DIR__/missing_pvar.pfile.json');
 ----
 file not found: .pvar
 
@@ -58,13 +58,13 @@ COPY (SELECT * FROM read_pvar('test/data/large_example.pvar'))
 TO '__TEST_DIR__/pq_shard.pvar.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT '{"howard": 1, "dataset": "pq", "pfile": {"prefix": "pq_shard"}}' AS j)
-TO '__TEST_DIR__/pq_shard.howard.json' (FORMAT csv, HEADER false, QUOTE '');
+COPY (SELECT '{"pfile_catalog": 1, "dataset": "pq", "pfile": {"prefix": "pq_shard"}}' AS j)
+TO '__TEST_DIR__/pq_shard.pfile.json' (FORMAT csv, HEADER false, QUOTE '');
 
 # Verifies (no error) and the extent is read from the parquet sidecar.
 query IIITIIT
 SELECT partition_start, partition_stop, source_ordinal, array_to_string(chrom, ','), pos_min, pos_max, verified
-FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
+FROM read_pfile_catalog('__TEST_DIR__/pq_shard.pfile.json');
 ----
 0	3000	0	1,2,3	100	100000	true
 
@@ -73,7 +73,7 @@ FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
 # companion to the text `.psam` the bundle wrote. concat_dim is NULL (single-fileset).
 query TTT
 SELECT concat_dim, ends_with(pvar, 'pq_shard.pvar.parquet'), ends_with(psam, 'pq_shard.psam')
-FROM read_howard_manifest('__TEST_DIR__/pq_shard.howard.json');
+FROM read_pfile_catalog('__TEST_DIR__/pq_shard.pfile.json');
 ----
 NULL	true	true
 
@@ -93,14 +93,14 @@ COPY (SELECT * FROM read_psam('test/data/large_example.psam'))
 TO '__TEST_DIR__/pqsam_shard.psam.parquet' (FORMAT parquet);
 
 statement ok
-COPY (SELECT '{"howard": 1, "dataset": "pqsam", "pfile": {"prefix": "pqsam_shard"}}' AS j)
-TO '__TEST_DIR__/pqsam_shard.howard.json' (FORMAT csv, HEADER false, QUOTE '');
+COPY (SELECT '{"pfile_catalog": 1, "dataset": "pqsam", "pfile": {"prefix": "pqsam_shard"}}' AS j)
+TO '__TEST_DIR__/pqsam_shard.pfile.json' (FORMAT csv, HEADER false, QUOTE '');
 
 # The count check passes (probe reads the .psam.parquet sidecar) and the fileset enriches to 3000
 # variants. The omitted psam is emitted as the RESOLVED `.psam.parquet` sidecar path, the omitted pvar
 # as the text `.pvar` the bundle wrote — each the exact file read_pfile would open.
 query ITTT
 SELECT partition_stop, verified, ends_with(pvar, 'pqsam_shard.pvar'), ends_with(psam, 'pqsam_shard.psam.parquet')
-FROM read_howard_manifest('__TEST_DIR__/pqsam_shard.howard.json');
+FROM read_pfile_catalog('__TEST_DIR__/pqsam_shard.pfile.json');
 ----
 3000	true	true	true

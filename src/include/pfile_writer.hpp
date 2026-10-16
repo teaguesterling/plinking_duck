@@ -22,8 +22,8 @@ class ExtensionLoader;
 //!   * `COPY (query) TO 'out' (FORMAT pfile, shard_by '<col>')` — the sharded
 //!     bundle (Phase D): one ordered COPY fans out one pfile per contiguous key
 //!     value under a hive layout (out/<col>=<value>/data.{pgen,pvar}), ONE shared
-//!     root `out.psam`, and an `out.howard.json` catalog (emitted last) read back
-//!     by howard's `.howard` loader. Input must be sorted so each key is contiguous.
+//!     root `out.psam`, and an `out.pfile.json` catalog (emitted last) read back
+//!     by howard's `pfile_catalog` loader. Input must be sorted so each key is contiguous.
 void RegisterPfileWriter(ExtensionLoader &loader);
 
 } // namespace duckdb

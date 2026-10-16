@@ -81,14 +81,14 @@ Special missing value conventions:
 - `0` in SEX means unknown sex (mapped to NULL)
 - `-9` in PHENO1 is left as the string `"-9"` (not mapped to NULL, since this is a PLINK-specific convention)
 
-## `.howard` Catalogs
+## `pfile_catalog` Catalogs
 
-A `.howard.json` (or `.pfile.json`) is a thin JSON catalog **over** one or more
+A `.pfile.json` is a thin JSON catalog **over** one or more
 filesets — it stores no genotypes, only references to the `.pgen`/`.pvar`/`.psam`
 files above plus the metadata to assemble them into one dataset. PlinkingDuck writes
 it (the sharded [`COPY … (FORMAT pfile, shard_by …)`](functions/write_pfile.md#sharded-output-shard_by)
-writer) and reads it ([`read_howard_manifest`](functions/read_howard_manifest.md)).
-See the [**`.howard` catalog format reference**](formats/howard.md) for the full
+writer) and reads it ([`read_pfile_catalog`](functions/read_pfile_catalog.md)).
+See the [**`pfile_catalog` catalog format reference**](formats/pfile_catalog.md) for the full
 schema, boundary law, and trust model.
 
 ## VCF Files

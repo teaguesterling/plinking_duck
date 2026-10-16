@@ -39,11 +39,11 @@ FROM duckdb_functions()
 WHERE function_name = 'plinking_duck_capabilities';
 ```
 
-If `has_capability_surface` is false, treat the build as capability-less and fall back. This two-step shape (catalog read, then — only if present — evaluate) is exactly how the `ducks_in_a_row`/`howard` consumers detect PlinkingDuck features at rewrite time.
+If `has_capability_surface` is false, treat the build as capability-less and fall back. This two-step shape (catalog read, then — only if present — evaluate) is exactly how the `ducks_in_a_row`/`pfile_catalog` consumers detect PlinkingDuck features at rewrite time.
 
 ## Optional: behavioral probing via scalarfs (third-party pattern)
 
-> This is an **optional** pattern for a third party; the PlinkingDuck readers do not depend on it, and neither do `ducks_in_a_row`/`howard`. `scalarfs` is **not** a dependency.
+> This is an **optional** pattern for a third party; the PlinkingDuck readers do not depend on it, and neither do `ducks_in_a_row`/`pfile_catalog`. `scalarfs` is **not** a dependency.
 
 When a build is old enough to lack `plinking_duck_capabilities()`, a consumer can still probe a capability *behaviorally* — hermetically, in SQL, with no temp file — if the [`scalarfs`](https://github.com/teaguesterling/duckdb_scalarfs) extension is also loaded. PlinkingDuck's readers go through DuckDB's **FileSystem**, so a scalarfs inline-content protocol (which serves a literal payload where a path is expected) can stand in for a file path. Schematically — pass an inline `.pvar` literal to a reader and ask for the feature:
 

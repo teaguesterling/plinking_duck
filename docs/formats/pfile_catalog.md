@@ -1,23 +1,23 @@
-# The `.howard` catalog format
+# The `pfile_catalog` catalog format
 
-`.howard` is a small, human-editable **JSON catalog** layered on top of **existing**
+`pfile_catalog` is a small, human-editable **JSON catalog** layered on top of **existing**
 PLINK 2 filesets. It stores no genotype data of its own — it references `.pgen` /
 `.pvar` / `.psam` files that already exist and records just enough metadata to
 assemble them into one logical dataset: which files make up a cohort, how they
 concatenate, and (for pruning) the genomic extent of each shard.
 
-PlinkingDuck both **writes** `.howard` (the sharded [`COPY … (FORMAT pfile, shard_by …)`](../functions/write_pfile.md#sharded-output-shard_by)
+PlinkingDuck both **writes** `pfile_catalog` (the sharded [`COPY … (FORMAT pfile, shard_by …)`](../functions/write_pfile.md#sharded-output-shard_by)
 writer emits one as its output manifest) and **reads** it back
-([`read_howard_manifest`](../functions/read_howard_manifest.md) parses, verifies,
+([`read_pfile_catalog`](../functions/read_pfile_catalog.md) parses, verifies,
 and prunes it) — closing the write→read loop. The Python
-[howard](https://github.com/teaguesterling/howard) library also reads `.howard` to
+[howard](https://github.com/teaguesterling/howard) library also reads `pfile_catalog` to
 register a cohort as a diar dataset; the format is its design, and this page
 documents the subset PlinkingDuck implements.
 
 !!! note "Why a catalog, not a new store"
 
     VCF-Zarr, Hail MatrixTable, and TileDB all **re-store** the genotype data in a
-    new on-disk form. `.howard` deliberately does not: the canonical artifacts stay
+    new on-disk form. `pfile_catalog` deliberately does not: the canonical artifacts stay
     the foreign `.pgen`/`.pvar`/`.psam` files, and the catalog is a thin
     serialization pointing at them. JSON was chosen because DuckDB reads it
     natively (`read_json`), so the catalog is itself a queryable relation — the
@@ -26,7 +26,7 @@ documents the subset PlinkingDuck implements.
 ## What it is for
 
 A single `read_pfile('cohort', pvar := …, psam := …)` already handles one fileset
-with companion overrides. `.howard` earns its keep on the **multi-file shard case**
+with companion overrides. `pfile_catalog` earns its keep on the **multi-file shard case**
 that SQL has no syntax for: several `.pgen` that **share** one `.pvar` or one
 `.psam`, concatenated along an axis, each annotated with the global ordinal range
 it occupies and the genomic range it covers. That annotation is what lets a query
@@ -34,17 +34,19 @@ skip shards it cannot touch without opening their `.pgen` at all (see
 [Partition and range](#partition-and-range)).
 
 The single-fileset case is in scope too, as declarative capture — it is barely more
-than a written-down `read_pfile(…)`, but it gives `.howard` one shape for both.
+than a written-down `read_pfile(…)`, but it gives `pfile_catalog` one shape for both.
 
-## Discovery: two spellings
+## One extension, two shapes
 
-Both are JSON and parse with the same reader; the extension is a discovery hint,
-not a different format.
+A pfile catalog always uses the **`.pfile.json`** extension, whether it indexes a
+single fileset or a sharded cohort. The shape is discriminated by the catalog's own
+top-level keys, not by the file name — the reader routes on the presence of a
+`pfile` key vs `files`/`concat_dim` (and rejects a catalog that declares both):
 
-| Spelling | Use |
-|----------|-----|
-| **`*.howard.json`** | A **multi-file** cohort (one dataset assembled from several `.pgen`), e.g. `cohort.howard.json`. This is what the sharded writer emits. |
-| **`*.pfile.json`** | A **single-fileset** sidecar sitting beside one fileset, e.g. `cohort.pfile.json` next to `cohort.{pgen,pvar,psam}`. |
+| Shape | How it reads | Use |
+|-------|--------------|-----|
+| **multi-file** | has `concat_dim` + `shared` + `files` | A **multi-file** cohort (one dataset assembled from several `.pgen`), e.g. `cohort.pfile.json`. This is what the sharded writer emits. |
+| **single-fileset** | has `pfile` | A **single-fileset** sidecar sitting beside one fileset, e.g. `cohort.pfile.json` next to `cohort.{pgen,pvar,psam}`. |
 
 A catalog describes **exactly one dataset**. Grouping several datasets into one
 catalog file is out of scope.
@@ -56,7 +58,7 @@ the **single-fileset** form (`pfile`), never both.
 
 | Field | Where | Meaning |
 |-------|-------|---------|
-| `howard` | top | Format version integer. Must be `1`. |
+| `pfile_catalog` | top | Format version integer. Must be `1`. |
 | `dataset` | top | The dataset name. |
 | `concat_dim` | multi-file | `"variants"` (shards share one `.psam`) or `"samples"` (shards share one `.pvar`) — the axis the shards concatenate on. |
 | `shared` | multi-file | The reused companion: `{ "psam": … }` for variant-shards, `{ "pvar": … }` for sample-shards. |
@@ -77,7 +79,7 @@ opt-out or a column name-map is needed.
 
 Every `prefix` and companion path resolves **relative to the catalog file's own
 directory** by default — so a catalog moves together with its files: copy the
-`.howard.json` and the filesets as a set and the references still resolve. An
+`.pfile.json` and the filesets as a set and the references still resolve. An
 **absolute path is honored as-is.** On a companion **object**,
 `"path_is_relative": false` opts that one path out of relative resolution.
 
@@ -105,7 +107,7 @@ by a text-only `read_pvar('<prefix>.pvar')`). Verification is parquet-aware: the
 checks read the resolved companion natively. A companion that resolves to **nothing** (no declared
 file, no discoverable default) raises `file not found`.
 
-### Example — a variant-sharded cohort (`cohort.howard.json`)
+### Example — a variant-sharded cohort (`cohort.pfile.json`)
 
 Three `.pgen`, 8 shared samples, one shared `.psam`, concatenated along `variants`,
 one contig per shard. This is the **actual output** of
@@ -114,7 +116,7 @@ one contig per shard. This is the **actual output** of
 
 ```json
 {
-  "howard": 1,
+  "pfile_catalog": 1,
   "dataset": "cohort",
   "concat_dim": "variants",
   "shared": { "psam": "cohort.psam" },
@@ -153,7 +155,7 @@ concatenated along `samples`. Each shard carries its own `.psam`:
 
 ```json
 {
-  "howard": 1,
+  "pfile_catalog": 1,
   "dataset": "cohort",
   "concat_dim": "samples",
   "shared": { "pvar": "data/cohort.pvar" },
@@ -181,14 +183,14 @@ are identical across sample-shards — so sample-shards prune on `sample_index` 
 
     The sharded `COPY … shard_by` writer produces the **variant-sharded** form
     (a shared `.psam`, `concat_dim: "variants"`). The sample-sharded form is a valid
-    catalog that `read_howard_manifest` reads, but writing it is a separate
+    catalog that `read_pfile_catalog` reads, but writing it is a separate
     follow-on.
 
 ### Example — a single fileset (`cohort.pfile.json`)
 
 ```json
 {
-  "howard": 1,
+  "pfile_catalog": 1,
   "dataset": "wes_single",
   "pfile": { "prefix": "large_example" },
   "chunks": { "dim": "variants", "chunk_size": 1000 }
@@ -259,7 +261,7 @@ and is **never** wrongly dropped (a conservative keep).
 
 ## Trust model
 
-`.howard` bounds are **assertions about foreign files** PlinkingDuck did not write —
+`pfile_catalog` bounds are **assertions about foreign files** PlinkingDuck did not write —
 a `.pgen`/`.pvar` can be swapped, truncated, or re-sorted out from under the catalog.
 A stale bound would then cause a shard to be **wrongly skipped** (a correctness bug,
 not just a slow query). So, unlike Hail's constructive partition invariants, these
@@ -275,10 +277,10 @@ bounds are **verified, never assumed**:
 By default only the **survivors** of a prune are verified. `verify_all := true`
 checks every shard before pruning, closing the hole where an under-claiming range on
 a shard that was *itself* dropped would never be opened. See
-[`read_howard_manifest`](../functions/read_howard_manifest.md#verification-the-trust-model)
+[`read_pfile_catalog`](../functions/read_pfile_catalog.md#verification-the-trust-model)
 for the full behavior.
 
-## Producing a `.howard`
+## Producing a `pfile_catalog`
 
 The sharded pfile writer emits one as its output manifest:
 
@@ -289,43 +291,43 @@ TO 'cohort' (FORMAT pfile, shard_by 'CHROM');
 
 This writes one fileset per contiguous `CHROM` value under a hive layout
 (`cohort/CHROM=<value>/data.{pgen,pvar}`), **one** shared `cohort.psam`, and
-`cohort.howard.json` **last** — the catalog is the completion marker, so a
+`cohort.pfile.json` **last** — the catalog is the completion marker, so a
 mid-run failure leaves no catalog and the shard set reads as
 incomplete-by-construction. The writer fills each shard's `range` for free as it
 streams the data. See [Writing filesets](../functions/write_pfile.md#sharded-output-shard_by)
 for the full layout, contract, and limitations.
 
-## Consuming a `.howard`
+## Consuming a `pfile_catalog`
 
-In SQL, [`read_howard_manifest`](../functions/read_howard_manifest.md) parses,
+In SQL, [`read_pfile_catalog`](../functions/read_pfile_catalog.md) parses,
 verifies, and prunes the catalog, returning one row per surviving shard:
 
 ```sql
 -- Every shard, with resolved paths, partition tiling, and range extent.
-SELECT * FROM read_howard_manifest('cohort.howard.json');
+SELECT * FROM read_pfile_catalog('cohort.pfile.json');
 
 -- Genomic prune: only the shards whose range overlaps chr2:1-5Mb (and verify them).
-SELECT prefix, pvar FROM read_howard_manifest('cohort.howard.json', region := '2:1-5000000');
+SELECT prefix, pvar FROM read_pfile_catalog('cohort.pfile.json', region := '2:1-5000000');
 ```
 
 This is the **manifest** surface (Phase A): it resolves *which* shards a query needs
 and vouches for them. It does not itself scan genotypes or `ATTACH` — a consumer
 reads each surviving shard with [`read_pfile`](../functions/read_pfile.md), using the
 resolved `prefix` and the shared companion the manifest reports. The Python
-`howard` library consumes the same catalog to register the cohort as a single
+`pfile_catalog` library consumes the same catalog to register the cohort as a single
 concatenated diar dataset.
 
 ## What PlinkingDuck validates — and what it leaves to the loader
 
 PlinkingDuck's reader is a *manifest* over the catalog, not the full dataset loader.
 It deliberately checks less than the end-to-end howard loader does, so a catalog that
-passes `read_howard_manifest` is not guaranteed to be a complete, gapless cohort:
+passes `read_pfile_catalog` is not guaranteed to be a complete, gapless cohort:
 
 - **Per-shard checks only.** The reader validates each shard's `partition` width
   (`stop > start`), rejects a duplicate `partition.start`, and sorts shards by
   `start`. It does **not** check the cross-shard `[0, total)` tiling (no-gap /
   no-overlap contiguity) — that stays in the howard loader, which owns registration.
-- **No index rebasing.** When a prune drops shards, `read_howard_manifest` returns
+- **No index rebasing.** When a prune drops shards, `read_pfile_catalog` returns
   the survivors with their **original global** `partition_start`/`stop` and
   `source_ordinal` — it does not rebase the subset to `[0, subset_total)`. (The
   howard Python loader does rebase, and warns when it does; the SQL manifest does
@@ -343,7 +345,7 @@ passes `read_howard_manifest` is not guaranteed to be a complete, gapless cohort
 
 ## See also
 
-- [`read_howard_manifest`](../functions/read_howard_manifest.md) — read, verify, and prune a catalog in SQL
+- [`read_pfile_catalog`](../functions/read_pfile_catalog.md) — read, verify, and prune a catalog in SQL
 - [Writing filesets (`COPY … TO`)](../functions/write_pfile.md#sharded-output-shard_by) — emit a catalog with the sharded writer
 - [`read_pfile`](../functions/read_pfile.md) — read a single fileset (how a surviving shard is scanned)
 - [File Formats](../file-formats.md) — the underlying `.pgen` / `.pvar` / `.psam` fileset

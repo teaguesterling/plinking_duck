@@ -3,7 +3,7 @@
 # group: [sql]
 
 #   one pfile per contiguous key value under a hive layout, ONE shared root .psam, and a
-#   .howard.json catalog emitted LAST (the write↔read loop with howard's .howard loader).
+#   .pfile.json catalog emitted LAST (the write↔read loop with howard's pfile_catalog loader).
 
 require plinking_duck
 
@@ -11,7 +11,7 @@ require plinking_duck
 # HEADLINE — shard pfile_example by CHROM. pfile_example has CHROM 1 (3 variants:
 # POS 10000/20000/30000) + CHROM 2 (1 variant: POS 15000), 4 samples. shard_by
 # 'CHROM' → 2 shards (CHROM=1 with 3 variants, CHROM=2 with 1), one shared root
-# .psam, one out.howard.json. The STRUCT stream carries the IIDs (identity contract).
+# .psam, one out.pfile.json. The STRUCT stream carries the IIDs (identity contract).
 # ===========================================================================
 
 statement ok
@@ -32,7 +32,7 @@ SELECT count(*) FROM glob('__TEST_DIR__/out/CHROM=2/data.*');
 # Exactly one shared .psam and one catalog at the root (next to the out/ tree).
 query II
 SELECT (SELECT count(*) FROM glob('__TEST_DIR__/out.psam')),
-       (SELECT count(*) FROM glob('__TEST_DIR__/out.howard.json'));
+       (SELECT count(*) FROM glob('__TEST_DIR__/out.pfile.json'));
 ----
 1	1
 
@@ -46,7 +46,7 @@ SAMPLE3
 SAMPLE4
 
 # ===========================================================================
-# CATALOG (.howard.json) — §7 schema. Assert via decode(read_blob) substrings:
+# CATALOG (.pfile.json) — §7 schema. Assert via decode(read_blob) substrings:
 # the BLOB::VARCHAR cast escapes bytes, so decode() is used to get clean text.
 # (The structured/semantic cross-check is howard's parse_catalog, run out of band.)
 # ===========================================================================
@@ -54,8 +54,8 @@ SAMPLE4
 # Top-level + shared + both files' prefix/pvar + partition tiling + range (CHROM + POS min/max).
 # The two partitions tile [0,4): [0,3) then [3,4), global half-open ordinals (spec §6).
 query I
-SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/out.howard.json'))
-WHERE contains(c, '"howard": 1')
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/out.pfile.json'))
+WHERE contains(c, '"pfile_catalog": 1')
   AND contains(c, '"dataset": "out"')
   AND contains(c, '"concat_dim": "variants"')
   AND contains(c, '"shared": { "psam": "out.psam" }')
@@ -72,7 +72,7 @@ WHERE contains(c, '"howard": 1')
 
 # A per-file `psam` must NEVER appear (that is the shared one; the loader rejects a per-file psam).
 query I
-SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/out.howard.json'))
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/out.pfile.json'))
 WHERE contains(c, '"psam":') AND NOT contains(c, '"shared": { "psam":');
 ----
 0
@@ -174,7 +174,7 @@ SELECT count(*) FROM read_psam('__TEST_DIR__/big.psam');
 
 # 3 shards tiling [0,3000) with no gap/overlap, 1000 variants each, source_ordinal 0/1/2.
 query I
-SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/big.howard.json'))
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/big.pfile.json'))
 WHERE contains(c, '"partition": { "start": 0, "stop": 1000, "source_ordinal": 0 }')
   AND contains(c, '"partition": { "start": 1000, "stop": 2000, "source_ordinal": 1 }')
   AND contains(c, '"partition": { "start": 2000, "stop": 3000, "source_ordinal": 2 }')
@@ -223,7 +223,7 @@ reappears
 
 # No catalog was written (incomplete-by-construction).
 query I
-SELECT count(*) FROM glob('__TEST_DIR__/uns.howard.json');
+SELECT count(*) FROM glob('__TEST_DIR__/uns.pfile.json');
 ----
 0
 
@@ -347,7 +347,7 @@ SELECT count(*) FROM glob('__TEST_DIR__/u_ok/grp=pop-A_1/data.*');
 
 # ===========================================================================
 # ATOMICITY / CLEANUP — a mid-run failure in shard 2 (a bad genotype on the CHROM=2 variant)
-# leaves NO .howard.json (catalog-last) and NO .staging. The shared .psam is NOT promoted
+# leaves NO .pfile.json (catalog-last) and NO .staging. The shared .psam is NOT promoted
 # (finalize never ran). The already-closed shard 1 .pgen/.pvar are durable — so without a
 # catalog AND without the shared .psam the set reads as incomplete, the intended semantics.
 # ===========================================================================
@@ -368,7 +368,7 @@ SELECT count(*) FROM glob('__TEST_DIR__/atom/CHROM=1/data.*');
 
 # No catalog, no promoted shared .psam, no .staging anywhere — the completion markers never landed.
 query I
-SELECT (SELECT count(*) FROM glob('__TEST_DIR__/atom.howard.json'))
+SELECT (SELECT count(*) FROM glob('__TEST_DIR__/atom.pfile.json'))
      + (SELECT count(*) FROM glob('__TEST_DIR__/atom.psam'))
      + (SELECT count(*) FROM glob('__TEST_DIR__/atom.*.staging'))
      + (SELECT count(*) FROM glob('__TEST_DIR__/atom/CHROM=*/data.*.staging'));

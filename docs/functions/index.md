@@ -11,7 +11,7 @@ PlinkingDuck provides 13 core SQL table functions: 6 file readers and 7 analysis
 | [`read_pgen(path)`](read_pgen.md) | `.pgen` | Binary genotypes as `ARRAY(TINYINT, N)` |
 | [`read_pfile(prefix)`](read_pfile.md) | `.pgen` + `.pvar` + `.psam` (single or list) | Complete fileset with orient mode support |
 | [`read_plink_vcf(path)`](read_plink_vcf.md) | `.vcf` / `.vcf.gz` | Fast biallelic genotype extraction from VCF |
-| [`read_howard_manifest(path)`](read_howard_manifest.md) | `.howard.json` catalog | One row per surviving shard of a sharded pfile set (verify + prune) |
+| [`read_pfile_catalog(path)`](read_pfile_catalog.md) | `.pfile.json` catalog | One row per surviving shard of a sharded pfile set (verify + prune) |
 
 ## Analysis Functions
 
@@ -60,8 +60,8 @@ local-only / atomic-overwrite behavior, and the current limitations (biallelic
 hardcalls only).
 
 The writer can also **shard** a cohort into one fileset per key with `shard_by`,
-emitting a [`.howard.json` catalog](../formats/howard.md) that
-[`read_howard_manifest`](read_howard_manifest.md) reads back as a single logical
+emitting a [`.pfile.json` catalog](../formats/pfile_catalog.md) that
+[`read_pfile_catalog`](read_pfile_catalog.md) reads back as a single logical
 dataset — see [Writing filesets](write_pfile.md#sharded-output-shard_by).
 
 ## Common Features

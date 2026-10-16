@@ -42,7 +42,7 @@ nav:
   - Tutorial: tutorial.md
   - File Formats: file-formats.md
   - Format reference:
-      - .howard catalog: formats/howard.md
+      - pfile_catalog catalog: formats/pfile_catalog.md
   - Genotype Encoding: genotype-encoding.md
   - Common Parameters: common-parameters.md
   - Functions:
@@ -52,7 +52,7 @@ nav:
       - read_pgen: functions/read_pgen.md
       - read_pfile: functions/read_pfile.md
       - read_plink_vcf: functions/read_plink_vcf.md
-      - read_howard_manifest: functions/read_howard_manifest.md
+      - read_pfile_catalog: functions/read_pfile_catalog.md
       - Writing filesets (COPY TO): functions/write_pfile.md
       - plink_freq: functions/plink_freq.md
       - plink_hardy: functions/plink_hardy.md
