@@ -1,5 +1,7 @@
 #include "plinking_capabilities.hpp"
 #include "register_helper.hpp"
+#include "duckdb_compat.hpp" // DUCKDB_SCALAR_BIND_*, CompatExprBindInfo, CompatReferenceConstant, CompatMakeName
+#include "named_parameter_compat.hpp" // TableFunctionDeclaresParam, CompatDerefTableFunction
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -85,8 +87,18 @@ const vector<string> &FunctionCapabilities() {
 }
 
 optional_ptr<TableFunctionCatalogEntry> LookupTableFunction(ClientContext &context, const string &name) {
-	return Catalog::GetEntry<TableFunctionCatalogEntry>(context, INVALID_CATALOG, DEFAULT_SCHEMA, name,
-	                                                    OnEntryNotFound::RETURN_NULL);
+	// v2.0 dropped the typed Catalog::GetEntry<T>(catalog, schema, name, ...) template.
+	// Use the non-throwing instance form on the system catalog (where extension table
+	// functions live) and check the type ourselves — the type-arg form does not filter
+	// by type reliably (see duckdb_func_apply's note). CompatMakeName gives a string on
+	// v1.5 / an Identifier on v2.0 for the name argument.
+	auto &system_catalog = Catalog::GetSystemCatalog(context);
+	auto entry = system_catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, DEFAULT_SCHEMA,
+	                                     CompatMakeName(name), OnEntryNotFound::RETURN_NULL);
+	if (!entry || entry->type != CatalogType::TABLE_FUNCTION_ENTRY) {
+		return nullptr;
+	}
+	return &entry->Cast<TableFunctionCatalogEntry>();
 }
 
 // True iff `reader` is registered AND EVERY overload exposes a named parameter
@@ -100,7 +112,9 @@ bool ReaderHasParam(ClientContext &context, const string &reader, const string &
 		return false;
 	}
 	for (auto &fn : entry->functions.functions) {
-		if (fn.named_parameters.find(param) == fn.named_parameters.end()) {
+		// v2.0 holds declared params as typed kwargs on the signature (not a flat map),
+		// and the overload list is shared_ptr<const TableFunction> rather than by value.
+		if (!TableFunctionDeclaresParam(CompatDerefTableFunction(fn), param)) {
 			return false;
 		}
 	}
@@ -144,13 +158,16 @@ struct CapabilitiesBindData : public FunctionData {
 	}
 };
 
-unique_ptr<FunctionData> CapabilitiesBind(ClientContext &context, ScalarFunction &, vector<unique_ptr<Expression>> &) {
-	return make_uniq<CapabilitiesBindData>(ComputeCapabilities(context));
+// v2.0 collapsed the scalar bind signature into BindScalarFunctionInput& — see the
+// DUCKDB_SCALAR_BIND_* macros in duckdb_compat.hpp.
+unique_ptr<FunctionData> CapabilitiesBind(DUCKDB_SCALAR_BIND_PARAMS) {
+	return make_uniq<CapabilitiesBindData>(ComputeCapabilities(DUCKDB_SCALAR_BIND_CONTEXT));
 }
 
-void CapabilitiesFunc(DataChunk &, ExpressionState &state, Vector &result) {
+void CapabilitiesFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind_data = func_expr.bind_info->Cast<CapabilitiesBindData>();
+	// v2.0 made BoundFunctionExpression::bind_info private (reached via BindInfo()).
+	auto &bind_data = CompatExprBindInfo(func_expr).Cast<CapabilitiesBindData>();
 
 	vector<Value> elems;
 	elems.reserve(bind_data.tokens.size());
@@ -158,7 +175,8 @@ void CapabilitiesFunc(DataChunk &, ExpressionState &state, Vector &result) {
 		elems.emplace_back(Value(tok));
 	}
 	// The result is constant for the whole build; broadcast one constant value.
-	result.Reference(Value::LIST(LogicalType::VARCHAR, std::move(elems)));
+	// v2.0's Vector::Reference(Value) requires an explicit row count.
+	CompatReferenceConstant(result, Value::LIST(LogicalType::VARCHAR, std::move(elems)), args.size());
 }
 
 } // namespace

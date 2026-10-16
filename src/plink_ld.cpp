@@ -13,6 +13,7 @@
 #include "plink_ld.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -1424,23 +1425,21 @@ void RegisterPlinkLd(ExtensionLoader &loader) {
 	TableFunction plink_ld("plink_ld", {LogicalType::VARCHAR}, PlinkLdScan, PlinkLdBind, PlinkLdInitGlobal,
 	                       PlinkLdInitLocal);
 
-	plink_ld.named_parameters["pvar"] = LogicalType::VARCHAR;
-	plink_ld.named_parameters["psam"] = LogicalType::VARCHAR;
-	plink_ld.named_parameters["variant1"] = LogicalType::VARCHAR;
-	plink_ld.named_parameters["variant2"] = LogicalType::VARCHAR;
-	plink_ld.named_parameters["window_kb"] = LogicalType::INTEGER;
-	plink_ld.named_parameters["r2_threshold"] = LogicalType::DOUBLE;
-	plink_ld.named_parameters["region"] = LogicalType::VARCHAR;
-	plink_ld.named_parameters["samples"] = LogicalType::ANY;
-	// Composable selection: a STRUCT seeding the SAMPLE axis only. plink_ld routes
-	// just its sample axis through the handler; a variant-axis field (region /
-	// variants / variant_range) inside `selection` is REJECTED (its region grammar
-	// differs). Use the individual `region :=` param for LD region selection.
-	plink_ld.named_parameters["selection"] = LogicalType::ANY;
-	plink_ld.named_parameters["inter_chr"] = LogicalType::BOOLEAN;
-	plink_ld.named_parameters["cache_genotypes"] = LogicalType::BOOLEAN;
-	plink_ld.named_parameters["population_column"] = LogicalType::VARCHAR;
-	plink_ld.named_parameters["population_weights"] = LogicalType::VARCHAR;
+	DeclareNamedParameters(plink_ld, {
+	                       {"pvar", LogicalType::VARCHAR},
+	                       {"psam", LogicalType::VARCHAR},
+	                       {"variant1", LogicalType::VARCHAR},
+	                       {"variant2", LogicalType::VARCHAR},
+	                       {"window_kb", LogicalType::INTEGER},
+	                       {"r2_threshold", LogicalType::DOUBLE},
+	                       {"region", LogicalType::VARCHAR},
+	                       {"samples", LogicalType::ANY},
+	                       {"selection", LogicalType::ANY},
+	                       {"inter_chr", LogicalType::BOOLEAN},
+	                       {"cache_genotypes", LogicalType::BOOLEAN},
+	                       {"population_column", LogicalType::VARCHAR},
+	                       {"population_weights", LogicalType::VARCHAR}});
+	CompatSetCaptureArgumentAliases(plink_ld);
 	plink_ld.projection_pushdown = true;
 	RegisterTableWithDesc(loader, plink_ld, {}, "Compute pairwise linkage disequilibrium metrics.",
 	                      {"SELECT * FROM plink_ld('data/cohort.pgen', window_kb := 500, r2_threshold := 0.2)"});

@@ -33,7 +33,7 @@
 // Tying several changes to one macro picks the wrong branch the moment they
 // land in different releases.
 //
-// See teaguesterling/duckdb_markdown's docs/DUCKDB_API_MIGRATION.md for the
+// See teaguesterling/duckdb_markdown's docs/duckdb_v2_migration.md for the
 // long-form rationale + upgrade checklist for other extensions.
 
 // v2.0 split the per-vector-type accessor classes out of types/vector.hpp into
@@ -84,6 +84,25 @@
 #if __has_include("duckdb/common/identifier.hpp")
 #define DUCKDB_HAS_IDENTIFIER 1
 #include "duckdb/common/identifier.hpp"
+#endif
+
+// --- scalar function bind signature --------------------------------------------
+// Pattern from duckdb_func_apply. v2.0 collapsed bind_scalar_function_t's
+// (ClientContext&, ScalarFunction&, vector<unique_ptr<Expression>>&) into a
+// single BindScalarFunctionInput&. Declare a scalar bind callback as
+// `MyBind(DUCKDB_SCALAR_BIND_PARAMS)` and unpack via the macros. Must be at file
+// scope (macros), gated on the same new-vector-headers probe the rest of the
+// v2.0 surface uses.
+#ifdef DUCKDB_HAS_NEW_VECTOR_HEADERS
+#define DUCKDB_SCALAR_BIND_PARAMS  duckdb::BindScalarFunctionInput &bind_input
+#define DUCKDB_SCALAR_BIND_CONTEXT bind_input.GetClientContext()
+#define DUCKDB_SCALAR_BIND_ARGS    bind_input.GetArguments()
+#else
+#define DUCKDB_SCALAR_BIND_PARAMS                                                                                      \
+	duckdb::ClientContext &context, duckdb::ScalarFunction &bound_function,                                            \
+	    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &arguments
+#define DUCKDB_SCALAR_BIND_CONTEXT context
+#define DUCKDB_SCALAR_BIND_ARGS    arguments
 #endif
 
 namespace duckdb {
@@ -343,5 +362,75 @@ inline ValidityMask &CompatFlatValidityMutable(Vector &vec) {
 		return FV::Validity(vec);
 	}
 }
+
+// --- capture_argument_aliases (SILENT runtime break) ----------------------------
+// Pattern from duckdb_func_apply's duckdb_compat.hpp. v2.0 added an opt-in flag
+// that defaults to FALSE: with it off, argument aliases come back EMPTY, so a
+// function that derives named parameters from GetAlias() silently binds every
+// argument as unnamed — a RUNTIME failure on a perfectly green build, nothing to
+// grep for. plinking's table functions take their params via `:=` (the
+// COMPARE_EQUAL colref path, which reads the column name directly, NOT GetAlias),
+// so this is defensive insurance rather than an observed fix — set it on every
+// table function and verify at runtime that `foo(..., x := ...)` still binds by
+// name. Probed on the member, which exists only on v2.0; a no-op on v1.5.
+template <class T, class = void>
+struct CompatHasCaptureArgumentAliases : std::false_type {};
+template <class T>
+struct CompatHasCaptureArgumentAliases<T, decltype(void(std::declval<T &>().SetCaptureArgumentAliases(true)))>
+    : std::true_type {};
+
+template <class F>
+inline void CompatSetCaptureArgumentAliasesImpl(F &f, std::true_type) {
+	f.SetCaptureArgumentAliases(true);
+}
+template <class F>
+inline void CompatSetCaptureArgumentAliasesImpl(F &, std::false_type) {
+}
+//! Keep argument aliases visible to the function's own bind callback.
+template <class F>
+inline void CompatSetCaptureArgumentAliases(F &f) {
+	CompatSetCaptureArgumentAliasesImpl(f, CompatHasCaptureArgumentAliases<F>());
+}
+
+// --- BoundFunctionExpression::bind_info became private on v2.0 ------------------
+// v1.5: `bind_info` is a public unique_ptr<FunctionData> member.
+// v2.0: private, reached via BindInfo() / BindInfoMutable(). Probed on the
+// accessor (v2.0-only); templated so the `.bind_info` branch is a dependent name
+// not looked up until instantiated on v1.5.
+template <class E, class = void>
+struct CompatHasBindInfoAccessor : std::false_type {};
+template <class E>
+struct CompatHasBindInfoAccessor<E, decltype(void(std::declval<const E &>().BindInfo()))> : std::true_type {};
+
+template <class E>
+inline const FunctionData &CompatExprBindInfoImpl(const E &expr, std::true_type) {
+	return *expr.BindInfo();
+}
+template <class E>
+inline const FunctionData &CompatExprBindInfoImpl(const E &expr, std::false_type) {
+	return *expr.bind_info;
+}
+//! The FunctionData a bound function expression carries, on either line.
+template <class E>
+inline const FunctionData &CompatExprBindInfo(const E &expr) {
+	return CompatExprBindInfoImpl(expr, CompatHasBindInfoAccessor<E>());
+}
+
+// --- Vector::Reference(Value) gained a required count on v2.0 -------------------
+// v1.5: Vector::Reference(const Value&) sets a constant vector.
+// v2.0: Reference(const Value&, count_t) -- the no-count form was REMOVED (not
+// deprecated), and count_t is a v2.0-only strong type, so this must be a
+// preprocessor branch (SFINAE cannot hide an absent type name). Probed via the
+// v2.0-only size.hpp (where count_t lives).
+#if __has_include("duckdb/common/types/size.hpp")
+inline void CompatReferenceConstant(Vector &vec, const Value &value, idx_t count) {
+	vec.Reference(value, count_t(count));
+}
+#else
+inline void CompatReferenceConstant(Vector &vec, const Value &value, idx_t count) {
+	(void)count;
+	vec.Reference(value);
+}
+#endif
 
 } // namespace duckdb

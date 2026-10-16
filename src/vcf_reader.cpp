@@ -1,6 +1,7 @@
 #include "vcf_reader.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "vcf_genotype_parse.hpp"
 
@@ -785,13 +786,15 @@ static void VcfScan(ClientContext &context, TableFunctionInput &data_p, DataChun
 
 void RegisterPlinkVcfReader(ExtensionLoader &loader) {
 	TableFunction func("read_plink_vcf", {LogicalType::VARCHAR}, VcfScan, VcfBind, VcfInitGlobal, VcfInitLocal);
-	func.named_parameters["genotypes"] = LogicalType::VARCHAR;
-	func.named_parameters["phased"] = LogicalType::BOOLEAN;
-	func.named_parameters["region"] = LogicalType::VARCHAR;
-	func.named_parameters["min_gq"] = LogicalType::INTEGER;
-	func.named_parameters["min_dp"] = LogicalType::INTEGER;
-	func.named_parameters["max_dp"] = LogicalType::INTEGER;
-	func.named_parameters["halfcall"] = LogicalType::VARCHAR;
+	DeclareNamedParameters(func, {
+	                       {"genotypes", LogicalType::VARCHAR},
+	                       {"phased", LogicalType::BOOLEAN},
+	                       {"region", LogicalType::VARCHAR},
+	                       {"min_gq", LogicalType::INTEGER},
+	                       {"min_dp", LogicalType::INTEGER},
+	                       {"max_dp", LogicalType::INTEGER},
+	                       {"halfcall", LogicalType::VARCHAR}});
+	CompatSetCaptureArgumentAliases(func);
 	func.projection_pushdown = true;
 	RegisterTableWithDesc(loader, func, {}, "Read VCF files using PLINK engine into tabular format.",
 	                      {"SELECT * FROM read_plink_vcf('data/cohort.vcf.gz')"});

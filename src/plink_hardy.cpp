@@ -1,6 +1,7 @@
 #include "plink_hardy.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -701,15 +702,15 @@ void RegisterPlinkHardy(ExtensionLoader &loader) {
 
 	plink_hardy.projection_pushdown = true;
 
-	plink_hardy.named_parameters["pvar"] = LogicalType::VARCHAR;
-	plink_hardy.named_parameters["psam"] = LogicalType::VARCHAR;
-	plink_hardy.named_parameters["samples"] = LogicalType::ANY;
-	plink_hardy.named_parameters["region"] = LogicalType::VARCHAR;
-	// Composable selection: a STRUCT whose samples/region fields seed the axes,
-	// overridden per-field by the individual params above (see ParseSelection).
-	plink_hardy.named_parameters["selection"] = LogicalType::ANY;
-	plink_hardy.named_parameters["midp"] = LogicalType::BOOLEAN;
-	plink_hardy.named_parameters["build"] = LogicalType::VARCHAR;
+	DeclareNamedParameters(plink_hardy, {
+	                       {"pvar", LogicalType::VARCHAR},
+	                       {"psam", LogicalType::VARCHAR},
+	                       {"samples", LogicalType::ANY},
+	                       {"region", LogicalType::VARCHAR},
+	                       {"selection", LogicalType::ANY},
+	                       {"midp", LogicalType::BOOLEAN},
+	                       {"build", LogicalType::VARCHAR}});
+	CompatSetCaptureArgumentAliases(plink_hardy);
 
 	RegisterTableWithDesc(loader, plink_hardy, {}, "Compute Hardy-Weinberg equilibrium exact test statistics.",
 	                      {"SELECT * FROM plink_hardy('data/cohort.pgen')"});

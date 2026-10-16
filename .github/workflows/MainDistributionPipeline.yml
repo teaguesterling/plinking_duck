@@ -17,18 +17,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Forward-compat canary: intentionally builds against duckdb `main` (the v2.0
-  # line). community-extensions' build_next.yml builds every release PR against
-  # v2.0-cyanoptera with NO per-extension opt-out, so this leg is how we learn
-  # about API drift before a release PR goes red.
+  # Next-line build against the PINNED v2.0 release branch -- this is the exact
+  # target community-extensions' build_next.yml uses (duckdb_version:
+  # v2.0-cyanoptera, ci_tools_version: main, NO per-extension opt-out), so a
+  # green here is what tells us a release PR will build on the 2.0 line. The
+  # older canary below built `main` (the moving tip), which can drift ahead of
+  # (or behind) the frozen cyanoptera branch the registry actually compiles --
+  # keep both: cyanoptera is the gate, `main` is the early-warning.
   #
-  # Advisory, NOT a merge blocker -- merge-readiness is judged on the stable
-  # v1.5 build below. Gated with `if:` rather than `continue-on-error:`: a job
-  # calling a REUSABLE workflow accepts only a fixed set of keys, and adding
-  # `continue-on-error` makes the whole workflow fail to PARSE, scheduling zero
-  # jobs. The gate also keeps the canary out of pull_request check rollups,
-  # where an advisory red reads as a real failure.
+  # Gated to run on PRs too (unlike the `main` canary): cyanoptera IS the line
+  # the registry ships against, so a red here on a PR is a genuine, actionable
+  # signal, not upstream churn. Gated with `if:` rather than
+  # `continue-on-error:`: a job calling a REUSABLE workflow accepts only a fixed
+  # set of keys, and adding `continue-on-error` makes the whole workflow fail to
+  # PARSE, scheduling zero jobs.
   duckdb-next-build:
+    name: Next-line build — DuckDB v2.0 (cyanoptera)
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
+      extension_name: plinking_duck
+      # Same plink-ng portability exclusions as the stable leg below -- they are
+      # plink-ng source issues, independent of the DuckDB version.
+      exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+  # ADVISORY canary on DuckDB `main`, the line beyond 2.0. Pushes to main and
+  # dispatch only, never pull requests: a PR rollup would go red for a line
+  # nothing ships against. `main` moves under the cyanoptera gate above, so a red
+  # here is a warning about upstream churn, not necessarily a bug in the change.
+  duckdb-main-canary:
     name: Canary — build against DuckDB main (advisory)
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main

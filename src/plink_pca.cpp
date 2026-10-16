@@ -13,6 +13,7 @@
 #include "plink_pca.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -1108,15 +1109,15 @@ void RegisterPlinkPca(ExtensionLoader &loader) {
 
 	plink_pca.projection_pushdown = true;
 
-	plink_pca.named_parameters["pvar"] = LogicalType::VARCHAR;
-	plink_pca.named_parameters["psam"] = LogicalType::VARCHAR;
-	plink_pca.named_parameters["mode"] = LogicalType::VARCHAR;
-	plink_pca.named_parameters["n_pcs"] = LogicalType::INTEGER;
-	plink_pca.named_parameters["samples"] = LogicalType::ANY;
-	plink_pca.named_parameters["region"] = LogicalType::VARCHAR;
-	// Composable selection: a STRUCT whose samples/region fields seed the axes,
-	// overridden per-field by the individual params above (see ParseSelection).
-	plink_pca.named_parameters["selection"] = LogicalType::ANY;
+	DeclareNamedParameters(plink_pca, {
+	                       {"pvar", LogicalType::VARCHAR},
+	                       {"psam", LogicalType::VARCHAR},
+	                       {"mode", LogicalType::VARCHAR},
+	                       {"n_pcs", LogicalType::INTEGER},
+	                       {"samples", LogicalType::ANY},
+	                       {"region", LogicalType::VARCHAR},
+	                       {"selection", LogicalType::ANY}});
+	CompatSetCaptureArgumentAliases(plink_pca);
 
 	RegisterTableWithDesc(loader, plink_pca, {}, "Compute principal components analysis from PLINK files.",
 	                      {"SELECT * FROM plink_pca('data/cohort.pgen', n_pcs := 10)"});

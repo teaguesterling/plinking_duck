@@ -1,5 +1,7 @@
 #include "pfile_reader.hpp"
 #include "duckdb_compat.hpp"
+#include "duckdb_compat_planner.hpp"  // filter-pushdown shims (Legacy* kinds, TableFilterSet) for DuckDB v2.0
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap for DuckDB v2.0 typed kwargs
 #include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "plink_profile.hpp"
@@ -188,7 +190,9 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 	if (cnt_res->HasError()) {
 		throw IOException("read_pfile: failed to count rows in source '%s': %s", source, cnt_res->GetError());
 	}
-	sample_info_out.sample_ct = cnt_res->GetValue(0, 0).GetValue<int64_t>();
+	// v2.0 removed QueryResult::GetValue; fetch the first chunk and read (0,0).
+	// COUNT(*) always returns exactly one row. (Matches howard_reader's idiom.)
+	sample_info_out.sample_ct = cnt_res->Fetch()->GetValue(0, 0).GetValue<int64_t>();
 	// iids are NOT materialized here — see EnsureSourceIids (only a VARCHAR sample
 	// subset needs them; IID output reads from the projected CDC at scan).
 	return meta;
@@ -2313,8 +2317,8 @@ static bool PruneTryGetStr(const Value &v, string &out) {
 //! the applicator). On true, `out` holds the complete allowed set for this column.
 static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<string> &out) {
 	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &cf = filter.Cast<ConstantFilter>();
+	case CompatConstantFilterType: {
+		auto &cf = filter.Cast<CompatConstantFilter>();
 		if (cf.comparison_type != ExpressionType::COMPARE_EQUAL) {
 			return false;
 		}
@@ -2325,8 +2329,8 @@ static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<strin
 		out.insert(std::move(s));
 		return true;
 	}
-	case TableFilterType::IN_FILTER: {
-		auto &inf = filter.Cast<InFilter>();
+	case CompatInFilterType: {
+		auto &inf = filter.Cast<CompatInFilter>();
 		for (auto &v : inf.values) {
 			string s;
 			if (!PruneTryGetStr(v, s)) {
@@ -2336,10 +2340,10 @@ static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<strin
 		}
 		return !inf.values.empty();
 	}
-	case TableFilterType::CONJUNCTION_OR: {
+	case CompatConjunctionOrFilterType: {
 		// OR is kept only if EVERY branch is a recognized equality/IN (union of sets);
 		// a single unrecognized branch could keep rows the union omits → bail.
-		auto &conj = filter.Cast<ConjunctionOrFilter>();
+		auto &conj = filter.Cast<CompatConjunctionOrFilter>();
 		for (auto &child : conj.child_filters) {
 			if (!PruneCollectStringSet(*child, out)) {
 				return false;
@@ -2347,8 +2351,8 @@ static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<strin
 		}
 		return !conj.child_filters.empty();
 	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &opt = filter.Cast<OptionalFilter>();
+	case CompatOptionalFilterType: {
+		auto &opt = filter.Cast<CompatOptionalFilter>();
 		return opt.child_filter ? PruneCollectStringSet(*opt.child_filter, out) : false;
 	}
 	default:
@@ -2366,8 +2370,8 @@ static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<strin
 //! handling exact-or-residual avoids a future refactor silently introducing a gap.)
 static bool PruneCollectIntBounds(const TableFilter &filter, int64_t &lo, int64_t &hi) {
 	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &cf = filter.Cast<ConstantFilter>();
+	case CompatConstantFilterType: {
+		auto &cf = filter.Cast<CompatConstantFilter>();
 		int64_t c;
 		if (!PruneTryGetInt(cf.constant, c)) {
 			return false;
@@ -2397,16 +2401,16 @@ static bool PruneCollectIntBounds(const TableFilter &filter, int64_t &lo, int64_
 			return false;
 		}
 	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj = filter.Cast<ConjunctionAndFilter>();
+	case CompatConjunctionAndFilterType: {
+		auto &conj = filter.Cast<CompatConjunctionAndFilter>();
 		bool any = false;
 		for (auto &child : conj.child_filters) {
 			any |= PruneCollectIntBounds(*child, lo, hi); // AND → keep intersecting
 		}
 		return any;
 	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &opt = filter.Cast<OptionalFilter>();
+	case CompatOptionalFilterType: {
+		auto &opt = filter.Cast<CompatOptionalFilter>();
 		return opt.child_filter ? PruneCollectIntBounds(*opt.child_filter, lo, hi) : false;
 	}
 	default:
@@ -2416,16 +2420,19 @@ static bool PruneCollectIntBounds(const TableFilter &filter, int64_t &lo, int64_
 
 //! Build the conservative prune plan from the pushed filters. `column_ids` maps each
 //! filter's key (its position in the projection) to an output column id.
-static PfilePrunePlan BuildPrunePlan(const TableFilterSet &fs, const vector<column_t> &column_ids,
+static PfilePrunePlan BuildPrunePlan(TableFilterSet &fs, const vector<column_t> &column_ids,
                                      const PfileBindData &bind_data) {
 	PfilePrunePlan plan;
-	for (auto &kv : fs.filters) {
-		idx_t proj_idx = kv.first;
+	// CompatTableFilters flattens the set to (projection index, filter) on both the
+	// v1.5 public-map and v2.0 begin()/end() shapes. Multi-column filters are refused
+	// up front (see PfileInitGlobal), so the per-column view here is complete.
+	for (auto &kv : CompatTableFilters(fs)) {
+		idx_t proj_idx = kv.index;
 		if (proj_idx >= column_ids.size()) {
 			continue;
 		}
 		column_t file_col = column_ids[proj_idx];
-		const TableFilter &filter = *kv.second;
+		const TableFilter &filter = kv.filter.get();
 
 		if (file_col == PfileBindData::CHROM_COL) {
 			unordered_set<string> s;
@@ -2451,8 +2458,8 @@ static PfilePrunePlan BuildPrunePlan(const TableFilterSet &fs, const vector<colu
 			}
 		} else if (bind_data.with_ordinal && file_col == static_cast<column_t>(bind_data.ordinal_col_idx)) {
 			// __ordinal: try an exact IN-set first, else inclusive bounds.
-			if (filter.filter_type == TableFilterType::IN_FILTER) {
-				auto &inf = filter.Cast<InFilter>();
+			if (filter.filter_type == CompatInFilterType) {
+				auto &inf = filter.Cast<CompatInFilter>();
 				bool ok = !inf.values.empty();
 				unordered_set<int64_t> s;
 				for (auto &v : inf.values) {
@@ -2520,19 +2527,20 @@ static bool VariantPassesPrunePlan(const PfilePrunePlan &plan, const VariantMeta
 //! maps filters by column_ids[key]). `output`'s cardinality must already be set to the
 //! emitted row count before calling. Covers every filter type with no per-type code.
 static void ApplyResidualFilters(ClientContext &context, optional_ptr<TableFilterSet> filters, DataChunk &output) {
-	if (!filters || filters->filters.empty() || output.size() == 0) {
+	if (!filters || !CompatTableFilterSetHasFilters(*filters) || output.size() == 0) {
 		return;
 	}
+	auto entries = CompatTableFilters(*filters);
 	vector<unique_ptr<Expression>> conds;
-	conds.reserve(filters->filters.size());
-	for (auto &kv : filters->filters) {
-		idx_t proj_idx = kv.first;
+	conds.reserve(entries.size());
+	for (auto &entry : entries) {
+		idx_t proj_idx = entry.index;
 		if (proj_idx >= output.ColumnCount()) {
 			continue; // defensive — DuckDB guarantees filtered columns are projected
 		}
 		auto &vec = output.data[proj_idx];
 		BoundReferenceExpression colref(vec.GetType(), proj_idx);
-		conds.push_back(kv.second->ToExpression(colref));
+		conds.push_back(entry.filter.get().ToExpression(colref));
 	}
 	if (conds.empty()) {
 		return;
@@ -2543,7 +2551,7 @@ static void ApplyResidualFilters(ClientContext &context, optional_ptr<TableFilte
 	} else {
 		auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
 		for (auto &c : conds) {
-			conj->children.push_back(std::move(c));
+			CompatConjunctionChildren(*conj).push_back(std::move(c));
 		}
 		pred = std::move(conj);
 	}
@@ -2578,6 +2586,20 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	// global state (physical_table_scan.cpp). Consumed by ApplyResidualFilters in EVERY
 	// scan path — this is what makes filter_pushdown := true correct across all orients.
 	state->residual_filters = input.filters;
+
+	// v2.0 correctness guard: DuckDB v2.0 can push MULTI-COLUMN filters (spanning more
+	// than one column, no single projection index). They live in a separate collection
+	// that neither BuildPrunePlan nor the per-column residual applicator walk, and
+	// DuckDB deletes a fully-pushed filter from the plan — so silently skipping one
+	// would DROP rows (wrong genotype counts) on a green build. Refuse loudly instead;
+	// this is rare (e.g. WHERE a > b across two pushed columns). v1.5 has no such
+	// collection, so CompatHasMultiColumnFilters is a compile-time false there.
+	if (state->residual_filters && CompatHasMultiColumnFilters(*state->residual_filters)) {
+		throw NotImplementedException(
+		    "read_pfile: multi-column filter pushdown is not supported on this DuckDB version "
+		    "(a filter spanning multiple columns would be silently dropped); rewrite the predicate "
+		    "or disable pushdown for this query");
+	}
 
 	if (bind_data.orient_mode == OrientMode::GENOTYPE) {
 		state->total_count = bind_data.EffectiveVariantCt();
@@ -2692,7 +2714,7 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	// bind, so pruning the scan would contradict the declared schema — it is
 	// residual-applicator-only. Pruning is a conservative INTERSECTION with the existing
 	// named-param selection (region ∩ variant_range ∩ variants): it only ever shrinks.
-	if (state->residual_filters && !state->residual_filters->filters.empty() &&
+	if (state->residual_filters && CompatTableFilterSetHasFilters(*state->residual_filters) &&
 	    (bind_data.orient_mode == OrientMode::VARIANT || bind_data.orient_mode == OrientMode::GENOTYPE)) {
 		PfilePrunePlan plan = BuildPrunePlan(*state->residual_filters, input.column_ids, bind_data);
 		if (plan.any) {
@@ -3412,7 +3434,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 	// output.Reset() restores flat, writable vectors even after a prior Slice (via the
 	// chunk's vector cache). The retry is gated on has_residual so the no-pushdown path is
 	// byte-for-byte identical to before.
-	const bool has_residual = gstate.residual_filters && !gstate.residual_filters->filters.empty();
+	const bool has_residual = gstate.residual_filters && CompatTableFilterSetHasFilters(*gstate.residual_filters);
 	bool producer_exhausted = false;
 	do {
 		if (has_residual) {
@@ -3819,7 +3841,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 	// not return empty (DuckDB would treat it as end-of-scan). Retry across batches until
 	// the chunk is non-empty or the producer is exhausted. Gated on has_residual so the
 	// no-pushdown path is unchanged.
-	const bool has_residual = gstate.residual_filters && !gstate.residual_filters->filters.empty();
+	const bool has_residual = gstate.residual_filters && CompatTableFilterSetHasFilters(*gstate.residual_filters);
 	bool producer_exhausted = false;
 	do {
 		if (has_residual) {
@@ -4136,7 +4158,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 	// must not return empty (DuckDB would end the scan early). Retry across sample batches
 	// until the chunk is non-empty or every sample has been emitted. Gated on has_residual.
 	// The one-time Phase 1 accumulation above is OUTSIDE this loop (guarded + already done).
-	const bool has_residual = gstate.residual_filters && !gstate.residual_filters->filters.empty();
+	const bool has_residual = gstate.residual_filters && CompatTableFilterSetHasFilters(*gstate.residual_filters);
 	bool producer_exhausted = false;
 	do {
 		if (has_residual) {
@@ -4643,29 +4665,29 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		// (input.filters). The scan prunes the variant set where it safely can and ALWAYS
 		// re-applies the full set per chunk (ApplyResidualFilters) for correctness.
 		fn.filter_pushdown = true;
-		fn.named_parameters["pgen"] = LogicalType::VARCHAR;
-		fn.named_parameters["pvar"] = LogicalType::VARCHAR;
-		fn.named_parameters["psam"] = LogicalType::VARCHAR;
-		fn.named_parameters["orient"] = LogicalType::VARCHAR;
-		fn.named_parameters["dosages"] = LogicalType::BOOLEAN;
-		fn.named_parameters["phased"] = LogicalType::BOOLEAN;
-		fn.named_parameters["region"] = LogicalType::VARCHAR;
-		// Accept ANY for samples and variants — type dispatch handled in bind
-		fn.named_parameters["samples"] = LogicalType::ANY;
-		fn.named_parameters["variants"] = LogicalType::ANY;
 		// Composable selection: a STRUCT whose samples/region/variants/variant_range
-		// fields seed the axes; the individual params above override per-field
-		// (most-specific-wins). Parsed via the shared ParseSelection handler in bind.
-		fn.named_parameters["selection"] = LogicalType::ANY;
-		fn.named_parameters["genotypes"] = LogicalType::VARCHAR;
-		fn.named_parameters["af_range"] = LogicalType::ANY;
-		fn.named_parameters["ac_range"] = LogicalType::ANY;
-		fn.named_parameters["genotype_range"] = LogicalType::ANY;
-		fn.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
-		fn.named_parameters["combine_samples"] = LogicalType::VARCHAR;
-		fn.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
+		// fields seed the axes; the individual params override per-field
+		// (most-specific-wins). samples/variants are ANY — type dispatch is in bind.
 		// variant_range := [lo, hi) — ANY so bind can accept a 2-element list.
-		fn.named_parameters["variant_range"] = LogicalType::ANY;
+		DeclareNamedParameters(fn, {{"pgen", LogicalType::VARCHAR},
+		                            {"pvar", LogicalType::VARCHAR},
+		                            {"psam", LogicalType::VARCHAR},
+		                            {"orient", LogicalType::VARCHAR},
+		                            {"dosages", LogicalType::BOOLEAN},
+		                            {"phased", LogicalType::BOOLEAN},
+		                            {"region", LogicalType::VARCHAR},
+		                            {"samples", LogicalType::ANY},
+		                            {"variants", LogicalType::ANY},
+		                            {"selection", LogicalType::ANY},
+		                            {"genotypes", LogicalType::VARCHAR},
+		                            {"af_range", LogicalType::ANY},
+		                            {"ac_range", LogicalType::ANY},
+		                            {"genotype_range", LogicalType::ANY},
+		                            {"include_genotypes", LogicalType::LIST(LogicalType::VARCHAR)},
+		                            {"combine_samples", LogicalType::VARCHAR},
+		                            {"with_ordinal", LogicalType::BOOLEAN},
+		                            {"variant_range", LogicalType::ANY}});
+		CompatSetCaptureArgumentAliases(fn);
 	};
 
 	TableFunctionSet set("read_pfile");
@@ -4682,7 +4704,8 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	// pfile_partitions: ordinal-range partitions along the variants dimension.
 	// Single-prefix and list-of-prefixes overloads (per-source partitions).
 	auto add_chunk_size = [](TableFunction &fn) {
-		fn.named_parameters["chunk_size"] = LogicalType::BIGINT;
+		DeclareNamedParameters(fn, {{"chunk_size", LogicalType::BIGINT}});
+		CompatSetCaptureArgumentAliases(fn);
 	};
 	TableFunctionSet part_set("pfile_partitions");
 	TableFunction part_one("pfile_partitions", {LogicalType::VARCHAR}, PfilePartitionsScan, PfilePartitionsBind,
