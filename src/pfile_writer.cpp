@@ -1117,8 +1117,8 @@ bool TryStructIidsFromSchema(CopyFunctionBindInput &input, const vector<string> 
                              const vector<LogicalType> &sql_types, vector<string> &out) {
 	string geno_col = "genotypes";
 	for (auto &opt : input.info.options) {
-		if (StringUtil::Lower(CompatNameStr(opt.first)) == "genotype_fields" && !opt.second.empty() && !opt.second[0].IsNull() &&
-		    opt.second[0].type().id() != LogicalTypeId::STRUCT) {
+		if (StringUtil::Lower(CompatNameStr(opt.first)) == "genotype_fields" && !opt.second.empty() &&
+		    !opt.second[0].IsNull() && opt.second[0].type().id() != LogicalTypeId::STRUCT) {
 			geno_col = opt.second[0].ToString();
 		}
 	}

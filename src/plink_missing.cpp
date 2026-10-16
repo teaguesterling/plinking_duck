@@ -817,13 +817,12 @@ void RegisterPlinkMissing(ExtensionLoader &loader) {
 
 	plink_missing.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_missing, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"mode", LogicalType::VARCHAR},
-	                       {"samples", LogicalType::ANY},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"selection", LogicalType::ANY}});
+	DeclareNamedParameters(plink_missing, {{"pvar", LogicalType::VARCHAR},
+	                                       {"psam", LogicalType::VARCHAR},
+	                                       {"mode", LogicalType::VARCHAR},
+	                                       {"samples", LogicalType::ANY},
+	                                       {"region", LogicalType::VARCHAR},
+	                                       {"selection", LogicalType::ANY}});
 	CompatSetCaptureArgumentAliases(plink_missing);
 
 	RegisterTableWithDesc(loader, plink_missing, {}, "Compute missingness rates per variant or per sample.",

@@ -667,15 +667,14 @@ void RegisterPlinkFreq(ExtensionLoader &loader) {
 
 	plink_freq.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_freq, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"samples", LogicalType::ANY},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"selection", LogicalType::ANY},
-	                       {"counts", LogicalType::BOOLEAN},
-	                       {"dosage", LogicalType::BOOLEAN},
-	                       {"build", LogicalType::VARCHAR}});
+	DeclareNamedParameters(plink_freq, {{"pvar", LogicalType::VARCHAR},
+	                                    {"psam", LogicalType::VARCHAR},
+	                                    {"samples", LogicalType::ANY},
+	                                    {"region", LogicalType::VARCHAR},
+	                                    {"selection", LogicalType::ANY},
+	                                    {"counts", LogicalType::BOOLEAN},
+	                                    {"dosage", LogicalType::BOOLEAN},
+	                                    {"build", LogicalType::VARCHAR}});
 	CompatSetCaptureArgumentAliases(plink_freq);
 
 	RegisterTableWithDesc(loader, plink_freq, {}, "Compute allele frequencies and counts from PLINK files.",

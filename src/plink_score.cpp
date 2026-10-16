@@ -849,15 +849,14 @@ void RegisterPlinkScore(ExtensionLoader &loader) {
 
 	plink_score.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_score, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"weights", LogicalType::ANY},
-	                       {"samples", LogicalType::ANY},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"selection", LogicalType::ANY},
-	                       {"center", LogicalType::BOOLEAN},
-	                       {"no_mean_imputation", LogicalType::BOOLEAN}});
+	DeclareNamedParameters(plink_score, {{"pvar", LogicalType::VARCHAR},
+	                                     {"psam", LogicalType::VARCHAR},
+	                                     {"weights", LogicalType::ANY},
+	                                     {"samples", LogicalType::ANY},
+	                                     {"region", LogicalType::VARCHAR},
+	                                     {"selection", LogicalType::ANY},
+	                                     {"center", LogicalType::BOOLEAN},
+	                                     {"no_mean_imputation", LogicalType::BOOLEAN}});
 	CompatSetCaptureArgumentAliases(plink_score);
 
 	RegisterTableWithDesc(loader, plink_score, {}, "Compute polygenic risk scores from variant weights.",

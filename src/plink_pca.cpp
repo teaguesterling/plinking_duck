@@ -1109,14 +1109,13 @@ void RegisterPlinkPca(ExtensionLoader &loader) {
 
 	plink_pca.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_pca, {
-	                       {"pvar", LogicalType::VARCHAR},
-	                       {"psam", LogicalType::VARCHAR},
-	                       {"mode", LogicalType::VARCHAR},
-	                       {"n_pcs", LogicalType::INTEGER},
-	                       {"samples", LogicalType::ANY},
-	                       {"region", LogicalType::VARCHAR},
-	                       {"selection", LogicalType::ANY}});
+	DeclareNamedParameters(plink_pca, {{"pvar", LogicalType::VARCHAR},
+	                                   {"psam", LogicalType::VARCHAR},
+	                                   {"mode", LogicalType::VARCHAR},
+	                                   {"n_pcs", LogicalType::INTEGER},
+	                                   {"samples", LogicalType::ANY},
+	                                   {"region", LogicalType::VARCHAR},
+	                                   {"selection", LogicalType::ANY}});
 	CompatSetCaptureArgumentAliases(plink_pca);
 
 	RegisterTableWithDesc(loader, plink_pca, {}, "Compute principal components analysis from PLINK files.",
