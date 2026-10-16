@@ -33,7 +33,7 @@
 // Tying several changes to one macro picks the wrong branch the moment they
 // land in different releases.
 //
-// See teaguesterling/duckdb_markdown's docs/DUCKDB_API_MIGRATION.md for the
+// See teaguesterling/duckdb_markdown's docs/duckdb_v2_migration.md for the
 // long-form rationale + upgrade checklist for other extensions.
 
 // v2.0 split the per-vector-type accessor classes out of types/vector.hpp into
@@ -342,6 +342,35 @@ inline ValidityMask &CompatFlatValidityMutable(Vector &vec) {
 	} else {
 		return FV::Validity(vec);
 	}
+}
+
+// --- capture_argument_aliases (SILENT runtime break) ----------------------------
+// Pattern from duckdb_func_apply's duckdb_compat.hpp. v2.0 added an opt-in flag
+// that defaults to FALSE: with it off, argument aliases come back EMPTY, so a
+// function that derives named parameters from GetAlias() silently binds every
+// argument as unnamed — a RUNTIME failure on a perfectly green build, nothing to
+// grep for. plinking's table functions take their params via `:=` (the
+// COMPARE_EQUAL colref path, which reads the column name directly, NOT GetAlias),
+// so this is defensive insurance rather than an observed fix — set it on every
+// table function and verify at runtime that `foo(..., x := ...)` still binds by
+// name. Probed on the member, which exists only on v2.0; a no-op on v1.5.
+template <class T, class = void>
+struct CompatHasCaptureArgumentAliases : std::false_type {};
+template <class T>
+struct CompatHasCaptureArgumentAliases<T, decltype(void(std::declval<T &>().SetCaptureArgumentAliases(true)))>
+    : std::true_type {};
+
+template <class F>
+inline void CompatSetCaptureArgumentAliasesImpl(F &f, std::true_type) {
+	f.SetCaptureArgumentAliases(true);
+}
+template <class F>
+inline void CompatSetCaptureArgumentAliasesImpl(F &, std::false_type) {
+}
+//! Keep argument aliases visible to the function's own bind callback.
+template <class F>
+inline void CompatSetCaptureArgumentAliases(F &f) {
+	CompatSetCaptureArgumentAliasesImpl(f, CompatHasCaptureArgumentAliases<F>());
 }
 
 } // namespace duckdb

@@ -2,6 +2,7 @@
 #include "howard_catalog.hpp"
 #include "plink_common.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "duckdb_compat.hpp" // CompatName — bind-signature name type on DuckDB v2.0
 
 #include "duckdb/common/file_system.hpp"
@@ -984,10 +985,12 @@ static void HowardManifestScan(ClientContext &context, TableFunctionInput &data_
 void RegisterHowardReader(ExtensionLoader &loader) {
 	TableFunction fn("read_howard_manifest", {LogicalType::VARCHAR}, HowardManifestScan, HowardManifestBind,
 	                 HowardManifestInitGlobal);
-	fn.named_parameters["region"] = LogicalType::VARCHAR;
-	fn.named_parameters["variant_index"] = LogicalType::ANY;
-	fn.named_parameters["sample_index"] = LogicalType::ANY;
-	fn.named_parameters["verify_all"] = LogicalType::BOOLEAN;
+	DeclareNamedParameters(fn, {
+	                       {"region", LogicalType::VARCHAR},
+	                       {"variant_index", LogicalType::ANY},
+	                       {"sample_index", LogicalType::ANY},
+	                       {"verify_all", LogicalType::BOOLEAN}});
+	CompatSetCaptureArgumentAliases(fn);
 	RegisterTableWithDesc(
 	    loader, fn, {"path", "region", "variant_index", "sample_index", "verify_all"},
 	    "Parse, verify, and prune a .howard.json shard catalog, returning one row per surviving shard. "

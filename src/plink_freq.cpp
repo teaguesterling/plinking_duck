@@ -1,6 +1,7 @@
 #include "plink_freq.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -666,16 +667,16 @@ void RegisterPlinkFreq(ExtensionLoader &loader) {
 
 	plink_freq.projection_pushdown = true;
 
-	plink_freq.named_parameters["pvar"] = LogicalType::VARCHAR;
-	plink_freq.named_parameters["psam"] = LogicalType::VARCHAR;
-	plink_freq.named_parameters["samples"] = LogicalType::ANY;
-	plink_freq.named_parameters["region"] = LogicalType::VARCHAR;
-	// Composable selection: a STRUCT whose samples/region fields seed the axes,
-	// overridden per-field by the individual params above (see ParseSelection).
-	plink_freq.named_parameters["selection"] = LogicalType::ANY;
-	plink_freq.named_parameters["counts"] = LogicalType::BOOLEAN;
-	plink_freq.named_parameters["dosage"] = LogicalType::BOOLEAN;
-	plink_freq.named_parameters["build"] = LogicalType::VARCHAR;
+	DeclareNamedParameters(plink_freq, {
+	                       {"pvar", LogicalType::VARCHAR},
+	                       {"psam", LogicalType::VARCHAR},
+	                       {"samples", LogicalType::ANY},
+	                       {"region", LogicalType::VARCHAR},
+	                       {"selection", LogicalType::ANY},
+	                       {"counts", LogicalType::BOOLEAN},
+	                       {"dosage", LogicalType::BOOLEAN},
+	                       {"build", LogicalType::VARCHAR}});
+	CompatSetCaptureArgumentAliases(plink_freq);
 
 	RegisterTableWithDesc(loader, plink_freq, {}, "Compute allele frequencies and counts from PLINK files.",
 	                      {"SELECT * FROM plink_freq('data/cohort.pgen')"});

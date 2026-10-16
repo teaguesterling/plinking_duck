@@ -1,6 +1,7 @@
 #include "pgen_reader.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -1102,20 +1103,20 @@ void RegisterPgenReader(ExtensionLoader &loader) {
 
 	read_pgen.projection_pushdown = true;
 
-	read_pgen.named_parameters["pvar"] = LogicalType::VARCHAR;
-	read_pgen.named_parameters["psam"] = LogicalType::VARCHAR;
-	read_pgen.named_parameters["dosages"] = LogicalType::BOOLEAN;
-	read_pgen.named_parameters["phased"] = LogicalType::BOOLEAN;
-	// Accept ANY for samples — type dispatch (LIST(INTEGER) vs LIST(VARCHAR))
-	// is handled in PgenBind based on the actual value type.
-	read_pgen.named_parameters["samples"] = LogicalType::ANY;
-	read_pgen.named_parameters["genotypes"] = LogicalType::VARCHAR;
-	read_pgen.named_parameters["orient"] = LogicalType::VARCHAR;
-	read_pgen.named_parameters["af_range"] = LogicalType::ANY;
-	read_pgen.named_parameters["ac_range"] = LogicalType::ANY;
-	read_pgen.named_parameters["genotype_range"] = LogicalType::ANY;
-	read_pgen.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
-	read_pgen.named_parameters["variants"] = LogicalType::ANY;
+	DeclareNamedParameters(read_pgen, {
+	                       {"pvar", LogicalType::VARCHAR},
+	                       {"psam", LogicalType::VARCHAR},
+	                       {"dosages", LogicalType::BOOLEAN},
+	                       {"phased", LogicalType::BOOLEAN},
+	                       {"samples", LogicalType::ANY},
+	                       {"genotypes", LogicalType::VARCHAR},
+	                       {"orient", LogicalType::VARCHAR},
+	                       {"af_range", LogicalType::ANY},
+	                       {"ac_range", LogicalType::ANY},
+	                       {"genotype_range", LogicalType::ANY},
+	                       {"include_genotypes", LogicalType::LIST(LogicalType::VARCHAR)},
+	                       {"variants", LogicalType::ANY}});
+	CompatSetCaptureArgumentAliases(read_pgen);
 
 	RegisterTableWithDesc(loader, read_pgen, {}, "Read PLINK .pgen or .bed genotype files into tabular format.",
 	                      {"SELECT * FROM read_pgen('data/cohort.pgen')"});

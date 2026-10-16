@@ -1,6 +1,7 @@
 #include "plink_glm.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 #include "psam_reader.hpp"
@@ -1494,18 +1495,18 @@ void RegisterPlinkGlm(ExtensionLoader &loader) {
 
 	plink_glm.projection_pushdown = true;
 
-	plink_glm.named_parameters["pvar"] = LogicalType::VARCHAR;
-	plink_glm.named_parameters["psam"] = LogicalType::VARCHAR;
-	plink_glm.named_parameters["phenotype"] = LogicalType::ANY;
-	plink_glm.named_parameters["covariates"] = LogicalType::ANY;
-	plink_glm.named_parameters["samples"] = LogicalType::ANY;
-	plink_glm.named_parameters["region"] = LogicalType::VARCHAR;
-	// Composable selection: a STRUCT whose samples/region fields seed the axes,
-	// overridden per-field by the individual params above (see ParseSelection).
-	plink_glm.named_parameters["selection"] = LogicalType::ANY;
-	plink_glm.named_parameters["model"] = LogicalType::VARCHAR;
-	plink_glm.named_parameters["firth"] = LogicalType::BOOLEAN;
-	plink_glm.named_parameters["p_threshold"] = LogicalType::DOUBLE;
+	DeclareNamedParameters(plink_glm, {
+	                       {"pvar", LogicalType::VARCHAR},
+	                       {"psam", LogicalType::VARCHAR},
+	                       {"phenotype", LogicalType::ANY},
+	                       {"covariates", LogicalType::ANY},
+	                       {"samples", LogicalType::ANY},
+	                       {"region", LogicalType::VARCHAR},
+	                       {"selection", LogicalType::ANY},
+	                       {"model", LogicalType::VARCHAR},
+	                       {"firth", LogicalType::BOOLEAN},
+	                       {"p_threshold", LogicalType::DOUBLE}});
+	CompatSetCaptureArgumentAliases(plink_glm);
 
 	RegisterTableWithDesc(loader, plink_glm, {},
 	                      "Fit generalized linear models (linear/logistic regression) across variants.",

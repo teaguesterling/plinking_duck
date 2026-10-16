@@ -1,6 +1,7 @@
 #include "pvar_reader.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -644,13 +645,17 @@ void RegisterPvarReader(ExtensionLoader &loader) {
 	// Single path
 	TableFunction one("read_pvar", {LogicalType::VARCHAR}, PvarScan, PvarBind, PvarInitGlobal, PvarInitLocal);
 	one.projection_pushdown = true;
-	one.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
+	DeclareNamedParameters(one, {
+	                       {"with_ordinal", LogicalType::BOOLEAN}});
+	CompatSetCaptureArgumentAliases(one);
 	set.AddFunction(one);
 	// List of paths (row-concatenated in order)
 	TableFunction many("read_pvar", {LogicalType::LIST(LogicalType::VARCHAR)}, PvarScan, PvarBind, PvarInitGlobal,
 	                   PvarInitLocal);
 	many.projection_pushdown = true;
-	many.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
+	DeclareNamedParameters(many, {
+	                       {"with_ordinal", LogicalType::BOOLEAN}});
+	CompatSetCaptureArgumentAliases(many);
 	set.AddFunction(many);
 	RegisterTableSetWithDesc(loader, set, {}, "Read PLINK .pvar or .bim variant files into tabular format.",
 	                         {"SELECT * FROM read_pvar('data/cohort.pvar')"});

@@ -2203,7 +2203,7 @@ static void MergeSelectionStruct(const Value &select_val, Selection &sel) {
 	auto &child_types = StructType::GetChildTypes(select_val.type());
 	auto &children = StructValue::GetChildren(select_val);
 	for (idx_t i = 0; i < child_types.size(); i++) {
-		const string &field = child_types[i].first;
+		const auto &field = child_types[i].first; // Identifier on v2.0, string on v1.5; compared below
 		const Value &fv = children[i];
 		if (field == "samples") {
 			if (!fv.IsNull()) {
@@ -2260,7 +2260,7 @@ static void MergeSelectionStruct(const Value &select_val, Selection &sel) {
 	}
 }
 
-Selection ParseSelection(const named_parameter_map_t &params) {
+Selection ParseSelection(const NamedParamMap &params) {
 	Selection sel;
 
 	// --- Lowest precedence: a shared `selection := <STRUCT>` seeds the axes ---
@@ -2371,7 +2371,7 @@ ResolvedSelection ResolveSelection(const Selection &selection, const VariantMeta
 	return resolved;
 }
 
-void RejectSelectionVariantAxis(const named_parameter_map_t &params, const string &func_name) {
+void RejectSelectionVariantAxis(const NamedParamMap &params, const string &func_name) {
 	// For a function that does NOT take the variant axis from the `selection` struct
 	// (currently only plink_ld, whose region grammar differs and which does not
 	// support arbitrary/ordinal variant selection): a variant-axis FIELD inside the
@@ -2388,7 +2388,7 @@ void RejectSelectionVariantAxis(const named_parameter_map_t &params, const strin
 	auto &child_types = StructType::GetChildTypes(sv.type());
 	auto &children = StructValue::GetChildren(sv);
 	for (idx_t i = 0; i < child_types.size(); i++) {
-		const string &field = child_types[i].first;
+		const auto &field = child_types[i].first; // Identifier on v2.0, string on v1.5; compared below
 		if (children[i].IsNull()) {
 			continue;
 		}

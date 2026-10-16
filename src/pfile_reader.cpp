@@ -1,6 +1,7 @@
 #include "pfile_reader.hpp"
 #include "duckdb_compat.hpp"
-#include "duckdb_compat_planner.hpp" // filter-pushdown shims (Legacy* kinds, TableFilterSet) for DuckDB v2.0
+#include "duckdb_compat_planner.hpp"  // filter-pushdown shims (Legacy* kinds, TableFilterSet) for DuckDB v2.0
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap for DuckDB v2.0 typed kwargs
 #include "register_helper.hpp"
 #include "plink_common.hpp"
 #include "plink_profile.hpp"
@@ -4662,29 +4663,29 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		// (input.filters). The scan prunes the variant set where it safely can and ALWAYS
 		// re-applies the full set per chunk (ApplyResidualFilters) for correctness.
 		fn.filter_pushdown = true;
-		fn.named_parameters["pgen"] = LogicalType::VARCHAR;
-		fn.named_parameters["pvar"] = LogicalType::VARCHAR;
-		fn.named_parameters["psam"] = LogicalType::VARCHAR;
-		fn.named_parameters["orient"] = LogicalType::VARCHAR;
-		fn.named_parameters["dosages"] = LogicalType::BOOLEAN;
-		fn.named_parameters["phased"] = LogicalType::BOOLEAN;
-		fn.named_parameters["region"] = LogicalType::VARCHAR;
-		// Accept ANY for samples and variants — type dispatch handled in bind
-		fn.named_parameters["samples"] = LogicalType::ANY;
-		fn.named_parameters["variants"] = LogicalType::ANY;
 		// Composable selection: a STRUCT whose samples/region/variants/variant_range
-		// fields seed the axes; the individual params above override per-field
-		// (most-specific-wins). Parsed via the shared ParseSelection handler in bind.
-		fn.named_parameters["selection"] = LogicalType::ANY;
-		fn.named_parameters["genotypes"] = LogicalType::VARCHAR;
-		fn.named_parameters["af_range"] = LogicalType::ANY;
-		fn.named_parameters["ac_range"] = LogicalType::ANY;
-		fn.named_parameters["genotype_range"] = LogicalType::ANY;
-		fn.named_parameters["include_genotypes"] = LogicalType::LIST(LogicalType::VARCHAR);
-		fn.named_parameters["combine_samples"] = LogicalType::VARCHAR;
-		fn.named_parameters["with_ordinal"] = LogicalType::BOOLEAN;
+		// fields seed the axes; the individual params override per-field
+		// (most-specific-wins). samples/variants are ANY — type dispatch is in bind.
 		// variant_range := [lo, hi) — ANY so bind can accept a 2-element list.
-		fn.named_parameters["variant_range"] = LogicalType::ANY;
+		DeclareNamedParameters(fn, {{"pgen", LogicalType::VARCHAR},
+		                            {"pvar", LogicalType::VARCHAR},
+		                            {"psam", LogicalType::VARCHAR},
+		                            {"orient", LogicalType::VARCHAR},
+		                            {"dosages", LogicalType::BOOLEAN},
+		                            {"phased", LogicalType::BOOLEAN},
+		                            {"region", LogicalType::VARCHAR},
+		                            {"samples", LogicalType::ANY},
+		                            {"variants", LogicalType::ANY},
+		                            {"selection", LogicalType::ANY},
+		                            {"genotypes", LogicalType::VARCHAR},
+		                            {"af_range", LogicalType::ANY},
+		                            {"ac_range", LogicalType::ANY},
+		                            {"genotype_range", LogicalType::ANY},
+		                            {"include_genotypes", LogicalType::LIST(LogicalType::VARCHAR)},
+		                            {"combine_samples", LogicalType::VARCHAR},
+		                            {"with_ordinal", LogicalType::BOOLEAN},
+		                            {"variant_range", LogicalType::ANY}});
+		CompatSetCaptureArgumentAliases(fn);
 	};
 
 	TableFunctionSet set("read_pfile");
@@ -4701,7 +4702,8 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	// pfile_partitions: ordinal-range partitions along the variants dimension.
 	// Single-prefix and list-of-prefixes overloads (per-source partitions).
 	auto add_chunk_size = [](TableFunction &fn) {
-		fn.named_parameters["chunk_size"] = LogicalType::BIGINT;
+		DeclareNamedParameters(fn, {{"chunk_size", LogicalType::BIGINT}});
+		CompatSetCaptureArgumentAliases(fn);
 	};
 	TableFunctionSet part_set("pfile_partitions");
 	TableFunction part_one("pfile_partitions", {LogicalType::VARCHAR}, PfilePartitionsScan, PfilePartitionsBind,

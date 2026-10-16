@@ -6,6 +6,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "psam_reader.hpp"
+#include "named_parameter_compat.hpp" // NamedParamMap — bind-input param map type on DuckDB v2.0
 
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
@@ -779,7 +780,7 @@ struct ResolvedSelection {
 //! name is rejected (catches e.g. `sample` vs `samples`). A non-STRUCT `selection`
 //! is a type error. With no `selection` param the behavior is byte-identical to the
 //! individual-param path.
-Selection ParseSelection(const named_parameter_map_t &params);
+Selection ParseSelection(const NamedParamMap &params);
 
 //! Reject any VARIANT-axis field (`region` / `variants` / `variant_range`) carried
 //! by a `selection` STRUCT, for a function that does not take the variant axis from
@@ -787,7 +788,7 @@ Selection ParseSelection(const named_parameter_map_t &params);
 //! supplied field from being silently dropped. The individual `region :=` param is
 //! not inspected. No-op when there is no `selection` struct (or it is NULL / not a
 //! STRUCT — the latter is reported by ParseSelection).
-void RejectSelectionVariantAxis(const named_parameter_map_t &params, const string &func_name);
+void RejectSelectionVariantAxis(const NamedParamMap &params, const string &func_name);
 
 //! Resolve a `Selection` against loaded metadata — pure GLUE over the existing
 //! primitives, NOT new logic. Resolves the SAMPLE axis BEFORE the VARIANT axis,

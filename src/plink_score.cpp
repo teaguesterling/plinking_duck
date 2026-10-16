@@ -1,6 +1,7 @@
 #include "plink_score.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
+#include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
 
@@ -848,16 +849,16 @@ void RegisterPlinkScore(ExtensionLoader &loader) {
 
 	plink_score.projection_pushdown = true;
 
-	plink_score.named_parameters["pvar"] = LogicalType::VARCHAR;
-	plink_score.named_parameters["psam"] = LogicalType::VARCHAR;
-	plink_score.named_parameters["weights"] = LogicalType::ANY;
-	plink_score.named_parameters["samples"] = LogicalType::ANY;
-	plink_score.named_parameters["region"] = LogicalType::VARCHAR;
-	// Composable selection: a STRUCT whose samples/region fields seed the axes,
-	// overridden per-field by the individual params above (see ParseSelection).
-	plink_score.named_parameters["selection"] = LogicalType::ANY;
-	plink_score.named_parameters["center"] = LogicalType::BOOLEAN;
-	plink_score.named_parameters["no_mean_imputation"] = LogicalType::BOOLEAN;
+	DeclareNamedParameters(plink_score, {
+	                       {"pvar", LogicalType::VARCHAR},
+	                       {"psam", LogicalType::VARCHAR},
+	                       {"weights", LogicalType::ANY},
+	                       {"samples", LogicalType::ANY},
+	                       {"region", LogicalType::VARCHAR},
+	                       {"selection", LogicalType::ANY},
+	                       {"center", LogicalType::BOOLEAN},
+	                       {"no_mean_imputation", LogicalType::BOOLEAN}});
+	CompatSetCaptureArgumentAliases(plink_score);
 
 	RegisterTableWithDesc(loader, plink_score, {}, "Compute polygenic risk scores from variant weights.",
 	                      {"SELECT * FROM plink_score('data/cohort.pgen', weights := 'weights.tsv')"});
