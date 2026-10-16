@@ -190,7 +190,9 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 	if (cnt_res->HasError()) {
 		throw IOException("read_pfile: failed to count rows in source '%s': %s", source, cnt_res->GetError());
 	}
-	sample_info_out.sample_ct = cnt_res->GetValue(0, 0).GetValue<int64_t>();
+	// v2.0 removed QueryResult::GetValue; fetch the first chunk and read (0,0).
+	// COUNT(*) always returns exactly one row. (Matches howard_reader's idiom.)
+	sample_info_out.sample_ct = cnt_res->Fetch()->GetValue(0, 0).GetValue<int64_t>();
 	// iids are NOT materialized here — see EnsureSourceIids (only a VARCHAR sample
 	// subset needs them; IID output reads from the projected CDC at scan).
 	return meta;

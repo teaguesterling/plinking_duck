@@ -168,4 +168,15 @@ inline bool TableFunctionDeclaresParam(const TableFunction &func, const string &
 }
 #endif
 
+//! A CatalogEntry's overload list changed element type: vector<TableFunction> on
+//! v1.5, vector<shared_ptr<const TableFunction>> on v2.0. Overloads (not a
+//! template) so each line picks the one that matches and the other is simply
+//! unused; both named types are valid on both lines.
+inline const TableFunction &CompatDerefTableFunction(const TableFunction &func) {
+	return func;
+}
+inline const TableFunction &CompatDerefTableFunction(const shared_ptr<const TableFunction> &func) {
+	return *func;
+}
+
 } // namespace duckdb
