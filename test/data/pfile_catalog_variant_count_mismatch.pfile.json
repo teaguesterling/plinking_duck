@@ -1,5 +1,5 @@
 {
-  "howard": 1,
+  "pfile_catalog": 1,
   "dataset": "vcm",
   "concat_dim": "variants",
   "shared": { "psam": "large_example.psam" },

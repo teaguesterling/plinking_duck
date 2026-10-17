@@ -17,7 +17,7 @@ set(EXTENSION_SOURCES
     src/psam_reader.cpp
     src/pgen_reader.cpp
     src/pfile_reader.cpp
-    src/howard_reader.cpp
+    src/pfile_catalog_reader.cpp
     src/plink_common.cpp
     src/plink_freq.cpp
     src/plink_hardy.cpp
@@ -274,10 +274,10 @@ if(NOT HAVE_RAWMEMCHR)
     )
 endif()
 
-# --- yyjson (vendored from the duckdb submodule) for .howard.json parsing ---
+# --- yyjson (vendored from the duckdb submodule) for .pfile.json parsing ---
 # Compiled into the extension exactly as DuckDB's own `json` extension does, with
 # hidden visibility so its symbols never clash with a host duckdb that also carries
-# yyjson. This is what makes plinking_duck the owner of .howard READING.
+# yyjson. This is what makes plinking_duck the owner of pfile_catalog READING.
 set(PLINKING_YYJSON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson)
 add_library(plinking_yyjson STATIC ${PLINKING_YYJSON_DIR}/yyjson.cpp)
 target_include_directories(plinking_yyjson PUBLIC $<BUILD_INTERFACE:${PLINKING_YYJSON_DIR}/include>)

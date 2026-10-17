@@ -5,14 +5,14 @@
 namespace duckdb {
 
 // ---------------------------------------------------------------------------
-// Shared `.howard` catalog model (spec:
+// Shared `pfile_catalog` catalog model (spec:
 //   ~/Projects/howard/docs/superpowers/specs/2026-10-09-howard-catalog-design.md §6/§7/§10).
 //
-// ONE struct for both sides of the `.howard` boundary plinking_duck owns:
+// ONE struct for both sides of the `pfile_catalog` boundary plinking_duck owns:
 //   * the sharded pfile WRITER (`src/pfile_writer.cpp`) fills these as it finalizes each
-//     shard, then serializes them to `out.howard.json` (paths RELATIVE to the catalog dir,
+//     shard, then serializes them to `out.pfile.json` (paths RELATIVE to the catalog dir,
 //     `psam` left empty — the shared companion lives at the catalog root);
-//   * the `read_howard_manifest` READER (`src/howard_reader.cpp`) parses them back, RESOLVES
+//   * the `read_pfile_catalog` READER (`src/pfile_catalog_reader.cpp`) parses them back, RESOLVES
 //     every path against the catalog's own directory, folds the shared companion into each
 //     shard, and prunes with the overlap predicates below.
 //
@@ -22,7 +22,7 @@ namespace duckdb {
 //   * `range.CHROM`             is MEMBERSHIP   — a contig is covered or it is not.
 // ---------------------------------------------------------------------------
 
-//! One shard's catalog facts → one `files[]` entry in a `.howard.json`.
+//! One shard's catalog facts → one `files[]` entry in a `.pfile.json`.
 struct ShardEntry {
 	string prefix;               //! fileset path, NO extension (writer: relative; reader: resolved)
 	string pvar;                 //! this shard's own `.pvar` (writer: relative; reader: resolved)
@@ -74,10 +74,10 @@ struct ShardEntry {
 	}
 };
 
-//! A parsed `.howard` catalog. `base_dir` is the (absolute) directory every path resolved against.
+//! A parsed `pfile_catalog` catalog. `base_dir` is the (absolute) directory every path resolved against.
 //! Both forms are supported: a single-fileset (`pfile`) catalog (`is_single`, empty `concat_dim`,
 //! one entry) and the multi-file / sharded `files` form.
-struct HowardCatalog {
+struct PfileCatalog {
 	int64_t version = 0;
 	string dataset;
 	string base_dir;
