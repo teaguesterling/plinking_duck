@@ -78,6 +78,13 @@ jobs:
       # not something a DuckDB/ci-tools bump can resolve.
       exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
+  # FORMAT only via the upstream reusable workflow. Tidy is split out into the
+  # local job below because the reusable tidy job installs only ninja-build +
+  # clang-tidy + pybind11 and provides no Eigen3 / vcpkg, so `make tidy-check`'s
+  # cmake configure died with "Eigen3 not found" (plinking's hard #53 requirement)
+  # before clang-tidy ever ran. The reusable workflow's extra_toolchains input is
+  # not consumed by its tidy job, and that workflow is not ours to edit — hence a
+  # local mirror.
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
@@ -85,4 +92,41 @@ jobs:
       duckdb_version: v1.5.6
       ci_tools_version: v1.5-variegata
       extension_name: plinking_duck
-      format_checks: 'format;tidy'
+      format_checks: 'format'
+
+  # LOCAL tidy job: mirrors the reusable _extension_code_quality tidy job's steps
+  # (checkout + submodules, extension-ci-tools@v1.5-variegata, make tidy-check)
+  # but ALSO apt-installs libeigen3-dev so the configure satisfies
+  # find_package(Eigen3) (CMakeLists falls back to the system headers under
+  # /usr/include/eigen3). Note: v1.5-variegata's tidy-check lints ALL of src/
+  # (run-clang-tidy over 'src/.*/', not a git diff), so this gives real tidy
+  # coverage of the extension once the configure gets past the Eigen3 gate.
+  tidy-check:
+    name: Tidy Check
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc
+      CXX: g++
+      GEN: ninja
+      TIDY_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+        name: Checkout current repository
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@v4
+        name: Checkout Extension CI tools
+        with:
+          path: 'extension-ci-tools'
+          ref: 'v1.5-variegata'
+          repository: 'duckdb/extension-ci-tools'
+
+      - name: Install
+        shell: bash
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build clang-tidy libeigen3-dev && sudo pip3 install pybind11[global] --break-system-packages
+
+      - name: Tidy Check Diff
+        shell: bash
+        run: make tidy-check
