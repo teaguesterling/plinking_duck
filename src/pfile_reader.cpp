@@ -715,7 +715,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 	DataChunk psam_chunk;
 	idx_t psam_chunk_idx = DConstants::INVALID_INDEX;
 
-	~PfileLocalState() {
+	~PfileLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
 			plink2::CleanupPgr(&pgr, &reterr);
@@ -3788,6 +3788,8 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 					}
 					break;
 				}
+				default:
+					break;
 				}
 			} else if (file_col == bind_data.geno_genotype_col) {
 				// Genotype column

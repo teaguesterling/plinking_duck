@@ -108,7 +108,7 @@ struct PlinkFreqLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
-	~PlinkFreqLocalState() {
+	~PlinkFreqLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
 			plink2::CleanupPgr(&pgr, &reterr);

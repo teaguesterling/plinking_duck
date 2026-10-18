@@ -172,7 +172,7 @@ void CapabilitiesFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<Value> elems;
 	elems.reserve(bind_data.tokens.size());
 	for (auto &tok : bind_data.tokens) {
-		elems.emplace_back(Value(tok));
+		elems.emplace_back(tok);
 	}
 	// The result is constant for the whole build; broadcast one constant value.
 	// v2.0's Vector::Reference(Value) requires an explicit row count.

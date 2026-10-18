@@ -186,7 +186,7 @@ struct PlinkScoreLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
-	~PlinkScoreLocalState() {
+	~PlinkScoreLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
 			plink2::CleanupPgr(&pgr, &reterr);

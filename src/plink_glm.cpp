@@ -359,7 +359,7 @@ struct PlinkGlmLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
-	~PlinkGlmLocalState() {
+	~PlinkGlmLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
 			plink2::CleanupPgr(&pgr, &reterr);
