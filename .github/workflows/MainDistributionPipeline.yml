@@ -98,9 +98,14 @@ jobs:
   # (checkout + submodules, extension-ci-tools@v1.5-variegata, make tidy-check)
   # but ALSO apt-installs libeigen3-dev so the configure satisfies
   # find_package(Eigen3) (CMakeLists falls back to the system headers under
-  # /usr/include/eigen3). Note: v1.5-variegata's tidy-check lints ALL of src/
-  # (run-clang-tidy over 'src/.*/', not a git diff), so this gives real tidy
-  # coverage of the extension once the configure gets past the Eigen3 gate.
+  # /usr/include/eigen3). The extension-ci-tools tidy-check selects TUs with the
+  # regex 'src/.*/', whose trailing slash needs a subdirectory of src/; plinking's
+  # sources are flat, so that regex matched zero files and the gate linted nothing.
+  # The repo Makefile now OVERRIDES tidy-check with a flat-source regex, a
+  # plinking-anchored header filter, -std=c++17, and a guard that fails if zero
+  # TUs are selected. .clang-tidy is a real, owned file (no longer the duckdb
+  # symlink) whose WarningsAsErrors blocks a high-value subset and leaves the
+  # plink2 integer idioms advisory. So this lints all 21 sources for real.
   tidy-check:
     name: Tidy Check
     runs-on: ubuntu-24.04

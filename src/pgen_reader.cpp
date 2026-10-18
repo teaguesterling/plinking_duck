@@ -124,7 +124,7 @@ struct PgenLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
-	~PgenLocalState() {
+	~PgenLocalState() override {
 		if (initialized) {
 			// PgenReader must be cleaned up before PgenFileInfo
 			plink2::PglErr reterr = plink2::kPglRetSuccess;

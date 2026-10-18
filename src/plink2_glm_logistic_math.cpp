@@ -461,6 +461,8 @@ void ComputeHessianF(const float *mm, const float *vv, uint32_t col_ct, uint32_t
 	case 1:
 		dest[(row_ct - 1) * row_ctavp1] =
 		    TripleProductF(&(mm[(row_ct - 1) * col_ctav]), &(mm[(row_ct - 1) * col_ctav]), vv, col_ct);
+	default:
+		break;
 	}
 }
 

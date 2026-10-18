@@ -345,16 +345,21 @@ VariantMetadataIndex LoadVariantMetadataIndex(ClientContext &context, const stri
 		// silently pushing default-initialized values.
 		if (!got_chrom || !got_pos || !got_id || !got_ref || !got_alt) {
 			string missing;
-			if (!got_chrom)
+			if (!got_chrom) {
 				missing += " CHROM";
-			if (!got_pos)
+			}
+			if (!got_pos) {
 				missing += " POS";
-			if (!got_id)
+			}
+			if (!got_id) {
 				missing += " ID";
-			if (!got_ref)
+			}
+			if (!got_ref) {
 				missing += " REF";
-			if (!got_alt)
+			}
+			if (!got_alt) {
 				missing += " ALT";
+			}
 			throw InvalidInputException(
 			    "%s: .pvar/.bim file '%s' has a line missing required fields [%s] at byte offset %llu", func_name, path,
 			    missing.c_str(), static_cast<unsigned long long>(pos));
@@ -452,16 +457,21 @@ static bool ParseVariantDataLine(const char *buf, size_t content_end, bool white
 
 	if (!got_chrom || !got_pos || !got_id || !got_ref || !got_alt) {
 		string missing;
-		if (!got_chrom)
+		if (!got_chrom) {
 			missing += " CHROM";
-		if (!got_pos)
+		}
+		if (!got_pos) {
 			missing += " POS";
-		if (!got_id)
+		}
+		if (!got_id) {
 			missing += " ID";
-		if (!got_ref)
+		}
+		if (!got_ref) {
 			missing += " REF";
-		if (!got_alt)
+		}
+		if (!got_alt) {
 			missing += " ALT";
+		}
 		throw InvalidInputException("%s: .pvar/.bim file '%s' line %llu missing required fields [%s]", func_name, path,
 		                            static_cast<unsigned long long>(line_number), missing.c_str());
 	}
