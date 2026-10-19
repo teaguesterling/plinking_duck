@@ -67,8 +67,10 @@ Checks: >-
 #                                          plus one lazy-init cache.
 #   google-build-using-namespace (2)    -> `using namespace plink2;` in a C-API-heavy
 #                                          translation unit.
-#   google-explicit-constructor (24)    -> real but call-site-risky; tracked as a
-#                                          separate follow-up, not bundled here.
+# google-explicit-constructor is BLOCKING: the "24" findings were one site, the
+# AlignedAllocator rebinding constructor in plink_common.hpp, which must stay implicit
+# per the C++ Allocator requirement. That one line is NOLINT-suppressed with a reason;
+# the check now catches any new single-argument constructor that should be explicit.
 #   performance-*, rvalue-reference-param-not-moved, avoid-non-const-global-variables,
 #   misc-*                              -> style/noise on this codebase for now.
 WarningsAsErrors: >-
@@ -82,6 +84,7 @@ WarningsAsErrors: >-
   modernize-use-nullptr,
   modernize-use-emplace,
   modernize-use-bool-literals,
+  google-explicit-constructor,
   readability-braces-around-statements,
   readability-container-size-empty,
   hicpp-exception-baseclass,
