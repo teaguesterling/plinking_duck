@@ -856,6 +856,14 @@ static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState 
 		eigenval_entries.push_back(Value::DOUBLE(gs.eigenvalues[pc]));
 	}
 
+	// Build each list value once, outside the loop, then copy it into the projected
+	// column. DuckDB dedupes a scan's column_ids, so file_col 0 and 1 each appear at
+	// most once and moving inside the loop happens to be safe today; building the
+	// values here does not rely on that and stays correct if a repeated file_col is
+	// ever passed (SetValue copies).
+	Value eigenvec_list = Value::LIST(std::move(eigenvec_entries));
+	Value eigenval_list = Value::LIST(std::move(eigenval_entries));
+
 	auto &column_ids = gs.column_ids;
 	for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 		auto file_col = column_ids[out_col];
@@ -866,9 +874,9 @@ static void EmitBothMode(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState 
 		auto &vec = output.data[out_col];
 
 		if (file_col == 0) {
-			vec.SetValue(0, Value::LIST(std::move(eigenvec_entries)));
+			vec.SetValue(0, eigenvec_list);
 		} else if (file_col == 1) {
-			vec.SetValue(0, Value::LIST(std::move(eigenval_entries)));
+			vec.SetValue(0, eigenval_list);
 		}
 	}
 	CompatSetOutputCardinality(output, 1);
