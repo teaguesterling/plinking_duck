@@ -87,7 +87,11 @@ struct AlignedAllocator {
 	using value_type = T;
 
 	AlignedAllocator() noexcept = default;
+	// The allocator rebinding constructor must be implicit -- the C++ Allocator requirement
+	// and std::allocator_traits rely on AlignedAllocator<U> converting to AlignedAllocator<T>
+	// without a cast, so google-explicit-constructor is suppressed on it by design.
 	template <class U>
+	// NOLINTNEXTLINE(google-explicit-constructor)
 	AlignedAllocator(const AlignedAllocator<U, ALIGNMENT> &) noexcept {
 	}
 
