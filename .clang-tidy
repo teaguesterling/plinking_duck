@@ -59,10 +59,10 @@ Checks: >-
 #                                          no variant_ct x sample_ct buffer multiply.
 #   bugprone-multi-level-implicit-pointer-conversion (24) -> void**/void* plink2
 #                                          C-API interop idiom.
-#   bugprone-use-after-move (2)         -> a real latent bug in plink_pca.cpp (move
-#                                          inside the output-column loop); FILED as a
-#                                          tracked issue, fixed separately with a
-#                                          regression test, not bundled into CI setup.
+# bugprone-use-after-move is now BLOCKING (via bugprone-* with no exclusion). Its one
+# finding, a move inside the plink_pca mode:='both' output loop, was measured NOT
+# reachable (DuckDB dedupes a table function's column_ids) and then hoisted out of the
+# loop in #66, so the check is clean and now guards against any reachable use-after-move.
 #   cppcoreguidelines-pro-type-const-cast (6) -> DuckDB/plink2 C-API takes non-const,
 #                                          plus one lazy-init cache.
 #   google-build-using-namespace (2)    -> `using namespace plink2;` in a C-API-heavy
@@ -79,7 +79,6 @@ WarningsAsErrors: >-
   -bugprone-narrowing-conversions,
   -bugprone-multi-level-implicit-pointer-conversion,
   -bugprone-implicit-widening-of-multiplication-result,
-  -bugprone-use-after-move,
   modernize-use-override,
   modernize-use-nullptr,
   modernize-use-emplace,
