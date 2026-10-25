@@ -25,23 +25,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Next-line build against the PINNED v2.0 release branch -- this is the exact
-  # target community-extensions' build_next.yml uses (duckdb_version:
-  # v2.0-cyanoptera, ci_tools_version: main, NO per-extension opt-out), so a
-  # green here is what tells us a release PR will build on the 2.0 line. The
-  # older canary below built `main` (the moving tip), which can drift ahead of
-  # (or behind) the frozen cyanoptera branch the registry actually compiles --
-  # keep both: cyanoptera is the gate, `main` is the early-warning.
+  # Next-line build against the v2.0 release branch the registry ships against
+  # (duckdb_version: v2.0-cyanoptera, ci_tools_version: main — the exact target
+  # community-extensions' build_next.yml uses, NO per-extension opt-out).
   #
-  # Gated to run on PRs too (unlike the `main` canary): cyanoptera IS the line
-  # the registry ships against, so a red here on a PR is a genuine, actionable
-  # signal, not upstream churn. Gated with `if:` rather than
-  # `continue-on-error:`: a job calling a REUSABLE workflow accepts only a fixed
-  # set of keys, and adding `continue-on-error` makes the whole workflow fail to
-  # PARSE, scheduling zero jobs.
+  # NOT run on ordinary pull_requests (fleet standard, see #71). The leg builds
+  # MOVING upstream pins (the v2.0-cyanoptera branch + ci-tools main + a fetched
+  # prebuilt DuckDB), so it goes red on upstream drift that has nothing to do
+  # with the PR — which makes a PR's red X unreadable as "this PR is OK to
+  # merge." Keeping it off PRs means a PR red reliably means the PR broke
+  # something. The 2.0 signal still runs on every push to main (early warning)
+  # and on demand (workflow_dispatch), and it re-enables on a PR LABELED
+  # `release` so a release candidate is gated against the 2.0 line when it
+  # actually matters. (`continue-on-error` is not an option here: a job calling
+  # a REUSABLE workflow rejects that key and the whole workflow fails to parse.)
   duckdb-next-build:
     name: Next-line build — DuckDB v2.0 (cyanoptera)
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release'))
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       duckdb_version: v2.0-cyanoptera
