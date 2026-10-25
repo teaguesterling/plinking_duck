@@ -25,43 +25,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Next-line build against the v2.0 release branch the registry ships against
-  # (duckdb_version: v2.0-cyanoptera, ci_tools_version: main — the exact target
-  # community-extensions' build_next.yml uses, NO per-extension opt-out).
+  # Next-line build against the v2.0 release branch the registry ships against,
+  # and the gate that tells us a release PR will build + test on the 2.0 line.
   #
-  # NOT run on ordinary pull_requests (fleet standard, see #71). The leg builds
-  # MOVING upstream pins (the v2.0-cyanoptera branch + ci-tools main + a fetched
-  # prebuilt DuckDB), so it goes red on upstream drift that has nothing to do
-  # with the PR — which makes a PR's red X unreadable as "this PR is OK to
-  # merge." Keeping it off PRs means a PR red reliably means the PR broke
-  # something. The 2.0 signal still runs on every push to main (early warning)
-  # and on demand (workflow_dispatch), and it re-enables on a PR LABELED
-  # `release` so a release candidate is gated against the 2.0 line when it
-  # actually matters. (`continue-on-error` is not an option here: a job calling
-  # a REUSABLE workflow rejects that key and the whole workflow fails to parse.)
+  # RESOLVE THE STAGED VERSION FIRST (issue #71, fleet pattern — see scalarfs /
+  # duck_tails). ci-tools fetches a PREBUILT libduckdb from duckdb-staging, which
+  # reports a concrete version (e.g. v2.0.1-alphaN). Passing the branch NAME
+  # "v2.0-cyanoptera" as duckdb_version stamps that string into the extension, so
+  # the loader refuses the prebuilt lib ("built specifically for DuckDB version
+  # 'v2.0-cyanoptera'") and `require plinking_duck` FAILS every test in a retried
+  # batch. Resolving the staged version + commit and passing BOTH makes the stamp
+  # match the prebuilt, so the leg runs on PRs and stays GREEN — a usable PR gate
+  # rather than drift noise. (The advisory `main` canary below stays off PRs.)
+  duckdb-next-ref:
+    name: Next-line build — resolve DuckDB v2.0
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          commit=$(git ls-remote https://github.com/duckdb/duckdb.git refs/heads/v2.0-cyanoptera | cut -f1)
+          [ -n "$commit" ] || { echo "::error::could not resolve duckdb v2.0-cyanoptera"; exit 1; }
+          version=$(curl -sSfL "https://duckdb-staging.duckdb.org/${commit:0:10}/latest_alpha_version.txt" | tr -d '[:space:]') || version=
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|dev)[0-9]+)?$ ]]; then
+            echo "::error::no staged DuckDB version for v2.0-cyanoptera at $commit (got '$version')"
+            exit 1
+          fi
+          echo "v2.0-cyanoptera -> $commit, version $version"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   duckdb-next-build:
     name: Next-line build — DuckDB v2.0 (cyanoptera)
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-      || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release'))
+    needs: duckdb-next-ref
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v2.0-cyanoptera
+      duckdb_version: ${{ needs.duckdb-next-ref.outputs.version }}
+      duckdb_commit: ${{ needs.duckdb-next-ref.outputs.commit }}
       ci_tools_version: main
       extension_name: plinking_duck
       # Same plink-ng portability exclusions as the stable leg below -- they are
       # plink-ng source issues, independent of the DuckDB version.
       exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
-      # Make a skipped test run FAIL on this leg. `T` is the test pattern ci-tools
-      # hands run_tests.py (`T ?=` in duckdb_extension.Makefile, so an env var wins)
-      # and test_env_variables reaches `make test_release` via ci_phase.py.
-      # `--require plinking_duck` turns "could not load" into `require plinking_duck: FAILED`
-      # instead of a silent skip. Verified on ci-tools main against b15358c371d:
-      # present -> exit 0 "16 passed, 2 skipped"; hidden -> exit 2 "0 passed, 18 failed".
-      # Needs a ci_tools_version that HAS `T` (main / v2.0-cyanoptera); on
-      # v1.5-variegata the variable is silently ignored -- hence `make test-require`.
+      # Make a skipped test run FAIL on this leg. `--require plinking_duck` turns
+      # "could not load" into `require plinking_duck: FAILED` instead of a silent
+      # skip (the `T` test pattern reaches `make test_release` via ci_phase.py).
       test_config: '{"test_env_variables": {"T": "--test-flags \"--require plinking_duck\" \"test/*\""}}'
   # ADVISORY canary on DuckDB `main`, the line beyond 2.0. Pushes to main and
   # dispatch only, never pull requests: a PR rollup would go red for a line
