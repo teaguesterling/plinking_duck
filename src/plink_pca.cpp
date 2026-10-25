@@ -157,6 +157,18 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint32_t> next_block_idx {0};      // variant block claiming
 	std::atomic<bool> algorithm_done {false};
 
+	// Issue #60 tripwire (detection, not the full barrier fix). The barrier is
+	// meant to let exactly one thread run MergePass per logical pass; in_merge
+	// counts threads inside the MergePass call site and must never exceed 1. A
+	// stress probe (threads 4-64, ~2600 PCA queries) never observed it exceed 1,
+	// so the race is not reproduced on today's scheduler — but the counter is a
+	// running one, so this is "not observed," not "proven safe." If two threads
+	// ever merge concurrently, double_merge_detected latches and the emit path
+	// fails loud rather than returning silently-corrupted eigenvectors. A real
+	// fix (a generation-gated latch, one merger per generation) is deferred.
+	std::atomic<uint32_t> in_merge {0};
+	std::atomic<bool> double_merge_detected {false};
+
 	// Thread ID assignment
 	std::atomic<uint32_t> next_thread_id {0};
 
@@ -960,6 +972,9 @@ static void MergePass(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs
 		}
 
 		if (pass == bind_data.n_pcs) {
+			// On this final Krylov pass StepB was gated off (pass < n_pcs is false),
+			// so the G1 merge above summed zeros into gs.G1 — dead O(threads·N·pc_ct_x2)
+			// work, harmless: RunKrylovSVD overwrites QQ and G1 is not read afterward.
 			RunKrylovSVD(gs);
 		}
 	}
@@ -1060,9 +1075,20 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	// only returning when it either emits rows (algorithm done) or yields
 	// to let other threads help with the next pass.
 	while (true) {
+		// Issue #60 tripwire: fetch_add returns the prior count; anything but 0
+		// means a second thread is already inside MergePass (the race).
+		if (gs.in_merge.fetch_add(1, std::memory_order_acq_rel) != 0) {
+			gs.double_merge_detected.store(true, std::memory_order_release);
+		}
 		MergePass(bind_data, gs, pass);
+		gs.in_merge.fetch_sub(1, std::memory_order_acq_rel);
 
 		if (gs.algorithm_done.load(std::memory_order_relaxed)) {
+			if (gs.double_merge_detected.load(std::memory_order_acquire)) {
+				throw InternalException("plink_pca: concurrent MergePass detected — the "
+				                        "pass_active_threads barrier admitted two mergers "
+				                        "(issue #60); results would be corrupt, failing loud");
+			}
 			switch (bind_data.mode) {
 			case PcaMode::SAMPLES:
 				EmitSamplesMode(bind_data, gs, output);
