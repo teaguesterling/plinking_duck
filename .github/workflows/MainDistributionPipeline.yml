@@ -62,11 +62,12 @@ jobs:
       # matches the prebuilt libduckdb the build will download -- while taking the
       # newest commit that can actually be built. It still fails loudly when NO
       # commit in range is staged, which is a real staging outage rather than lag.
+      # Cap ruled at ~50 commits by Teague, 2026-10-26.
       - id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          DEPTH=25
+          DEPTH=50
           tip=$(git ls-remote https://github.com/duckdb/duckdb.git refs/heads/v2.0-cyanoptera | cut -f1)
           [ -n "$tip" ] || { echo "::error::could not resolve duckdb v2.0-cyanoptera"; exit 1; }
 
