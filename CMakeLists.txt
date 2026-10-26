@@ -28,8 +28,7 @@ set(EXTENSION_SOURCES
     src/plink2_glm_logistic_math.cpp
     src/vcf_genotype_parse.cpp
     src/vcf_reader.cpp
-    src/pgen_vfs_opener.cpp
-)
+    src/pgen_vfs_opener.cpp)
 
 # plink_pca requires Eigen3 — added conditionally after find_package below
 
@@ -45,9 +44,9 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # C++11-built TUs, producing multiple-definition link errors.
 if(MSVC)
     target_compile_options(${EXTENSION_NAME} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/std:c++17>")
-    target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/std:c++17>")
+    target_compile_options(${LOADABLE_EXTENSION_NAME}
+                           PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/std:c++17>")
 endif()
-
 
 # ===========================================================================
 # pgenlib build integration
@@ -71,9 +70,8 @@ set(SIMDE_DIR ${PLINK_NG_DIR}/simde)
 
 # Fail early if submodule is not initialized
 if(NOT EXISTS ${PGENLIB_DIR}/pgenlib_read.cc)
-    message(FATAL_ERROR
-        "plink-ng submodule not initialized. Run:\n"
-        "  git submodule update --init third_party/plink-ng")
+    message(FATAL_ERROR "plink-ng submodule not initialized. Run:\n"
+                        "  git submodule update --init third_party/plink-ng")
 endif()
 
 # --- Apply our vendored plink-ng patches (idempotent) ---
@@ -92,11 +90,11 @@ endif()
 foreach(_patch ${PLINK_NG_PATCHES})
     execute_process(
         COMMAND ${GIT_EXECUTABLE} -C ${PLINK_NG_SUBMODULE} apply --reverse --check ${_patch}
-        RESULT_VARIABLE _already_applied OUTPUT_QUIET ERROR_QUIET)
+        RESULT_VARIABLE _already_applied
+        OUTPUT_QUIET ERROR_QUIET)
     if(NOT _already_applied EQUAL 0)
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} -C ${PLINK_NG_SUBMODULE} apply ${_patch}
-            RESULT_VARIABLE _apply_rc)
+        execute_process(COMMAND ${GIT_EXECUTABLE} -C ${PLINK_NG_SUBMODULE} apply ${_patch}
+                        RESULT_VARIABLE _apply_rc)
         if(NOT _apply_rc EQUAL 0)
             message(FATAL_ERROR "Failed to apply plink-ng patch: ${_patch}")
         endif()
@@ -111,13 +109,15 @@ endforeach()
 # instead of shipping a feature-less binary that still passes every test.
 file(READ ${PGENLIB_DIR}/pgenlib_read.cc _pgenlib_read_src)
 if(NOT _pgenlib_read_src MATCHES "plinking_pgen_fopen")
-    message(FATAL_ERROR
-        "plink-ng patch did not take effect: pgenlib_read.cc has no 'plinking_pgen_fopen' hook. "
-        "The patches/plink-ng/*.patch apply step failed silently.")
+    message(
+        FATAL_ERROR
+            "plink-ng patch did not take effect: pgenlib_read.cc has no 'plinking_pgen_fopen' hook. "
+            "The patches/plink-ng/*.patch apply step failed silently.")
 endif()
 
 # --- libdeflate (C library) ---
-add_library(plink_libdeflate STATIC
+add_library(
+    plink_libdeflate STATIC
     ${LIBDEFLATE_DIR}/lib/adler32.c
     ${LIBDEFLATE_DIR}/lib/crc32.c
     ${LIBDEFLATE_DIR}/lib/deflate_compress.c
@@ -128,14 +128,11 @@ add_library(plink_libdeflate STATIC
     ${LIBDEFLATE_DIR}/lib/zlib_compress.c
     ${LIBDEFLATE_DIR}/lib/zlib_decompress.c
     ${LIBDEFLATE_DIR}/lib/arm/arm_cpu_features.c
-    ${LIBDEFLATE_DIR}/lib/x86/x86_cpu_features.c
-)
+    ${LIBDEFLATE_DIR}/lib/x86/x86_cpu_features.c)
 target_include_directories(plink_libdeflate PUBLIC ${LIBDEFLATE_DIR})
 target_compile_definitions(plink_libdeflate PRIVATE LIBDEFLATE_STATIC)
-set_target_properties(plink_libdeflate PROPERTIES
-    C_VISIBILITY_PRESET hidden
-    POSITION_INDEPENDENT_CODE ON
-)
+set_target_properties(plink_libdeflate PROPERTIES C_VISIBILITY_PRESET hidden
+                                                  POSITION_INDEPENDENT_CODE ON)
 
 # --- zstd (C library, pgenlib's vendored copy) ---
 # Hidden visibility is critical to avoid symbol collisions with DuckDB's bundled zstd.
@@ -143,22 +140,13 @@ set_target_properties(plink_libdeflate PROPERTIES
 file(GLOB PLINK_ZSTD_COMMON_SRCS ${ZSTD_DIR}/lib/common/*.c)
 file(GLOB PLINK_ZSTD_DECOMPRESS_SRCS ${ZSTD_DIR}/lib/decompress/*.c)
 file(GLOB PLINK_ZSTD_COMPRESS_SRCS ${ZSTD_DIR}/lib/compress/*.c)
-add_library(plink_zstd STATIC
-    ${PLINK_ZSTD_COMMON_SRCS}
-    ${PLINK_ZSTD_DECOMPRESS_SRCS}
-    ${PLINK_ZSTD_COMPRESS_SRCS}
-)
+add_library(plink_zstd STATIC ${PLINK_ZSTD_COMMON_SRCS} ${PLINK_ZSTD_DECOMPRESS_SRCS}
+                              ${PLINK_ZSTD_COMPRESS_SRCS})
 # PRIVATE: don't leak vendored zstd headers to extension targets (collision risk
 # with DuckDB's own bundled zstd headers).
-target_include_directories(plink_zstd PRIVATE
-    ${ZSTD_DIR}/lib
-    ${ZSTD_DIR}/lib/common
-)
+target_include_directories(plink_zstd PRIVATE ${ZSTD_DIR}/lib ${ZSTD_DIR}/lib/common)
 target_compile_definitions(plink_zstd PRIVATE ZSTD_DISABLE_ASM)
-set_target_properties(plink_zstd PROPERTIES
-    C_VISIBILITY_PRESET hidden
-    POSITION_INDEPENDENT_CODE ON
-)
+set_target_properties(plink_zstd PROPERTIES C_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
 
 # --- musl libc compatibility ---
 # rawmemchr is a GNU extension that plink-ng uses when _GNU_SOURCE is defined.
@@ -176,7 +164,8 @@ check_symbol_exists(rawmemchr "string.h" HAVE_RAWMEMCHR)
 # statistical functions (HweLnP / HweXchrLnP for HWE, TstatToP2 / ChisqToP for GLM
 # p-values) instead of reimplementing them; it depends only on plink2_stats.h +
 # plink2_string.h (both already linked) and has no bigstack/thread/CLI entanglement.
-add_library(pgenlib STATIC
+add_library(
+    pgenlib STATIC
     ${PGENLIB_DIR}/plink2_base.cc
     ${PGENLIB_DIR}/plink2_bits.cc
     ${PGENLIB_DIR}/plink2_bgzf.cc
@@ -196,31 +185,24 @@ add_library(pgenlib STATIC
     # plinking_duck VFS shim: pgenlib_read.cc's fopen sites call plinking_pgen_fopen
     # (defined here). No DuckDB dependency — pure libc + a runtime-registered opener —
     # so it lives in pgenlib itself and resolves for every target that links pgenlib.
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/plinking_pgen_vfs.cpp
-)
-target_include_directories(pgenlib PUBLIC
-    ${PGENLIB_DIR}
-    ${LIBDEFLATE_DIR}
-    ${SIMDE_DIR}
-)
-target_include_directories(pgenlib PRIVATE
-    ${ZSTD_DIR}/lib
-    ${ZSTD_DIR}/lib/common
-)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/plinking_pgen_vfs.cpp)
+target_include_directories(pgenlib PUBLIC ${PGENLIB_DIR} ${LIBDEFLATE_DIR} ${SIMDE_DIR})
+target_include_directories(pgenlib PRIVATE ${ZSTD_DIR}/lib ${ZSTD_DIR}/lib/common)
 target_link_libraries(pgenlib PRIVATE plink_libdeflate plink_zstd)
-target_compile_definitions(pgenlib PRIVATE
-    ZSTD_DISABLE_ASM
-    LIBDEFLATE_STATIC
-)
+target_compile_definitions(pgenlib PRIVATE ZSTD_DISABLE_ASM LIBDEFLATE_STATIC)
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Eigen3 CONFIG QUIET)
 if(NOT Eigen3_FOUND)
     # Fallback: try system-installed Eigen3 (e.g., /usr/include/eigen3)
-    find_path(EIGEN3_INCLUDE_DIR NAMES Eigen/Dense PATHS /usr/include/eigen3 /usr/local/include/eigen3)
+    find_path(
+        EIGEN3_INCLUDE_DIR
+        NAMES Eigen/Dense
+        PATHS /usr/include/eigen3 /usr/local/include/eigen3)
     if(EIGEN3_INCLUDE_DIR)
         add_library(Eigen3::Eigen INTERFACE IMPORTED)
-        set_target_properties(Eigen3::Eigen PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
+        set_target_properties(Eigen3::Eigen PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                                       "${EIGEN3_INCLUDE_DIR}")
         set(Eigen3_FOUND TRUE)
     endif()
 endif()
@@ -231,25 +213,24 @@ if(NOT Eigen3_FOUND)
     # Eigen3 only warned and silently compiled plink_pca out, which surfaced as two
     # mysterious test failures on a clean non-vcpkg checkout and let CI go green
     # exactly when the feature vanished. Fail configuration loudly instead.
-    message(FATAL_ERROR
-        "Eigen3 not found. It is a required build dependency of plinking_duck "
-        "(needed by plink_pca) and is declared in vcpkg.json, so a standard "
-        "vcpkg-based build supplies it automatically. For a non-vcpkg build, "
-        "install it first — e.g. 'apt install libeigen3-dev', 'brew install eigen', "
-        "or 'vcpkg install eigen3'.")
+    message(
+        FATAL_ERROR
+            "Eigen3 not found. It is a required build dependency of plinking_duck "
+            "(needed by plink_pca) and is declared in vcpkg.json, so a standard "
+            "vcpkg-based build supplies it automatically. For a non-vcpkg build, "
+            "install it first — e.g. 'apt install libeigen3-dev', 'brew install eigen', "
+            "or 'vcpkg install eigen3'.")
 endif()
 target_link_libraries(pgenlib PRIVATE ZLIB::ZLIB Threads::Threads)
-set_target_properties(pgenlib PROPERTIES
-    CXX_VISIBILITY_PRESET hidden
-    C_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
-    POSITION_INDEPENDENT_CODE ON
-    CXX_STANDARD 17
-)
+set_target_properties(
+    pgenlib
+    PROPERTIES CXX_VISIBILITY_PRESET hidden
+               C_VISIBILITY_PRESET hidden
+               VISIBILITY_INLINES_HIDDEN ON
+               POSITION_INDEPENDENT_CODE ON
+               CXX_STANDARD 17)
 if(NOT HAVE_RAWMEMCHR)
-    target_compile_options(pgenlib PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h
-    )
+    target_compile_options(pgenlib PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h)
 endif()
 
 # --- plink2_glm_math (C++ library for GLM regression) ---
@@ -263,15 +244,14 @@ target_compile_definitions(plink2_glm_math PRIVATE NOLAPACK)
 # plink2_matrix.h uses fabs() in inline functions before <math.h> is included
 # by the .cc file. Force-include <cmath> so it's available in the header.
 target_compile_options(plink2_glm_math PRIVATE "SHELL:-include cmath")
-set_target_properties(plink2_glm_math PROPERTIES
-    CXX_VISIBILITY_PRESET hidden
-    POSITION_INDEPENDENT_CODE ON
-    CXX_STANDARD 17
-)
+set_target_properties(
+    plink2_glm_math
+    PROPERTIES CXX_VISIBILITY_PRESET hidden
+               POSITION_INDEPENDENT_CODE ON
+               CXX_STANDARD 17)
 if(NOT HAVE_RAWMEMCHR)
-    target_compile_options(plink2_glm_math PRIVATE
-        "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h"
-    )
+    target_compile_options(plink2_glm_math
+                           PRIVATE "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/musl_compat.h")
 endif()
 
 # --- yyjson (vendored from the duckdb submodule) for .pfile.json parsing ---
@@ -281,10 +261,11 @@ endif()
 set(PLINKING_YYJSON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson)
 add_library(plinking_yyjson STATIC ${PLINKING_YYJSON_DIR}/yyjson.cpp)
 target_include_directories(plinking_yyjson PUBLIC $<BUILD_INTERFACE:${PLINKING_YYJSON_DIR}/include>)
-set_target_properties(plinking_yyjson PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
-    C_VISIBILITY_PRESET hidden
-    CXX_VISIBILITY_PRESET hidden)
+set_target_properties(
+    plinking_yyjson
+    PROPERTIES POSITION_INDEPENDENT_CODE ON
+               C_VISIBILITY_PRESET hidden
+               CXX_VISIBILITY_PRESET hidden)
 target_link_libraries(${EXTENSION_NAME} plinking_yyjson)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} plinking_yyjson)
 target_include_directories(${EXTENSION_NAME} PRIVATE ${PLINKING_YYJSON_DIR}/include)
@@ -294,8 +275,22 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PLINKING_YYJSON_
 # Deps are listed explicitly because pgenlib links them PRIVATE (won't propagate
 # in static builds) and DuckDB's macros require the plain target_link_libraries
 # signature (no PRIVATE/PUBLIC keyword).
-target_link_libraries(${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd ZLIB::ZLIB Threads::Threads)
+target_link_libraries(
+    ${EXTENSION_NAME}
+    pgenlib
+    plink2_glm_math
+    plink_libdeflate
+    plink_zstd
+    ZLIB::ZLIB
+    Threads::Threads)
+target_link_libraries(
+    ${LOADABLE_EXTENSION_NAME}
+    pgenlib
+    plink2_glm_math
+    plink_libdeflate
+    plink_zstd
+    ZLIB::ZLIB
+    Threads::Threads)
 target_include_directories(${EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_DIR})
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${PGENLIB_DIR} ${PLINK_NG_DIR})
 target_compile_definitions(${EXTENSION_NAME} PRIVATE NOLAPACK)
@@ -312,7 +307,7 @@ if(Eigen3_FOUND)
 endif()
 
 install(
-  TARGETS ${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd plinking_yyjson
-  EXPORT "${DUCKDB_EXPORT_SET}"
-  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+    TARGETS ${EXTENSION_NAME} pgenlib plink2_glm_math plink_libdeflate plink_zstd plinking_yyjson
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
