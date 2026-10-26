@@ -62,7 +62,10 @@ jobs:
       # matches the prebuilt libduckdb the build will download -- while taking the
       # newest commit that can actually be built. It still fails loudly when NO
       # commit in range is staged, which is a real staging outage rather than lag.
-      # Cap ruled at ~50 commits by Teague, 2026-10-26.
+      # Teague ruled the SHAPE (walk back to the newest staged commit). The cap of
+      # ~50 is the fleet coordinator's number, not his, and not measured -- my own
+      # first value was 25, equally invented. It only has to exceed the longest run
+      # of consecutive unstaged commits that can sit below the tip.
       - id: resolve
         shell: bash
         run: |
