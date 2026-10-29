@@ -73,12 +73,27 @@ Checks: >-
 # the check now catches any new single-argument constructor that should be explicit.
 #   performance-*, rvalue-reference-param-not-moved, avoid-non-const-global-variables,
 #   misc-*                              -> style/noise on this codebase for now.
+# DuckDB v2.0.0 promotion (shipping line, #74) demotes two checks to advisory:
+#   clang-diagnostic-deprecated-declarations -> v2.0.0 marks ListVector/ArrayVector::
+#                                          GetEntry (70 sites) and DataChunk::
+#                                          SetCardinality (6) [[deprecated]]. The
+#                                          GetChild/GetChildMutable replacements are
+#                                          v2.0-only; the v1.5.6 variant leg exposes
+#                                          only GetEntry, so the source cannot migrate
+#                                          while both lines ship. Advisory for the
+#                                          dual-version window; re-block and migrate
+#                                          (via a version shim) when v1.5.6 is dropped.
+#   bugprone-switch-missing-default-case (1) -> vendored plink2 SIMD kernel
+#                                          plink2_glm_logistic_math.cpp, switch on
+#                                          row_ct % 4; not worth patching upstream.
 WarningsAsErrors: >-
   clang-diagnostic-*,
   bugprone-*,
   -bugprone-narrowing-conversions,
   -bugprone-multi-level-implicit-pointer-conversion,
   -bugprone-implicit-widening-of-multiplication-result,
+  -clang-diagnostic-deprecated-declarations,
+  -bugprone-switch-missing-default-case,
   modernize-use-override,
   modernize-use-nullptr,
   modernize-use-emplace,

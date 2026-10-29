@@ -45,16 +45,69 @@ jobs:
       commit: ${{ steps.resolve.outputs.commit }}
       version: ${{ steps.resolve.outputs.version }}
     steps:
+      # WALK BACK FROM THE TIP to the newest commit that duckdb-staging actually
+      # built. Resolving the tip alone is what this job used to do, and it is red
+      # whenever staging lags -- measured 2026-10-26: of the 8 newest cyanoptera
+      # commits, only 2 had a staged build, and the tip was not one of them:
+      #
+      #   af2d380a19  404      <- tip
+      #   99b013ad36  404
+      #   c4d7b8bd7e  200  v2.0.1-alpha50398
+      #   defed5fd79  404
+      #   3ea22a8bc3  404
+      #   bb5bdadda4  200  v2.0.1-alpha50125
+      #
+      # So the premise "the tip has a staged build" is false most of the time. The
+      # walk keeps what the resolver was for -- no manual bump, and a version that
+      # matches the prebuilt libduckdb the build will download -- while taking the
+      # newest commit that can actually be built. It still fails loudly when NO
+      # commit in range is staged, which is a real staging outage rather than lag.
+      # Teague ruled the SHAPE (walk back to the newest staged commit). The CAP is
+      # mine, and unlike the two invented values before it (25, then the
+      # coordinator's 50) this one is measured.
+      #
+      # Staging does not keep a trailing window of recent builds; it builds SOME
+      # commits and skips runs of others. Probing the newest 60 commits found only
+      # 2 staged, with a run of 54 CONSECUTIVE unstaged commits spanning just 0.8
+      # days -- while a staged build 3.1 days old was still being served. Age does
+      # not explain it, so a burst of commits can get one build for the whole burst.
+      #
+      # That makes the run length the thing the cap must clear, and 50 does not
+      # clear it: on 2026-10-23 around 10:13, when 420d03f67 was the tip, a walk of
+      # depth 50 would have found nothing and failed. 150 gives roughly 3x the
+      # worst run measured. It costs nothing in the normal case, because the loop
+      # breaks at the first staged commit -- today the 3rd probe.
       - id: resolve
+        shell: bash
         run: |
-          commit=$(git ls-remote https://github.com/duckdb/duckdb.git refs/heads/v2.0-cyanoptera | cut -f1)
-          [ -n "$commit" ] || { echo "::error::could not resolve duckdb v2.0-cyanoptera"; exit 1; }
-          version=$(curl -sSfL "https://duckdb-staging.duckdb.org/${commit:0:10}/latest_alpha_version.txt" | tr -d '[:space:]') || version=
-          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|dev)[0-9]+)?$ ]]; then
-            echo "::error::no staged DuckDB version for v2.0-cyanoptera at $commit (got '$version')"
+          set -euo pipefail
+          DEPTH=150
+          tip=$(git ls-remote https://github.com/duckdb/duckdb.git refs/heads/v2.0-cyanoptera | cut -f1)
+          [ -n "$tip" ] || { echo "::error::could not resolve duckdb v2.0-cyanoptera"; exit 1; }
+
+          tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+          git clone --quiet --filter=blob:none --no-checkout --depth "$DEPTH" \
+              --branch v2.0-cyanoptera https://github.com/duckdb/duckdb.git "$tmp/duckdb"
+
+          commit=""; version=""; behind=0
+          for sha in $(git -C "$tmp/duckdb" log --format=%H -n "$DEPTH"); do
+            v=$(curl -sSfL "https://duckdb-staging.duckdb.org/${sha:0:10}/latest_alpha_version.txt" 2>/dev/null | tr -d '[:space:]') || { behind=$((behind+1)); continue; }
+            if [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|dev)[0-9]+)?$ ]]; then
+              commit="$sha"; version="$v"; break
+            fi
+            behind=$((behind+1))
+          done
+
+          if [ -z "$commit" ]; then
+            echo "::error::no staged DuckDB build for v2.0-cyanoptera in its last $DEPTH commits (tip $tip)"
             exit 1
           fi
-          echo "v2.0-cyanoptera -> $commit, version $version"
+
+          echo "v2.0-cyanoptera tip is $tip"
+          echo "resolved $commit, version $version ($behind commit(s) behind the tip)"
+          if [ "$behind" -gt 0 ]; then
+            echo "::notice::the v2.0-cyanoptera tip ($tip) has no staged build; using $commit ($version), $behind commit(s) back"
+          fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -91,15 +144,30 @@ jobs:
       # plink-ng source issues, independent of the DuckDB version.
       exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
+  # THE SHIPPING LINE, promoted from v1.5.6 to v2.0.0 (2026-10-26). The commit is
+  # upstream's v2.0.0 release TAG, measured today:
+  #   git ls-remote --tags https://github.com/duckdb/duckdb.git v2.0.0
+  #     -> d54cbbe3df17e8e5ce68312f483b4155836112aa
+  #
+  # duckdb_version is a RELEASE TAG and never a branch name. ci_phase.py checks
+  # this value against a semver pattern; a branch name such as `v2.0-cyanoptera`
+  # fails that check, so the script resolves the branch's staged version for the
+  # download URL only and never writes it back. CMake then stamps the extension
+  # with the branch name while the library it links reports the staged version,
+  # DuckDB refuses a stamp that differs from its own version, and every test fails
+  # at its `require` line (measured on three sibling repos, 2026-10-25). A release
+  # tag matches the pattern, so nothing is substituted, and duckdb_commit selects
+  # the checkout.
+  #
+  # The `uses:` ref and ci_tools_version are the extension-ci-tools BRANCH
+  # v2.0-cyanoptera, which is unrelated to the DuckDB branch of the same name.
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      # Build/ship against the latest v1.5 RELEASE tag so the produced extension is
-      # loadable in released DuckDB (branch-tip builds produce non-loadable -dev
-      # binaries). The submodule pointers track the v1.5-variegata branch tips.
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5-variegata
+      duckdb_version: v2.0.0
+      duckdb_commit: d54cbbe3df17e8e5ce68312f483b4155836112aa
+      ci_tools_version: v2.0-cyanoptera
       extension_name: plinking_duck
       # plink-ng portability issues (not ours), independent of the DuckDB version:
       #   musl: SIMD segfault at runtime
@@ -108,6 +176,34 @@ jobs:
       #   Wasm: plink-ng requires POSIX APIs (pthreads, file I/O)
       # Windows stays excluded: the libdeflate/MSVC blocker is a plink-ng source issue,
       # not something a DuckDB/ci-tools bump can resolve.
+      exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+      # THE GUARD BELONGS ON THE SHIPPING LEG, which is the point of the promote.
+      # Without it an extension that fails to load yields `ran tests: 0 passed,
+      # N skipped` and the leg still reports SUCCESS -- measured on duckdb_webbed's
+      # unguarded canary (0 passed, 130 skipped, conclusion success, 2026-10-25).
+      # `--require plinking_duck` turns "could not load" into
+      # `require plinking_duck: FAILED`. The token is the literal this repo's own
+      # tests use, measured with `grep -rhoE '^require [a-z_]+' test/ | sort -u`
+      # (which gives `parquet` and `plinking_duck`), never derived from EXT_NAME.
+      test_config: '{"test_env_variables": {"T": "--test-flags \"--require plinking_duck\" \"test/*\""}}'
+
+  # THE VARIANT LINE. v1.5.6 is what the community registry still builds for
+  # current installs, so it keeps a leg of its own after the promote rather than
+  # being dropped.
+  #
+  # NO test_config here, deliberately: `T ?=` is absent from
+  # duckdb_extension.Makefile on v1.5-variegata, so the variable is silently
+  # ignored on this ref. The guard above cannot be mirrored here, and adding it
+  # would advertise a check that does not run.
+  duckdb-variegata-build:
+    name: Build extension binaries (DuckDB v1.5 variant)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.6
+      ci_tools_version: v1.5-variegata
+      extension_name: plinking_duck
+      # The same plink-ng portability exclusions as the shipping leg above.
       exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   # FORMAT only via the upstream reusable workflow. Tidy is split out into the
@@ -119,10 +215,14 @@ jobs:
   # local mirror.
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5-variegata
+      # duckdb_version is DEPRECATED on this workflow and is ignored for format
+      # purposes -- upstream states it outright: "code quality checks use the
+      # checked-out duckdb submodule". It is the SUBMODULE BUMP below that changes
+      # the formatter, which is why a promote reddens files no commit touched.
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
       extension_name: plinking_duck
       format_checks: 'format'
 
