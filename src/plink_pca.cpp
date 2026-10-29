@@ -157,15 +157,23 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint32_t> next_block_idx {0};      // variant block claiming
 	std::atomic<bool> algorithm_done {false};
 
-	// Issue #60 tripwire (detection, not the full barrier fix). The barrier is
-	// meant to let exactly one thread run MergePass per logical pass; in_merge
-	// counts threads inside the MergePass call site and must never exceed 1. A
-	// stress probe (threads 4-64, ~2600 PCA queries) never observed it exceed 1,
-	// so the race is not reproduced on today's scheduler — but the counter is a
-	// running one, so this is "not observed," not "proven safe." If two threads
-	// ever merge concurrently, double_merge_detected latches and the emit path
-	// fails loud rather than returning silently-corrupted eigenvectors. A real
-	// fix (a generation-gated latch, one merger per generation) is deferred.
+	// Issue #60 fix: single-merger election. pass_active_threads is a running
+	// counter, not a true barrier, so it can admit a second would-be merger for a
+	// pass (a thread that skipped the pass re-drives the counter 0→1→0 while the
+	// first merger is still inside MergePass). merge_claim closes that: it holds
+	// the next pass number eligible to merge, and a thread claims pass P with
+	// CAS(P → P+1). Exactly one thread wins, so MergePass(P) runs once — no double
+	// RunFinalSVD, no double generation advance, no corrupt eigenvectors. The
+	// loser backs off and rejoins on its next Scan re-call. This is correct
+	// because ScanVariantPass drains every variant block before any thread is
+	// elected, so a losing late-comer contributed no data and the winner's merge
+	// is complete regardless of which thread wins.
+	std::atomic<uint32_t> merge_claim {0}; // next pass eligible to merge; claim via CAS(P→P+1)
+
+	// Tripwire kept as a permanent backstop: in_merge counts threads inside the
+	// MergePass call site and must never exceed 1. If the claim above ever failed
+	// to hold (or a future edit reintroduces the race), double_merge_detected
+	// latches and the emit path throws rather than returning corrupt results.
 	std::atomic<uint32_t> in_merge {0};
 	std::atomic<bool> double_merge_detected {false};
 
@@ -1075,8 +1083,20 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 	// only returning when it either emits rows (algorithm done) or yields
 	// to let other threads help with the next pass.
 	while (true) {
-		// Issue #60 tripwire: fetch_add returns the prior count; anything but 0
-		// means a second thread is already inside MergePass (the race).
+		// Issue #60 fix: claim the merge for this pass. CAS(pass → pass+1) succeeds
+		// for exactly one thread; a second would-be merger admitted by the
+		// pass_active_threads counter race loses and backs off, so MergePass runs
+		// once per pass. Wait for the winner to advance the generation, then rejoin.
+		uint32_t claim = pass;
+		if (!gs.merge_claim.compare_exchange_strong(claim, pass + 1, std::memory_order_acq_rel,
+		                                            std::memory_order_acquire)) {
+			ls.last_generation_seen = pass;
+			CompatSetOutputCardinality(output, 0);
+			return;
+		}
+
+		// Issue #60 tripwire (backstop): fetch_add returns the prior count; anything
+		// but 0 means a second thread is already inside MergePass (the race).
 		if (gs.in_merge.fetch_add(1, std::memory_order_acq_rel) != 0) {
 			gs.double_merge_detected.store(true, std::memory_order_release);
 		}
