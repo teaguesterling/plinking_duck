@@ -53,6 +53,8 @@ nav:
       - read_pfile: functions/read_pfile.md
       - read_plink_vcf: functions/read_plink_vcf.md
       - read_pfile_catalog: functions/read_pfile_catalog.md
+      - read_pfile_catalog_metadata: functions/read_pfile_catalog_metadata.md
+      - read_pfile_catalog_layout: functions/read_pfile_catalog_layout.md
       - Writing filesets (COPY TO): functions/write_pfile.md
       - plink_freq: functions/plink_freq.md
       - plink_hardy: functions/plink_hardy.md
