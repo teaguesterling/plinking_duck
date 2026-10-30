@@ -1,5 +1,7 @@
 #include "pfile_catalog_reader.hpp"
 #include "pfile_catalog.hpp"
+#include "pfile_catalog_matrix.hpp"
+#include "pfile_catalog_util.hpp"
 #include "plink_common.hpp"
 #include "register_helper.hpp"
 #include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
@@ -48,15 +50,7 @@ constexpr int64_t PFILE_CATALOG_VERSION = 1;
 
 // ---- yyjson helpers -------------------------------------------------------
 
-//! RAII for a parsed yyjson document, so every throw path frees it.
-struct YyDocGuard {
-	yyjson_doc *doc = nullptr;
-	~YyDocGuard() {
-		if (doc) {
-			yyjson_doc_free(doc);
-		}
-	}
-};
+} // namespace
 
 //! Read a JSON integer (yyjson stores non-negative ints as UINT, negatives as SINT; the safe
 //! typed accessors each return 0 for the other subtype, so branch explicitly). An unsigned value
@@ -155,6 +149,8 @@ string ResolvePath(FileSystem &fs, const string &base_dir, const string &path, b
 	}
 	return NormPath(fs.JoinPath(base_dir, path));
 }
+
+namespace {
 
 // ---- SQL quoting ----------------------------------------------------------
 
@@ -790,6 +786,8 @@ struct PfileCatalogBindData : public TableFunctionData {
 	bool is_single = false;      //! single-fileset catalog → emit NULL concat_dim (the signal howard routes on)
 	bool has_chunk_size = false; //! surface chunks.chunk_size (single-fileset only; multi-shard → NULL)
 	int64_t chunk_size = 0;
+	bool is_matrix = false; //! v2 matrix catalog → `cells` rows, the v2 schema
+	vector<MatrixCell> cells;
 };
 
 struct PfileCatalogGlobalState : public GlobalTableFunctionState {
@@ -813,6 +811,31 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		if (size > 0) {
 			handle->Read(reinterpret_cast<void *>(&content[0]), size);
 		}
+	}
+
+	// ---- version routing: a v2 matrix catalog takes its own parse + schema (the v1 path below is untouched).
+	if (IsMatrixCatalog(content)) {
+		for (auto &np : {"region", "variant_index", "sample_index", "verify_all"}) {
+			auto it = input.named_parameters.find(np);
+			if (it != input.named_parameters.end() && !it->second.IsNull()) {
+				throw InvalidInputException("read_pfile_catalog: invalid predicate: %s is not supported for a "
+				                            "version-2 matrix catalog yet",
+				                            np);
+			}
+		}
+		MatrixCatalog mcat = ParseMatrixCatalog(fs, path, content);
+		result->is_matrix = true;
+		result->dataset = mcat.dataset;
+		result->cells = BuildCells(mcat, fs);
+		names = {"dataset",      "prefix",      "pvar",           "psam", "variant_start", "variant_stop",
+		         "sample_start", "sample_stop", "source_ordinal", "keys", "verified"};
+		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                LogicalType::BIGINT,  LogicalType::BIGINT,
+		                LogicalType::BIGINT,  LogicalType::BIGINT,
+		                LogicalType::BIGINT,  LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+		                LogicalType::BOOLEAN};
+		return std::move(result);
 	}
 
 	PfileCatalog cat = ParseCatalog(fs, path, content);
@@ -943,6 +966,34 @@ static unique_ptr<GlobalTableFunctionState> PfileCatalogInitGlobal(ClientContext
 static void PfileCatalogScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind = data_p.bind_data->Cast<PfileCatalogBindData>();
 	auto &gstate = data_p.global_state->Cast<PfileCatalogGlobalState>();
+
+	if (bind.is_matrix) {
+		idx_t n = MinValue<idx_t>(bind.cells.size() - gstate.row_idx, STANDARD_VECTOR_SIZE);
+		for (idx_t i = 0; i < n; i++) {
+			auto &c = bind.cells[gstate.row_idx + i];
+			output.data[0].SetValue(i, Value(bind.dataset));
+			output.data[1].SetValue(i, Value(c.prefix));
+			output.data[2].SetValue(i, Value(c.pvar));
+			output.data[3].SetValue(i, Value(c.psam));
+			output.data[4].SetValue(i, Value::BIGINT(c.variant_start));
+			output.data[5].SetValue(i, Value::BIGINT(c.variant_stop));
+			output.data[6].SetValue(i, Value::BIGINT(c.sample_start));
+			output.data[7].SetValue(i, Value::BIGINT(c.sample_stop));
+			output.data[8].SetValue(i, Value::BIGINT(c.source_ordinal));
+			vector<Value> ks, vs;
+			for (auto &kv : c.keys) {
+				ks.push_back(Value(kv.first));
+				vs.push_back(Value(kv.second));
+			}
+			output.data[9].SetValue(
+			    i, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(ks), std::move(vs)));
+			// Verification is not wired for v2 yet (next task): never claim a cell is verified.
+			output.data[10].SetValue(i, Value::BOOLEAN(false));
+		}
+		gstate.row_idx += n;
+		output.SetCardinality(n);
+		return;
+	}
 
 	idx_t remaining = bind.survivors.size() - gstate.row_idx;
 	idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);

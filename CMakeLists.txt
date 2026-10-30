@@ -18,6 +18,7 @@ set(EXTENSION_SOURCES
     src/pgen_reader.cpp
     src/pfile_reader.cpp
     src/pfile_catalog_reader.cpp
+    src/pfile_catalog_matrix.cpp
     src/plink_common.cpp
     src/plink_freq.cpp
     src/plink_hardy.cpp
