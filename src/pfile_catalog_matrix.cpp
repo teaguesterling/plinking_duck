@@ -86,6 +86,7 @@ AxisDef ParseAxis(const string &path, yyjson_val *axis, const char *expected_nam
 void ValidateTemplate(const string &path, const char *which, const string &tmpl, const AxisKey *allowed,
                       const AxisKey *other) {
 	size_t i = 0;
+	bool uses_own = false;
 	while ((i = tmpl.find('{', i)) != string::npos) {
 		auto close = tmpl.find('}', i);
 		if (close == string::npos) {
@@ -93,7 +94,7 @@ void ValidateTemplate(const string &path, const char *which, const string &tmpl,
 		}
 		string name = tmpl.substr(i + 1, close - i - 1);
 		if (allowed && name == allowed->name) {
-			// ok
+			uses_own = true;
 		} else if (other && name == other->name) {
 			ParseError(path, StringUtil::Format("template.%s '%s' references key '%s' of the other axis — a "
 			                                    "companion is shared only along its own axis (spec §5)",
@@ -102,6 +103,11 @@ void ValidateTemplate(const string &path, const char *which, const string &tmpl,
 			ParseError(path, StringUtil::Format("template.%s '%s' references undeclared key '%s'", which, tmpl, name));
 		}
 		i = close + 1;
+	}
+	if (!uses_own) {
+		ParseError(path, StringUtil::Format("template.%s '%s' does not reference its own axis's key '%s' — it would "
+		                                    "share one companion across every block of that axis (spec §3.1/§5)",
+		                                    which, tmpl, allowed->name));
 	}
 }
 
@@ -200,6 +206,7 @@ MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const strin
 	cat.psam_template = get_tmpl("psam");
 
 	// The .pgen path may use either axis's key; each companion only its own axis's (§3.1 / §5).
+	bool uses_variants = false, uses_samples = false;
 	for (size_t pos = 0; (pos = cat.pfile_template.find('{', pos)) != string::npos;) {
 		auto close = cat.pfile_template.find('}', pos);
 		string name = close == string::npos ? "" : cat.pfile_template.substr(pos + 1, close - pos - 1);
@@ -207,7 +214,14 @@ MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const strin
 			ParseError(path, StringUtil::Format("template.pfile '%s' references undeclared key '%s'",
 			                                    cat.pfile_template, name));
 		}
+		uses_variants |= name == cat.variants.key.name;
+		uses_samples |= name == cat.samples.key.name;
 		pos = close + 1;
+	}
+	if (!uses_variants || !uses_samples) {
+		ParseError(path, StringUtil::Format("template.pfile '%s' must reference the key of every axis ('%s' and "
+		                                    "'%s'), or distinct cells would resolve to the same .pgen",
+		                                    cat.pfile_template, cat.variants.key.name, cat.samples.key.name));
 	}
 	ValidateTemplate(path, "pvar", cat.pvar_template, &cat.variants.key, &cat.samples.key);
 	ValidateTemplate(path, "psam", cat.psam_template, &cat.samples.key, &cat.variants.key);
