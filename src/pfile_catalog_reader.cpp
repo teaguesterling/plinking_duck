@@ -814,9 +814,24 @@ void VerifyMatrixCells(ClientContext &context, FileSystem &fs, const MatrixCatal
 			                            (long long)c.variant_stop, (long long)st.count);
 		}
 
-		// Under-claim: the declared POS extent / CHROM of a POS-bounded block must COVER the real .pvar,
-		// or a stale bound would wrongly drop this block on a `region` prune (spec §10).
+		// Under-claim (spec §10): a declared prune statistic must COVER the real .pvar, or a stale value
+		// would wrongly drop this block on a `region` prune while `verified` still reads true.
 		const AxisBlock &vb = cat.variants.blocks[c.variant_block];
+		// CHROM membership: run whenever a CHROM enum key exists, INDEPENDENT of a POS key — `region`
+		// prunes on CHROM alone for a CHROM-only matrix, so the declared CHROM must match the contig the
+		// .pvar actually holds (mirrors the v1 reader's range.CHROM check).
+		if (has_chrom_key) {
+			string declared = vb.ValueOf("CHROM");
+			for (auto &actual : st.chroms) {
+				if (actual != declared) {
+					throw InvalidInputException(
+					    "read_pfile_catalog: verification failed (range under-claim): cell '%s': declared CHROM "
+					    "'%s' does not cover contig '%s' the .pvar actually holds (spec §10)",
+					    c.prefix, declared, actual);
+				}
+			}
+		}
+		// POS extent: only a block that declares an ordinal_interval-over-POS bound carries this statistic.
 		if (pos_key) {
 			const BlockBound *b = vb.FindBound(pos_key->name);
 			if (b && st.has_pos && (st.pos_min < b->lo || st.pos_max > b->hi)) {
@@ -825,17 +840,6 @@ void VerifyMatrixCells(ClientContext &context, FileSystem &fs, const MatrixCatal
 				    "[%lld, %lld] does not cover the real POS extent [%lld, %lld] — an under-claiming bound would "
 				    "wrongly drop this block (spec §10)",
 				    c.prefix, (long long)b->lo, (long long)b->hi, (long long)st.pos_min, (long long)st.pos_max);
-			}
-			if (has_chrom_key) {
-				string declared = vb.ValueOf("CHROM");
-				for (auto &actual : st.chroms) {
-					if (actual != declared) {
-						throw InvalidInputException(
-						    "read_pfile_catalog: verification failed (range under-claim): cell '%s': declared CHROM "
-						    "'%s' does not cover contig '%s' the .pvar actually holds (spec §10)",
-						    c.prefix, declared, actual);
-					}
-				}
 			}
 		}
 

@@ -362,6 +362,41 @@ SELECT * FROM read_pfile_catalog('{TEST_DIR}/pvar_collapse.pfile.json');
 same .pvar
 
 # ---------------------------------------------------------------------------
+# CHROM under-claim on a CHROM-ONLY matrix (enum CHROM, NO POS/CHUNK key). Task 4 makes `region` prune on
+# CHROM membership for exactly this shape, so a block mislabeled CHROM=2 whose .pvar actually holds contig
+# 3 must be caught at survivor verification (not reported verified=true). This fires independent of a POS
+# key, matching the v1 reader's range.CHROM check.
+# ---------------------------------------------------------------------------
+
+# 1 cell: .pgen holds 1 variant x 1 sample; counts match its companions, so ONLY the CHROM label lies.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/cell_2_A' (FORMAT pfile, samples ['S1']);
+
+# the variant-block .pvar companion ACTUALLY holds contig '3' (relabeled), contradicting the block's CHROM=2.
+statement ok
+COPY (SELECT '3' AS CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/mv_2' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/ms_A' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"mislabel","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"2","start":0,"stop":1}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":1}]}]}],"template":{"pfile":"cell_{CHROM}_{GROUP}","pvar":"mv_{CHROM}.pvar","psam":"ms_{GROUP}.psam"}}')
+TO '{TEST_DIR}/chrom_mislabel.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# region := '2' keeps the (conservatively-kept) CHROM=2 block; its survivor verification must catch the
+# contig-3 .pvar as a CHROM under-claim rather than returning a verified=true row.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/chrom_mislabel.pfile.json', region := '2');
+----
+range under-claim
+
+# ---------------------------------------------------------------------------
 # grammar negatives (parse-time, no filesets needed).
 # ---------------------------------------------------------------------------
 
