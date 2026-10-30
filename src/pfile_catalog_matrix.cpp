@@ -504,7 +504,7 @@ MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const strin
 	return cat;
 }
 
-vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs) {
+vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs, bool include_holes) {
 	vector<MatrixCell> cells;
 	std::unordered_set<string> seen_prefix, seen_pvar, seen_psam;
 	int64_t ordinal = 0;
@@ -515,12 +515,26 @@ vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs) {
 		auto &vb = cat.variants.blocks[vi];
 		for (size_t si = 0; si < cat.samples.blocks.size(); si++) {
 			auto &sb = cat.samples.blocks[si];
-			if (IsHole(cat, vb, sb)) {
+			bool hole = IsHole(cat, vb, sb);
+			if (hole && !include_holes) {
 				continue; // absent: never resolve a path for it
 			}
 			MatrixCell c;
 			c.keys = vb.key_values;
 			c.keys.insert(c.keys.end(), sb.key_values.begin(), sb.key_values.end());
+			if (hole) {
+				// Layout view only: a hole keeps its geometry but resolves no path and joins no collision set.
+				c.present = false;
+				c.variant_start = vb.ordinal_start;
+				c.variant_stop = vb.ordinal_stop;
+				c.sample_start = sb.ordinal_start;
+				c.sample_stop = sb.ordinal_stop;
+				c.variant_block = (int64_t)vi;
+				c.sample_block = (int64_t)si;
+				c.source_ordinal = -1;
+				cells.push_back(std::move(c));
+				continue;
+			}
 			c.prefix = ResolvePath(fs, cat.base_dir, Substitute(cat.pfile_template, c.keys), true);
 			c.pvar = ResolvePath(fs, cat.base_dir, Substitute(cat.pvar_template, c.keys), true);
 			c.psam = ResolvePath(fs, cat.base_dir, Substitute(cat.psam_template, c.keys), true);
@@ -558,40 +572,6 @@ vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs) {
 	return cells;
 }
 
-namespace {
-
-//! The interval a bound-key predicate overlaps against, resolved from the cell's block. Returns false
-//! when the key is not an interval key on either axis (handled as a predicate error upstream).
-bool ResolveBoundInterval(const MatrixCatalog &cat, const MatrixCell &c, const string &key_name, int64_t &lo,
-                          int64_t &hi, bool &inclusive) {
-	for (auto *axis : {&cat.variants, &cat.samples}) {
-		const AxisKey *key = axis->FindKey(key_name);
-		if (!key) {
-			continue;
-		}
-		const AxisBlock &block =
-		    axis->name == "variants" ? cat.variants.blocks[c.variant_block] : cat.samples.blocks[c.sample_block];
-		if (key->type == AxisKeyType::ORDINAL_INTERVAL && key->over != "POS") {
-			// over an axis ordinal: the bound IS the block's half-open [start,stop).
-			lo = block.ordinal_start;
-			hi = block.ordinal_stop;
-			inclusive = false;
-			return true;
-		}
-		const BlockBound *b = block.FindBound(key_name);
-		if (!b) {
-			return false;
-		}
-		lo = b->lo;
-		hi = b->hi;
-		inclusive = key->type == AxisKeyType::ORDINAL_INTERVAL; // POS inclusive; value_bin half-open
-		return true;
-	}
-	return false;
-}
-
-} // namespace
-
 vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell> &cells,
                               const MatrixPredicates &preds) {
 	// Resolve the variant-axis ordinal_interval-over-POS key once (for `region`'s POS window).
@@ -621,19 +601,6 @@ vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell>
 				}
 				keep = keep && in_set;
 			}
-		}
-
-		// bound `keys` overlap (ordinal_interval / value_bin, either axis).
-		for (auto &bp : preds.bound_keys) {
-			int64_t blo, bhi;
-			bool inclusive;
-			if (!ResolveBoundInterval(cat, c, bp.key_name, blo, bhi, inclusive)) {
-				keep = false; // no bound on this block -> cannot overlap
-				continue;
-			}
-			bool overlap = inclusive ? !(bp.hi < blo || bp.lo > bhi)  // inclusive [blo,bhi] vs inclusive [lo,hi]
-			                         : (bp.lo < bhi && bp.hi >= blo); // half-open [blo,bhi) vs inclusive [lo,hi]
-			keep = keep && overlap;
 		}
 
 		// region: variant-axis CHROM membership (verbatim) + POS-window overlap against the POS key.

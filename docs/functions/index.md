@@ -1,6 +1,6 @@
 # Function Reference
 
-PlinkingDuck provides 13 core SQL table functions: 6 file readers and 7 analysis functions. (`plink_pca` additionally requires Eigen3 at build time — a hard dependency supplied by `vcpkg.json`, so standard builds always include it; see [its page](plink_pca.md).) In addition there is a utility table function ([`pfile_partitions`](pfile_partitions.md)) and a scalar feature-detection function ([`plinking_duck_capabilities`](plinking_duck_capabilities.md)).
+PlinkingDuck provides 13 core SQL table functions: 6 file readers and 7 analysis functions. (`plink_pca` additionally requires Eigen3 at build time — a hard dependency supplied by `vcpkg.json`, so standard builds always include it; see [its page](plink_pca.md).) In addition there are utility table functions ([`pfile_partitions`](pfile_partitions.md), [`read_pfile_catalog_metadata`](read_pfile_catalog_metadata.md), [`read_pfile_catalog_layout`](read_pfile_catalog_layout.md)) and a scalar feature-detection function ([`plinking_duck_capabilities`](plinking_duck_capabilities.md)).
 
 ## File Readers
 
@@ -30,6 +30,8 @@ PlinkingDuck provides 13 core SQL table functions: 6 file readers and 7 analysis
 | Function | Input | Description |
 |----------|-------|-------------|
 | [`pfile_partitions(prefix)`](pfile_partitions.md) | pfile prefix (single or list) | Half-open `[lo, hi)` ordinal-range partitions over the variants dimension, for chunked/parallel reads |
+| [`read_pfile_catalog_metadata(path)`](read_pfile_catalog_metadata.md) | `.pfile.json` catalog | The catalog's literal declared schema: one row per declared partition key (no file I/O) |
+| [`read_pfile_catalog_layout(path)`](read_pfile_catalog_layout.md) | `.pfile.json` catalog | The interpreted chunk map: one row per grid cell, holes included (structural; opens no data file) |
 
 ## Scalar Functions
 

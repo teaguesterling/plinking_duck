@@ -512,13 +512,24 @@ files that do not exist. The reader rejects:
 surviving cell**. Its output columns, prune parameters, and verification are described
 on the function page. In short:
 
-- `keys` prunes by key. An `enum` key matches by membership. An interval or bin key
-  matches by overlap with an inclusive `[lo, hi]`.
+- `keys` prunes by key, on `enum` keys only (membership). An interval or bin key is
+  rejected; use the positional parameters below.
 - `region`, `variant_index`, and `samples` prune by position.
 - A cell survives only if it passes **every** predicate. The predicates multiply
   across the two axes.
 - A predicate that names an undeclared key, or the wrong axis, raises an error. It is
   never ignored.
+
+### Inspecting a matrix without reading it
+
+Two functions look at the catalog file alone and open no data file:
+
+- [`read_pfile_catalog_metadata`](../functions/read_pfile_catalog_metadata.md) returns the
+  **literal declared schema**: one row per declared key, with its axis, `type`, `over` and
+  position.
+- [`read_pfile_catalog_layout`](../functions/read_pfile_catalog_layout.md) returns the
+  **interpreted chunk map**: one row per grid cell, **holes included** (`present = false`),
+  with the 2-D spans and the template-resolved (unchecked) paths.
 
 ### Trust model for a matrix
 
@@ -557,6 +568,8 @@ verifies every present cell first. Holes are never verified. See
 ## See also
 
 - [`read_pfile_catalog`](../functions/read_pfile_catalog.md) — read, verify, and prune a catalog in SQL
+- [`read_pfile_catalog_metadata`](../functions/read_pfile_catalog_metadata.md) — the catalog's literal declared schema
+- [`read_pfile_catalog_layout`](../functions/read_pfile_catalog_layout.md) — the catalog's interpreted chunk map (holes included, no file I/O)
 - [Writing filesets (`COPY … TO`)](../functions/write_pfile.md#sharded-output-shard_by) — emit a catalog with the sharded writer
 - [`read_pfile`](../functions/read_pfile.md) — read a single fileset (how a surviving shard is scanned)
 - [File Formats](../file-formats.md) — the underlying `.pgen` / `.pvar` / `.psam` fileset

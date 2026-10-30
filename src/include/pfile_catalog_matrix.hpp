@@ -65,7 +65,7 @@ struct AxisKey {
 	bool needs_bounds = false;
 };
 
-//! Typed per-block bounds for one interval key. Semantics follow the key type (set at prune time):
+//! Typed per-block bounds for one interval key. Semantics follow the key type:
 //! an `ordinal_interval` over POS is INCLUSIVE `[lo,hi]`; a `value_bin` is HALF-OPEN `[lo,hi)`.
 struct BlockBound {
 	string key_name;
@@ -138,6 +138,7 @@ struct MatrixCell {
 	int64_t sample_start = 0;
 	int64_t sample_stop = 0;
 	int64_t source_ordinal = 0;
+	bool present = true;       //! false only for a declared hole (BuildCells with include_holes; paths left empty)
 	int64_t variant_block = 0; //! index into MatrixCatalog::variants.blocks (for bound lookups)
 	int64_t sample_block = 0;  //! index into MatrixCatalog::samples.blocks
 };
@@ -165,24 +166,17 @@ MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const strin
 //! Cartesian product of the two axes' blocks (variants-major) MINUS the declared holes; resolves each
 //! PRESENT cell's `.pgen` from the template and its shared `.pvar`/`.psam`. A hole is skipped before any
 //! path is resolved, so it is never touched. Opens no file. Throws when two cells collide on a path.
-vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs);
+//! With `include_holes`, a hole is ALSO emitted (variants-major, `present=false`, spans + keys set, paths
+//! empty, no source_ordinal consumed) — the structural layout view; present cells are unchanged.
+vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs, bool include_holes = false);
 
 //! Per-key requested value sets (the `keys :=` predicate on `enum` keys): (key name, allowed values).
 using KeyPredicates = vector<std::pair<string, vector<string>>>;
 
-//! One interval-overlap predicate carried by `keys` for an `ordinal_interval`/`value_bin` key:
-//! an INCLUSIVE `[lo,hi]` matched against the block's typed bound (overlap semantics per key type).
-struct BoundPredicate {
-	string key_name;
-	int64_t lo = 0;
-	int64_t hi = 0;
-};
-
 //! The resolved, typed prune predicates for a matrix catalog. The reader parses the named parameters
 //! (region/variant_index/samples/keys) into this struct; PruneCells applies them as pure geometry.
 struct MatrixPredicates {
-	KeyPredicates enum_keys;           //! `keys` entries on `enum` keys — membership
-	vector<BoundPredicate> bound_keys; //! `keys` entries on `ordinal_interval`/`value_bin` keys — overlap
+	KeyPredicates enum_keys; //! `keys` entries — `enum` keys only (membership); interval/bin keys are rejected upstream
 
 	bool has_region = false; //! `region` — variant-axis CHROM membership + POS-window overlap
 	string region_contig;    //! the contig matched VERBATIM against the variant-axis `CHROM` enum key
@@ -197,7 +191,7 @@ struct MatrixPredicates {
 	vector<int64_t> sample_points;
 };
 
-//! Prune: keep a cell iff it passes EVERY predicate (product across axes, §6). `enum`/bound `keys`
+//! Prune: keep a cell iff it passes EVERY predicate (product across axes, §6). `enum` `keys`
 //! prune whichever axis the key lives on; `region`/`variant_index` prune the variant axis; `samples`
 //! prunes the sample axis. An empty result is not an error.
 vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell> &cells, const MatrixPredicates &preds);
