@@ -51,6 +51,10 @@ top-level keys, not by the file name — the reader routes on the presence of a
 A catalog describes **exactly one dataset**. Grouping several datasets into one
 catalog file is out of scope.
 
+Both shapes above are **version 1** and are 1-D: shards concatenate along one axis.
+A grid of shards (variants × samples) is **version 2**. See
+[Version 2: the matrix form](#version-2-the-matrix-form).
+
 ## JSON schema
 
 A catalog is either the **multi-file** form (`concat_dim` + `shared` + `files`) or
@@ -58,7 +62,7 @@ the **single-fileset** form (`pfile`), never both.
 
 | Field | Where | Meaning |
 |-------|-------|---------|
-| `pfile_catalog` | top | Format version integer. Must be `1`. |
+| `pfile_catalog` | top | Format version integer. `1` for the forms on this page; `2` for the [matrix form](#version-2-the-matrix-form). Any other value is rejected. |
 | `dataset` | top | The dataset name. |
 | `concat_dim` | multi-file | `"variants"` (shards share one `.psam`) or `"samples"` (shards share one `.pvar`) — the axis the shards concatenate on. |
 | `shared` | multi-file | The reused companion: `{ "psam": … }` for variant-shards, `{ "pvar": … }` for sample-shards. |
@@ -342,6 +346,213 @@ passes `read_pfile_catalog` is not guaranteed to be a complete, gapless cohort:
   path** in the output, so the consumer reads the exact file the manifest checked. What is still left
   to the loader is the companion's *content* beyond the row count and (for `.pvar`) the CHROM/POS
   extent — PlinkingDuck does not validate every field.
+
+## Version 2: the matrix form
+
+Version 1 tiles one axis. Version 2 tiles **two** axes at once: a grid of `.pgen` files
+where variants are split one way and samples are split the other way.
+
+### Version discriminator
+
+A catalog is version 2 when its top-level `"pfile_catalog"` is the integer `2`. It must
+then have an `axes` block, a `template` object, and a `dataset` name. Version 1 is
+unchanged. Any other version number is rejected. A version-2 catalog must **not** also
+carry `concat_dim`, `files`, `shared`, or `pfile`. The reader rejects the mix.
+
+### Data model
+
+- A matrix has two **axes**, named `variants` and `samples`. Both are required. The
+  format has two axes today.
+- Each axis is cut into ordered **blocks**. The blocks tile the axis `[0, length)` with
+  no gap and no overlap.
+- A **cell** is one variant-block × one sample-block. It is one `.pgen` fileset.
+- Companions are shared **along** each axis. All cells in a variant-block share that
+  block's `.pvar`. All cells in a sample-block share that block's `.psam`. A grid of
+  M variant-blocks and N sample-blocks has M `.pvar`, N `.psam`, and M×N `.pgen`.
+- Block spans are half-open `[start, stop)`, as in the [boundary law](#partition-and-range).
+
+### Grammar
+
+Each axis has a **key schema** (`keys`) and a **tiling** (`blocks`). The catalog
+defines its own key names. Only the key **types** are fixed.
+
+| Key type | Extra field | Per-block value | Bound the block carries |
+|----------|-------------|-----------------|-------------------------|
+| `enum` | none | A label string. | None. |
+| `ordinal_interval` | `over`: `"POS"` on `variants`, `"sample_index"` on `samples` | A label string. | Over `POS`: `bounds.<key>` = `{ "min", "max" }`, **inclusive**. Over `sample_index`: none. The block's own `[start, stop)` is the bound. |
+| `value_bin` | `over`: the name of the binned value (for example `"age"`) | A label string. | `bounds.<key>` = `{ "lo", "hi" }`, **half-open** `[lo, hi)`. |
+
+Bound values are integers.
+
+| Field | Where | Meaning |
+|-------|-------|---------|
+| `axes[].name` | axis | `"variants"` or `"samples"`. Each appears once. |
+| `axes[].keys[]` | axis | Ordered key schema: `{ name, type, over? }`. At least one key. A key name is unique across **both** axes. |
+| `axes[].blocks[]` | axis | The tiling, in ordinal order: `{ keys, start, stop, bounds? }`. |
+| `blocks[].keys` | block | An object with a **string** value for **every** key the axis declares. The same combination of values may not appear twice on an axis. |
+| `blocks[].start`, `stop` | block | Integer ordinals, half-open. The first block starts at 0. Each next block starts where the last one stopped. `stop` must be greater than `start`. |
+| `blocks[].bounds` | block | Required for each `value_bin` key and each `ordinal_interval` key over `POS`. `hi` (or `max`) may not be less than `lo` (or `min`). |
+| `template` | top | `{ "pfile", "pvar", "psam" }`. Path templates (see below). |
+| `holes` | top | Optional. Absent cells (see [Sparse grids](#sparse-grids-holes)). |
+
+`ordinal_interval` over the wrong quantity for its axis (for example `POS` on `samples`)
+is a parse error. So is an unknown key type.
+
+!!! note "Short form for one `enum` key"
+
+    An axis with exactly one `enum` key may omit `blocks`. It lists
+    `"values": [{ "value", "start", "stop" }, …]` inside the key instead. The reader
+    turns each entry into one block. An axis with more than one key needs `blocks`.
+    An axis may not use both forms.
+
+### Path templates
+
+`template.pfile`, `template.pvar`, and `template.psam` are paths with `{KEY}`
+placeholders. For each cell, the reader replaces `{KEY}` with that cell's value for the
+key. Paths resolve relative to the catalog directory, as in
+[Path resolution](#path-resolution). `template.pfile` has no extension.
+
+- `template.pfile` must use at least one key of **each** axis. Otherwise two cells
+  resolve to the same `.pgen`.
+- `template.pvar` may use **only** `variants` keys, and at least one.
+- `template.psam` may use **only** `samples` keys, and at least one.
+- A placeholder that names an undeclared key, or an unclosed `{`, is a parse error.
+- Two cells that resolve to the same `.pgen`, or two blocks that resolve to the same
+  `.pvar` or `.psam`, are a parse error.
+
+Omitted-companion discovery (see [above](#companion-kinds-and-omitted-companion-discovery))
+does not apply to version 2. The templates always name the companions.
+
+### Example — a 3 × 4 grid with compound keys
+
+Variants are keyed by `CHROM` (an `enum`) and `CHUNK` (an `ordinal_interval` over
+`POS`). Samples are keyed by `GROUP` (an `enum`), `SLICE` (an `ordinal_interval` over
+`sample_index`), and `age` (a `value_bin`). This is the catalog the
+`read_pfile_catalog_matrix_compound` test builds. It has 3 variant-blocks and 4
+sample-blocks, so 12 cells, 3 `.pvar`, and 4 `.psam`.
+
+```json
+{
+  "pfile_catalog": 2,
+  "dataset": "compound",
+  "axes": [
+    {
+      "name": "variants",
+      "keys": [
+        { "name": "CHROM", "type": "enum" },
+        { "name": "CHUNK", "type": "ordinal_interval", "over": "POS" }
+      ],
+      "blocks": [
+        { "keys": { "CHROM": "1", "CHUNK": "001" }, "start": 0, "stop": 2,
+          "bounds": { "CHUNK": { "min": 10000, "max": 20000 } } },
+        { "keys": { "CHROM": "1", "CHUNK": "002" }, "start": 2, "stop": 3,
+          "bounds": { "CHUNK": { "min": 30000, "max": 30000 } } },
+        { "keys": { "CHROM": "2", "CHUNK": "001" }, "start": 3, "stop": 4,
+          "bounds": { "CHUNK": { "min": 15000, "max": 15000 } } }
+      ]
+    },
+    {
+      "name": "samples",
+      "keys": [
+        { "name": "GROUP", "type": "enum" },
+        { "name": "SLICE", "type": "ordinal_interval", "over": "sample_index" },
+        { "name": "age", "type": "value_bin", "over": "age" }
+      ],
+      "blocks": [
+        { "keys": { "GROUP": "A", "SLICE": "0", "age": "young" }, "start": 0, "stop": 1,
+          "bounds": { "age": { "lo": 20, "hi": 40 } } },
+        { "keys": { "GROUP": "A", "SLICE": "1", "age": "old" }, "start": 1, "stop": 2,
+          "bounds": { "age": { "lo": 40, "hi": 60 } } },
+        { "keys": { "GROUP": "B", "SLICE": "0", "age": "young" }, "start": 2, "stop": 3,
+          "bounds": { "age": { "lo": 20, "hi": 40 } } },
+        { "keys": { "GROUP": "B", "SLICE": "1", "age": "old" }, "start": 3, "stop": 4,
+          "bounds": { "age": { "lo": 40, "hi": 60 } } }
+      ]
+    }
+  ],
+  "template": {
+    "pfile": "c_{CHROM}_{CHUNK}_{GROUP}_{SLICE}",
+    "pvar": "v_{CHROM}_{CHUNK}.pvar",
+    "psam": "s_{GROUP}_{SLICE}.psam"
+  }
+}
+```
+
+`template.pvar` uses `CHROM` and `CHUNK`, so each variant-block gets its own `.pvar`.
+`template.psam` uses `GROUP` and `SLICE`, so each sample-block gets its own `.psam`.
+The `age` key labels the sample-blocks and drives the `age` prune. It is not in a
+template, which is allowed.
+
+### Sparse grids (`holes`)
+
+A grid need not be full. The optional top-level `holes` array lists **absent** cells.
+Each entry is an object of `key: "value"` pairs over declared keys of either axis. A
+hole removes every cell whose block labels match **all** of its pairs. A partial hole
+removes a whole row or column of the grid:
+
+```json
+"holes": [ { "CHROM": "2", "GROUP": "C" } ]
+```
+
+The example above (a 2 × 3 grid with `CHROM` ∈ {1, 2} and `GROUP` ∈ {A, B, C}) has 5
+cells, not 6. `{ "GROUP": "C" }` alone would remove both `GROUP=C` cells.
+
+A hole is never opened, and its path is never resolved. A hole may therefore point at
+files that do not exist. The reader rejects:
+
+- a hole that matches no cell (a typo must not leave the cell present);
+- a hole that names an undeclared key;
+- an empty hole `{}`;
+- a hole value that is not a string;
+- a `holes` value that is not an array.
+
+### Reading and pruning a matrix
+
+[`read_pfile_catalog`](../functions/read_pfile_catalog.md) returns **one row per
+surviving cell**. Its output columns, prune parameters, and verification are described
+on the function page. In short:
+
+- `keys` prunes by key. An `enum` key matches by membership. An interval or bin key
+  matches by overlap with an inclusive `[lo, hi]`.
+- `region`, `variant_index`, and `samples` prune by position.
+- A cell survives only if it passes **every** predicate. The predicates multiply
+  across the two axes.
+- A predicate that names an undeclared key, or the wrong axis, raises an error. It is
+  never ignored.
+
+### Trust model for a matrix
+
+Version 2 keeps the version 1 rule: bounds are **verified, never assumed**. For each
+verified cell:
+
+- The `.pgen` header counts must match the cell's `.pvar` and `.psam` row counts.
+- The variant span width (`variant_stop - variant_start`) must equal the real `.pvar`
+  row count. The sample span width must equal the real `.psam` row count.
+- If the variants axis has an `enum` key named `CHROM`, each contig the `.pvar` holds
+  must equal the block's `CHROM` label.
+- If the variants axis has an `ordinal_interval` over `POS`, the block's `{ min, max }`
+  must cover the real `.pvar` POS extent. An under-claim raises. An over-claim only
+  prunes less.
+
+By default only the cells that survive a prune are verified. `verify_all := true`
+verifies every present cell first. Holes are never verified. See
+[Verification](../functions/read_pfile_catalog.md#matrix-catalogs-version-2).
+
+### What version 2 does not do yet
+
+- **No `ATTACH`.** A matrix catalog cannot be attached as a database.
+- **No genotype cascade.** `read_pfile_catalog` returns cell metadata and resolved
+  paths. It does not scan genotypes across cells. A consumer reads each surviving cell
+  with [`read_pfile`](../functions/read_pfile.md).
+- **No analysis over the grid.** The `plink_*` analysis functions do not take a matrix
+  catalog.
+- **No writer.** The sharded `COPY … shard_by` writer emits version 1 only. A matrix
+  catalog is written by hand or by other tooling.
+- **Two axes only.** The format names `variants` and `samples`. Other axes are not
+  supported.
+- **`region` needs a `CHROM` key.** `region` matches its contig against a variants-axis
+  `enum` key named exactly `CHROM`. A catalog with no such key rejects `region`. All
+  other key names are free.
 
 ## See also
 
