@@ -123,13 +123,35 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', ke
 ----
 4
 
-# Predicates on both axes multiply: CHROM in {2} x GROUP in {B} -> one cell.
+# Predicates on both axes multiply: CHROM in {2} AND GROUP in {A,B} -> 2 rows (product across axes, union within a key).
 query II
 SELECT keys['CHROM'], keys['GROUP'] FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json',
        keys := {'CHROM': ['2'], 'GROUP': ['A', 'B']}) ORDER BY 2;
 ----
 2	A
 2	B
+
+# NULL is fail-loud for a named key (a NULL list or a NULL element), never an empty or '' match.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': NULL::VARCHAR[]});
+----
+invalid predicate
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A', NULL]});
+----
+invalid predicate
+
+# A NULL or empty keys map itself means no prune.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := NULL);
+----
+4
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := map {}::MAP(VARCHAR, VARCHAR[]));
+----
+4
 
 # An empty selection (no such value) is 0 rows, not an error and not the whole grid.
 query I

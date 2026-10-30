@@ -872,10 +872,17 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 			for (auto &entry : entries) {
 				auto &kv = StructValue::GetChildren(entry);
 				vector<string> vals;
-				if (!kv[1].IsNull()) {
-					for (auto &v : ListValue::GetChildren(kv[1])) {
-						vals.push_back(v.IsNull() ? string() : v.GetValue<string>());
+				if (kv[1].IsNull()) {
+					throw InvalidInputException("read_pfile_catalog: invalid predicate: keys['%s'] is NULL",
+					                            kv[0].ToString());
+				}
+				for (auto &v : ListValue::GetChildren(kv[1])) {
+					if (v.IsNull()) {
+						throw InvalidInputException(
+						    "read_pfile_catalog: invalid predicate: keys['%s'] contains a NULL value",
+						    kv[0].ToString());
 					}
+					vals.push_back(v.GetValue<string>());
 				}
 				preds.emplace_back(kv[0].GetValue<string>(), std::move(vals));
 			}
@@ -905,6 +912,13 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		return std::move(result);
 	}
 
+	{
+		auto it = input.named_parameters.find("keys");
+		if (it != input.named_parameters.end() && !it->second.IsNull()) {
+			throw InvalidInputException(
+			    "read_pfile_catalog: invalid predicate: keys is not supported for a version-1 catalog");
+		}
+	}
 	PfileCatalog cat = ParseCatalog(fs, path, content);
 	result->dataset = cat.dataset;
 	result->concat_dim = cat.concat_dim;
