@@ -1,0 +1,62 @@
+# name: test/sql/read_pfile_catalog_metadata.test
+# description: read_pfile_catalog_metadata — the LITERAL declared schema of a catalog, one row per declared partition key; no tiling, no data-file I/O
+# group: [sql]
+
+require plinking_duck
+
+# FIXTURE — the compound v2 catalog. NONE of its cell files exist: metadata reads only the .pfile.json.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"compound","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"CHUNK","type":"ordinal_interval","over":"POS"}],"blocks":[{"keys":{"CHROM":"1","CHUNK":"001"},"start":0,"stop":2,"bounds":{"CHUNK":{"min":10000,"max":20000}}},{"keys":{"CHROM":"1","CHUNK":"002"},"start":2,"stop":3,"bounds":{"CHUNK":{"min":30000,"max":30000}}},{"keys":{"CHROM":"2","CHUNK":"001"},"start":3,"stop":4,"bounds":{"CHUNK":{"min":15000,"max":15000}}}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"},{"name":"SLICE","type":"ordinal_interval","over":"sample_index"},{"name":"age","type":"value_bin","over":"age"}],"blocks":[{"keys":{"GROUP":"A","SLICE":"0","age":"young"},"start":0,"stop":1,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"A","SLICE":"1","age":"old"},"start":1,"stop":2,"bounds":{"age":{"lo":40,"hi":60}}},{"keys":{"GROUP":"B","SLICE":"0","age":"young"},"start":2,"stop":3,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"B","SLICE":"1","age":"old"},"start":3,"stop":4,"bounds":{"age":{"lo":40,"hi":60}}}]}],"template":{"pfile":"c_{CHROM}_{CHUNK}_{GROUP}_{SLICE}","pvar":"v_{CHROM}_{CHUNK}.pvar","psam":"s_{GROUP}_{SLICE}.psam"}}')
+TO '{TEST_DIR}/meta_v2.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# one row per declared key: 2 variants-axis keys + 3 samples-axis keys, in declared order.
+query IIIIII
+SELECT axis, key, type, over, axis_position, format FROM read_pfile_catalog_metadata('{TEST_DIR}/meta_v2.pfile.json') ORDER BY axis DESC, axis_position;
+----
+variants	CHROM	enum	NULL	0	matrix
+variants	CHUNK	ordinal_interval	POS	1	matrix
+samples	GROUP	enum	NULL	0	matrix
+samples	SLICE	ordinal_interval	sample_index	1	matrix
+samples	age	value_bin	age	2	matrix
+
+query I
+SELECT DISTINCT dataset FROM read_pfile_catalog_metadata('{TEST_DIR}/meta_v2.pfile.json');
+----
+compound
+
+# an enum key marked over:CHROM reports that over.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"oc","axes":[{"name":"variants","keys":[{"name":"contig","type":"enum","over":"CHROM"}],"blocks":[{"keys":{"contig":"1"},"start":0,"stop":1}]},{"name":"samples","keys":[{"name":"G","type":"enum"}],"blocks":[{"keys":{"G":"a"},"start":0,"stop":1}]}],"template":{"pfile":"c_{contig}_{G}","pvar":"v_{contig}.pvar","psam":"s_{G}.psam"}}')
+TO '{TEST_DIR}/meta_v2_chrom.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+query II
+SELECT key, over FROM read_pfile_catalog_metadata('{TEST_DIR}/meta_v2_chrom.pfile.json') WHERE axis = 'variants';
+----
+contig	CHROM
+
+# v1 multi-file (samples-sharded): no error; one minimal row, key/type/over/axis_position NULL.
+query IIIIIII
+SELECT dataset, format, axis, key, type, over, axis_position FROM read_pfile_catalog_metadata('test/data/pfile_catalog_samples.pfile.json');
+----
+sampleshards	samples	samples	NULL	NULL	NULL	NULL
+
+# v1 single fileset: format = 'single', no axis.
+query IIIIIII
+SELECT dataset, format, axis, key, type, over, axis_position FROM read_pfile_catalog_metadata('test/data/pfile_catalog_single.pfile.json');
+----
+wes_single	single	NULL	NULL	NULL	NULL	NULL
+
+statement error
+SELECT * FROM read_pfile_catalog_metadata('{TEST_DIR}/does_not_exist.pfile.json');
+----
+file not found
+
+# a malformed v2 catalog keeps the read_pfile_catalog parse-error prefix.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"bad"}')
+TO '{TEST_DIR}/meta_bad.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog_metadata('{TEST_DIR}/meta_bad.pfile.json');
+----
+catalog parse error

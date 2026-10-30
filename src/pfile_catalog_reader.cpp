@@ -1245,6 +1245,174 @@ static void PfileCatalogScan(ClientContext &context, TableFunctionInput &data_p,
 	output.SetCardinality(count);
 }
 
+// ---------------------------------------------------------------------------
+// read_pfile_catalog_metadata / read_pfile_catalog_layout — structural views of a catalog.
+//
+// Neither verifies, prunes or opens a data file: they read ONLY the `.pfile.json` itself.
+//   * _metadata: the LITERAL declared schema — one row per declared partition key (v2), as written.
+//   * _layout:   the INTERPRETED chunk map — one row per grid cell incl. declared holes (v2), with the
+//                template-resolved paths as unchecked strings.
+// Both route the older forms (v1 multi-file / single) to a minimal row instead of raising.
+// ---------------------------------------------------------------------------
+
+struct CatalogViewBindData : public TableFunctionData {
+	vector<vector<Value>> rows; //! fully built at bind; the scan only slices them
+};
+
+static string ReadCatalogFile(ClientContext &context, FileSystem &fs, const char *fn_name, const string &path) {
+	if (!fs.FileExists(path)) {
+		throw IOException("%s: file not found: catalog '%s'", fn_name, path);
+	}
+	string content;
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	idx_t size = handle->GetFileSize();
+	content.resize(size);
+	if (size > 0) {
+		handle->Read(reinterpret_cast<void *>(&content[0]), size);
+	}
+	return content;
+}
+
+static Value NullVarchar() {
+	return Value(LogicalType::VARCHAR);
+}
+static Value NullBigint() {
+	return Value(LogicalType::BIGINT);
+}
+static Value VarcharOrNull(const string &s) {
+	return s.empty() ? NullVarchar() : Value(s);
+}
+
+static const char *KeyTypeName(AxisKeyType t) {
+	switch (t) {
+	case AxisKeyType::ENUM:
+		return "enum";
+	case AxisKeyType::ORDINAL_INTERVAL:
+		return "ordinal_interval";
+	default:
+		return "value_bin";
+	}
+}
+
+static unique_ptr<FunctionData> PfileCatalogMetadataBind(ClientContext &context, TableFunctionBindInput &input,
+                                                         vector<LogicalType> &return_types, vector<CompatName> &names) {
+	auto result = make_uniq<CatalogViewBindData>();
+	auto &fs = FileSystem::GetFileSystem(context);
+	string path = input.inputs[0].GetValue<string>();
+	string content = ReadCatalogFile(context, fs, "read_pfile_catalog_metadata", path);
+
+	if (IsMatrixCatalog(content)) {
+		MatrixCatalog mcat = ParseMatrixCatalog(fs, path, content);
+		for (auto *axis : {&mcat.variants, &mcat.samples}) {
+			for (size_t i = 0; i < axis->keys.size(); i++) {
+				auto &k = axis->keys[i];
+				result->rows.push_back({Value(mcat.dataset), Value("matrix"), Value(axis->name), Value(k.name),
+				                        Value(KeyTypeName(k.type)), VarcharOrNull(k.over), Value::INTEGER((int32_t)i)});
+			}
+		}
+	} else {
+		PfileCatalog cat = ParseCatalog(fs, path, content);
+		// v1: no partition keys exist — one descriptive row (format = the concat axis, or 'single').
+		result->rows.push_back({Value(cat.dataset), Value(cat.is_single ? string("single") : cat.concat_dim),
+		                        cat.is_single ? NullVarchar() : Value(cat.concat_dim), NullVarchar(), NullVarchar(),
+		                        NullVarchar(), Value(LogicalType::INTEGER)});
+	}
+	names = {"dataset", "format", "axis", "key", "type", "over", "axis_position"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
+	return std::move(result);
+}
+
+static unique_ptr<FunctionData> PfileCatalogLayoutBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<CompatName> &names) {
+	auto result = make_uniq<CatalogViewBindData>();
+	auto &fs = FileSystem::GetFileSystem(context);
+	string path = input.inputs[0].GetValue<string>();
+	string content = ReadCatalogFile(context, fs, "read_pfile_catalog_layout", path);
+	auto empty_map = [] {
+		return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, vector<Value> {}, vector<Value> {});
+	};
+
+	if (IsMatrixCatalog(content)) {
+		MatrixCatalog mcat = ParseMatrixCatalog(fs, path, content);
+		// Holes included; no path is checked, no companion is read, nothing is verified or pruned.
+		auto cells = BuildCells(mcat, fs, /*include_holes=*/true);
+		const AxisKey *pos_key = nullptr;
+		for (auto &k : mcat.variants.keys) {
+			if (k.type == AxisKeyType::ORDINAL_INTERVAL && k.over == "POS") {
+				pos_key = &k;
+				break;
+			}
+		}
+		for (auto &c : cells) {
+			vector<Value> ks, vs;
+			for (auto &kv : c.keys) {
+				ks.push_back(Value(kv.first));
+				vs.push_back(Value(kv.second));
+			}
+			Value pos_min = NullBigint(), pos_max = NullBigint();
+			if (pos_key) {
+				const BlockBound *b = mcat.variants.blocks[c.variant_block].FindBound(pos_key->name);
+				if (b) {
+					pos_min = Value::BIGINT(b->lo);
+					pos_max = Value::BIGINT(b->hi);
+				}
+			}
+			result->rows.push_back(
+			    {Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(ks), std::move(vs)),
+			     Value::BIGINT(c.variant_start), Value::BIGINT(c.variant_stop), Value::BIGINT(c.sample_start),
+			     Value::BIGINT(c.sample_stop), pos_min, pos_max, Value::BOOLEAN(c.present),
+			     c.present ? Value(c.prefix) : NullVarchar(), c.present ? Value(c.pvar) : NullVarchar(),
+			     c.present ? Value(c.psam) : NullVarchar()});
+		}
+	} else {
+		PfileCatalog cat = ParseCatalog(fs, path, content);
+		bool by_variants = cat.concat_dim == "variants";
+		for (auto &e : cat.files) {
+			// A single fileset has no declared span without probing its .pgen (file I/O) — NULL here.
+			bool has_span = !cat.is_single;
+			Value vs_ = has_span && by_variants ? Value::BIGINT(e.partition_start) : NullBigint();
+			Value ve_ = has_span && by_variants ? Value::BIGINT(e.partition_stop) : NullBigint();
+			Value ss_ = has_span && !by_variants ? Value::BIGINT(e.partition_start) : NullBigint();
+			Value se_ = has_span && !by_variants ? Value::BIGINT(e.partition_stop) : NullBigint();
+			string pvar = e.pvar.empty() ? cat.shared_pvar : e.pvar;
+			string psam = e.psam.empty() ? cat.shared_psam : e.psam;
+			result->rows.push_back({empty_map(), vs_, ve_, ss_, se_,
+			                        e.has_pos ? Value::BIGINT(e.pos_min) : NullBigint(),
+			                        e.has_pos ? Value::BIGINT(e.pos_max) : NullBigint(), Value::BOOLEAN(true),
+			                        Value(e.prefix), VarcharOrNull(pvar), VarcharOrNull(psam)});
+		}
+	}
+	names = {"keys",    "variant_start", "variant_stop", "sample_start", "sample_stop", "pos_min",
+	         "pos_max", "present",       "prefix",       "pvar",         "psam"};
+	return_types = {LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+	                LogicalType::BIGINT,
+	                LogicalType::BIGINT,
+	                LogicalType::BIGINT,
+	                LogicalType::BIGINT,
+	                LogicalType::BIGINT,
+	                LogicalType::BIGINT,
+	                LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR};
+	return std::move(result);
+}
+
+static void CatalogViewScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<CatalogViewBindData>();
+	auto &gstate = data_p.global_state->Cast<PfileCatalogGlobalState>();
+	idx_t n = MinValue<idx_t>(bind.rows.size() - gstate.row_idx, STANDARD_VECTOR_SIZE);
+	for (idx_t i = 0; i < n; i++) {
+		auto &row = bind.rows[gstate.row_idx + i];
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.data[col].SetValue(i, row[col]);
+		}
+	}
+	gstate.row_idx += n;
+	output.SetCardinality(n);
+}
+
 void RegisterPfileCatalogReader(ExtensionLoader &loader) {
 	TableFunction fn("read_pfile_catalog", {LogicalType::VARCHAR}, PfileCatalogScan, PfileCatalogBind,
 	                 PfileCatalogInitGlobal);
@@ -1263,6 +1431,27 @@ void RegisterPfileCatalogReader(ExtensionLoader &loader) {
 	    "pfile writer).",
 	    {"SELECT * FROM read_pfile_catalog('cohort.pfile.json')",
 	     "SELECT prefix FROM read_pfile_catalog('cohort.pfile.json', region := '2:1-5000000')"});
+
+	TableFunction meta_fn("read_pfile_catalog_metadata", {LogicalType::VARCHAR}, CatalogViewScan,
+	                      PfileCatalogMetadataBind, PfileCatalogInitGlobal);
+	CompatSetCaptureArgumentAliases(meta_fn);
+	RegisterTableWithDesc(
+	    loader, meta_fn, {"path"},
+	    "Read a .pfile.json catalog LITERALLY: one row per declared partition key (axis, key, type, over, position). "
+	    "The declared schema only; no tiling, no pruning, no data-file I/O.",
+	    {"SELECT * FROM read_pfile_catalog_metadata('cohort.pfile.json')",
+	     "SELECT axis, key, type FROM read_pfile_catalog_metadata('cohort.pfile.json') WHERE type <> 'enum'"});
+
+	TableFunction layout_fn("read_pfile_catalog_layout", {LogicalType::VARCHAR}, CatalogViewScan,
+	                        PfileCatalogLayoutBind, PfileCatalogInitGlobal);
+	CompatSetCaptureArgumentAliases(layout_fn);
+	RegisterTableWithDesc(
+	    loader, layout_fn, {"path"},
+	    "Interpreted chunk map of a .pfile.json catalog: one row per grid cell INCLUDING declared holes "
+	    "(present=false), with ordinal spans and template-resolved paths. Structural only; opens no data file.",
+	    {"SELECT * FROM read_pfile_catalog_layout('cohort.pfile.json')",
+	     "SELECT keys, variant_start, sample_start FROM read_pfile_catalog_layout('cohort.pfile.json') "
+	     "WHERE NOT present"});
 }
 
 } // namespace duckdb

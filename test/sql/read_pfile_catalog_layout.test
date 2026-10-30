@@ -1,0 +1,103 @@
+# name: test/sql/read_pfile_catalog_layout.test
+# description: read_pfile_catalog_layout — the INTERPRETED chunk map: one row per grid cell INCLUDING holes, structural only (opens no data file)
+# group: [sql]
+
+require plinking_duck
+
+# FIXTURE — the compound 3 x 4 grid (12 cells) with a hole {CHROM=2, GROUP=B} that removes 2 cells.
+# NO cell file, .pvar or .psam exists on disk: every assertion below holds with zero data files, which is
+# the no-file-I/O proof (verify/prune/read_pfile would raise file-not-found).
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"compound","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"CHUNK","type":"ordinal_interval","over":"POS"}],"blocks":[{"keys":{"CHROM":"1","CHUNK":"001"},"start":0,"stop":2,"bounds":{"CHUNK":{"min":10000,"max":20000}}},{"keys":{"CHROM":"1","CHUNK":"002"},"start":2,"stop":3,"bounds":{"CHUNK":{"min":30000,"max":30000}}},{"keys":{"CHROM":"2","CHUNK":"001"},"start":3,"stop":4,"bounds":{"CHUNK":{"min":15000,"max":15000}}}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"},{"name":"SLICE","type":"ordinal_interval","over":"sample_index"},{"name":"age","type":"value_bin","over":"age"}],"blocks":[{"keys":{"GROUP":"A","SLICE":"0","age":"young"},"start":0,"stop":1,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"A","SLICE":"1","age":"old"},"start":1,"stop":2,"bounds":{"age":{"lo":40,"hi":60}}},{"keys":{"GROUP":"B","SLICE":"0","age":"young"},"start":2,"stop":3,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"B","SLICE":"1","age":"old"},"start":3,"stop":4,"bounds":{"age":{"lo":40,"hi":60}}}]}],"template":{"pfile":"c_{CHROM}_{CHUNK}_{GROUP}_{SLICE}","pvar":"v_{CHROM}_{CHUNK}.pvar","psam":"s_{GROUP}_{SLICE}.psam"},"holes":[{"CHROM":"2","GROUP":"B"}]}')
+TO '{TEST_DIR}/lay_hole.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# full product: holes INCLUDED (12), 10 present, 2 absent.
+query III
+SELECT count(*), count(*) FILTER (WHERE present), count(*) FILTER (WHERE NOT present) FROM read_pfile_catalog_layout('{TEST_DIR}/lay_hole.pfile.json');
+----
+12	10	2
+
+# the hole rows: which cells, with their 2-D spans; paths are NULL (never resolved).
+query IIIIIIII
+SELECT keys['CHROM'], keys['GROUP'], keys['SLICE'], variant_start, variant_stop, sample_start, sample_stop, prefix IS NULL AND pvar IS NULL AND psam IS NULL
+FROM read_pfile_catalog_layout('{TEST_DIR}/lay_hole.pfile.json') WHERE NOT present ORDER BY sample_start;
+----
+2	B	0	3	4	2	3	true
+2	B	1	3	4	3	4	true
+
+# a present cell: every key in the map, the 2-D span, pos_min/max from the CHUNK bound, resolved (unchecked) paths.
+query IIIIIIIII
+SELECT map_keys(keys), variant_start, variant_stop, sample_start, sample_stop, pos_min, pos_max, present, keys['age']
+FROM read_pfile_catalog_layout('{TEST_DIR}/lay_hole.pfile.json') WHERE keys['CHROM'] = '1' AND keys['CHUNK'] = '001' AND keys['GROUP'] = 'A' AND keys['SLICE'] = '1';
+----
+[CHROM, CHUNK, GROUP, SLICE, age]	0	2	1	2	10000	20000	true	old
+
+query III
+SELECT regexp_replace(prefix, '^.*/', ''), regexp_replace(pvar, '^.*/', ''), regexp_replace(psam, '^.*/', '')
+FROM read_pfile_catalog_layout('{TEST_DIR}/lay_hole.pfile.json') WHERE keys['CHROM'] = '1' AND keys['CHUNK'] = '002' AND keys['GROUP'] = 'B' AND keys['SLICE'] = '0';
+----
+c_1_002_B_0	v_1_002.pvar	s_B_0.psam
+
+# resolved paths are absolute (catalog-dir relative, normalized) strings.
+query I
+SELECT bool_and(prefix LIKE '/%' AND pvar LIKE '/%' AND psam LIKE '/%') FROM read_pfile_catalog_layout('{TEST_DIR}/lay_hole.pfile.json') WHERE present;
+----
+true
+
+# variants-major order; the grid tiles each axis (spans of the variant axis cover [0,4)).
+query II
+SELECT min(variant_start), max(variant_stop) FROM read_pfile_catalog_layout('{TEST_DIR}/lay_hole.pfile.json');
+----
+0	4
+
+# NO pruning, NO verification: the same catalog through read_pfile_catalog fails on the absent files...
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/lay_hole.pfile.json');
+----
+file not found
+
+# ...while layout is unaffected by absent files, and returns the same cells (minus holes) read_pfile_catalog would.
+query I
+SELECT count(*) FROM read_pfile_catalog_layout('{TEST_DIR}/lay_hole.pfile.json') WHERE present;
+----
+10
+
+# no ordinal_interval-over-POS key on the variants axis -> pos_min/pos_max NULL.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"np","axes":[{"name":"variants","keys":[{"name":"SEG","type":"enum"}],"blocks":[{"keys":{"SEG":"x"},"start":0,"stop":2}]},{"name":"samples","keys":[{"name":"GRP","type":"enum"}],"blocks":[{"keys":{"GRP":"g"},"start":0,"stop":1}]}],"template":{"pfile":"c_{SEG}_{GRP}","pvar":"v_{SEG}.pvar","psam":"s_{GRP}.psam"}}')
+TO '{TEST_DIR}/lay_nopos.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+query III
+SELECT pos_min, pos_max, present FROM read_pfile_catalog_layout('{TEST_DIR}/lay_nopos.pfile.json');
+----
+NULL	NULL	true
+
+# a colliding companion template is still a parse error in layout (structural validity), also with a hole at the first grid cell.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"coll","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"P","type":"enum"}],"blocks":[{"keys":{"CHROM":"1","P":"a"},"start":0,"stop":1},{"keys":{"CHROM":"1","P":"b"},"start":1,"stop":2}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2}]}],"holes":[{"CHROM":"1","P":"a","GROUP":"A"}],"template":{"pfile":"c_{CHROM}_{P}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/lay_collide.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog_layout('{TEST_DIR}/lay_collide.pfile.json');
+----
+the same .pvar
+
+# v1 samples-sharded: shards as present cells; sample spans from partition, variant span NULL; shared .pvar folded in.
+query IIIIIIII
+SELECT variant_start, variant_stop, sample_start, sample_stop, present, cardinality(keys), regexp_replace(pvar, '^.*/', ''), regexp_replace(psam, '^.*/', '')
+FROM read_pfile_catalog_layout('test/data/pfile_catalog_samples.pfile.json') ORDER BY sample_start;
+----
+NULL	NULL	0	8	true	0	large_example.pvar	large_example.psam
+NULL	NULL	8	16	true	0	large_example.pvar	large_example.psam
+
+# v1 single: one present cell, no spans, nothing probed.
+query IIII
+SELECT count(*), bool_and(present), bool_and(sample_start IS NULL AND variant_start IS NULL), bool_and(regexp_replace(prefix, '^.*/', '') = 'large_example')
+FROM read_pfile_catalog_layout('test/data/pfile_catalog_single.pfile.json');
+----
+1	true	true	true
+
+statement error
+SELECT * FROM read_pfile_catalog_layout('{TEST_DIR}/does_not_exist.pfile.json');
+----
+file not found
