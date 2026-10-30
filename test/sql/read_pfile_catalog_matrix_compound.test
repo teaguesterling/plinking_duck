@@ -1,0 +1,441 @@
+# name: test/sql/read_pfile_catalog_matrix_compound.test
+# description: read_pfile_catalog v2 — compound keys + ordinal_interval/value_bin cell pruning (P13 phase 2)
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# FIXTURE — compound keys on BOTH axes, tiled by explicit blocks.
+#   variants = CHROM (enum) x CHUNK (ordinal_interval over POS):
+#     CHROM=1/CHUNK=001  ordinal [0,2)  POS [10000,20000]  (rs1@10000, rs2@20000)
+#     CHROM=1/CHUNK=002  ordinal [2,3)  POS [30000,30000]  (rs3@30000)
+#     CHROM=2/CHUNK=001  ordinal [3,4)  POS [15000,15000]  (rs4@15000)   <- POS 15000 like CHROM=1 would NOT
+#   samples  = GROUP (enum) x SLICE (ordinal_interval over sample_index) x age (value_bin):
+#     GROUP=A/SLICE=0/age=young  [0,1)  age [20,40)
+#     GROUP=A/SLICE=1/age=old    [1,2)  age [40,60)
+#     GROUP=B/SLICE=0/age=young  [2,3)  age [20,40)
+#     GROUP=B/SLICE=1/age=old    [3,4)  age [40,60)
+# => 3 variant-blocks x 4 sample-blocks = 12 cells, each a REAL 1-sample fileset whose .pgen header
+# counts match its block companions (verification reads them). Flat names in {TEST_DIR} (no PARTITION_BY).
+# ===========================================================================
+
+# ---- 12 cells (variant selection x 1-sample slice) ----
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS <= 20000)
+TO '{TEST_DIR}/c_1_001_A_0' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 2, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS <= 20000)
+TO '{TEST_DIR}/c_1_001_A_1' (FORMAT pfile, samples ['S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS <= 20000)
+TO '{TEST_DIR}/c_1_001_B_0' (FORMAT pfile, samples ['S3']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 4, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS <= 20000)
+TO '{TEST_DIR}/c_1_001_B_1' (FORMAT pfile, samples ['S4']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS = 30000)
+TO '{TEST_DIR}/c_1_002_A_0' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 2, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS = 30000)
+TO '{TEST_DIR}/c_1_002_A_1' (FORMAT pfile, samples ['S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS = 30000)
+TO '{TEST_DIR}/c_1_002_B_0' (FORMAT pfile, samples ['S3']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 4, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS = 30000)
+TO '{TEST_DIR}/c_1_002_B_1' (FORMAT pfile, samples ['S4']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/c_2_001_A_0' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 2, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/c_2_001_A_1' (FORMAT pfile, samples ['S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/c_2_001_B_0' (FORMAT pfile, samples ['S3']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 4, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/c_2_001_B_1' (FORMAT pfile, samples ['S4']);
+
+# ---- 3 variant-block .pvar companions (shared along the variant axis) ----
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS <= 20000)
+TO '{TEST_DIR}/v_1_001' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1' AND POS = 30000)
+TO '{TEST_DIR}/v_1_002' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/v_2_001' (FORMAT pfile, samples ['S1']);
+
+# ---- 4 sample-block .psam companions (shared along the sample axis, 1 sample each) ----
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/s_A_0' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 2, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/s_A_1' (FORMAT pfile, samples ['S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/s_B_0' (FORMAT pfile, samples ['S3']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 4, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/s_B_1' (FORMAT pfile, samples ['S4']);
+
+# ---- the compound catalog ----
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"compound","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"CHUNK","type":"ordinal_interval","over":"POS"}],"blocks":[{"keys":{"CHROM":"1","CHUNK":"001"},"start":0,"stop":2,"bounds":{"CHUNK":{"min":10000,"max":20000}}},{"keys":{"CHROM":"1","CHUNK":"002"},"start":2,"stop":3,"bounds":{"CHUNK":{"min":30000,"max":30000}}},{"keys":{"CHROM":"2","CHUNK":"001"},"start":3,"stop":4,"bounds":{"CHUNK":{"min":15000,"max":15000}}}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"},{"name":"SLICE","type":"ordinal_interval","over":"sample_index"},{"name":"age","type":"value_bin","over":"age"}],"blocks":[{"keys":{"GROUP":"A","SLICE":"0","age":"young"},"start":0,"stop":1,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"A","SLICE":"1","age":"old"},"start":1,"stop":2,"bounds":{"age":{"lo":40,"hi":60}}},{"keys":{"GROUP":"B","SLICE":"0","age":"young"},"start":2,"stop":3,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"B","SLICE":"1","age":"old"},"start":3,"stop":4,"bounds":{"age":{"lo":40,"hi":60}}}]}],"template":{"pfile":"c_{CHROM}_{CHUNK}_{GROUP}_{SLICE}","pvar":"v_{CHROM}_{CHUNK}.pvar","psam":"s_{GROUP}_{SLICE}.psam"}}')
+TO '{TEST_DIR}/compound.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# dense grid: 12 cells, 3 distinct .pvar, 4 distinct .psam, all verified.
+query III
+SELECT count(*), count(DISTINCT pvar), count(DISTINCT psam) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json');
+----
+12	3	4
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json') WHERE verified;
+----
+12
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', verify_all := true);
+----
+12
+
+# compound keys surface as one map per cell.
+query TT
+SELECT keys['CHROM'] || '/' || keys['CHUNK'], keys['GROUP'] || '/' || keys['SLICE'] || '/' || keys['age']
+FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json') ORDER BY source_ordinal LIMIT 1;
+----
+1/001	A/0/young
+
+# ---------------------------------------------------------------------------
+# region — variant-axis CHROM membership + POS-window overlap against the CHUNK (ordinal_interval/POS).
+# ---------------------------------------------------------------------------
+
+# THE compound-key hazard: POS 15000 falls in CHROM=1/CHUNK=001 [10000,20000] AND in CHROM=2/CHUNK=001
+# [15000,15000], but the contig '1' keeps ONLY the CHROM=1 block (x 4 sample-blocks). 4, not 8.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:15000-15000');
+----
+4
+
+query TT
+SELECT DISTINCT keys['CHROM'], keys['CHUNK']
+FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:15000-15000');
+----
+1	001
+
+# inclusive-POS boundary: a window at the block's exact min OR exact max keeps it.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:10000-10000');
+----
+4
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:20000-20000');
+----
+4
+
+# CHROM=1/CHUNK=002 is the POS=30000 block.
+query TT
+SELECT DISTINCT keys['CHROM'], keys['CHUNK']
+FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:30000-30000');
+----
+1	002
+
+# a window in the inter-block gap selects nothing (0 rows, NOT an error).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:20001-29999');
+----
+0
+
+# the CHROM=2 block (its POS also contains 15000, reached only via contig '2').
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '2:15000-15000');
+----
+4
+
+# ---------------------------------------------------------------------------
+# variant_index — variant-axis ordinal span overlap (inclusive [lo,hi] vs half-open [start,stop)).
+# ---------------------------------------------------------------------------
+
+# ordinal 2 is the STOP of CHUNK=001 [0,2) and the START of CHUNK=002 [2,3): half-open keeps CHUNK=002.
+query TT
+SELECT DISTINCT keys['CHROM'], keys['CHUNK']
+FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', variant_index := [2, 2]);
+----
+1	002
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', variant_index := [0, 0]);
+----
+4
+
+# ---------------------------------------------------------------------------
+# samples := LIST(INTEGER) — sample-axis ordinal POINT membership (a point list, NOT a range).
+# ---------------------------------------------------------------------------
+
+# points {1,3} hit SLICE blocks [1,2) and [3,4): 2 sample-blocks x 3 variant-blocks = 6. A RANGE
+# reading of [1,3] would wrongly keep [1,2)+[2,3)+[3,4) = 9.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', samples := [1, 3]);
+----
+6
+
+# half-open boundary: index 2 is the STOP of [1,2) and START of [2,3) -> keeps GROUP=B/SLICE=0 only.
+query TT
+SELECT DISTINCT keys['GROUP'], keys['SLICE']
+FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', samples := [2]);
+----
+B	0
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', samples := [0]);
+----
+3
+
+# FINDING A: a numeric IID STRING must NOT be silently cast to a sample INDEX (a wrong, non-empty cohort).
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', samples := ['1']);
+----
+samples by IID is not yet supported
+
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', samples := ['S1']);
+----
+samples by IID is not yet supported
+
+# ---------------------------------------------------------------------------
+# `keys` is enum-membership ONLY. An ordinal_interval / value_bin key in `keys` is an error that points at
+# region / variant_index / samples (Way B). GROUP is an enum and still prunes.
+# ---------------------------------------------------------------------------
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'CHUNK': ['10000', '15000']});
+----
+CHUNK is an ordinal_interval key; use region / variant_index / samples
+
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'SLICE': ['0', '1']});
+----
+SLICE is an ordinal_interval key
+
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'age': ['40', '40']});
+----
+age is a value_bin key; use region / variant_index / samples
+
+# the genomic window that `keys := {'CHUNK': ...}` used to express is `region`: POS [10000,15000] on contig 1
+# keeps CHUNK=001 only (4 cells = 1 variant block x 4 sample blocks).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:10000-15000');
+----
+4
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'GROUP': ['A']});
+----
+6
+
+# ---------------------------------------------------------------------------
+# product across axes: region (variant) AND keys (sample enum) multiply.
+# ---------------------------------------------------------------------------
+
+# region '1:10000-20000' (CHROM=1/CHUNK=001) x GROUP=A (SLICE 0 and 1) = 1 x 2 = 2 cells.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:10000-20000',
+       keys := {'GROUP': ['A']});
+----
+2
+
+# region (variant) AND samples (sample axis) multiply: 1 variant-block x 1 sample-block = 1 cell.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:10000-20000',
+       samples := [1]);
+----
+1
+
+# ---------------------------------------------------------------------------
+# fail-loud — never accept-and-ignore.
+# ---------------------------------------------------------------------------
+
+# sample_index is the 1-D param; a matrix uses `samples` (point list) -> reject, do not ignore.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', sample_index := [0, 1]);
+----
+invalid predicate
+
+# an undeclared key in `keys` still throws.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'NOPE': ['x']});
+----
+invalid predicate
+
+# ---------------------------------------------------------------------------
+# region needs a variant-axis CHROM key (the contig anchor). A catalog without one rejects region.
+# (No filesets needed: the predicate is rejected before any verification.)
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"nochrom","axes":[{"name":"variants","keys":[{"name":"SEG","type":"enum","values":[{"value":"x","start":0,"stop":2}]}]},{"name":"samples","keys":[{"name":"GRP","type":"enum","values":[{"value":"g","start":0,"stop":1}]}]}],"template":{"pfile":"c_{SEG}_{GRP}","pvar":"v_{SEG}.pvar","psam":"s_{GRP}.psam"}}')
+TO '{TEST_DIR}/nochrom.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/nochrom.pfile.json', region := '1:1-2');
+----
+invalid predicate
+
+# ---------------------------------------------------------------------------
+# under-claim: a CHUNK POS bound that does NOT cover the real .pvar extent would wrongly drop the block
+# on a region prune, so verification rejects it (the `verified` column cannot lie). CHROM=1/CHUNK=001
+# really spans POS [10000,20000]; a bound [10000,15000] under-claims it.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"underclaim","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"CHUNK","type":"ordinal_interval","over":"POS"}],"blocks":[{"keys":{"CHROM":"1","CHUNK":"001"},"start":0,"stop":2,"bounds":{"CHUNK":{"min":10000,"max":15000}}},{"keys":{"CHROM":"1","CHUNK":"002"},"start":2,"stop":3,"bounds":{"CHUNK":{"min":30000,"max":30000}}},{"keys":{"CHROM":"2","CHUNK":"001"},"start":3,"stop":4,"bounds":{"CHUNK":{"min":15000,"max":15000}}}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"},{"name":"SLICE","type":"ordinal_interval","over":"sample_index"},{"name":"age","type":"value_bin","over":"age"}],"blocks":[{"keys":{"GROUP":"A","SLICE":"0","age":"young"},"start":0,"stop":1,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"A","SLICE":"1","age":"old"},"start":1,"stop":2,"bounds":{"age":{"lo":40,"hi":60}}},{"keys":{"GROUP":"B","SLICE":"0","age":"young"},"start":2,"stop":3,"bounds":{"age":{"lo":20,"hi":40}}},{"keys":{"GROUP":"B","SLICE":"1","age":"old"},"start":3,"stop":4,"bounds":{"age":{"lo":40,"hi":60}}}]}],"template":{"pfile":"c_{CHROM}_{CHUNK}_{GROUP}_{SLICE}","pvar":"v_{CHROM}_{CHUNK}.pvar","psam":"s_{GROUP}_{SLICE}.psam"}}')
+TO '{TEST_DIR}/underclaim.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/underclaim.pfile.json');
+----
+range under-claim
+
+# In DEFAULT mode an under-claiming block that a prune DROPS is never verified, so the lie is silent
+# (0 rows, matching the 1-D design). verify_all verifies BEFORE pruning and still catches it: a region
+# past the under-claimed bound (16000-20000) would wrongly drop CHROM=1/CHUNK=001, yet verify_all throws.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/underclaim.pfile.json', region := '1:16000-20000');
+----
+0
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/underclaim.pfile.json', region := '1:16000-20000', verify_all := true);
+----
+range under-claim
+
+# ---------------------------------------------------------------------------
+# companion collision: a template.pvar that omits CHUNK pairs two variant-blocks with one .pvar.
+# (Parse-time, no filesets needed — the collision is detected before verification.)
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"CHUNK","type":"ordinal_interval","over":"POS"}],"blocks":[{"keys":{"CHROM":"1","CHUNK":"001"},"start":0,"stop":2,"bounds":{"CHUNK":{"min":1,"max":2}}},{"keys":{"CHROM":"1","CHUNK":"002"},"start":2,"stop":4,"bounds":{"CHUNK":{"min":3,"max":4}}}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c_{CHROM}_{CHUNK}_{GROUP}","pvar":"v_{CHROM}.pvar","psam":"s_{GROUP}.psam"}}')
+TO '{TEST_DIR}/pvar_collapse.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/pvar_collapse.pfile.json');
+----
+same .pvar
+
+# ---------------------------------------------------------------------------
+# CHROM under-claim on a CHROM-ONLY matrix (enum CHROM, NO POS/CHUNK key). Task 4 makes `region` prune on
+# CHROM membership for exactly this shape, so a block mislabeled CHROM=2 whose .pvar actually holds contig
+# 3 must be caught at survivor verification (not reported verified=true). This fires independent of a POS
+# key, matching the v1 reader's range.CHROM check.
+# ---------------------------------------------------------------------------
+
+# 1 cell: .pgen holds 1 variant x 1 sample; counts match its companions, so ONLY the CHROM label lies.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/cell_2_A' (FORMAT pfile, samples ['S1']);
+
+# the variant-block .pvar companion ACTUALLY holds contig '3' (relabeled), contradicting the block's CHROM=2.
+statement ok
+COPY (SELECT '3' AS CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/mv_2' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/ms_A' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"mislabel","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"2","start":0,"stop":1}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":1}]}]}],"template":{"pfile":"cell_{CHROM}_{GROUP}","pvar":"mv_{CHROM}.pvar","psam":"ms_{GROUP}.psam"}}')
+TO '{TEST_DIR}/chrom_mislabel.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# region := '2' keeps the (conservatively-kept) CHROM=2 block; its survivor verification must catch the
+# contig-3 .pvar as a CHROM under-claim rather than returning a verified=true row.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/chrom_mislabel.pfile.json', region := '2');
+----
+range under-claim
+
+# The same mislabel, but the contig key is named `contig` and marked over:"CHROM": the verification and the
+# region prune must follow the marker, not the literal name.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"mislabel2","axes":[{"name":"variants","keys":[{"name":"contig","type":"enum","over":"CHROM","values":[{"value":"2","start":0,"stop":1}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":1}]}]}],"template":{"pfile":"cell_{contig}_{GROUP}","pvar":"mv_{contig}.pvar","psam":"ms_{GROUP}.psam"}}')
+TO '{TEST_DIR}/contig_mislabel.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/contig_mislabel.pfile.json', region := '2');
+----
+range under-claim
+
+# ---------------------------------------------------------------------------
+# grammar negatives (parse-time, no filesets needed).
+# ---------------------------------------------------------------------------
+
+# a value_bin block missing its bin edges.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"},{"name":"age","type":"value_bin","over":"age"}],"blocks":[{"keys":{"GROUP":"A","age":"young"},"start":0,"stop":3}]}],"template":{"pfile":"c_{CHROM}_{GROUP}","pvar":"v_{CHROM}.pvar","psam":"s_{GROUP}.psam"}}')
+TO '{TEST_DIR}/missing_bounds.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/missing_bounds.pfile.json');
+----
+needs bounds
+
+# an ordinal_interval over the wrong quantity for its axis (POS on the sample axis).
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"SLICE","type":"ordinal_interval","over":"POS"}],"blocks":[{"keys":{"SLICE":"0"},"start":0,"stop":3}]}],"template":{"pfile":"c_{CHROM}_{SLICE}","pvar":"v_{CHROM}.pvar","psam":"s_{SLICE}.psam"}}')
+TO '{TEST_DIR}/wrong_over.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/wrong_over.pfile.json');
+----
+must range 'over'
+
+# a blocks array that does not tile the axis contiguously.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"CHUNK","type":"ordinal_interval","over":"POS"}],"blocks":[{"keys":{"CHROM":"1","CHUNK":"001"},"start":0,"stop":2,"bounds":{"CHUNK":{"min":1,"max":2}}},{"keys":{"CHROM":"1","CHUNK":"002"},"start":5,"stop":6,"bounds":{"CHUNK":{"min":3,"max":4}}}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c_{CHROM}_{CHUNK}_{GROUP}","pvar":"v_{CHROM}_{CHUNK}.pvar","psam":"s_{GROUP}.psam"}}')
+TO '{TEST_DIR}/blocks_gap.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/blocks_gap.pfile.json');
+----
+tiling expects

@@ -1,0 +1,137 @@
+# pfile_catalog matrix — metadata layer Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Read and prune progressively more involved multi-file pfile *grids* through a `pfile_catalog` v2, returning one manifest row per surviving cell.
+
+**Architecture:** Extend `read_pfile_catalog` with a **version-routed** v2 path; the existing 1-D path is untouched. A v2 model (axes of catalog-defined **typed keys**) and a generic typed prune live in new `pfile_catalog_matrix.{hpp,cpp}`, called from the reader's bind. Three data-shape phases, each a working reader: **(1) dense grid assembly**, **(2) typed-key pruning**, **(3) sparse grids**. ATTACH, the pushdown cascade, projection-driven genotype columns, and analysis macros are **out of scope** — later plans.
+
+**Tech Stack:** C++ DuckDB extension (DuckDB v1.5.6 **and** v2.0.0 via the `duckdb_compat*.hpp` shims), yyjson, DuckDB `.test` SQL tests, extension-ci-tools make (`GEN=ninja make`), clang-format 11.0.1 (`~/.local/bin/clang-format`).
+
+**Spec:** `docs/planning/P13-001-pfile-catalog-matrix` (read it; this plan argues from it). Cross-refs there to `DESIGN-GUIDE` and howard spec §5/§6/§10.
+
+## Global Constraints
+
+- **Version discriminator.** `"pfile_catalog": 2` → matrix form; `1` → the existing 1-D / single-fileset forms, **unchanged**; any other value → parse error. (The current reader already throws on `!= 1`, so a v1 reader rejects a v2 catalog cleanly — keep that.)
+- **Keys are catalog-defined; only the type vocabulary is code:** `enum`, `ordinal_interval`, `value_bin`. No key name (`CHROM`/`GROUP`/…) is hard-coded in the reader.
+- **Companions shared along axes:** M `.pvar` (one per variant-block) + N `.psam` (one per sample-block); cell (i,j) pairs variant-block i's `.pvar` with sample-block j's `.psam`.
+- **Bounds declared in the catalog;** pruning opens no `.pgen`. **Verification stays lazy on survivors** (`verify_all := true` verifies all first). Reuse the 1-D `VerifyCounts` / `VerifyWidthAndRange` and path helpers (`ResolvePath`, `ResolveExistingCompanion`).
+- **Paths** resolve relative to the catalog dir, returned absolute + normalized (reuse `ResolvePath`).
+- **Sparse:** a cell may be absent; the manifest skips holes (never resolves a missing `.pgen`); a query selecting only holes returns **empty, not error**.
+- **Fail loud, never widen:** a predicate naming an unknown key, or a key on the wrong axis, **throws** (`invalid predicate` prefix, mirroring the 1-D taxonomy) — it must not silently return the whole grid.
+- Tests: `.test` with `require plinking_duck`; must pass on **both** DuckDB lines; `clang-format` clean.
+
+## Review Focus
+
+- **Stale per-cell bound:** a cell whose declared span ≠ its real companion count must raise `verification failed (count mismatch)`, not silently keep/drop. → Task 2.
+- **Unknown / wrong-axis key in a predicate:** must throw `invalid predicate`, never widen to the whole grid. → Task 3.
+- **Zero-cell result:** predicates (or all-holes) that select no cell return 0 rows, not an error and not the whole grid. → Task 3 (empty prune), Task 5 (all-holes).
+- **Malformed v2 catalog:** axes declaring a key of unknown type, a cell template referencing an undeclared key, or both a v1 (`concat_dim`) and a v2 (`axes`) block → parse error. → Task 1.
+- **Companion shared along the wrong axis:** a `.pvar` declared per sample-block (or `.psam` per variant-block) → parse error (§5 invariant, generalized). → Task 1.
+
+---
+
+## File Structure
+
+- **Create `src/include/pfile_catalog_matrix.hpp`** — the v2 model: `AxisKeyType` (`ENUM`/`ORDINAL_INTERVAL`/`VALUE_BIN`), `AxisKey` (name, axis, type, per-value bounds), `AxisDef` (name, ordered keys, sort fields), `MatrixCell` (key-values, resolved prefix/pvar/psam, per-axis `[start,stop)` spans, source_ordinal), `MatrixCatalog` (version, dataset, base_dir, axes, cells, template, companion map, holes). Overlap/membership helpers on the key types.
+- **Create `src/pfile_catalog_matrix.cpp`** — `ParseMatrixCatalog`, `BuildCells` (Cartesian product minus holes, with declared bounds), `PruneCells` (per-key typed operators), resolve the shared companions per cell.
+- **Modify `src/pfile_catalog_reader.cpp`** — route on version in the bind: `1` → existing path; `2` → the matrix branch (parse → build → prune → verify survivors → emit per-cell rows). Register the generic prune params. Keep every existing 1-D line intact.
+- **Create `test/sql/read_pfile_catalog_matrix.test`** — the phase tests.
+- **Create** fixtures under the test (generated into `__TEST_DIR__` where feasible; see Task 1).
+
+---
+
+## Phase 1 — Dense grid: assemble + manifest
+
+### Task 1: v2 parse + dense cell manifest (single `enum` key per axis, shared companions)
+
+**Files:**
+- Create: `src/include/pfile_catalog_matrix.hpp`, `src/pfile_catalog_matrix.cpp`
+- Modify: `src/pfile_catalog_reader.cpp` (version routing in `PfileCatalogBind`; matrix bind branch; output columns; registration)
+- Test: `test/sql/read_pfile_catalog_matrix.test`
+
+**Interfaces:**
+- Produces: `MatrixCatalog ParseMatrixCatalog(FileSystem&, const string& path, const string& content)`; `vector<MatrixCell> BuildCells(const MatrixCatalog&, FileSystem&)` (resolves each cell's `.pgen` from the template and its shared `.pvar`/`.psam` from the companion map); the manifest row columns (below).
+- Consumes: the existing `ResolvePath`, `ResolveCompanion`, `NormPath`, `DirName`, `AbsPath` in `pfile_catalog_reader.cpp` (expose them via the matrix TU as needed — do not duplicate).
+
+**Manifest columns (v2 rows):** `dataset`, `prefix`, `pvar`, `psam`, per-axis `variant_start`/`variant_stop`/`sample_start`/`sample_stop`, `source_ordinal`, a `keys` `MAP(VARCHAR,VARCHAR)` of this cell's key→value, and `verified`. (v1 rows keep their existing schema; a v2 call returns the v2 schema — the two shapes are distinct, routed by version.)
+
+- [ ] **Step 1: Write the failing test.** In `read_pfile_catalog_matrix.test`, create a dense 2×2 fixture under `__TEST_DIR__`: variants split into `CHROM={1,2}` (one `.pvar` each, shared), samples split into `GROUP={A,B}` (one `.psam` each, shared), 4 cells `data/CHROM=i/GROUP=j/cell.pgen`. (Build it by `COPY (…) TO … (FORMAT pfile, shard_by 'CHROM')` for the two variant-blocks, and per-group `COPY (SELECT … WHERE sample in group) …` for the per-group filesets; the shared `.pvar`/`.psam` live at a `ref/CHROM=i` / `ref/GROUP=j` path.) Hand-write `matrix_dense.pfile.json` (version 2, two axes each with one `enum` key, a `template`, the companion map, declared per-block spans). Assert:
+  - `SELECT count(*) FROM read_pfile_catalog('…/matrix_dense.pfile.json')` → `4`.
+  - one row's `prefix` ends with `CHROM=1/GROUP=A/cell`, its `pvar` ends with `ref/CHROM=1/…pvar`, its `psam` ends with `ref/GROUP=A/…psam`.
+  - a `"pfile_catalog": 3` fixture → error containing `unsupported`.
+  - a fixture with both `axes` and `concat_dim` → error `one or the other`.
+  - a fixture whose `.pvar` is declared per sample-block → error (`spec §5`).
+  - the existing `read_pfile_catalog.test` (v1) still passes unchanged.
+- [ ] **Step 2: Run to verify it fails.** `GEN=ninja make && ./build/release/test/unittest "test/sql/read_pfile_catalog_matrix.test"` → FAIL (v2 currently throws `unsupported version 2`).
+- [ ] **Step 3: Implement.** Add the model header; `ParseMatrixCatalog` (yyjson, mirroring the v1 parser's helpers and error prefixes; reject unknown key types, undeclared template keys, wrong-axis companions, mixed v1/v2); `BuildCells` (dense Cartesian product, resolve `.pgen` via template, fold the shared `.pvar`/`.psam` per cell); in `PfileCatalogBind`, read the version first and branch to the matrix path, emitting the v2 columns.
+- [ ] **Step 4: Run to verify it passes.** Same command → PASS; also run `make test-require` to confirm v1 tests still pass.
+- [ ] **Step 5: Format + commit.** `clang-format -i` the new/changed C++; `git add` the sources + test; `git commit -m "feat(pfile_catalog): v2 matrix parse + dense cell manifest (P13 phase 1)"`.
+
+### Task 2: survivor verification for cells
+
+**Files:** Modify `src/pfile_catalog_matrix.cpp` / `pfile_catalog_reader.cpp` (matrix branch); Test: extend `read_pfile_catalog_matrix.test`.
+
+**Interfaces:** Consumes the 1-D `VerifyCounts` / `VerifyWidthAndRange` (per cell: `.pgen` header vs its shared `.pvar`/`.psam`; declared span == real companion count). Produces: `verified = true` on returned cells; a count lie throws `verification failed (count mismatch)`.
+
+- [ ] **Step 1: Write the failing test.** Assert: a good dense grid → all 4 rows `verified = true`; a fixture whose one cell declares a variant span ≠ its `.pvar` count → error containing `count mismatch`; `verify_all := true` verifies every cell before returning.
+- [ ] **Step 2: Run → FAIL** (verification not wired into the matrix branch; the bad-span case returns a row instead of throwing).
+- [ ] **Step 3: Implement.** In the matrix bind, after building/pruning, run `VerifyCounts` + the per-axis width check on survivors (reusing the 1-D helpers — the variant width checks against the shared `.pvar`, the sample width against the shared `.psam`), set `verified`. Probe each distinct companion once (M `.pvar` + N `.psam`), not once per cell.
+- [ ] **Step 4: Run → PASS**; `make test-require` green.
+- [ ] **Step 5: Format + commit** (`"feat(pfile_catalog): per-cell survivor verification (P13 phase 1)"`).
+
+## Phase 2 — Typed-key pruning (both axes)
+
+### Task 3: generic typed-key predicate params + `enum` membership prune
+
+**Files:** Modify `pfile_catalog_matrix.cpp` (`PruneCells`), `pfile_catalog_reader.cpp` (register params, pass predicates); Test: extend the matrix test.
+
+**Interfaces:** Reuse the house params (`DESIGN-GUIDE` §2): `region` (variant-axis genomic), `variants := LIST(INTEGER)` (variant_index), `samples := LIST(VARCHAR)|LIST(INTEGER)` (sample-axis, by IID or `sample_index`). Add `keys := MAP(VARCHAR, LIST(VARCHAR))` for arbitrary catalog-defined `enum` keys (e.g. `{'GROUP': ['AFR','EUR']}`). Produces: `PruneCells(cat, predicates) -> vector<MatrixCell>`; an unknown key or wrong-axis key throws `invalid predicate`.
+
+- [ ] **Step 1: Write the failing test.** On the dense 2×2 (+ a 2×3 with `GROUP={A,B,C}`): `keys := {'GROUP':['A']}` → only the 2 cells with GROUP=A; `keys := {'GROUP':['A','C']}` → 4 cells; `keys := {'NOPE':['x']}` → error `invalid predicate` (unknown key); a `keys` entry naming a *variant*-axis key → still fine (it's a declared enum there) but a genomic `region` with no variant axis declared → `invalid predicate`; `keys := {'GROUP':['ZZZ']}` (no such value) → `0` rows (not error).
+- [ ] **Step 2: Run → FAIL** (`keys` param unknown; no membership prune).
+- [ ] **Step 3: Implement.** Register `keys`; in `PruneCells`, for each `enum` key apply membership (cell kept iff its value ∈ the requested set); validate every predicate key exists and is on a declared axis, else throw. The surviving set is the product across axes (a cell survives iff it passes every axis's keys).
+- [ ] **Step 4: Run → PASS**; `make test-require` green.
+- [ ] **Step 5: Format + commit** (`"feat(pfile_catalog): enum-key membership prune + generic predicate params (P13 phase 2)"`).
+
+### Task 4: `ordinal_interval` + `value_bin` prune (compound keys, both axes)
+
+**Files:** Modify `pfile_catalog_matrix.{hpp,cpp}`; Test: extend.
+
+**Interfaces:** `ordinal_interval` key carries `[lo, hi)` over a named quantity (`POS` for `CHUNK`, `sample_index` for `SLICE`); `value_bin` carries bin edges. Operators: `region`/`variants` → variant-axis interval overlap (reuse `RangeOverlaps`/`IndexOverlaps` shapes); `samples := LIST(INTEGER)` → `sample_index` interval overlap; a bounds list in `keys` for a `value_bin`/`ordinal_interval` key → overlap. Boundary law: `[start,stop)` half-open, `POS [min,max]` inclusive (mirror the 1-D boundary tests).
+
+- [ ] **Step 1: Write the failing test.** Fixture with compound keys: variants `CHROM={1,2}` × `CHUNK={001,002}` (each CHUNK an `ordinal_interval` over POS), samples `GROUP={A,B}` × `SLICE={0,1}` (`ordinal_interval` over `sample_index`), plus a `value_bin` `age`. Assert: `region := '1:<window in CHUNK=001>'` keeps only CHROM=1/CHUNK=001 variant-blocks (× all surviving sample cells); `samples := [<index in SLICE=1>]` keeps only SLICE=1 sample-blocks; `region` **and** `keys := {'GROUP':['A']}` → the product (intersection of surviving blocks); inclusive-POS boundary at a block's exact min/max keeps it; a half-open index boundary at the block edge selects the correct block.
+- [ ] **Step 2: Run → FAIL** (ordinal/bin operators absent).
+- [ ] **Step 3: Implement.** Add the `ordinal_interval` and `value_bin` operators in the matrix model; wire `region`/`variants`/`samples`(INTEGER)/bin-bounds-in-`keys` through `PruneCells`; keep the product-across-axes rule from Task 3.
+- [ ] **Step 4: Run → PASS**; `make test-require` green.
+- [ ] **Step 5: Format + commit** (`"feat(pfile_catalog): ordinal_interval + value_bin cell pruning (P13 phase 2)"`).
+
+## Phase 3 — Sparse grids (holes)
+
+### Task 5: holes / mask
+
+**Files:** Modify `pfile_catalog_matrix.{hpp,cpp}` (`BuildCells`); Test: extend.
+
+**Interfaces:** `MatrixCatalog` carries an explicit hole representation (an absent-cell mask, or an `omit` list, in the v2 JSON — exact spelling left to Task 1's grammar but consumed here). `BuildCells` emits only present cells and never resolves a missing `.pgen`.
+
+- [ ] **Step 1: Write the failing test.** A 2×3 grid declaring `CHROM=2/GROUP=C` absent: `count(*)` → 5 (not 6); no row's `prefix` points at the absent cell; `keys := {'GROUP':['C']}` with `region` on CHROM=2 → `0` rows (the only such cell is a hole), **not** an error and **not** a file-not-found; verification runs only on the 5 present survivors (a fixture where the *absent* cell would fail verification still passes, proving holes are never opened).
+- [ ] **Step 2: Run → FAIL** (holes resolved as missing `.pgen` → file-not-found, or counted as 6).
+- [ ] **Step 3: Implement.** Parse the hole representation in `ParseMatrixCatalog`; skip holes in `BuildCells`; ensure prune + verify operate only on present cells.
+- [ ] **Step 4: Run → PASS**; `make test-require` green.
+- [ ] **Step 5: Format + commit** (`"feat(pfile_catalog): sparse grids / holes (P13 phase 3)"`).
+
+---
+
+## Out of scope (later plans)
+
+- **ATTACH surface** (`TYPE pfile_catalog` → `c.variants`/`c.samples`/`c.genotypes`/`c.cells`/blocks), projection-driven genotype columns, planner/join dynamic-filter pushdown — P13-003.
+- **Cascade** (companion parquet row-group skip, count-only genotype path, materialized `sample_index`, optional declared id→block index) — P13-004.
+- **Analysis macros** (`c.freq`/`score`/`pca`/`glm`) + cross-cell per-variant aggregation — separate plan.
+
+## Self-review
+
+- **Spec coverage:** §3.1 companions-along-axes → Task 1; §3.2 typed keys → Tasks 3–4; §3.2 sparse → Task 5; §4 v2 parse/discriminator → Task 1; §5.D generic predicate params / lower layer → Tasks 3–4; §7 trust model → Task 2. §3.3 sort/materialized-index and §6.3 cascade are **phase-4** (the prune here uses declared bounds, so it does not yet depend on the materialized index) — flagged out of scope. Surface A/B ATTACH + C analysis → out of scope. **No metadata-layer gap.**
+- **Step scan:** each step writes one thing (a fixture+assertions, a signature, a run, a commit); no "handle edge cases" lines; no C++ bodies transcribed (signatures + test SQL only).
+- **Type consistency:** `MatrixCatalog`/`MatrixCell`/`ParseMatrixCatalog`/`BuildCells`/`PruneCells` named identically across Tasks 1–5; manifest columns defined once in Task 1 and extended (not renamed).
+- **Review Focus:** all five lines are pinned to Tasks 1/2/3/5 above.
+- **Proportion:** ~5 tasks, signatures + test shapes, no code bodies — proportionate to a spec of this size; fixture mechanics are the bulk of the implementer's work, not the plan's.

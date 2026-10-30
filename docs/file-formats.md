@@ -89,7 +89,8 @@ files above plus the metadata to assemble them into one dataset. PlinkingDuck wr
 it (the sharded [`COPY … (FORMAT pfile, shard_by …)`](functions/write_pfile.md#sharded-output-shard_by)
 writer) and reads it ([`read_pfile_catalog`](functions/read_pfile_catalog.md)).
 See the [**`pfile_catalog` catalog format reference**](formats/pfile_catalog.md) for the full
-schema, boundary law, and trust model.
+schema, boundary law, and trust model. Version 2 of the format describes a variants × samples
+grid of filesets; see [Version 2: the matrix form](formats/pfile_catalog.md#version-2-the-matrix-form).
 
 ## VCF Files
 

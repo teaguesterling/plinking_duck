@@ -1,0 +1,493 @@
+# name: test/sql/read_pfile_catalog_matrix.test
+# description: read_pfile_catalog v2 — matrix (2-D) catalog: parse + dense cell manifest (P13 phase 1)
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# FIXTURE — dense 2x2 grid: variants split by CHROM={1,2} (one shared .pvar each: 3 and 1 variants),
+# samples split by GROUP={A,B} (one shared .psam each: 2 samples). 4 cells data/CHROM=i/GROUP=j/cell.pgen,
+# each a REAL fileset whose .pgen header counts match its block companions (verification reads them).
+# PARTITION_BY only creates the hive directories the pfile writer needs.
+# ===========================================================================
+
+statement ok
+COPY (SELECT c AS CHROM, g AS "GROUP", 0 AS x FROM (VALUES ('1'),('2')) a(c), (VALUES ('A'),('B')) b(g))
+TO '{TEST_DIR}/data' (FORMAT csv, PARTITION_BY (CHROM, "GROUP"));
+
+statement ok
+COPY (SELECT c AS CHROM, 0 AS x FROM (VALUES ('1'),('2')) a(c)) TO '{TEST_DIR}/refv' (FORMAT csv, PARTITION_BY (CHROM));
+
+statement ok
+COPY (SELECT g AS "GROUP", 0 AS x FROM (VALUES ('A'),('B')) b(g)) TO '{TEST_DIR}/refs' (FORMAT csv, PARTITION_BY ("GROUP"));
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/data/CHROM=1/GROUP=A/cell' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/data/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S3', 'S4']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/data/CHROM=2/GROUP=A/cell' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/data/CHROM=2/GROUP=B/cell' (FORMAT pfile, samples ['S3', 'S4']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/refv/CHROM=1/blk' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/refv/CHROM=2/blk' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/refs/GROUP=A/blk' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/refs/GROUP=B/blk' (FORMAT pfile, samples ['S3', 'S4']);
+
+# Hand-written v2 catalog.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"dense","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/matrix_dense.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json');
+----
+4
+
+query TTTT
+SELECT ends_with(prefix, 'CHROM=1/GROUP=A/cell'), ends_with(pvar, 'refv/CHROM=1/blk.pvar'),
+       ends_with(psam, 'refs/GROUP=A/blk.psam'), dataset
+FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json') WHERE keys['CHROM'] = '1' AND keys['GROUP'] = 'A';
+----
+true	true	true	dense
+
+# Companions are shared along each axis: 2 distinct .pvar, 2 distinct .psam across 4 cells.
+query II
+SELECT count(DISTINCT pvar), count(DISTINCT psam) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json');
+----
+2	2
+
+# Declared per-block spans and source_ordinal (variants-major).
+query IIIII
+SELECT source_ordinal, variant_start, variant_stop, sample_start, sample_stop
+FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json') ORDER BY source_ordinal;
+----
+0	0	3	0	2
+1	0	3	2	4
+2	3	4	0	2
+3	3	4	2	4
+
+# Every returned cell is verified (a lie throws instead).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json') WHERE verified;
+----
+4
+
+# verify_all is accepted on a matrix catalog and verifies every cell.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', verify_all := true) WHERE verified;
+----
+4
+
+# ---------------------------------------------------------------------------
+# keys := enum-membership prune (P13 task 3): a cell survives iff it passes every axis's enum predicate.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT keys['CHROM'], keys['GROUP'] FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']})
+ORDER BY 1;
+----
+1	A
+2	A
+
+# A multi-value set keeps the union of its values.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A', 'B']});
+----
+4
+
+# Predicates on both axes multiply: CHROM in {2} AND GROUP in {A,B} -> 2 rows (product across axes, union within a key).
+query II
+SELECT keys['CHROM'], keys['GROUP'] FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json',
+       keys := {'CHROM': ['2'], 'GROUP': ['A', 'B']}) ORDER BY 2;
+----
+2	A
+2	B
+
+# NULL is fail-loud for a named key (a NULL list or a NULL element), never an empty or '' match.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': NULL::VARCHAR[]});
+----
+invalid predicate
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A', NULL]});
+----
+invalid predicate
+
+# A NULL or empty keys map itself means no prune.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := NULL);
+----
+4
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := map {}::MAP(VARCHAR, VARCHAR[]));
+----
+4
+
+# An empty selection (no such value) is 0 rows, not an error and not the whole grid.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['ZZZ']});
+----
+0
+
+# Survivors only are verified, and they report verified.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']}) WHERE verified;
+----
+2
+
+# An unknown key never widens: it throws.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'NOPE': ['x']});
+----
+invalid predicate
+
+# A variant span that disagrees with the shared .pvar (CHROM=1 really has 3 variants) -> count mismatch.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"bad","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":2},{"value":"2","start":2,"stop":3}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/bad_vspan.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/bad_vspan.pfile.json');
+----
+verification failed (count mismatch)
+
+# A sample span that disagrees with the shared .psam (GROUP=B really has 2 samples) -> count mismatch.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"bad","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":5}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/bad_sspan.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/bad_sspan.pfile.json');
+----
+verification failed (count mismatch)
+
+# A cell whose .pgen header disagrees with its block companions (the cell holds 1 variant, the .pvar 3).
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/data/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json');
+----
+verification failed (count mismatch)
+
+# Verification runs on SURVIVORS: cell CHROM=1/GROUP=B is now corrupt. Pruned away, it is not touched;
+# included (or verify_all, which verifies before pruning), it throws.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']});
+----
+2
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']}, verify_all := true);
+----
+verification failed (count mismatch)
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['B']});
+----
+verification failed (count mismatch)
+
+# ---------------------------------------------------------------------------
+# Negative fixtures
+# ---------------------------------------------------------------------------
+
+# unsupported version (v1 path still owns the message)
+statement ok
+COPY (SELECT '{"pfile_catalog":3,"dataset":"x"}') TO '{TEST_DIR}/v3.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/v3.pfile.json');
+----
+unsupported
+
+# axes AND concat_dim
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","concat_dim":"variants","axes":[]}') TO '{TEST_DIR}/mixed.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/mixed.pfile.json');
+----
+one or the other
+
+# .pvar templated by a sample-axis key (declared per sample-block)
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{GROUP}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/wrongaxis.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/wrongaxis.pfile.json');
+----
+spec §5
+
+# unknown key type
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"bogus","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/badtype.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/badtype.pfile.json');
+----
+unknown key type
+
+# template references an undeclared key
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{NOPE}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/undeclared.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/undeclared.pfile.json');
+----
+undeclared key
+
+# ---------------------------------------------------------------------------
+# Fix round 1: more negative fixtures (companion axis, cell collision, tiling, shape, v1 keys)
+# ---------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{CHROM}.psam"}}')
+TO '{TEST_DIR}/psam_on_variant_axis.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/psam_on_variant_axis.pfile.json');
+----
+spec §5
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/block.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/pvar_no_axis_key.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/pvar_no_axis_key.pfile.json');
+----
+does not reference its own axis
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/block.psam"}}')
+TO '{TEST_DIR}/psam_no_axis_key.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/psam_no_axis_key.pfile.json');
+----
+does not reference its own axis
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"data/{CHROM}/cell","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/pfile_missing_axis.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/pfile_missing_axis.pfile.json');
+----
+must reference the key of every axis
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4},{"value":"2","start":5,"stop":9}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/gap.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/gap.pfile.json');
+----
+tiling expects
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4},{"value":"2","start":3,"stop":9}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/overlap.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/overlap.pfile.json');
+----
+tiling expects
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":2,"stop":2}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/emptyspan.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/emptyspan.pfile.json');
+----
+empty or inverted
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4},{"value":"1","start":4,"stop":9}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/dupvalue.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/dupvalue.pfile.json');
+----
+twice
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/unclosed.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/unclosed.pfile.json');
+----
+unclosed
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]},{"name":"X","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/twokeys.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/twokeys.pfile.json');
+----
+needs a 'blocks'
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","files":[],"axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/mixed_files.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/mixed_files.pfile.json');
+----
+one or the other
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","shared":{},"axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/mixed_shared.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/mixed_shared.pfile.json');
+----
+one or the other
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"x","pfile":{"prefix":"p"},"axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
+TO '{TEST_DIR}/mixed_pfile.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/mixed_pfile.pfile.json');
+----
+one or the other
+
+# region + variant_index now PRUNE a v2 matrix (Task 4). matrix_dense's CHROM is an enum with no POS
+# key, so region is CHROM-only. CHROM=2 is chosen because CHROM=1/GROUP=B was corrupted above; both
+# CHROM=2 cells are intact, so the survivors verify.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', region := '2:1-100');
+----
+2
+
+# ---------------------------------------------------------------------------
+# over:"CHROM" — the contig key is catalog-declarable. Same fixture as matrix_dense, but the variant
+# enum key is named `contig` and marks itself the genomic-contig dimension.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"marked","axes":[{"name":"variants","keys":[{"name":"contig","type":"enum","over":"CHROM","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={contig}/GROUP={GROUP}/cell","pvar":"refv/CHROM={contig}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/marked_contig.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# region prunes on the marked key (not a literal CHROM): only contig=2 survives.
+query T
+SELECT DISTINCT keys['contig'] FROM read_pfile_catalog('{TEST_DIR}/marked_contig.pfile.json', region := '2:1-100');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/marked_contig.pfile.json', region := '2:1-100');
+----
+2
+
+# a contig no block holds prunes everything.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/marked_contig.pfile.json', region := '9');
+----
+0
+
+# two enum keys both claiming over:"CHROM" is ambiguous -> parse error.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"dup","axes":[{"name":"variants","keys":[{"name":"a","type":"enum","over":"CHROM"},{"name":"b","type":"enum","over":"CHROM"}],"blocks":[{"keys":{"a":"1","b":"x"},"start":0,"stop":3}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":2}]}],"template":{"pfile":"c_{a}_{b}_{GROUP}","pvar":"v_{a}_{b}.pvar","psam":"s_{GROUP}.psam"}}')
+TO '{TEST_DIR}/dup_chrom_marker.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/dup_chrom_marker.pfile.json');
+----
+both claim
+
+# variant_index [3,3] overlaps only the CHROM=2 block [3,4) (half-open); CHROM=1 [0,3) excludes 3.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', variant_index := [3, 3]);
+----
+2
+
+# a predicate on an undeclared key still throws (never accept-and-ignore).
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'ZZZ': ['x']});
+----
+invalid predicate
+
+# FINDING E: a stale single-key 'values' array on a MULTI-key axis is ambiguous and must throw, not be ignored.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"stale","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3}]},{"name":"X","type":"enum"}],"blocks":[{"keys":{"CHROM":"1","X":"a"},"start":0,"stop":3}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":2}]}],"template":{"pfile":"c_{CHROM}_{X}_{GROUP}","pvar":"v_{CHROM}_{X}.pvar","psam":"s_{GROUP}.psam"}}')
+TO '{TEST_DIR}/stale_values.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/stale_values.pfile.json');
+----
+'values'
+
+# FINDING C: the unsupported-version message names BOTH supported versions.
+statement ok
+COPY (SELECT '{"pfile_catalog":9,"dataset":"x"}')
+TO '{TEST_DIR}/ver9.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/ver9.pfile.json');
+----
+supports versions 1 and 2
+
+# FINDING B: companions that exist ONLY as .pvar.parquet / .psam.parquet sidecars while the template names
+# the text spelling must verify (the 1-D reader would find the sidecar), not raise file-not-found.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/sc_1_A' (FORMAT pfile, samples ['S1', 'S2'], pvar '{TEST_DIR}/sc_throw.pvar', psam '{TEST_DIR}/sc_throw.psam');
+
+statement ok
+COPY (SELECT * FROM read_pvar('{TEST_DIR}/sc_throw.pvar')) TO '{TEST_DIR}/scv_1.pvar.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT * FROM read_psam('{TEST_DIR}/sc_throw.psam')) TO '{TEST_DIR}/scs_A.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"sidecar","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":2}]}],"template":{"pfile":"sc_{CHROM}_{GROUP}","pvar":"scv_{CHROM}.pvar","psam":"scs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/sidecar.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+query TT
+SELECT verified, ends_with(pvar, 'scv_1.pvar.parquet') AND ends_with(psam, 'scs_A.psam.parquet')
+FROM read_pfile_catalog('{TEST_DIR}/sidecar.pfile.json');
+----
+true	true

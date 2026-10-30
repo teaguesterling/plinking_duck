@@ -279,3 +279,15 @@ statement error
 SELECT * FROM read_pfile_catalog('test/data/pfile_catalog_samples.pfile.json', variant_index := [0, 10]);
 ----
 invalid predicate: variant_index requires concat_dim='variants'
+
+# keys is a v2-only predicate: on a v1 catalog it throws instead of being ignored (no silent widening).
+statement error
+SELECT * FROM read_pfile_catalog('test/data/pfile_catalog_samples.pfile.json', keys := {'GROUP': ['A']});
+----
+invalid predicate: keys is not supported for a version-1 catalog
+
+# samples (the v2-matrix sample-axis point list) is likewise rejected on a v1 catalog, not ignored.
+statement error
+SELECT * FROM read_pfile_catalog('test/data/pfile_catalog_samples.pfile.json', samples := [0]);
+----
+invalid predicate: samples is not supported for a version-1 catalog

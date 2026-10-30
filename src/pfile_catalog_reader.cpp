@@ -1,5 +1,7 @@
 #include "pfile_catalog_reader.hpp"
 #include "pfile_catalog.hpp"
+#include "pfile_catalog_matrix.hpp"
+#include "pfile_catalog_util.hpp"
 #include "plink_common.hpp"
 #include "register_helper.hpp"
 #include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
@@ -16,6 +18,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -48,15 +51,7 @@ constexpr int64_t PFILE_CATALOG_VERSION = 1;
 
 // ---- yyjson helpers -------------------------------------------------------
 
-//! RAII for a parsed yyjson document, so every throw path frees it.
-struct YyDocGuard {
-	yyjson_doc *doc = nullptr;
-	~YyDocGuard() {
-		if (doc) {
-			yyjson_doc_free(doc);
-		}
-	}
-};
+} // namespace
 
 //! Read a JSON integer (yyjson stores non-negative ints as UINT, negatives as SINT; the safe
 //! typed accessors each return 0 for the other subtype, so branch explicitly). An unsigned value
@@ -155,6 +150,8 @@ string ResolvePath(FileSystem &fs, const string &base_dir, const string &path, b
 	}
 	return NormPath(fs.JoinPath(base_dir, path));
 }
+
+namespace {
 
 // ---- SQL quoting ----------------------------------------------------------
 
@@ -295,8 +292,8 @@ PfileCatalog ParseCatalog(FileSystem &fs, const string &path, const string &cont
 	}
 	if (version != PFILE_CATALOG_VERSION) {
 		throw InvalidInputException("read_pfile_catalog: catalog parse error: '%s' unsupported 'pfile_catalog' "
-		                            "version %lld (this reader supports %lld)",
-		                            path, (long long)version, (long long)PFILE_CATALOG_VERSION);
+		                            "version %lld (this reader supports versions 1 and 2)",
+		                            path, (long long)version);
 	}
 	cat.version = version;
 
@@ -777,6 +774,89 @@ void VerifyWidthAndRange(ClientContext &context, ShardEntry &e, const string &co
 	}
 }
 
+//! Verify v2 matrix survivors. Per cell: the `.pgen`-header-vs-companion check (VerifyCounts — each cell
+//! is its own `.pgen`). Per DISTINCT companion (M `.pvar`, N `.psam`, probed once and cached): the
+//! declared span width must equal the real row count. A variant block that declares an `ordinal_interval`
+//! over POS carries a new prune statistic (its POS extent + CHROM); like the 1-D reader (§10), that
+//! statistic is UNDER-CLAIM checked against the real `.pvar` so a stale bound cannot wrongly drop a
+//! block while `verified` still reads true. Throws on the first lie.
+void VerifyMatrixCells(ClientContext &context, FileSystem &fs, const MatrixCatalog &cat,
+                       const vector<MatrixCell> &cells) {
+	// The variant-axis ordinal_interval-over-POS key (if any) — its per-block bound is the POS statistic.
+	const AxisKey *pos_key = nullptr;
+	for (auto &k : cat.variants.keys) {
+		if (k.type == AxisKeyType::ORDINAL_INTERVAL && k.over == "POS") {
+			pos_key = &k;
+			break;
+		}
+	}
+	const AxisKey *contig_key = cat.variants.ContigKey();
+
+	std::unordered_map<string, PvarStats> pvar_stats;
+	std::unordered_map<string, int64_t> psam_count;
+	for (auto &c : cells) {
+		ShardEntry e;
+		e.prefix = c.prefix;
+		e.pvar = c.pvar;
+		e.psam = c.psam;
+		VerifyCounts(context, fs, e);
+
+		auto pv = pvar_stats.find(c.pvar);
+		if (pv == pvar_stats.end()) {
+			pv = pvar_stats.emplace(c.pvar, QueryPvarStats(context, c.pvar, c.prefix)).first;
+		}
+		const PvarStats &st = pv->second;
+		int64_t vwidth = c.variant_stop - c.variant_start;
+		if (vwidth != st.count) {
+			throw InvalidInputException("read_pfile_catalog: verification failed (count mismatch): cell '%s': "
+			                            "variant span declares %lld variants ([%lld, %lld)) but the .pvar has %lld",
+			                            c.prefix, (long long)vwidth, (long long)c.variant_start,
+			                            (long long)c.variant_stop, (long long)st.count);
+		}
+
+		// Under-claim (spec §10): a declared prune statistic must COVER the real .pvar, or a stale value
+		// would wrongly drop this block on a `region` prune while `verified` still reads true.
+		const AxisBlock &vb = cat.variants.blocks[c.variant_block];
+		// CHROM membership: run whenever a CHROM enum key exists, INDEPENDENT of a POS key — `region`
+		// prunes on CHROM alone for a CHROM-only matrix, so the declared CHROM must match the contig the
+		// .pvar actually holds (mirrors the v1 reader's range.CHROM check).
+		if (contig_key) {
+			string declared = vb.ValueOf(contig_key->name);
+			for (auto &actual : st.chroms) {
+				if (actual != declared) {
+					throw InvalidInputException(
+					    "read_pfile_catalog: verification failed (range under-claim): cell '%s': declared CHROM "
+					    "'%s' does not cover contig '%s' the .pvar actually holds (spec §10)",
+					    c.prefix, declared, actual);
+				}
+			}
+		}
+		// POS extent: only a block that declares an ordinal_interval-over-POS bound carries this statistic.
+		if (pos_key) {
+			const BlockBound *b = vb.FindBound(pos_key->name);
+			if (b && st.has_pos && (st.pos_min < b->lo || st.pos_max > b->hi)) {
+				throw InvalidInputException(
+				    "read_pfile_catalog: verification failed (range under-claim): cell '%s': declared POS bound "
+				    "[%lld, %lld] does not cover the real POS extent [%lld, %lld] — an under-claiming bound would "
+				    "wrongly drop this block (spec §10)",
+				    c.prefix, (long long)b->lo, (long long)b->hi, (long long)st.pos_min, (long long)st.pos_max);
+			}
+		}
+
+		auto ps = psam_count.find(c.psam);
+		if (ps == psam_count.end()) {
+			ps = psam_count.emplace(c.psam, QueryPsamCount(context, c.psam, c.prefix)).first;
+		}
+		int64_t swidth = c.sample_stop - c.sample_start;
+		if (swidth != ps->second) {
+			throw InvalidInputException("read_pfile_catalog: verification failed (count mismatch): cell '%s': "
+			                            "sample span declares %lld samples ([%lld, %lld)) but the .psam has %lld",
+			                            c.prefix, (long long)swidth, (long long)c.sample_start,
+			                            (long long)c.sample_stop, (long long)ps->second);
+		}
+	}
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -790,6 +870,8 @@ struct PfileCatalogBindData : public TableFunctionData {
 	bool is_single = false;      //! single-fileset catalog → emit NULL concat_dim (the signal howard routes on)
 	bool has_chunk_size = false; //! surface chunks.chunk_size (single-fileset only; multi-shard → NULL)
 	int64_t chunk_size = 0;
+	bool is_matrix = false; //! v2 matrix catalog → `cells` rows, the v2 schema
+	vector<MatrixCell> cells;
 };
 
 struct PfileCatalogGlobalState : public GlobalTableFunctionState {
@@ -815,6 +897,159 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		}
 	}
 
+	// ---- version routing: a v2 matrix catalog takes its own parse + schema (the v1 path below is untouched).
+	if (IsMatrixCatalog(content)) {
+		MatrixCatalog mcat = ParseMatrixCatalog(fs, path, content);
+		result->is_matrix = true;
+		result->dataset = mcat.dataset;
+		result->cells = BuildCells(mcat, fs);
+		// A templated companion that does not exist may exist as a `.pvar.parquet` / `.psam.parquet` sidecar;
+		// resolve it the way read_pfile does (parquet first), so verify and the emitted path agree with 1-D.
+		{
+			std::unordered_map<string, string> resolved;
+			auto resolve = [&](const string &p, const char *ext) {
+				if (fs.FileExists(p)) {
+					return p;
+				}
+				auto it = resolved.find(p);
+				if (it == resolved.end()) {
+					string found = FindCompanionFileWithParquet(context, fs, p, {ext});
+					it = resolved.emplace(p, found.empty() ? p : found).first;
+				}
+				return it->second;
+			};
+			for (auto &c : result->cells) {
+				c.pvar = resolve(c.pvar, ".pvar");
+				c.psam = resolve(c.psam, ".psam");
+			}
+		}
+
+		MatrixPredicates preds;
+		// ---- keys := MAP(VARCHAR, VARCHAR[]): enum membership ONLY. An ordinal_interval / value_bin key is
+		// rejected (use region / variant_index / samples); an undeclared key throws.
+		auto np_keys = input.named_parameters.find("keys");
+		if (np_keys != input.named_parameters.end() && !np_keys->second.IsNull()) {
+			auto &entries = MapValue::GetChildren(np_keys->second);
+			for (auto &entry : entries) {
+				auto &kv = StructValue::GetChildren(entry);
+				string kname = kv[0].GetValue<string>();
+				const AxisKey *key = mcat.variants.FindKey(kname);
+				if (!key) {
+					key = mcat.samples.FindKey(kname);
+				}
+				if (!key) {
+					throw InvalidInputException("read_pfile_catalog: invalid predicate: keys names '%s', which is "
+					                            "not a declared key of this catalog",
+					                            kname);
+				}
+				if (key->type != AxisKeyType::ENUM) {
+					throw InvalidInputException(
+					    "read_pfile_catalog: invalid predicate: %s is %s key; use "
+					    "region / variant_index / samples",
+					    kname, key->type == AxisKeyType::ORDINAL_INTERVAL ? "an ordinal_interval" : "a value_bin");
+				}
+				if (kv[1].IsNull()) {
+					throw InvalidInputException("read_pfile_catalog: invalid predicate: keys['%s'] is NULL", kname);
+				}
+				vector<string> vals;
+				for (auto &v : ListValue::GetChildren(kv[1])) {
+					if (v.IsNull()) {
+						throw InvalidInputException(
+						    "read_pfile_catalog: invalid predicate: keys['%s'] contains a NULL value", kname);
+					}
+					vals.push_back(v.GetValue<string>());
+				}
+				preds.enum_keys.emplace_back(kname, std::move(vals));
+			}
+		}
+
+		// ---- region := 'contig:lo-hi' | 'contig' — variant-axis CHROM membership + POS-window overlap.
+		// The contig key is the variant-axis enum marked "over":"CHROM", else the one named "CHROM".
+		auto np_region = input.named_parameters.find("region");
+		if (np_region != input.named_parameters.end() && !np_region->second.IsNull()) {
+			if (!mcat.variants.ContigKey()) {
+				throw InvalidInputException("read_pfile_catalog: invalid predicate: region needs a variant-axis "
+				                            "contig enum key (marked \"over\":\"CHROM\" or named 'CHROM') to match "
+				                            "the contig against");
+			}
+			RegionPredicate r = ParseRegionString(np_region->second.GetValue<string>());
+			preds.has_region = true;
+			preds.region_contig = r.contig;
+			preds.region_pos_lo = r.pos_lo;
+			preds.region_pos_hi = r.pos_hi;
+		}
+
+		// ---- variant_index := [lo, hi] — variant-axis ordinal span overlap (inclusive).
+		auto np_vi = input.named_parameters.find("variant_index");
+		if (np_vi != input.named_parameters.end() && !np_vi->second.IsNull()) {
+			ParseIndexPredicate(np_vi->second, "variant_index", preds.vi_lo, preds.vi_hi);
+			preds.has_variant_index = true;
+		}
+
+		// ---- sample_index is the 1-D [lo,hi] param; on a matrix the point-list `samples` prunes the
+		// sample axis, so a sample_index arg is rejected (never accepted-and-ignored).
+		auto np_si = input.named_parameters.find("sample_index");
+		if (np_si != input.named_parameters.end() && !np_si->second.IsNull()) {
+			throw InvalidInputException("read_pfile_catalog: invalid predicate: sample_index is not used for a "
+			                            "version-2 matrix catalog; use samples := [i, ...] (sample indices)");
+		}
+
+		// ---- samples := LIST(INTEGER) — sample-axis ordinal POINT membership (a block survives iff it
+		// holds one of the listed indices). A point list, NOT a range.
+		auto np_samples = input.named_parameters.find("samples");
+		if (np_samples != input.named_parameters.end() && !np_samples->second.IsNull()) {
+			preds.has_samples = true;
+			for (auto &v : ListValue::GetChildren(np_samples->second)) {
+				if (v.type().id() == LogicalTypeId::VARCHAR) {
+					// A numeric IID string would otherwise be cast to a sample INDEX: a silent wrong cohort.
+					throw InvalidInputException("read_pfile_catalog: invalid predicate: samples by IID is not yet "
+					                            "supported; pass 0-based sample indices");
+				}
+				if (v.IsNull()) {
+					throw InvalidInputException("read_pfile_catalog: invalid predicate: samples contains a NULL index");
+				}
+				preds.sample_points.push_back(v.GetValue<int64_t>());
+			}
+		}
+
+		bool verify_all = false;
+		auto np_va = input.named_parameters.find("verify_all");
+		if (np_va != input.named_parameters.end() && !np_va->second.IsNull()) {
+			verify_all = np_va->second.GetValue<bool>();
+		}
+		// verify_all: verify every cell BEFORE pruning (a lie in a pruned cell still throws); otherwise
+		// only the survivors are verified.
+		if (verify_all) {
+			VerifyMatrixCells(context, fs, mcat, result->cells);
+		}
+		result->cells = PruneCells(mcat, result->cells, preds);
+		if (!verify_all) {
+			VerifyMatrixCells(context, fs, mcat, result->cells);
+		}
+		names = {"dataset",      "prefix",      "pvar",           "psam", "variant_start", "variant_stop",
+		         "sample_start", "sample_stop", "source_ordinal", "keys", "verified"};
+		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                LogicalType::BIGINT,  LogicalType::BIGINT,
+		                LogicalType::BIGINT,  LogicalType::BIGINT,
+		                LogicalType::BIGINT,  LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+		                LogicalType::BOOLEAN};
+		return std::move(result);
+	}
+
+	{
+		auto it = input.named_parameters.find("keys");
+		if (it != input.named_parameters.end() && !it->second.IsNull()) {
+			throw InvalidInputException(
+			    "read_pfile_catalog: invalid predicate: keys is not supported for a version-1 catalog");
+		}
+		// `samples` is a v2-matrix-only predicate; a v1 catalog must reject it, not accept-and-ignore it.
+		auto sit = input.named_parameters.find("samples");
+		if (sit != input.named_parameters.end() && !sit->second.IsNull()) {
+			throw InvalidInputException(
+			    "read_pfile_catalog: invalid predicate: samples is not supported for a version-1 catalog");
+		}
+	}
 	PfileCatalog cat = ParseCatalog(fs, path, content);
 	result->dataset = cat.dataset;
 	result->concat_dim = cat.concat_dim;
@@ -944,6 +1179,34 @@ static void PfileCatalogScan(ClientContext &context, TableFunctionInput &data_p,
 	auto &bind = data_p.bind_data->Cast<PfileCatalogBindData>();
 	auto &gstate = data_p.global_state->Cast<PfileCatalogGlobalState>();
 
+	if (bind.is_matrix) {
+		idx_t n = MinValue<idx_t>(bind.cells.size() - gstate.row_idx, STANDARD_VECTOR_SIZE);
+		for (idx_t i = 0; i < n; i++) {
+			auto &c = bind.cells[gstate.row_idx + i];
+			output.data[0].SetValue(i, Value(bind.dataset));
+			output.data[1].SetValue(i, Value(c.prefix));
+			output.data[2].SetValue(i, Value(c.pvar));
+			output.data[3].SetValue(i, Value(c.psam));
+			output.data[4].SetValue(i, Value::BIGINT(c.variant_start));
+			output.data[5].SetValue(i, Value::BIGINT(c.variant_stop));
+			output.data[6].SetValue(i, Value::BIGINT(c.sample_start));
+			output.data[7].SetValue(i, Value::BIGINT(c.sample_stop));
+			output.data[8].SetValue(i, Value::BIGINT(c.source_ordinal));
+			vector<Value> ks, vs;
+			for (auto &kv : c.keys) {
+				ks.push_back(Value(kv.first));
+				vs.push_back(Value(kv.second));
+			}
+			output.data[9].SetValue(
+			    i, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(ks), std::move(vs)));
+			// Every returned cell was verified at bind (a failure throws).
+			output.data[10].SetValue(i, Value::BOOLEAN(true));
+		}
+		gstate.row_idx += n;
+		output.SetCardinality(n);
+		return;
+	}
+
 	idx_t remaining = bind.survivors.size() - gstate.row_idx;
 	idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
 	for (idx_t i = 0; i < count; i++) {
@@ -985,13 +1248,16 @@ static void PfileCatalogScan(ClientContext &context, TableFunctionInput &data_p,
 void RegisterPfileCatalogReader(ExtensionLoader &loader) {
 	TableFunction fn("read_pfile_catalog", {LogicalType::VARCHAR}, PfileCatalogScan, PfileCatalogBind,
 	                 PfileCatalogInitGlobal);
-	DeclareNamedParameters(fn, {{"region", LogicalType::VARCHAR},
-	                            {"variant_index", LogicalType::ANY},
-	                            {"sample_index", LogicalType::ANY},
-	                            {"verify_all", LogicalType::BOOLEAN}});
+	DeclareNamedParameters(fn,
+	                       {{"keys", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR))},
+	                        {"region", LogicalType::VARCHAR},
+	                        {"variant_index", LogicalType::ANY},
+	                        {"sample_index", LogicalType::ANY},
+	                        {"samples", LogicalType::LIST(LogicalType::ANY)},
+	                        {"verify_all", LogicalType::BOOLEAN}});
 	CompatSetCaptureArgumentAliases(fn);
 	RegisterTableWithDesc(
-	    loader, fn, {"path", "region", "variant_index", "sample_index", "verify_all"},
+	    loader, fn, {"path", "keys", "region", "variant_index", "sample_index", "samples", "verify_all"},
 	    "Parse, verify, and prune a .pfile.json shard catalog, returning one row per surviving shard. "
 	    "The parse+verify+prune surface plinking_duck owns for pfile_catalog reading (write side = the sharded "
 	    "pfile writer).",

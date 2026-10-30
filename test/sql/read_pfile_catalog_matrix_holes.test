@@ -1,0 +1,161 @@
+# name: test/sql/read_pfile_catalog_matrix_holes.test
+# description: read_pfile_catalog v2 — sparse grids (holes): absent cells are never resolved, opened or verified (P13 phase 3)
+# group: [sql]
+
+require plinking_duck
+
+# FIXTURE — 2 CHROM x 3 GROUP grid, CHROM=2/GROUP=C declared ABSENT. Its files do NOT exist, so any
+# attempt to resolve/open/verify it would error (file-not-found). 5 present cells, each a real 1-sample fileset.
+# variants: CHROM=1 [0,3) (rs1,rs2,rs3), CHROM=2 [3,4) (rs4). samples: A=S1, B=S2, C=S3 (1 each).
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/h_1_A' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 2, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/h_1_B' (FORMAT pfile, samples ['S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/h_1_C' (FORMAT pfile, samples ['S3']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/h_2_A' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 2, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/h_2_B' (FORMAT pfile, samples ['S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/hv_1' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/hv_2' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 1) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/hs_A' (FORMAT pfile, samples ['S1']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 2, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/hs_B' (FORMAT pfile, samples ['S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/hs_C' (FORMAT pfile, samples ['S3']);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holes","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3},{"keys":{"CHROM":"2"},"start":3,"stop":4}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2},{"keys":{"GROUP":"C"},"start":2,"stop":3}]}],"holes":[{"CHROM":"2","GROUP":"C"}],"template":{"pfile":"h_{CHROM}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_ok.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# 5 present cells, not 6; verify_all on the survivors only (the hole's files do not exist).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/holes_ok.pfile.json');
+----
+5
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/holes_ok.pfile.json', verify_all := true);
+----
+5
+
+# no row points at the absent cell.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/holes_ok.pfile.json') WHERE prefix LIKE '%h_2_C';
+----
+0
+
+# a predicate selecting only the hole: 0 rows, not an error, not file-not-found.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/holes_ok.pfile.json', keys := {'GROUP': ['C']}, region := '2:1-100');
+----
+0
+
+# the same GROUP=C without the region still returns the one present C cell (CHROM=1).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/holes_ok.pfile.json', keys := {'GROUP': ['C']});
+----
+1
+
+# a hole in the FIRST row/column (hole at CHROM=1/GROUP=A) must not break companion collision checks.
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holes","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3},{"keys":{"CHROM":"2"},"start":3,"stop":4}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2},{"keys":{"GROUP":"C"},"start":2,"stop":3}]}],"holes":[{"CHROM":"1","GROUP":"A"},{"CHROM":"2","GROUP":"C"}],"template":{"pfile":"h_{CHROM}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_first.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/holes_first.pfile.json');
+----
+4
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holes","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3},{"keys":{"CHROM":"2"},"start":3,"stop":4}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2},{"keys":{"GROUP":"C"},"start":2,"stop":3}]}],"holes":[{"GROUP":"C"}],"template":{"pfile":"h_{CHROM}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_partial.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# a partial hole removes every cell it matches (GROUP=C in both CHROM rows -> 4 cells, h_1_C also absent).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/holes_partial.pfile.json');
+----
+4
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holes","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3},{"keys":{"CHROM":"2"},"start":3,"stop":4}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2},{"keys":{"GROUP":"C"},"start":2,"stop":3}]}],"holes":[{"CHROM":"9","GROUP":"C"}],"template":{"pfile":"h_{CHROM}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_typo.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/holes_typo.pfile.json');
+----
+matches no cell
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holes","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3},{"keys":{"CHROM":"2"},"start":3,"stop":4}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2},{"keys":{"GROUP":"C"},"start":2,"stop":3}]}],"holes":[{"ZZZ":"1"}],"template":{"pfile":"h_{CHROM}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_undeclared.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/holes_undeclared.pfile.json');
+----
+undeclared key
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holes","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3},{"keys":{"CHROM":"2"},"start":3,"stop":4}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2},{"keys":{"GROUP":"C"},"start":2,"stop":3}]}],"holes":[{}],"template":{"pfile":"h_{CHROM}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_empty.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/holes_empty.pfile.json');
+----
+non-empty
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holes","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3},{"keys":{"CHROM":"2"},"start":3,"stop":4}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2},{"keys":{"GROUP":"C"},"start":2,"stop":3}]}],"holes":{"CHROM":"2"},"template":{"pfile":"h_{CHROM}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_notarr.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/holes_notarr.pfile.json');
+----
+must be an array
+
+# FINDING F: the companion-collision check is keyed to a block's FIRST PRESENT cell, not grid position (0,0).
+# Two variant-blocks (CHROM=1/P=a, CHROM=1/P=b) both resolve hv_{CHROM}.pvar -> hv_1.pvar; the hole removes the
+# first grid cell (a, A). Keyed to (0,0) the collision would go unseen; keyed to first-present it is caught.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"coll","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"P","type":"enum"}],"blocks":[{"keys":{"CHROM":"1","P":"a"},"start":0,"stop":1},{"keys":{"CHROM":"1","P":"b"},"start":1,"stop":2}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2}]}],"holes":[{"CHROM":"1","P":"a","GROUP":"A"}],"template":{"pfile":"c_{CHROM}_{P}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_collide.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/holes_collide.pfile.json');
+----
+the same .pvar

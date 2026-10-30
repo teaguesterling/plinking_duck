@@ -11,7 +11,7 @@ PlinkingDuck provides 13 core SQL table functions: 6 file readers and 7 analysis
 | [`read_pgen(path)`](read_pgen.md) | `.pgen` | Binary genotypes as `ARRAY(TINYINT, N)` |
 | [`read_pfile(prefix)`](read_pfile.md) | `.pgen` + `.pvar` + `.psam` (single or list) | Complete fileset with orient mode support |
 | [`read_plink_vcf(path)`](read_plink_vcf.md) | `.vcf` / `.vcf.gz` | Fast biallelic genotype extraction from VCF |
-| [`read_pfile_catalog(path)`](read_pfile_catalog.md) | `.pfile.json` catalog | One row per surviving shard of a sharded pfile set (verify + prune) |
+| [`read_pfile_catalog(path)`](read_pfile_catalog.md) | `.pfile.json` catalog | One row per surviving shard (version 1) or grid cell (version 2) of a pfile catalog (verify + prune) |
 
 ## Analysis Functions
 

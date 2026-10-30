@@ -1,6 +1,8 @@
 # read_pfile_catalog
 
 Parse, verify, and prune a `.pfile.json` shard catalog, returning **one row per surviving shard**.
+For a version-2 matrix catalog, it returns **one row per surviving cell** (see
+[Matrix catalogs](#matrix-catalogs-version-2)).
 
 This is the parse + verify + prune surface plinking_duck owns for `pfile_catalog` **reading**. The **write**
 side is the sharded pfile writer (`COPY (…) TO 'out' (FORMAT pfile, shard_by '<col>')`, see
@@ -20,6 +22,8 @@ read_pfile_catalog(path VARCHAR
     [, region := VARCHAR,
        variant_index := ANY,
        sample_index := ANY,
+       keys := MAP(VARCHAR, VARCHAR[]),
+       samples := ANY,
        verify_all := BOOLEAN]) -> TABLE
 ```
 
@@ -31,6 +35,8 @@ read_pfile_catalog(path VARCHAR
 | `region` | `VARCHAR` | *(none)* | Genomic prune, `'contig:lo-hi'` or a bare `'contig'`. Keeps only shards whose declared `range` could overlap. Valid **only** when `concat_dim = 'variants'`. POS bounds are **inclusive** `[lo, hi]`. |
 | `variant_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the variants axis. Keeps shards whose `partition` overlaps the **inclusive** index predicate `[lo, hi]`. Valid **only** when `concat_dim = 'variants'`. |
 | `sample_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the samples axis, inclusive `[lo, hi]`. Valid **only** when `concat_dim = 'samples'`. |
+| `keys` | `MAP(VARCHAR, VARCHAR[])` | *(none)* | **Version 2 only.** Prune by key. See [Matrix catalogs](#matrix-catalogs-version-2). A version-1 catalog rejects it. |
+| `samples` | `ANY` (list of `BIGINT`) | *(none)* | **Version 2 only.** Keep cells whose sample-block holds one of the listed sample indices. Pass 0-based integer indices; a string (IID) element raises `invalid predicate`, because IID lookup is not supported yet. A version-1 catalog rejects it. |
 | `verify_all` | `BOOLEAN` | `false` | When `true`, verify **every** shard (counts + declared range) *before* pruning, closing the dropped-shard hole; otherwise only the survivors are verified. |
 
 !!! warning "`variant_index` is INCLUSIVE `[lo, hi]` — not `read_pfile`'s `variant_range`"
@@ -124,13 +130,131 @@ writer-constructed.
 | `verified` | `BOOLEAN` | Whether this shard's companions were checked during this call. Currently always `true` on every returned row (a verification failure raises); the column exists for a future degrade-gracefully mode. |
 | `chunk_size` | `BIGINT` | A **single-fileset** catalog's declared `chunks.chunk_size` (consumed by howard's single-file loader). `NULL` for multi-shard rows — there the shards themselves are the chunks. |
 
+## Matrix catalogs (version 2)
+
+A catalog with `"pfile_catalog": 2` is a grid of cells: variant-blocks × sample-blocks.
+The reader routes on that version number. The catalog format is described in
+[Version 2: the matrix form](../formats/pfile_catalog.md#version-2-the-matrix-form).
+
+The function returns **one row per surviving cell**. The row order is variants-major.
+The output columns differ from version 1:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `dataset` | `VARCHAR` | The catalog's `dataset` name. |
+| `prefix` | `VARCHAR` | The cell's `.pgen` path, no extension. Absolute and normalized. |
+| `pvar` | `VARCHAR` | The `.pvar` shared by every cell in this cell's variant-block. |
+| `psam` | `VARCHAR` | The `.psam` shared by every cell in this cell's sample-block. |
+| `variant_start`, `variant_stop` | `BIGINT` | The variant-block's half-open ordinal span `[start, stop)`. |
+| `sample_start`, `sample_stop` | `BIGINT` | The sample-block's half-open ordinal span `[start, stop)`. |
+| `source_ordinal` | `BIGINT` | Position of the cell among the **present** cells, variants-major, counted before any prune. A prune does not renumber it. |
+| `keys` | `MAP(VARCHAR, VARCHAR)` | Every key of both axes and its value for this cell, for example `{CHROM=1, CHUNK=001, GROUP=A, SLICE=0, age=young}`. |
+| `verified` | `BOOLEAN` | Always `true`. A verification failure raises. |
+
+### Prune parameters
+
+A cell survives only if it passes **every** predicate you give. The predicates multiply
+across the two axes. A prune that keeps nothing returns 0 rows. It is not an error.
+
+| Parameter | Axis | Meaning |
+|-----------|------|---------|
+| `keys := {'GROUP': ['A', 'B']}` | either | Enum membership only: the cell's value must be in the list. A key of type `ordinal_interval` or `value_bin` is an `invalid predicate` error; use `region`, `variant_index` or `samples`. |
+| `region := '1:10000-20000'` | variants | The cell's `CHROM` must equal the contig. If the variants axis has an `ordinal_interval` over `POS`, the block's inclusive `[min, max]` must also overlap the window. A bare contig (`'1'`) keeps every POS. |
+| `variant_index := [lo, hi]` | variants | Inclusive `[lo, hi]` against the variant-block's half-open `[start, stop)`. |
+| `samples := [i, j, …]` | samples | A **list of points**, not a range. The cell stays if any listed index lies in the sample-block's `[start, stop)`. |
+
+Interval rules, by key type:
+
+- `ordinal_interval` over `POS`: the block bound is inclusive `[min, max]`. The query
+  `[lo, hi]` is inclusive. They overlap if they share at least one value.
+- `ordinal_interval` over `sample_index`: the block bound is its half-open
+  `[start, stop)`.
+- `value_bin`: **tiling only.** A `value_bin` key partitions the axis (so cells can be
+  grouped by its value), but no predicate prunes it — it carries no dedicated parameter
+  and `keys` rejects it. Filter or aggregate on its value downstream (the key's value is
+  in the `keys` output column).
+
+A predicate that cannot apply raises `invalid predicate` and never returns the whole grid:
+
+- `keys` names a key the catalog does not declare, or a key with a `NULL` value or
+  `NULL` list element.
+- `keys` names an `ordinal_interval` or `value_bin` key (`keys` carries enum membership
+  only — use `region` / `variant_index` / `samples` for ordinal or genomic pruning).
+- `region` on a catalog with no variants-axis contig key: an `enum` key marked `"over":"CHROM"`, or else one named `CHROM`.
+- `sample_index` on a version-2 catalog. Use `samples` instead.
+- `keys` or `samples` on a version-1 catalog.
+
+`variant_index` and `region` keep the meaning they have for version 1: inclusive
+`[lo, hi]`, and an inclusive POS window.
+
+### Holes
+
+A cell that the catalog lists in `holes` is absent. The reader skips it **before** it
+resolves any path. It never opens the cell, so a hole may point at files that do not
+exist. A hole never appears in the output. A predicate that selects only holes returns
+0 rows. It does not raise `file not found`. `verify_all := true` also skips holes.
+
+### Verification
+
+The trust model is the same as for version 1: bounds are checked, not assumed. A
+failure raises at bind. For each verified cell the reader checks:
+
+- the cell's `.pgen` header counts against its `.pvar` and `.psam` row counts;
+- the variant span width against the real `.pvar` row count, and the sample span width
+  against the real `.psam` row count (each distinct companion is read once);
+- each contig in the `.pvar` against the block's contig label, when the variants axis
+  has a contig `enum` key (marked `"over":"CHROM"`, or else named `CHROM`);
+- the block's declared POS bound against the real `.pvar` POS extent, when the variants
+  axis has an `ordinal_interval` over `POS`. A bound that does not cover the real extent
+  is a `range under-claim`.
+
+The `verified` column does **not** cover `value_bin` key bounds. A `value_bin` bound
+(for example an age bin) has no stored column to check against, so `verify_all` cannot
+catch a stale bin. Only the `CHROM` and `POS` bounds above are checked against data.
+
+The errors use the same prefixes as in [Error taxonomy](#error-taxonomy).
+
+Verification is **lazy on survivors**. By default only the cells that survive the prune
+are verified. A bad bound on a cell that the prune drops is not seen. This is the same
+gap as in version 1. `verify_all := true` verifies **every present cell before** the
+prune. Use it for a hand-written catalog.
+
+### Not supported yet
+
+- `ATTACH` of a matrix catalog.
+- Reading genotypes through the catalog (the genotype cascade). Read each surviving
+  cell with [`read_pfile`](read_pfile.md), using its `prefix`, `pvar`, and `psam`.
+- Analysis functions (`plink_*`) over the grid.
+- A writer for version 2. The sharded writer emits version 1.
+
+### Matrix examples
+
+```sql
+-- All present cells of the grid, with the shared companions of each.
+SELECT keys, prefix, pvar, psam FROM read_pfile_catalog('compound.pfile.json');
+
+-- Enum membership on the samples axis: GROUP A only.
+SELECT count(*) FROM read_pfile_catalog('compound.pfile.json', keys := {'GROUP': ['A']});
+
+-- Genomic prune: contig 1, POS 15000. Keeps CHROM=1/CHUNK=001 only (not CHROM=2).
+SELECT DISTINCT keys['CHROM'], keys['CHUNK']
+FROM read_pfile_catalog('compound.pfile.json', region := '1:15000-15000');
+
+-- Sample points 1 and 3: the sample-blocks [1,2) and [3,4).
+SELECT count(*) FROM read_pfile_catalog('compound.pfile.json', samples := [1, 3]);
+
+-- Both axes at once: the product of a region and a sample-axis key.
+SELECT count(*) FROM read_pfile_catalog('compound.pfile.json',
+    region := '1:10000-20000', keys := {'GROUP': ['A']});
+```
+
 ## Error taxonomy
 
 Errors carry distinct, classifiable message prefixes so a caller can tell failure classes apart:
 
 | Prefix | Class | Exception |
 |--------|-------|-----------|
-| `read_pfile_catalog: catalog parse error: …` | Malformed JSON or schema (bad version, missing field, both `pfile` and multi-file keys, duplicate `partition.start`, out-of-range integer) | `InvalidInputException` |
+| `read_pfile_catalog: catalog parse error: …` | Malformed JSON or schema (bad version, missing field, both `pfile` and multi-file keys, duplicate `partition.start`, out-of-range integer; for version 2: a bad key schema, a tiling gap or overlap, a bad template, a bad hole) | `InvalidInputException` |
 | `read_pfile_catalog: file not found: …` | A referenced catalog / `.pgen` / `.pvar` / `.psam` is missing | `IOException` |
 | `read_pfile_catalog: verification failed (count mismatch): …` | A `.pgen` header count disagrees with its companion | `InvalidInputException` |
 | `read_pfile_catalog: verification failed (companion unreadable): …` | A companion exists but could not be read (corrupt `.pgen` header, wrong-format `.pvar`/`.psam`) | `InvalidInputException` |
