@@ -865,8 +865,35 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		result->is_matrix = true;
 		result->dataset = mcat.dataset;
 		result->cells = BuildCells(mcat, fs);
-		// No pruning yet, so every cell is a survivor: verify them all (verify_all is therefore implied).
-		VerifyMatrixCells(context, fs, result->cells);
+		KeyPredicates preds;
+		auto np_keys = input.named_parameters.find("keys");
+		if (np_keys != input.named_parameters.end() && !np_keys->second.IsNull()) {
+			auto &entries = MapValue::GetChildren(np_keys->second);
+			for (auto &entry : entries) {
+				auto &kv = StructValue::GetChildren(entry);
+				vector<string> vals;
+				if (!kv[1].IsNull()) {
+					for (auto &v : ListValue::GetChildren(kv[1])) {
+						vals.push_back(v.IsNull() ? string() : v.GetValue<string>());
+					}
+				}
+				preds.emplace_back(kv[0].GetValue<string>(), std::move(vals));
+			}
+		}
+		bool verify_all = false;
+		auto np_va = input.named_parameters.find("verify_all");
+		if (np_va != input.named_parameters.end() && !np_va->second.IsNull()) {
+			verify_all = np_va->second.GetValue<bool>();
+		}
+		// verify_all: verify every cell BEFORE pruning (a lie in a pruned cell still throws); otherwise
+		// only the survivors are verified.
+		if (verify_all) {
+			VerifyMatrixCells(context, fs, result->cells);
+		}
+		result->cells = PruneCells(mcat, result->cells, preds);
+		if (!verify_all) {
+			VerifyMatrixCells(context, fs, result->cells);
+		}
 		names = {"dataset",      "prefix",      "pvar",           "psam", "variant_start", "variant_stop",
 		         "sample_start", "sample_stop", "source_ordinal", "keys", "verified"};
 		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
@@ -1076,13 +1103,15 @@ static void PfileCatalogScan(ClientContext &context, TableFunctionInput &data_p,
 void RegisterPfileCatalogReader(ExtensionLoader &loader) {
 	TableFunction fn("read_pfile_catalog", {LogicalType::VARCHAR}, PfileCatalogScan, PfileCatalogBind,
 	                 PfileCatalogInitGlobal);
-	DeclareNamedParameters(fn, {{"region", LogicalType::VARCHAR},
-	                            {"variant_index", LogicalType::ANY},
-	                            {"sample_index", LogicalType::ANY},
-	                            {"verify_all", LogicalType::BOOLEAN}});
+	DeclareNamedParameters(fn,
+	                       {{"keys", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR))},
+	                        {"region", LogicalType::VARCHAR},
+	                        {"variant_index", LogicalType::ANY},
+	                        {"sample_index", LogicalType::ANY},
+	                        {"verify_all", LogicalType::BOOLEAN}});
 	CompatSetCaptureArgumentAliases(fn);
 	RegisterTableWithDesc(
-	    loader, fn, {"path", "region", "variant_index", "sample_index", "verify_all"},
+	    loader, fn, {"path", "keys", "region", "variant_index", "sample_index", "verify_all"},
 	    "Parse, verify, and prune a .pfile.json shard catalog, returning one row per surviving shard. "
 	    "The parse+verify+prune surface plinking_duck owns for pfile_catalog reading (write side = the sharded "
 	    "pfile writer).",

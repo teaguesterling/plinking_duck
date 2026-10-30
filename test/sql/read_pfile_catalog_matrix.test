@@ -100,11 +100,54 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json') WH
 ----
 4
 
-# verify_all is accepted on a matrix catalog (every cell is a survivor until pruning lands).
+# verify_all is accepted on a matrix catalog and verifies every cell.
 query I
 SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', verify_all := true) WHERE verified;
 ----
 4
+
+# ---------------------------------------------------------------------------
+# keys := enum-membership prune (P13 task 3): a cell survives iff it passes every axis's enum predicate.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT keys['CHROM'], keys['GROUP'] FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']})
+ORDER BY 1;
+----
+1	A
+2	A
+
+# A multi-value set keeps the union of its values.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A', 'B']});
+----
+4
+
+# Predicates on both axes multiply: CHROM in {2} x GROUP in {B} -> one cell.
+query II
+SELECT keys['CHROM'], keys['GROUP'] FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json',
+       keys := {'CHROM': ['2'], 'GROUP': ['A', 'B']}) ORDER BY 2;
+----
+2	A
+2	B
+
+# An empty selection (no such value) is 0 rows, not an error and not the whole grid.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['ZZZ']});
+----
+0
+
+# Survivors only are verified, and they report verified.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']}) WHERE verified;
+----
+2
+
+# An unknown key never widens: it throws.
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'NOPE': ['x']});
+----
+invalid predicate
 
 # A variant span that disagrees with the shared .pvar (CHROM=1 really has 3 variants) -> count mismatch.
 statement ok
@@ -134,6 +177,23 @@ TO '{TEST_DIR}/data/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S1', 'S2']);
 
 statement error
 SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json');
+----
+verification failed (count mismatch)
+
+# Verification runs on SURVIVORS: cell CHROM=1/GROUP=B is now corrupt. Pruned away, it is not touched;
+# included (or verify_all, which verifies before pruning), it throws.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']});
+----
+2
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['A']}, verify_all := true);
+----
+verification failed (count mismatch)
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'GROUP': ['B']});
 ----
 verification failed (count mismatch)
 

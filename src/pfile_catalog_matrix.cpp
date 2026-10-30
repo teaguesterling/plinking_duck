@@ -249,4 +249,45 @@ vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs) {
 	return cells;
 }
 
+vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell> &cells, const KeyPredicates &preds) {
+	for (auto &p : preds) {
+		const AxisKey *key = nullptr;
+		for (auto *axis : {&cat.variants, &cat.samples}) {
+			if (axis->key.name == p.first) {
+				key = &axis->key;
+			}
+		}
+		if (!key) {
+			throw InvalidInputException("read_pfile_catalog: invalid predicate: keys names '%s', which is not a "
+			                            "declared key of this catalog",
+			                            p.first);
+		}
+		if (key->type != "enum") {
+			throw InvalidInputException("read_pfile_catalog: invalid predicate: key '%s' has type '%s'; only "
+			                            "enum keys support keys := membership yet",
+			                            p.first, key->type);
+		}
+	}
+	vector<MatrixCell> out;
+	for (auto &c : cells) {
+		bool keep = true;
+		for (auto &p : preds) {
+			for (auto &kv : c.keys) {
+				if (kv.first != p.first) {
+					continue;
+				}
+				bool in_set = false;
+				for (auto &v : p.second) {
+					in_set = in_set || v == kv.second;
+				}
+				keep = keep && in_set;
+			}
+		}
+		if (keep) {
+			out.push_back(c);
+		}
+	}
+	return out;
+}
+
 } // namespace duckdb

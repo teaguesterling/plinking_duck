@@ -78,4 +78,12 @@ MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const strin
 //! the template and its shared `.pvar`/`.psam`. Opens no file.
 vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs);
 
+//! Per-key requested value sets (the `keys :=` predicate): (key name, allowed values).
+using KeyPredicates = vector<std::pair<string, vector<string>>>;
+
+//! Enum-membership prune: keep a cell iff, for EVERY predicate, its value for that key is in the set
+//! (product across axes). Throws "read_pfile_catalog: invalid predicate: ..." when a key is not a
+//! declared key of the catalog or is not an `enum` key. An empty result is not an error.
+vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell> &cells, const KeyPredicates &preds);
+
 } // namespace duckdb
