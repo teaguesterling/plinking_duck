@@ -483,6 +483,84 @@ sample-blocks, so 12 cells, 3 `.pvar`, and 4 `.psam`.
 The `age` key labels the sample-blocks and drives the `age` prune. It is not in a
 template, which is allowed.
 
+### Example — build a catalog from existing exports (`glob` + JSON)
+
+You often have the filesets on disk already, but no catalog. You can build one in
+SQL. Fix the **axes** by hand — you know your data has a `CHROM` axis and a `GROUP`
+axis. Discover the **blocks** (each value and its ordinal span) from the files with
+`glob`, so you never hand-type the chromosomes or the groups.
+
+This example assumes the shared-companion layout, relative to the catalog directory:
+
+```
+cohort/
+  variants/CHROM=1.pvar, CHROM=2.pvar, …      one shared .pvar per variant-block
+  samples/GROUP=A.psam,  GROUP=B.psam,  …      one shared .psam per sample-block
+  cells/CHROM=1/GROUP=A/cell.pgen, …           one .pgen per cell
+```
+
+One query assembles the catalog. The two axes and their key names are literals. The
+`values` arrays come from the disk:
+
+```sql
+COPY (
+  WITH
+  -- Variant blocks: CHROM is a column of the .pvar, so one GROUP BY counts them.
+  variant_blocks AS (
+    SELECT CHROM AS value, count(*) AS n
+    FROM read_pvar('cohort/variants/*.pvar') GROUP BY CHROM),
+  variant_vals AS (
+    SELECT value, (sum(n) OVER w) - n AS start, sum(n) OVER w AS stop
+    FROM variant_blocks WINDOW w AS (ORDER BY value ROWS UNBOUNDED PRECEDING)),
+  -- Sample blocks: GROUP is in the companion path, so read it from the filename.
+  sample_blocks AS (
+    SELECT regexp_extract(filename, 'GROUP=([^/.]+)', 1) AS value, count(*) AS n
+    FROM read_csv('cohort/samples/*.psam', filename := true, delim := '\t',
+                  header := true, all_varchar := true)
+    GROUP BY value),
+  sample_vals AS (
+    SELECT value, (sum(n) OVER w) - n AS start, sum(n) OVER w AS stop
+    FROM sample_blocks WINDOW w AS (ORDER BY value ROWS UNBOUNDED PRECEDING)),
+  v AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY start) AS arr FROM variant_vals),
+  s AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY start) AS arr FROM sample_vals)
+  SELECT to_json({
+    'pfile_catalog': 2,
+    'dataset': 'cohort',
+    'axes': [
+      {'name': 'variants', 'keys': [{'name': 'CHROM', 'type': 'enum', 'values': v.arr}]},
+      {'name': 'samples',  'keys': [{'name': 'GROUP', 'type': 'enum', 'values': s.arr}]}
+    ],
+    'template': {
+      'pfile': 'cells/CHROM={CHROM}/GROUP={GROUP}/cell',
+      'pvar':  'variants/CHROM={CHROM}.pvar',
+      'psam':  'samples/GROUP={GROUP}.psam'
+    }
+  }) FROM v, s
+) TO 'cohort/cohort.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+```
+
+`to_json` builds the JSON from the struct. The `COPY … (FORMAT csv, QUOTE '', ESCAPE
+'')` options write the one JSON string to the file verbatim, with no CSV quoting. The
+window functions turn each block's count into a contiguous `[start, stop)` span, which
+the axis tiling requires. The result is a normal catalog:
+
+```sql
+SELECT keys['CHROM'] AS chrom, keys['GROUP'] AS grp,
+       variant_stop - variant_start AS n_variants,
+       sample_stop - sample_start  AS n_samples, verified
+FROM read_pfile_catalog('cohort/cohort.pfile.json');
+```
+
+Two notes:
+
+- This is the single-`enum`-key form, where each block is one `value`. An
+  `ordinal_interval` key (a `CHUNK` over `POS`) also needs per-block `bounds`. Compute
+  them with `min(POS)` and `max(POS)` per block and emit the `blocks` form instead (see
+  the [compound example](#example--a-3--4-grid-with-compound-keys)).
+- If your exports keep a companion in every cell rather than one per axis, point the
+  template at any one cell's companion per block. The `.pvar` is the same across a
+  variant-block's cells, and the `.psam` is the same across a sample-block's cells.
+
 ### Sparse grids (`holes`)
 
 A grid need not be full. The optional top-level `holes` array lists **absent** cells.
