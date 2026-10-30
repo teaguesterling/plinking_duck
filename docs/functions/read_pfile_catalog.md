@@ -158,7 +158,7 @@ across the two axes. A prune that keeps nothing returns 0 rows. It is not an err
 
 | Parameter | Axis | Meaning |
 |-----------|------|---------|
-| `keys := {'GROUP': ['A', 'B']}` | either | The key's declared type decides the test. An `enum` key: the cell's value must be in the list. An `ordinal_interval` or `value_bin` key: the list must be a 2-element integer `[lo, hi]`, written as strings, and the block's bound must overlap it. |
+| `keys := {'GROUP': ['A', 'B']}` | either | Enum membership only: the cell's value must be in the list. A key of type `ordinal_interval` or `value_bin` is an `invalid predicate` error; use `region`, `variant_index` or `samples`. |
 | `region := '1:10000-20000'` | variants | The cell's `CHROM` must equal the contig. If the variants axis has an `ordinal_interval` over `POS`, the block's inclusive `[min, max]` must also overlap the window. A bare contig (`'1'`) keeps every POS. |
 | `variant_index := [lo, hi]` | variants | Inclusive `[lo, hi]` against the variant-block's half-open `[start, stop)`. |
 | `samples := [i, j, …]` | samples | A **list of points**, not a range. The cell stays if any listed index lies in the sample-block's `[start, stop)`. |
@@ -177,7 +177,7 @@ A predicate that cannot apply raises `invalid predicate` and never returns the w
 - `keys` names a key the catalog does not declare, or a key with a `NULL` value or
   `NULL` list element.
 - `keys` on an interval key does not hold exactly two integers, or `lo > hi`.
-- `region` on a catalog with no variants-axis `enum` key named `CHROM`.
+- `region` on a catalog with no variants-axis contig key: an `enum` key marked `"over":"CHROM"`, or else one named `CHROM`.
 - `sample_index` on a version-2 catalog. Use `samples` instead.
 - `keys` or `samples` on a version-1 catalog.
 
@@ -199,8 +199,8 @@ failure raises at bind. For each verified cell the reader checks:
 - the cell's `.pgen` header counts against its `.pvar` and `.psam` row counts;
 - the variant span width against the real `.pvar` row count, and the sample span width
   against the real `.psam` row count (each distinct companion is read once);
-- each contig in the `.pvar` against the block's `CHROM` label, when the variants axis
-  has an `enum` key named `CHROM`;
+- each contig in the `.pvar` against the block's contig label, when the variants axis
+  has a contig `enum` key (marked `"over":"CHROM"`, or else named `CHROM`);
 - the block's declared POS bound against the real `.pvar` POS extent, when the variants
   axis has an `ordinal_interval` over `POS`. A bound that does not cover the real extent
   is a `range under-claim`.
@@ -239,9 +239,6 @@ FROM read_pfile_catalog('compound.pfile.json', region := '1:15000-15000');
 
 -- Sample points 1 and 3: the sample-blocks [1,2) and [3,4).
 SELECT count(*) FROM read_pfile_catalog('compound.pfile.json', samples := [1, 3]);
-
--- Value bin: age 40 lies in the half-open bin [40,60), the "old" slices.
-SELECT DISTINCT keys['age'] FROM read_pfile_catalog('compound.pfile.json', keys := {'age': ['40', '40']});
 
 -- Both axes at once: the product of a region and a sample-axis key.
 SELECT count(*) FROM read_pfile_catalog('compound.pfile.json',

@@ -242,43 +242,36 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', sample
 ----
 samples by IID is not yet supported
 
-# FINDING D: a partially-numeric interval bound ('15000abc') must throw, not parse to 15000.
+# ---------------------------------------------------------------------------
+# `keys` is enum-membership ONLY. An ordinal_interval / value_bin key in `keys` is an error that points at
+# region / variant_index / samples (Way B). GROUP is an enum and still prunes.
+# ---------------------------------------------------------------------------
 statement error
-SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'CHUNK': ['10000', '15000abc']});
-----
-invalid predicate
-
-# ---------------------------------------------------------------------------
-# value_bin age — interval overlap on the binned value, driven by a bounds list in `keys`.
-# ---------------------------------------------------------------------------
-
-# age bins are HALF-OPEN: [40,40] overlaps [40,60) (old) but NOT [20,40) (young) -> old slices only (6).
-query I
-SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'age': ['40', '40']});
-----
-6
-
-query T
-SELECT DISTINCT keys['age']
-FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'age': ['40', '40']});
-----
-old
-
-# 39 sits inside [20,40) -> young slices.
-query T
-SELECT DISTINCT keys['age']
-FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'age': ['39', '39']});
-----
-young
-
-# ---------------------------------------------------------------------------
-# ordinal_interval via `keys` bounds (POS, inclusive): CHUNK:[10000,15000] keeps CHROM=1/CHUNK=001
-# (POS [10000,20000] overlaps) and CHROM=2/CHUNK=001 (POS [15000,15000] overlaps), drops CHUNK=002.
-# ---------------------------------------------------------------------------
-query I
 SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'CHUNK': ['10000', '15000']});
 ----
-8
+CHUNK is an ordinal_interval key; use region / variant_index / samples
+
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'SLICE': ['0', '1']});
+----
+SLICE is an ordinal_interval key
+
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'age': ['40', '40']});
+----
+age is a value_bin key; use region / variant_index / samples
+
+# the genomic window that `keys := {'CHUNK': ...}` used to express is `region`: POS [10000,15000] on contig 1
+# keeps CHUNK=001 only (4 cells = 1 variant block x 4 sample blocks).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region := '1:10000-15000');
+----
+4
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'GROUP': ['A']});
+----
+6
 
 # ---------------------------------------------------------------------------
 # product across axes: region (variant) AND keys (sample enum) multiply.
@@ -301,17 +294,6 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', region
 # ---------------------------------------------------------------------------
 # fail-loud — never accept-and-ignore.
 # ---------------------------------------------------------------------------
-
-# an interval key in `keys` needs exactly a 2-element [lo, hi] bound.
-statement error
-SELECT * FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'age': ['40']});
-----
-invalid predicate
-
-statement error
-SELECT * FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'age': ['40', '20']});
-----
-invalid predicate
 
 # sample_index is the 1-D param; a matrix uses `samples` (point list) -> reject, do not ignore.
 statement error

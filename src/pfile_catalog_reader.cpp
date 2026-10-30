@@ -925,8 +925,8 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		}
 
 		MatrixPredicates preds;
-		// ---- keys := MAP(VARCHAR, VARCHAR[]): enum membership, OR a 2-element [lo,hi] overlap on an
-		// ordinal_interval / value_bin key. The key's declared TYPE decides which (an undeclared key throws).
+		// ---- keys := MAP(VARCHAR, VARCHAR[]): enum membership ONLY. An ordinal_interval / value_bin key is
+		// rejected (use region / variant_index / samples); an undeclared key throws.
 		auto np_keys = input.named_parameters.find("keys");
 		if (np_keys != input.named_parameters.end() && !np_keys->second.IsNull()) {
 			auto &entries = MapValue::GetChildren(np_keys->second);
@@ -942,6 +942,12 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 					                            "not a declared key of this catalog",
 					                            kname);
 				}
+				if (key->type != AxisKeyType::ENUM) {
+					throw InvalidInputException(
+					    "read_pfile_catalog: invalid predicate: %s is %s key; use "
+					    "region / variant_index / samples",
+					    kname, key->type == AxisKeyType::ORDINAL_INTERVAL ? "an ordinal_interval" : "a value_bin");
+				}
 				if (kv[1].IsNull()) {
 					throw InvalidInputException("read_pfile_catalog: invalid predicate: keys['%s'] is NULL", kname);
 				}
@@ -953,37 +959,7 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 					}
 					vals.push_back(v.GetValue<string>());
 				}
-				if (key->type == AxisKeyType::ENUM) {
-					preds.enum_keys.emplace_back(kname, std::move(vals));
-				} else {
-					// ordinal_interval / value_bin: a 2-element inclusive [lo, hi] (like every query predicate).
-					if (vals.size() != 2) {
-						throw InvalidInputException("read_pfile_catalog: invalid predicate: keys['%s'] is an "
-						                            "interval key and needs a 2-element [lo, hi] bound, got %llu",
-						                            kname, (unsigned long long)vals.size());
-					}
-					BoundPredicate bp;
-					bp.key_name = kname;
-					try {
-						// The whole string must be an integer: '15000abc' is an error, not 15000.
-						size_t used_lo = 0, used_hi = 0;
-						bp.lo = std::stoll(vals[0], &used_lo);
-						bp.hi = std::stoll(vals[1], &used_hi);
-						if (used_lo != vals[0].size() || used_hi != vals[1].size()) {
-							throw std::invalid_argument("trailing characters");
-						}
-					} catch (std::exception &) {
-						throw InvalidInputException("read_pfile_catalog: invalid predicate: keys['%s'] bound "
-						                            "[%s, %s] is not integer",
-						                            kname, vals[0], vals[1]);
-					}
-					if (bp.hi < bp.lo) {
-						throw InvalidInputException("read_pfile_catalog: invalid predicate: keys['%s'] bound "
-						                            "[%lld, %lld] is inverted",
-						                            kname, (long long)bp.lo, (long long)bp.hi);
-					}
-					preds.bound_keys.push_back(std::move(bp));
-				}
+				preds.enum_keys.emplace_back(kname, std::move(vals));
 			}
 		}
 
