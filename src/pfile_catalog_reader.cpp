@@ -790,7 +790,7 @@ void VerifyMatrixCells(ClientContext &context, FileSystem &fs, const MatrixCatal
 			break;
 		}
 	}
-	bool has_chrom_key = cat.variants.FindKey("CHROM") != nullptr;
+	const AxisKey *contig_key = cat.variants.ContigKey();
 
 	std::unordered_map<string, PvarStats> pvar_stats;
 	std::unordered_map<string, int64_t> psam_count;
@@ -820,8 +820,8 @@ void VerifyMatrixCells(ClientContext &context, FileSystem &fs, const MatrixCatal
 		// CHROM membership: run whenever a CHROM enum key exists, INDEPENDENT of a POS key — `region`
 		// prunes on CHROM alone for a CHROM-only matrix, so the declared CHROM must match the contig the
 		// .pvar actually holds (mirrors the v1 reader's range.CHROM check).
-		if (has_chrom_key) {
-			string declared = vb.ValueOf("CHROM");
+		if (contig_key) {
+			string declared = vb.ValueOf(contig_key->name);
 			for (auto &actual : st.chroms) {
 				if (actual != declared) {
 					throw InvalidInputException(
@@ -988,13 +988,13 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		}
 
 		// ---- region := 'contig:lo-hi' | 'contig' — variant-axis CHROM membership + POS-window overlap.
-		// The contig key is the variant-axis enum named "CHROM" (ASSUMPTION, matched verbatim).
+		// The contig key is the variant-axis enum marked "over":"CHROM", else the one named "CHROM".
 		auto np_region = input.named_parameters.find("region");
 		if (np_region != input.named_parameters.end() && !np_region->second.IsNull()) {
-			const AxisKey *chrom = mcat.variants.FindKey("CHROM");
-			if (!chrom || chrom->type != AxisKeyType::ENUM) {
+			if (!mcat.variants.ContigKey()) {
 				throw InvalidInputException("read_pfile_catalog: invalid predicate: region needs a variant-axis "
-				                            "'CHROM' enum key to match the contig against");
+				                            "contig enum key (marked \"over\":\"CHROM\" or named 'CHROM') to match "
+				                            "the contig against");
 			}
 			RegionPredicate r = ParseRegionString(np_region->second.GetValue<string>());
 			preds.has_region = true;

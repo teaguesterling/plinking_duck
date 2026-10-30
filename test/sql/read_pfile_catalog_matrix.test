@@ -402,6 +402,41 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', re
 ----
 2
 
+# ---------------------------------------------------------------------------
+# over:"CHROM" — the contig key is catalog-declarable. Same fixture as matrix_dense, but the variant
+# enum key is named `contig` and marks itself the genomic-contig dimension.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"marked","axes":[{"name":"variants","keys":[{"name":"contig","type":"enum","over":"CHROM","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={contig}/GROUP={GROUP}/cell","pvar":"refv/CHROM={contig}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/marked_contig.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# region prunes on the marked key (not a literal CHROM): only contig=2 survives.
+query T
+SELECT DISTINCT keys['contig'] FROM read_pfile_catalog('{TEST_DIR}/marked_contig.pfile.json', region := '2:1-100');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/marked_contig.pfile.json', region := '2:1-100');
+----
+2
+
+# a contig no block holds prunes everything.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/marked_contig.pfile.json', region := '9');
+----
+0
+
+# two enum keys both claiming over:"CHROM" is ambiguous -> parse error.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"dup","axes":[{"name":"variants","keys":[{"name":"a","type":"enum","over":"CHROM"},{"name":"b","type":"enum","over":"CHROM"}],"blocks":[{"keys":{"a":"1","b":"x"},"start":0,"stop":3}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":2}]}],"template":{"pfile":"c_{a}_{b}_{GROUP}","pvar":"v_{a}_{b}.pvar","psam":"s_{GROUP}.psam"}}')
+TO '{TEST_DIR}/dup_chrom_marker.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/dup_chrom_marker.pfile.json');
+----
+both claim
+
 # variant_index [3,3] overlaps only the CHROM=2 block [3,4) (half-open); CHROM=1 [0,3) excludes 3.
 query I
 SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', variant_index := [3, 3]);

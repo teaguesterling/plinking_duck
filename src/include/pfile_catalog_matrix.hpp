@@ -114,6 +114,17 @@ struct AxisDef {
 		}
 		return nullptr;
 	}
+	//! The genomic-contig key: the enum key marked `"over":"CHROM"`, else an enum key literally named
+	//! `CHROM`, else nullptr. (Parse rejects two marked keys.)
+	const AxisKey *ContigKey() const {
+		for (auto &k : keys) {
+			if (k.type == AxisKeyType::ENUM && k.over == "CHROM") {
+				return &k;
+			}
+		}
+		auto k = FindKey("CHROM");
+		return (k && k->type == AxisKeyType::ENUM) ? k : nullptr;
+	}
 };
 
 //! One grid cell, resolved. `keys` is (key name, value) for every variants key then every samples key.

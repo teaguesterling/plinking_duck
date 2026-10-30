@@ -40,6 +40,18 @@ AxisKey ParseKeySchema(const string &path, yyjson_val *k, const char *axis_name)
 	if (type == "enum") {
 		key.type = AxisKeyType::ENUM;
 		key.needs_bounds = false;
+		// An enum key may mark itself the genomic-contig dimension with "over":"CHROM" (variants axis only).
+		if (over) {
+			if (!yyjson_is_str(over) || string(yyjson_get_str(over)) != "CHROM") {
+				ParseError(path, StringUtil::Format("key '%s' (enum) may only declare 'over':\"CHROM\"", key.name));
+			}
+			if (!is_variants) {
+				ParseError(path, StringUtil::Format("key '%s' on the '%s' axis cannot be 'over':\"CHROM\" (the "
+				                                    "genomic contig is a variants-axis dimension)",
+				                                    key.name, axis_name));
+			}
+			key.over = "CHROM";
+		}
 	} else if (type == "ordinal_interval") {
 		key.type = AxisKeyType::ORDINAL_INTERVAL;
 		if (!over || !yyjson_is_str(over)) {
@@ -222,6 +234,15 @@ AxisDef ParseAxis(const string &path, yyjson_val *axis_val, const char *expected
 		for (auto &prev : out.keys) {
 			if (prev.name == key.name) {
 				ParseError(path, StringUtil::Format("axis '%s' declares key '%s' twice", expected_name, key.name));
+			}
+		}
+		if (key.type == AxisKeyType::ENUM && key.over == "CHROM") {
+			for (auto &prev : out.keys) {
+				if (prev.type == AxisKeyType::ENUM && prev.over == "CHROM") {
+					ParseError(path, StringUtil::Format("axis '%s' keys '%s' and '%s' both claim 'over':\"CHROM\"; "
+					                                    "at most one key may be the contig dimension",
+					                                    expected_name, prev.name, key.name));
+				}
 			}
 		}
 		out.keys.push_back(std::move(key));
@@ -582,6 +603,8 @@ vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell>
 		}
 	}
 
+	const AxisKey *contig_key = cat.variants.ContigKey();
+
 	vector<MatrixCell> out;
 	for (auto &c : cells) {
 		bool keep = true;
@@ -615,7 +638,8 @@ vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell>
 
 		// region: variant-axis CHROM membership (verbatim) + POS-window overlap against the POS key.
 		if (preds.has_region) {
-			string chrom = !c.keys.empty() ? cat.variants.blocks[c.variant_block].ValueOf("CHROM") : "";
+			string chrom =
+			    (contig_key && !c.keys.empty()) ? cat.variants.blocks[c.variant_block].ValueOf(contig_key->name) : "";
 			if (chrom != preds.region_contig) {
 				keep = false;
 			} else if (pos_key) {

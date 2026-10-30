@@ -413,6 +413,17 @@ SELECT * FROM read_pfile_catalog('{TEST_DIR}/chrom_mislabel.pfile.json', region 
 ----
 range under-claim
 
+# The same mislabel, but the contig key is named `contig` and marked over:"CHROM": the verification and the
+# region prune must follow the marker, not the literal name.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"mislabel2","axes":[{"name":"variants","keys":[{"name":"contig","type":"enum","over":"CHROM","values":[{"value":"2","start":0,"stop":1}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":1}]}]}],"template":{"pfile":"cell_{contig}_{GROUP}","pvar":"mv_{contig}.pvar","psam":"ms_{GROUP}.psam"}}')
+TO '{TEST_DIR}/contig_mislabel.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/contig_mislabel.pfile.json', region := '2');
+----
+range under-claim
+
 # ---------------------------------------------------------------------------
 # grammar negatives (parse-time, no filesets needed).
 # ---------------------------------------------------------------------------
