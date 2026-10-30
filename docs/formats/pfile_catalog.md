@@ -499,50 +499,65 @@ cohort/
   cells/CHROM=1/GROUP=A/cell.pgen, …           one .pgen per cell
 ```
 
-One query assembles the catalog. The two axes and their key names are literals. The
-`values` arrays come from the disk:
+One query assembles the catalog. The two axes and their key names are literals. Each
+axis's blocks come from the files on disk: `glob` lists them in file order, which fixes
+the block order (`idx`), and a running count turns each block's size into its contiguous
+`[start, stop)` ordinal span. The array order you emit **is** the axis order — the
+format tiles the blocks in the order they are listed.
 
 ```sql
 COPY (
   WITH
-  -- Variant blocks: CHROM is a column of the .pvar, so one GROUP BY counts them.
-  variant_blocks AS (
+  -- Variant blocks: glob fixes the block ORDER (file position). read_pvar cannot report
+  -- a filename, so take CHROM from the path and the per-block counts from its column.
+  variant_files AS (
+    SELECT file, regexp_extract(file, 'CHROM=([^/.]+)', 1) AS value
+    FROM glob('cohort/variants/*.pvar')),
+  variant_counts AS (
     SELECT CHROM AS value, count(*) AS n
     FROM read_pvar('cohort/variants/*.pvar') GROUP BY CHROM),
   variant_vals AS (
-    SELECT value, (sum(n) OVER w) - n AS start, sum(n) OVER w AS stop
-    FROM variant_blocks WINDOW w AS (ORDER BY value ROWS UNBOUNDED PRECEDING)),
-  -- Sample blocks: GROUP is in the companion path, so read it from the filename.
-  sample_blocks AS (
+    SELECT f.value,
+           row_number() OVER w - 1         AS idx,    -- block position along the axis
+           (sum(c.n) OVER w)::BIGINT - c.n  AS start,  -- running ordinal: where this block begins
+           (sum(c.n) OVER w)::BIGINT        AS stop
+    FROM variant_files f JOIN variant_counts c USING (value)
+    WINDOW w AS (ORDER BY f.file ROWS UNBOUNDED PRECEDING)),
+  -- Sample blocks: GROUP is in the companion path; glob fixes the order, read_csv counts.
+  sample_files AS (
+    SELECT file, regexp_extract(file, 'GROUP=([^/.]+)', 1) AS value
+    FROM glob('cohort/samples/*.psam')),
+  sample_counts AS (
     SELECT regexp_extract(filename, 'GROUP=([^/.]+)', 1) AS value, count(*) AS n
     FROM read_csv('cohort/samples/*.psam', filename := true, delim := '\t',
                   header := true, all_varchar := true)
     GROUP BY value),
   sample_vals AS (
-    SELECT value, (sum(n) OVER w) - n AS start, sum(n) OVER w AS stop
-    FROM sample_blocks WINDOW w AS (ORDER BY value ROWS UNBOUNDED PRECEDING)),
-  v AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY start) AS arr FROM variant_vals),
-  s AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY start) AS arr FROM sample_vals)
-  SELECT to_json({
-    'pfile_catalog': 2,
-    'dataset': 'cohort',
-    'axes': [
-      {'name': 'variants', 'keys': [{'name': 'CHROM', 'type': 'enum', 'values': v.arr}]},
-      {'name': 'samples',  'keys': [{'name': 'GROUP', 'type': 'enum', 'values': s.arr}]}
-    ],
-    'template': {
-      'pfile': 'cells/CHROM={CHROM}/GROUP={GROUP}/cell',
-      'pvar':  'variants/CHROM={CHROM}.pvar',
-      'psam':  'samples/GROUP={GROUP}.psam'
-    }
-  }) FROM v, s
-) TO 'cohort/cohort.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+    SELECT f.value,
+           row_number() OVER w - 1         AS idx,
+           (sum(c.n) OVER w)::BIGINT - c.n  AS start,
+           (sum(c.n) OVER w)::BIGINT        AS stop
+    FROM sample_files f JOIN sample_counts c USING (value)
+    WINDOW w AS (ORDER BY f.file ROWS UNBOUNDED PRECEDING)),
+  v AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY idx) AS arr FROM variant_vals),
+  s AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY idx) AS arr FROM sample_vals)
+  SELECT
+    2        AS pfile_catalog,
+    'cohort' AS dataset,
+    [ {'name': 'variants', 'keys': [{'name': 'CHROM', 'type': 'enum', 'values': v.arr}]},
+      {'name': 'samples',  'keys': [{'name': 'GROUP', 'type': 'enum', 'values': s.arr}]} ] AS axes,
+    {'pfile': 'cells/CHROM={CHROM}/GROUP={GROUP}/cell',
+     'pvar':  'variants/CHROM={CHROM}.pvar',
+     'psam':  'samples/GROUP={GROUP}.psam'} AS template
+  FROM v, s
+) TO 'cohort/cohort.pfile.json' (FORMAT json);
 ```
 
-`to_json` builds the JSON from the struct. The `COPY … (FORMAT csv, QUOTE '', ESCAPE
-'')` options write the one JSON string to the file verbatim, with no CSV quoting. The
-window functions turn each block's count into a contiguous `[start, stop)` span, which
-the axis tiling requires. The result is a normal catalog:
+`COPY … (FORMAT json)` writes each result row as one JSON object, keyed by the column
+names — so this single row is the whole catalog object, with no quoting to undo. The
+block order is the file order from `glob`, not a sort of `value`; `idx` is each block's
+position on the axis and the running `sum` is its ordinal. `sum` returns a 128-bit total,
+so the spans are cast to `BIGINT`, which the parser reads. The result is a normal catalog:
 
 ```sql
 SELECT keys['CHROM'] AS chrom, keys['GROUP'] AS grp,
@@ -551,8 +566,13 @@ SELECT keys['CHROM'] AS chrom, keys['GROUP'] AS grp,
 FROM read_pfile_catalog('cohort/cohort.pfile.json');
 ```
 
-Two notes:
+Three notes:
 
+- The block order is whatever `glob` returns, which is **lexicographic by path**, not
+  genomic — `CHROM=10.pvar` sorts before `CHROM=2.pvar`. The format accepts any tiling
+  order: the span is a label, and `verified` checks each block's width against its own
+  `.pvar`, never a global row order. So this is a labelling choice, not a bug. For genomic
+  order, replace `ORDER BY f.file` with a contig rank (or any sort key) you supply.
 - This is the single-`enum`-key form, where each block is one `value`. An
   `ordinal_interval` key (a `CHUNK` over `POS`) also needs per-block `bounds`. Compute
   them with `min(POS)` and `max(POS)` per block and emit the `blocks` form instead (see
