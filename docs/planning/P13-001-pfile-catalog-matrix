@@ -1,0 +1,354 @@
+# P13-001 — `pfile_catalog` matrix (2-D / N-axis typed-key sharding)
+
+Status: **DESIGN** (brainstormed + reviewed 2026-10-29; owner decisions folded
+in; not yet approved for build).
+Depends on: P10-001 (filter-pushdown), P11-001 (ATTACH), the 1-D
+`read_pfile_catalog` reader (`src/pfile_catalog_reader.cpp`), the `pfile_catalog`
+format (`docs/formats/pfile_catalog.md`).
+Reference: `DESIGN-GUIDE`; howard catalog spec §5/§6/§10/§11
+(`~/Projects/howard/docs/superpowers/specs/2026-10-09-howard-catalog-design.md`).
+
+> **Decisions log (owner, 2026-10-29).** Surface scope = **A+B+D now, analysis
+> macros (C) a separate plan**. Grid = **sparse (holes allowed)**. Sample
+> cross-block lookup = **scan `c.samples` by default, with an optional,
+> generally-declared auxiliary index sidecar**. Correction from review: the
+> sample sort is **per-block, not global**. Author's calls (settle, listed in
+> §12): generic typed-key predicate params for v1; join/planner pushdown stays
+> phase 3; output schema, tiling validation, ATTACH/v2.0 feasibility are
+> spikes/builder items.
+
+---
+
+## 1. Intent — why this exists
+
+A `pfile_catalog` today concatenates filesets along **one** axis: `concat_dim`
+is `"variants"` **xor** `"samples"`, with one shared companion (§5 of the howard
+spec). That is 1-D.
+
+The driving dataset is 2-D on both axes and large on both:
+
+| Now | Target |
+|-----|--------|
+| 7.5M samples × 170M variants | 11M samples × whole genome |
+
+At that scale a single `.pgen` is impossible and single-axis sharding is not
+enough — a variant-sharded catalog drags *every* sample through a region query;
+a sample-sharded one drags *every* variant through a cohort query. The data is
+already exported as a **hive-partitioned tree** of pfilesets
+(`CHROM=1/CHUNK=001/GROUP=AFR/…`), one `.pgen` per grid cell, sidecars built by
+hand. The need is to **catalog that grid and prune it on both axes at once**,
+reading only the cells a query touches.
+
+The canonical query is a metadata-first prune — *"aggregate by sex and ancestry
+for everyone with a het LoF variant in gene ASRA who self-reports a cardiac
+condition"*:
+
+```sql
+SELECT age_bin, ancestry, count(*) FILTER (het)
+FROM c.genotypes_by_sample g
+JOIN genes        ON g.CHROM = genes.chrom AND g.POS BETWEEN genes.start AND genes.end
+JOIN observations ON g.IID = observations.person_id
+JOIN concepts     ON observations.concept_id = concepts.id
+WHERE genes.symbol = 'ASRA' AND concepts.name = 'cardiac condition = yes';
+```
+
+The gene join selects a few variant-blocks of one chromosome; the concept joins
+select a scattered set of people, hence a few sample-blocks; only those cells are
+scanned, and a het **count** never decompresses full genotypes.
+
+plinking_duck is the reference implementation; diar consumption is **out of
+scope** (diar's `attach_chunks` is 1-D today —
+`ducks_in_a_row/src/ducks_in_a_row/attach.py`).
+
+## 2. Goals / non-goals / anti-goals
+
+**Goals**
+- A `pfile_catalog` v2 describing an **N-axis grid** (2 axes now) of existing
+  pfilesets, with **catalog-defined, typed partition keys**, and **sparse**
+  (holes legal).
+- Prune the grid to surviving **cells** on both axes by two mechanisms matched to
+  the key's nature: **range / min-max** for a contiguous axis (genomic POS), and
+  a **list-retained set** prune for scattered selections (sample IDs).
+- Make **ATTACH** the primary surface (§5, groups A/B/D), with
+  `read_pfile_catalog`/`read_pfile` as the explicit lower layer.
+- Carry the prune **down the whole stack**: cell → companion-parquet row-group →
+  minimal count-only genotype read.
+
+**Non-goals (this plan)**
+- Writing the 2-D shard set (exports + sidecars are produced elsewhere; this is
+  read + prune).
+- The **analysis macros (surface C)** — `c.freq`/`score`/`pca`/`glm` over the
+  grid — and their cross-cell per-variant aggregation. Deferred to its own plan
+  (§5.C, §11).
+- diar / howard registration of a 2-D grid.
+- Re-storing genotypes in any new on-disk form.
+
+**Anti-goals (failure even if it "works")**
+- A min/max range prune over a **scattered** ID set that reads every block
+  (§6.2, measured case E) — correct result, catastrophic cost.
+- Hard-coding key names in the reader. Keys are **catalog-defined**; only the
+  *type vocabulary* is code.
+- An off-axis / unhonorable predicate that quietly returns the whole cohort (the
+  §10.1 unsafe mode). Such a predicate must **throw**, never widen.
+
+## 3. Data model
+
+### 3.1 Axes, cells, companions
+
+- An **axis** is an ordinal dimension the grid concatenates along (`variants`,
+  `samples`). Each axis carries an **ordered list of blocks** tiling
+  `[0, axis_length)` with no gap or overlap (§6 boundary law, per axis) — but see
+  §3.2, holes are legal and simply absent from the tiling of *existing* cells.
+- A **cell** is the intersection of one variant-block and one sample-block: one
+  `.pgen`. An M×N grid has at most M×N cells (fewer if sparse).
+- **Companions are shared along each axis, not globally.** Every cell in a
+  variant-block shares that block's **`.pvar`**; every cell in a sample-block
+  shares that block's **`.psam`**. So the grid has **M `.pvar` + N `.psam`**, and
+  cell (i,j) pairs variant-block i's `.pvar` with sample-block j's `.psam`. Each
+  cell independently satisfies the plink2 header law — the §5 invariant
+  generalized, not broken.
+
+### 3.2 Typed partition keys (catalog-defined)
+
+The catalog's real content is a **type system for the hive keys**. Key names are
+open and self-describing; the reader owns a **closed vocabulary of prune
+operators**:
+
+| Key type | Bounds per value | Prune operator | Generalizes 1-D |
+|----------|------------------|----------------|------------------|
+| `enum` | the label | membership (value ∈ requested set) | `range.CHROM` |
+| `ordinal_interval` | `[lo, hi)` over a named quantity (POS, or an axis ordinal) | interval overlap | `range.POS` + `partition` |
+| `value_bin` | bin edges over a value | interval overlap on the binned value | (new, same shape) |
+
+Examples a catalog *declares* (none reserved): `CHROM` (ordered enum heading the
+variant axis), `CHUNK` (`ordinal_interval` over POS, nested under `CHROM`),
+`GROUP`/`SEX` (`enum`, sample axis), `SLICE` (`ordinal_interval` over
+`sample_index`), `age` (`value_bin`). Each key declares `{axis, type,
+bounds-per-value}`; a block's ordinal span and its prune both derive from that.
+The existing overlap predicates (`ShardEntry::IndexOverlaps`/`RangeOverlaps`) are
+the `ordinal_interval` and `enum` operators already — generalizing them to
+per-key typed operators is the core change.
+
+**Sparse grid.** Cells may be absent (a group lacking a contig). The generative
+form (ordered tick lists → Cartesian product) carries an explicit **hole/mask**;
+the manifest skips holes (never resolves a non-existent `.pgen`); a query landing
+only on holes returns **empty, not an error**.
+
+### 3.3 Three load-bearing rules
+
+- **Sort invariant — per BLOCK, not global.** Each block's companion is sorted on
+  declared fields: `(CHROM, POS, REF, ALT)` for a variant-block's `.pvar`,
+  `(IID, FID)` for a sample-block's `.psam`. The sort holds **within a block** —
+  ancestry groups are separate files, so IIDs do **not** interleave into one
+  global order. *(An earlier draft assumed a global sort; corrected after
+  review.)* The sort gives each block's companion parquet **locality**: a target
+  value hits one or few row-groups. The sort-key field set is **catalog-declared**
+  (defaulting to those fields).
+- **Cross-block lookup via sample metadata, optionally indexed.** Because the sort
+  is per-block, a scattered IID-keyed query cannot binary-search a global order.
+  It resolves through the **sample-metadata relation `c.samples`** (the psam
+  union: `IID`, `sample_index`, block keys) — a person-id set joins it (a cheap
+  metadata scan, no genotypes) to get each person's `(GROUP, SLICE)`. A catalog
+  **may optionally declare an auxiliary index sidecar** — a *general* catalog
+  declaration, a precomputed id→block map the reader uses when present to skip the
+  scan; absent, scanning `c.samples` is the baseline. (A `sample_index`-keyed
+  query needs neither: `SLICE` is `ordinal_interval` over the index, so an index
+  maps to its block directly.)
+- **Materialized index.** Any index a prune relies on must be a **stored, stable
+  column**, not an emission counter. `read_pfile` already made its variant
+  `__ordinal` the true pgen vidx (pushdown-safe); `read_pvar` **disables**
+  filter-pushdown because its ordinal is a per-row counter that *shifts* when rows
+  are skipped (its own comment). So for `.psam`-parquet row-group skipping to
+  yield correct sample indices, `sample_index` must be a **stored column** in the
+  psam sidecar — which the sorted, self-describing partitions provide.
+
+## 4. Catalog format v2 (sketch — grammar left to builder, §12)
+
+Discriminated so old readers fail loud, not wrong:
+- `"pfile_catalog": 2` with an `"axes"` block → matrix form. The current reader
+  enforces `== 1` and throws otherwise, so a v1 reader rejects a v2 catalog
+  cleanly.
+- `"pfile_catalog": 1` → the existing 1-D / single-fileset forms, unchanged.
+
+A v2 catalog declares, roughly:
+- `axes`: ordered list, each `{ name, keys: [...], sort: [...] }`.
+- per key: `{ name, type, over?: POS|sample_index|<value>, order?: [...] }`.
+- `template`: how a cell's `.pgen`/`.pvar`/`.psam` paths build from key values
+  (hive-style), plus the companion-sharing map (which keys index `.pvar` vs
+  `.psam`).
+- the grid: **generative** (ordered tick lists per key → Cartesian product),
+  with an explicit **hole/mask** for absent cells (§3.2). Per-block bounds (POS
+  extent, id / ordinal range, counts) are **declared** (filled at sidecar-build
+  time), so pruning opens no `.pgen`; verification stays lazy on survivors.
+- optional `index`: a general declaration of an auxiliary id→block lookup sidecar
+  (§3.3), usable on any axis.
+
+## 5. Surface
+
+### A. Data relations (the concatenated dataset)
+| Object | What | Notes |
+|---|---|---|
+| `c.variants` | pvar union, variant axis | + `variant_index`, + block keys (`CHROM`,`CHUNK`) |
+| `c.samples` | psam union, sample axis | + `sample_index`, + block keys (`GROUP`,`SLICE`,…); also the cross-block id→block index (§3.3) |
+| `c.genotypes` | variant-oriented genotype relation | projection-driven columns, below |
+| `c.genotypes_by_sample` | sample-oriented | same relation, `orient='sample'` |
+
+**Projection-driven columns ("clever select handling").** `c.genotypes` exposes a
+*superset* — `genotype`, `dosage`, `het`, `hom_alt`, `missing`, `n_alt` — and
+projection pushdown picks the decode path: `SELECT het …` takes the counts
+fast-path and never decompresses full calls; `SELECT genotype …` does the full
+decode. One relation whose *columns* are the API, replacing many
+`genotypes='…'`/`include_genotypes=[…]` variants. This is the DESIGN-GUIDE
+projection-pushdown rule as surface.
+
+### B. Grid / metadata relations (what the join-prune hits)
+| Object | What |
+|---|---|
+| `c.cells` | one row per cell: key values, resolved paths, per-axis spans, per-key bounds (= `read_pfile_catalog` output) |
+| `c.variant_blocks` / `c.sample_blocks` | one row per block per axis with its typed bounds — the gene/concept joins prune against these |
+
+### C. Analysis macros — DEFERRED to its own plan
+`c.freq()`/`hardy()`/`missing()`/`ld()`/`score(weights:=…)`/`pca(n_pcs:=…)`/
+`glm(…)` as parameterized **table macros** over the pruned grid. Deferred because
+per-variant stats across the sample axis are the **multi-source aggregation
+problem** (§12.2 of the howard spec): a variant's samples span all sample-blocks,
+so `freq`/`hwe`/`missing` must sum per-cell counts across sample-blocks and merge.
+Tractable (cell-wise counts → merge) but its own body of work. Named follow-on.
+
+### D. Lower layer / non-ATTACH
+`read_pfile_catalog(path, …)` returns **one row per surviving cell** (resolved
+paths, spans, per-key bound columns). It gains **generic typed-key predicate
+parameters**, generalizing today's `region` / `[lo,hi]`: a region/interval arg
+per `ordinal_interval` key and a **list-valued** arg per `enum` key (so a
+scattered IID or GROUP set is expressible without ATTACH). `read_pfile` scans a
+surviving cell. A table macro wraps the common "prune-then-fan-out" so non-ATTACH
+users get it in one call.
+
+## 6. Prune mechanism — unified with concatenation
+
+Concatenation and filtering are the **same structure**: the catalog defines how
+blocks tile each axis (concatenation); a filter selects a **sub-cover** (the
+survivors). Two prune styles, chosen by the key's nature; both measured
+2026-10-29 (v1.5.x build — **v2.0 confirmation owed**):
+
+### 6.1 Contiguous axis → range / min-max pushdown (MEASURED, works)
+A join bounding a contiguous axis pushes a **dynamic min/max filter** onto the
+scan. 1M-row probe joined to a one-row gene window:
+
+| Query shape | probe rows scanned (of 1M) |
+|-------------|----------------------------|
+| equi + `BETWEEN` range join | 101 |
+| equi + `>= / <` | 100 |
+| pure range join (nested-loop) | 200 |
+
+The gene join prunes the variant axis; `BETWEEN` vs `>=/<` is **identical**
+(DuckDB canonicalizes `BETWEEN`). `read_pfile` already receives
+`DYNAMIC_FILTER`/`BLOOM_FILTER` and recognizes `CHROM`/`POS` bounds in
+`BuildPrunePlan` — the matrix reader extends that to prune **cells**,
+conservatively, with the full pushed set re-applied for correctness.
+
+### 6.2 Scattered selection → retain the LIST; resolve by the key's nature (MEASURED trap)
+A min/max filter over a **scattered** set is useless. Same 1M probe, 4-element
+semijoin:
+
+| Set shape | probe rows scanned (of 1M) |
+|-----------|----------------------------|
+| contiguous `{700000,700001,700050,700099}` | 100 |
+| scattered `{5, 400000, 700050, 999000}` | 327,252 |
+
+The scattered min/max `[5, 999000]` overlaps every block. So a scattered
+selection keeps the set as a **list**, resolved by key type:
+- **`sample_index` scatter** (SLICE is ordinal over the index): each index maps to
+  its slice directly — ids `{1, 20000, 499990}` over 100k-slices touch **2**
+  slices, not 5.
+- **IID scatter** (the ASRA join is on `g.IID`): resolve id→block through the
+  sample metadata (§3.3) — a scan of `c.samples` (or the optional declared index),
+  cheap vs genotypes — then push the actual **IN-list** into the surviving blocks'
+  `.psam` parquet so row-group skipping prunes on the set. The per-block iid-sort
+  gives the within-block row-group locality.
+
+A pushed min/max *range* over either is the §2 anti-goal.
+
+### 6.3 The cascade (end-state)
+One query descends: join → **cell prune** (both axes) → **companion-parquet
+row-group skip** (POS min/max on `.pvar`; IID IN-list on the sorted `.psam`) →
+surviving row positions give the exact (variant × sample) indices → a count-only
+read (`read_pfile(orient:='sample', genotypes:='counts',
+include_genotypes:=['het'])`) that never decompresses full genotypes. Most of the
+bottom of this stack exists (parquet companions + discovery, `orient='sample'`,
+`genotypes='counts'`, `include_genotypes`, projection + filter pushdown). The new
+code is the grid layer above it.
+
+## 7. Trust model (generalized from §8/§10.1)
+- Per-block bounds are **assertions over foreign files** — **verified, never
+  assumed**. Default: verify **survivors** (`verify_all := true` verifies all
+  first).
+- Verification cost scales with the grid: block counts from **M `.pvar` + N
+  `.psam`** probes (cheap), not M×N; cell `.pgen` header checks only on
+  **survivors**.
+- Wrong-axis / unhonorable predicate **throws**, never widens.
+
+## 8. Phasing & build order
+Design scope for P13 = **A + B + D** (§5). Build bottom-up; each phase stands
+alone.
+
+1. **Catalog v2 parse + model** — extend `pfile_catalog.hpp` + the yyjson parser
+   to the N-axis typed-key, sparse form; optional index declaration; keep v1 paths
+   untouched; reject version drift loudly.
+2. **Cell manifest + typed prune (the v1 metadata layer)** — `read_pfile_catalog`
+   emits one row per surviving cell; prune loop becomes per-key typed operators
+   (generalizing `IndexOverlaps`/`RangeOverlaps`); **generic typed-key predicate
+   params incl. list-valued** (§5.D); list-retained set prune; lazy survivor
+   verification. **This is the recommended first shippable milestone** — it serves
+   the ASRA query over the proven manifest→`read_pfile` pattern and locks the
+   catalog shape.
+3. **ATTACH surface (TYPE pfile_catalog)** — the A/B relations + D macros as a
+   schema; WHERE/join pushdown pruning via the planner (§6.1). Validate the DuckDB
+   `StorageExtension`/`Catalog` feasibility first (the P11 unknown).
+4. **Cascade optimizations** — pushed filters reach companion parquet row-groups
+   and the count-only path; confirm the materialized `sample_index`; honor the
+   optional auxiliary index.
+
+**Separate plan:** surface **C** (analysis macros + cross-cell aggregation).
+
+## 9. Open questions (remaining, lower-stakes)
+1. **Type-vocabulary completeness:** are `enum`/`ordinal_interval`/`value_bin`
+   enough for v1? (Author's lean: fix the vocabulary for v1; the pluggable
+   type-handler path — czarr "handlers as separate extensions" — is a later door.)
+2. **N > 2 axes:** model strictly 2 axes with compound keys (`CHROM`+`CHUNK` on
+   variants) now, leaving true N-D later? (Author's lean: yes, 2-axes-compound.)
+3. **Sidecar producer:** the per-block bounds, the materialized `sample_index`,
+   and the optional id→block index must be produced when sidecars are built — a
+   hand step, or a helper? (Decides whether §3.3 holds in practice.)
+
+## 10. Resolved by owner (2026-10-29)
+- Surface scope: **A+B+D** in P13; analysis macros **C = own plan**.
+- Grid: **sparse** (holes legal; explicit mask; empty-on-all-holes, not error).
+- Cross-block id→block: **scan `c.samples`** by default; **optional,
+  generally-declared auxiliary index sidecar** as acceleration.
+- Sample sort: **per-block, not global** (review correction).
+
+## 11. Author's calls (settle; owner may override — listed for the read)
+- v1 reaches the scattered set via **generic typed-key predicate params incl.
+  list-valued** on `read_pfile_catalog`; planner/join pushdown stays **phase 3**.
+- Output-schema shape, cross-shard tiling validation left to the builder; the
+  ATTACH `StorageExtension` feasibility and the v2.0 pushdown re-measure are
+  **spikes**, not author questions.
+
+## 12. Left to the builder
+- The exact v2 JSON grammar (key/axis/bounds/template/mask/index serialization).
+- Error-taxonomy additions (matrix-specific parse/prune message prefixes),
+  mirroring the 1-D reader.
+- DuckDB-version compat shims for any new filter-set inspection
+  (`duckdb_compat_planner.hpp` convention — one place).
+- Test data: a small sparse M×N grid fixture + negative/edge fixtures
+  (`DESIGN-GUIDE` §6).
+
+## 13. References
+- `DESIGN-GUIDE`; `docs/formats/pfile_catalog.md`;
+  `docs/planning/P10-001-filter-pushdown`, `P11-001-attach-pfile-catalog`.
+- howard catalog spec §5 (invariant), §6 (boundary law), §10 (pushdown), §11
+  (ATTACH), §12.2 (multi-source stats), §13.2 (zarr), §13.3 (Hail MatrixTable —
+  a store you convert into, **not** a usable catalog format here).
+- Conventions: czarr n-D-array convention (NDARRAY, metadata-only stitching,
+  structured axes); dair axis/array convention.
