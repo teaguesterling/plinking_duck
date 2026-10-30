@@ -363,7 +363,7 @@ TO '{TEST_DIR}/twokeys.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '
 statement error
 SELECT * FROM read_pfile_catalog('{TEST_DIR}/twokeys.pfile.json');
 ----
-exactly one key
+needs a 'blocks'
 
 statement ok
 COPY (SELECT '{"pfile_catalog":2,"dataset":"x","files":[],"axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3}]}]}],"template":{"pfile":"c/{CHROM}/{GROUP}","pvar":"ref/{CHROM}.pvar","psam":"ref/{GROUP}.psam"}}')
@@ -392,13 +392,22 @@ SELECT * FROM read_pfile_catalog('{TEST_DIR}/mixed_pfile.pfile.json');
 ----
 one or the other
 
-# v2 never widens: a prune predicate on a matrix catalog is an error, not silently ignored.
-statement error
-SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', region := '1:1-100');
+# region + variant_index now PRUNE a v2 matrix (Task 4). matrix_dense's CHROM is an enum with no POS
+# key, so region is CHROM-only. CHROM=2 is chosen because CHROM=1/GROUP=B was corrupted above; both
+# CHROM=2 cells are intact, so the survivors verify.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', region := '2:1-100');
 ----
-invalid predicate
+2
 
+# variant_index [3,3] overlaps only the CHROM=2 block [3,4) (half-open); CHROM=1 [0,3) excludes 3.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', variant_index := [3, 3]);
+----
+2
+
+# a predicate on an undeclared key still throws (never accept-and-ignore).
 statement error
-SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', variant_index := [0, 1]);
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'ZZZ': ['x']});
 ----
 invalid predicate
