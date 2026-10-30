@@ -298,6 +298,74 @@ bool IsMatrixCatalog(const string &content) {
 	return yyjson_is_obj(root) && JsonGetInt64(yyjson_obj_get(root, "pfile_catalog"), version) && version == 2;
 }
 
+namespace {
+
+//! True when the hole's every (key, value) matches the labels of this variant-block x sample-block pair.
+bool HoleMatches(const MatrixCatalog &cat, const vector<std::pair<string, string>> &hole, const AxisBlock &vb,
+                 const AxisBlock &sb) {
+	for (auto &kv : hole) {
+		auto &block = cat.variants.FindKey(kv.first) ? vb : sb;
+		if (block.ValueOf(kv.first) != kv.second) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool IsHole(const MatrixCatalog &cat, const AxisBlock &vb, const AxisBlock &sb) {
+	for (auto &hole : cat.holes) {
+		if (HoleMatches(cat, hole, vb, sb)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ParseHoles(const string &path, yyjson_val *root, MatrixCatalog &cat) {
+	yyjson_val *holes = yyjson_obj_get(root, "holes");
+	if (!holes) {
+		return;
+	}
+	if (!yyjson_is_arr(holes)) {
+		ParseError(path, "'holes' must be an array of {key: value} objects");
+	}
+	size_t idx, max;
+	yyjson_val *h;
+	yyjson_arr_foreach(holes, idx, max, h) {
+		if (!yyjson_is_obj(h) || yyjson_obj_size(h) == 0) {
+			ParseError(path, StringUtil::Format("holes[%llu] must be a non-empty object of key: value pairs",
+			                                    (unsigned long long)idx));
+		}
+		vector<std::pair<string, string>> hole;
+		size_t i2, m2;
+		yyjson_val *k, *v;
+		yyjson_obj_foreach(h, i2, m2, k, v) {
+			string key = yyjson_get_str(k);
+			if (!cat.variants.FindKey(key) && !cat.samples.FindKey(key)) {
+				ParseError(path,
+				           StringUtil::Format("holes[%llu] names undeclared key '%s'", (unsigned long long)idx, key));
+			}
+			if (!yyjson_is_str(v)) {
+				ParseError(path,
+				           StringUtil::Format("holes[%llu]['%s'] must be a string", (unsigned long long)idx, key));
+			}
+			hole.emplace_back(key, yyjson_get_str(v));
+		}
+		bool matches_any = false;
+		for (auto &vb : cat.variants.blocks) {
+			for (auto &sb : cat.samples.blocks) {
+				matches_any |= HoleMatches(cat, hole, vb, sb);
+			}
+		}
+		if (!matches_any) {
+			ParseError(path, StringUtil::Format("holes[%llu] matches no cell of the grid", (unsigned long long)idx));
+		}
+		cat.holes.push_back(std::move(hole));
+	}
+}
+
+} // namespace
+
 MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const string &content) {
 	YyDocGuard guard;
 	guard.doc = yyjson_read(content.c_str(), content.size(), 0);
@@ -398,6 +466,7 @@ MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const strin
 	}
 	ValidateTemplate(path, "pvar", cat.pvar_template, cat.variants, cat.samples);
 	ValidateTemplate(path, "psam", cat.psam_template, cat.samples, cat.variants);
+	ParseHoles(path, root, cat);
 	return cat;
 }
 
@@ -405,10 +474,16 @@ vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs) {
 	vector<MatrixCell> cells;
 	std::unordered_set<string> seen_prefix, seen_pvar, seen_psam;
 	int64_t ordinal = 0;
+	// A companion is registered (and collision-checked) once per block, by the first PRESENT cell of that
+	// block — not by grid position, since holes may remove the first cell of a row/column.
+	vector<bool> pvar_done(cat.variants.blocks.size(), false), psam_done(cat.samples.blocks.size(), false);
 	for (size_t vi = 0; vi < cat.variants.blocks.size(); vi++) {
 		auto &vb = cat.variants.blocks[vi];
 		for (size_t si = 0; si < cat.samples.blocks.size(); si++) {
 			auto &sb = cat.samples.blocks[si];
+			if (IsHole(cat, vb, sb)) {
+				continue; // absent: never resolve a path for it
+			}
 			MatrixCell c;
 			c.keys = vb.key_values;
 			c.keys.insert(c.keys.end(), sb.key_values.begin(), sb.key_values.end());
@@ -418,13 +493,13 @@ vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs) {
 			// Each variant block owns one `.pvar`, each sample block one `.psam` (§3.1: an M×N grid has
 			// M `.pvar` + N `.psam`). A companion template that omits a block-distinguishing key would pair
 			// a block with another block's companion — caught here, not left to coincidental count match.
-			if (si == 0 && !seen_pvar.insert(c.pvar).second) {
+			if (!pvar_done[vi] && !seen_pvar.insert(c.pvar).second) {
 				throw InvalidInputException("read_pfile_catalog: catalog parse error: two variant-blocks resolve to "
 				                            "the same .pvar '%s' — the template.pvar omits a variant key that "
 				                            "distinguishes them",
 				                            c.pvar);
 			}
-			if (vi == 0 && !seen_psam.insert(c.psam).second) {
+			if (!psam_done[si] && !seen_psam.insert(c.psam).second) {
 				throw InvalidInputException("read_pfile_catalog: catalog parse error: two sample-blocks resolve to "
 				                            "the same .psam '%s' — the template.psam omits a sample key that "
 				                            "distinguishes them",
@@ -435,6 +510,7 @@ vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs) {
 				                            ".pgen prefix '%s' — the template omits a key that distinguishes them",
 				                            c.prefix);
 			}
+			pvar_done[vi] = psam_done[si] = true;
 			c.variant_start = vb.ordinal_start;
 			c.variant_stop = vb.ordinal_stop;
 			c.sample_start = sb.ordinal_start;

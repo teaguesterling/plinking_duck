@@ -28,6 +28,7 @@ namespace duckdb {
 //                {"name":"age","type":"value_bin","over":"age"}],
 //        "blocks":[{"keys":{"GROUP":"A","SLICE":"0","age":"young"},"start":0,"stop":1,
 //                   "bounds":{"age":{"lo":20,"hi":40}}}, ... ]} ],
+//     "holes": [{"CHROM":"2","GROUP":"C"}],     // optional: absent cells (see below)
 //     "template": {"pfile":"c_{CHROM}_{CHUNK}_{GROUP}_{SLICE}",
 //                  "pvar":"v_{CHROM}_{CHUNK}.pvar", "psam":"s_{GROUP}_{SLICE}.psam"} }
 //
@@ -35,6 +36,11 @@ namespace duckdb {
 // tile `[0, length)` with no gap or overlap, listed in ordinal order. An `ordinal_interval` over POS
 // carries INCLUSIVE `{min,max}` bounds per block; a `value_bin` carries HALF-OPEN `{lo,hi}` bin edges.
 // An `ordinal_interval` over the axis ordinal (`sample_index`) needs no bound — its bound IS `[start,stop)`.
+//
+// Sparse grids: an optional top-level `holes` array lists absent cells. Each entry is an object of
+// key->value (string) pairs over declared keys of either axis; it removes every product cell whose
+// block labels match ALL its pairs (so `{"CHROM":"2"}` drops the whole CHROM=2 row of the grid). A hole
+// that matches no cell is a parse error (a typo must not silently leave the cell present).
 //
 // Back-compat: the phase-1 single-`enum`-key form (`keys:[{name,type:"enum",values:[{value,start,stop}]}]`,
 // no `blocks`) is still accepted and NORMALIZED into one block per value at parse time, so the phase-1
@@ -134,6 +140,9 @@ struct MatrixCatalog {
 	string pfile_template; //! unresolved (relative to base_dir)
 	string pvar_template;
 	string psam_template;
+	//! Absent cells (§3.2 sparse grids). Each hole is a partial key->value map over either axis's keys; it
+	//! removes every cell of the variant-block x sample-block product whose labels match ALL its entries.
+	vector<vector<std::pair<string, string>>> holes;
 };
 
 //! True when `content` is a JSON object whose integer `pfile_catalog` is 2 (the version router).
@@ -142,8 +151,9 @@ bool IsMatrixCatalog(const string &content);
 //! Parse + validate a v2 matrix catalog. Throws "read_pfile_catalog: catalog parse error: ...".
 MatrixCatalog ParseMatrixCatalog(FileSystem &fs, const string &path, const string &content);
 
-//! Dense Cartesian product of the two axes' blocks, variants-major; resolves each cell's `.pgen` from
-//! the template and its shared `.pvar`/`.psam`. Opens no file. Throws when two cells collide on a path.
+//! Cartesian product of the two axes' blocks (variants-major) MINUS the declared holes; resolves each
+//! PRESENT cell's `.pgen` from the template and its shared `.pvar`/`.psam`. A hole is skipped before any
+//! path is resolved, so it is never touched. Opens no file. Throws when two cells collide on a path.
 vector<MatrixCell> BuildCells(const MatrixCatalog &cat, FileSystem &fs);
 
 //! Per-key requested value sets (the `keys :=` predicate on `enum` keys): (key name, allowed values).
