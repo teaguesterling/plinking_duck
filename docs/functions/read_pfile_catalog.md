@@ -169,14 +169,17 @@ Interval rules, by key type:
   `[lo, hi]` is inclusive. They overlap if they share at least one value.
 - `ordinal_interval` over `sample_index`: the block bound is its half-open
   `[start, stop)`.
-- `value_bin`: the block bound is half-open `[lo, hi)`. A query of `[40, 40]` overlaps
-  `[40, 60)` but not `[20, 40)`.
+- `value_bin`: **tiling only.** A `value_bin` key partitions the axis (so cells can be
+  grouped by its value), but no predicate prunes it — it carries no dedicated parameter
+  and `keys` rejects it. Filter or aggregate on its value downstream (the key's value is
+  in the `keys` output column).
 
 A predicate that cannot apply raises `invalid predicate` and never returns the whole grid:
 
 - `keys` names a key the catalog does not declare, or a key with a `NULL` value or
   `NULL` list element.
-- `keys` on an interval key does not hold exactly two integers, or `lo > hi`.
+- `keys` names an `ordinal_interval` or `value_bin` key (`keys` carries enum membership
+  only — use `region` / `variant_index` / `samples` for ordinal or genomic pruning).
 - `region` on a catalog with no variants-axis contig key: an `enum` key marked `"over":"CHROM"`, or else one named `CHROM`.
 - `sample_index` on a version-2 catalog. Use `samples` instead.
 - `keys` or `samples` on a version-1 catalog.
