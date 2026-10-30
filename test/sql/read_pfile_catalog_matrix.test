@@ -5,10 +5,10 @@
 require plinking_duck
 
 # ===========================================================================
-# FIXTURE — dense 2x2 grid: variants split by CHROM={1,2} (one shared .pvar each), samples split by
-# GROUP={A,B} (one shared .psam each); 4 cells data/CHROM=i/GROUP=j/cell.pgen. Verification is not
-# wired yet, so the cell filesets are copies of one small fileset. PARTITION_BY only creates the
-# hive directories the pfile writer needs.
+# FIXTURE — dense 2x2 grid: variants split by CHROM={1,2} (one shared .pvar each: 3 and 1 variants),
+# samples split by GROUP={A,B} (one shared .psam each: 2 samples). 4 cells data/CHROM=i/GROUP=j/cell.pgen,
+# each a REAL fileset whose .pgen header counts match its block companions (verification reads them).
+# PARTITION_BY only creates the hive directories the pfile writer needs.
 # ===========================================================================
 
 statement ok
@@ -16,11 +16,54 @@ COPY (SELECT c AS CHROM, g AS "GROUP", 0 AS x FROM (VALUES ('1'),('2')) a(c), (V
 TO '{TEST_DIR}/data' (FORMAT csv, PARTITION_BY (CHROM, "GROUP"));
 
 statement ok
-COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct')) TO '{TEST_DIR}/data/CHROM=1/GROUP=A/cell' (FORMAT pfile);
+COPY (SELECT c AS CHROM, 0 AS x FROM (VALUES ('1'),('2')) a(c)) TO '{TEST_DIR}/refv' (FORMAT csv, PARTITION_BY (CHROM));
+
+statement ok
+COPY (SELECT g AS "GROUP", 0 AS x FROM (VALUES ('A'),('B')) b(g)) TO '{TEST_DIR}/refs' (FORMAT csv, PARTITION_BY ("GROUP"));
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/data/CHROM=1/GROUP=A/cell' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/data/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S3', 'S4']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/data/CHROM=2/GROUP=A/cell' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/data/CHROM=2/GROUP=B/cell' (FORMAT pfile, samples ['S3', 'S4']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/refv/CHROM=1/blk' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/refv/CHROM=2/blk' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/refs/GROUP=A/blk' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/refs/GROUP=B/blk' (FORMAT pfile, samples ['S3', 'S4']);
 
 # Hand-written v2 catalog.
 statement ok
-COPY (SELECT '{"pfile_catalog":2,"dataset":"dense","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":4},{"value":"2","start":4,"stop":10}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":3},{"value":"B","start":3,"stop":6}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"ref/CHROM={CHROM}/block.pvar","psam":"ref/GROUP={GROUP}/block.psam"}}')
+COPY (SELECT '{"pfile_catalog":2,"dataset":"dense","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
 TO '{TEST_DIR}/matrix_dense.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
 
 query I
@@ -29,8 +72,8 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json');
 4
 
 query TTTT
-SELECT ends_with(prefix, 'CHROM=1/GROUP=A/cell'), ends_with(pvar, 'ref/CHROM=1/block.pvar'),
-       ends_with(psam, 'ref/GROUP=A/block.psam'), dataset
+SELECT ends_with(prefix, 'CHROM=1/GROUP=A/cell'), ends_with(pvar, 'refv/CHROM=1/blk.pvar'),
+       ends_with(psam, 'refs/GROUP=A/blk.psam'), dataset
 FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json') WHERE keys['CHROM'] = '1' AND keys['GROUP'] = 'A';
 ----
 true	true	true	dense
@@ -46,16 +89,53 @@ query IIIII
 SELECT source_ordinal, variant_start, variant_stop, sample_start, sample_stop
 FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json') ORDER BY source_ordinal;
 ----
-0	0	4	0	3
-1	0	4	3	6
-2	4	10	0	3
-3	4	10	3	6
+0	0	3	0	2
+1	0	3	2	4
+2	3	4	0	2
+3	3	4	2	4
 
-# Verification is not wired for v2 yet: no cell may claim to be verified.
+# Every returned cell is verified (a lie throws instead).
 query I
 SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json') WHERE verified;
 ----
-0
+4
+
+# verify_all is accepted on a matrix catalog (every cell is a survivor until pruning lands).
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', verify_all := true) WHERE verified;
+----
+4
+
+# A variant span that disagrees with the shared .pvar (CHROM=1 really has 3 variants) -> count mismatch.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"bad","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":2},{"value":"2","start":2,"stop":3}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/bad_vspan.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/bad_vspan.pfile.json');
+----
+verification failed (count mismatch)
+
+# A sample span that disagrees with the shared .psam (GROUP=B really has 2 samples) -> count mismatch.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"bad","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":5}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/bad_sspan.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/bad_sspan.pfile.json');
+----
+verification failed (count mismatch)
+
+# A cell whose .pgen header disagrees with its block companions (the cell holds 1 variant, the .pvar 3).
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/data/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json');
+----
+verification failed (count mismatch)
 
 # ---------------------------------------------------------------------------
 # Negative fixtures

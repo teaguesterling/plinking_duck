@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -773,6 +774,43 @@ void VerifyWidthAndRange(ClientContext &context, ShardEntry &e, const string &co
 	}
 }
 
+//! Verify v2 matrix survivors. Per cell: the `.pgen`-header-vs-companion check (VerifyCounts — each cell
+//! is its own `.pgen`). Per DISTINCT companion (M `.pvar`, N `.psam`, probed once and cached): the
+//! declared span width must equal the real row count. Throws on the first lie.
+void VerifyMatrixCells(ClientContext &context, FileSystem &fs, const vector<MatrixCell> &cells) {
+	std::unordered_map<string, int64_t> pvar_count, psam_count;
+	for (auto &c : cells) {
+		ShardEntry e;
+		e.prefix = c.prefix;
+		e.pvar = c.pvar;
+		e.psam = c.psam;
+		VerifyCounts(context, fs, e);
+
+		auto pv = pvar_count.find(c.pvar);
+		if (pv == pvar_count.end()) {
+			pv = pvar_count.emplace(c.pvar, QueryPvarStats(context, c.pvar, c.prefix).count).first;
+		}
+		int64_t vwidth = c.variant_stop - c.variant_start;
+		if (vwidth != pv->second) {
+			throw InvalidInputException("read_pfile_catalog: verification failed (count mismatch): cell '%s': "
+			                            "variant span declares %lld variants ([%lld, %lld)) but the .pvar has %lld",
+			                            c.prefix, (long long)vwidth, (long long)c.variant_start,
+			                            (long long)c.variant_stop, (long long)pv->second);
+		}
+		auto ps = psam_count.find(c.psam);
+		if (ps == psam_count.end()) {
+			ps = psam_count.emplace(c.psam, QueryPsamCount(context, c.psam, c.prefix)).first;
+		}
+		int64_t swidth = c.sample_stop - c.sample_start;
+		if (swidth != ps->second) {
+			throw InvalidInputException("read_pfile_catalog: verification failed (count mismatch): cell '%s': "
+			                            "sample span declares %lld samples ([%lld, %lld)) but the .psam has %lld",
+			                            c.prefix, (long long)swidth, (long long)c.sample_start,
+			                            (long long)c.sample_stop, (long long)ps->second);
+		}
+	}
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -815,7 +853,7 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 
 	// ---- version routing: a v2 matrix catalog takes its own parse + schema (the v1 path below is untouched).
 	if (IsMatrixCatalog(content)) {
-		for (auto &np : {"region", "variant_index", "sample_index", "verify_all"}) {
+		for (auto &np : {"region", "variant_index", "sample_index"}) {
 			auto it = input.named_parameters.find(np);
 			if (it != input.named_parameters.end() && !it->second.IsNull()) {
 				throw InvalidInputException("read_pfile_catalog: invalid predicate: %s is not supported for a "
@@ -827,6 +865,8 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		result->is_matrix = true;
 		result->dataset = mcat.dataset;
 		result->cells = BuildCells(mcat, fs);
+		// No pruning yet, so every cell is a survivor: verify them all (verify_all is therefore implied).
+		VerifyMatrixCells(context, fs, result->cells);
 		names = {"dataset",      "prefix",      "pvar",           "psam", "variant_start", "variant_stop",
 		         "sample_start", "sample_stop", "source_ordinal", "keys", "verified"};
 		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
@@ -987,8 +1027,8 @@ static void PfileCatalogScan(ClientContext &context, TableFunctionInput &data_p,
 			}
 			output.data[9].SetValue(
 			    i, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(ks), std::move(vs)));
-			// Verification is not wired for v2 yet (next task): never claim a cell is verified.
-			output.data[10].SetValue(i, Value::BOOLEAN(false));
+			// Every returned cell was verified at bind (a failure throws).
+			output.data[10].SetValue(i, Value::BOOLEAN(true));
 		}
 		gstate.row_idx += n;
 		output.SetCardinality(n);
