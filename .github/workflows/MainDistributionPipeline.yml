@@ -128,21 +128,84 @@ jobs:
       # "could not load" into `require plinking_duck: FAILED` instead of a silent
       # skip (the `T` test pattern reaches `make test_release` via ci_phase.py).
       test_config: '{"test_env_variables": {"T": "--test-flags \"--require plinking_duck\" \"test/*\""}}'
+  # RESOLVE main TO A (commit, version) PAIR. `duckdb_version: main` reached the
+  # build as DUCKDB_VERSION=main, and duckdb main's CMakeLists.txt reads that env var
+  # as its explicit version, so the library reports 'vmain' while the extension is
+  # stamped 'main'. The loader refuses that pair and every test SKIPS at its require
+  # line while the leg reports success. Measured HERE on 112c317 (run 40972741397):
+  #
+  #   -- git hash ed0443f18a, version main, extension folder main
+  #   0 passed, 95 skipped in 1s        <- linux_amd64 AND osx_arm64, conclusion success
+  #
+  # The version is computed the way duckdb's own CMake does for a dev build:
+  # v<scripts/ci/release_version.txt>.0-dev<git rev-list --count HEAD>. The `-dev`
+  # suffix does two jobs: it stops the engine treating the string as a release (what
+  # 'vmain' could not do), and it keeps the string inside ci_phase.py's
+  # STAGED_DUCKDB_VERSION_PATTERN, so no staged version is ever substituted behind it.
+  # Staging has no prebuilt for a main commit, so ci-tools builds from source.
+  #
+  # Unlike `duckdb-next-ref` above, this resolver does NOT walk back: it does not need
+  # a staged build, so the tip always works.
+  #
+  # `--filter=tree:0` is deliberate and is NOT `blob:none`: `rev-list --count` needs
+  # the whole commit history, only its trees are skippable.
+  #
+  # Canonical text: duckdb_scalarfs at 6271b22, now proven on seven sibling repos.
+  duckdb-main-ref:
+    name: Canary build — resolve DuckDB main
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+          # Commits only: rev-list --count needs the whole history, not its trees.
+          git clone --quiet --filter=tree:0 --no-checkout --single-branch --branch main \
+              https://github.com/duckdb/duckdb.git "$tmp/duckdb"
+          commit=$(git -C "$tmp/duckdb" rev-parse HEAD)
+          release=$(git -C "$tmp/duckdb" show HEAD:scripts/ci/release_version.txt | tr -d '[:space:]')
+          count=$(git -C "$tmp/duckdb" rev-list --count HEAD)
+          version="v${release}.0-dev${count}"
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.0-dev[0-9]+$ ]]; then
+            echo "::error::could not build a dev version for duckdb main at $commit (got '$version')"
+            exit 1
+          fi
+          echo "duckdb main -> $commit, version $version"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   # ADVISORY canary on DuckDB `main`, the line beyond 2.0. Pushes to main and
   # dispatch only, never pull requests: a PR rollup would go red for a line
   # nothing ships against. `main` moves under the cyanoptera gate above, so a red
   # here is a warning about upstream churn, not necessarily a bug in the change.
+  # A red canary after this change is a REAL FINDING, not a reason to revert it.
   duckdb-main-canary:
     name: Canary — build against DuckDB main (advisory)
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: duckdb-main-ref
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: main
+      duckdb_version: ${{ needs.duckdb-main-ref.outputs.version }}
+      duckdb_commit: ${{ needs.duckdb-main-ref.outputs.commit }}
       ci_tools_version: main
       extension_name: plinking_duck
       # Same plink-ng portability exclusions as the stable leg below -- they are
       # plink-ng source issues, independent of the DuckDB version.
       exclude_archs: 'linux_amd64_musl;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+      # THE GUARD. Fixing the version is only half of it: without
+      # `--require plinking_duck` a load failure stays a silent skip that reports
+      # success, which is exactly how `0 passed, 95 skipped` survived on this leg.
+      # With the guard the same condition reads `require plinking_duck: FAILED`.
+      # The token is the literal this repo's own tests use, measured with
+      # `grep -rhoE '^require [a-z_]+' test/ | sort -u` (which gives `parquet` and
+      # `plinking_duck`), never derived from EXT_NAME.
+      test_config: '{"test_env_variables": {"T": "--test-flags \"--require plinking_duck\" \"test/*\""}}'
 
   # THE SHIPPING LINE, promoted from v1.5.6 to v2.0.0 (2026-10-26). The commit is
   # upstream's v2.0.0 release TAG, measured today:
