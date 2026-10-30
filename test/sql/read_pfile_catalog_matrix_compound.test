@@ -231,6 +231,23 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', sample
 ----
 3
 
+# FINDING A: a numeric IID STRING must NOT be silently cast to a sample INDEX (a wrong, non-empty cohort).
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', samples := ['1']);
+----
+samples by IID is not yet supported
+
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', samples := ['S1']);
+----
+samples by IID is not yet supported
+
+# FINDING D: a partially-numeric interval bound ('15000abc') must throw, not parse to 15000.
+statement error
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/compound.pfile.json', keys := {'CHUNK': ['10000', '15000abc']});
+----
+invalid predicate
+
 # ---------------------------------------------------------------------------
 # value_bin age — interval overlap on the binned value, driven by a bounds list in `keys`.
 # ---------------------------------------------------------------------------

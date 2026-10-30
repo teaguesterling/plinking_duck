@@ -229,6 +229,19 @@ AxisDef ParseAxis(const string &path, yyjson_val *axis_val, const char *expected
 
 	yyjson_val *blocks = yyjson_obj_get(axis_val, "blocks");
 	bool has_legacy_values = out.keys.size() == 1 && yyjson_obj_get(yyjson_arr_get_first(keys), "values");
+	if (out.keys.size() > 1 && blocks) {
+		// 'values' is the single-key form only; beside 'blocks' on a multi-key axis it is stale/ambiguous, never
+		// silently ignored. (Without 'blocks' the generic needs-a-'blocks' error below applies.)
+		size_t kidx, kmax;
+		yyjson_val *kk;
+		yyjson_arr_foreach(keys, kidx, kmax, kk) {
+			if (yyjson_obj_get(kk, "values")) {
+				ParseError(path, StringUtil::Format("axis '%s' key '%s' carries a 'values' array, which is only valid "
+				                                    "on a single-key axis; declare the tiling in 'blocks'",
+				                                    expected_name, out.keys[kidx].name));
+			}
+		}
+	}
 	if (blocks) {
 		if (has_legacy_values) {
 			ParseError(path, StringUtil::Format("axis '%s' has both 'blocks' and a single-key 'values' list; use "

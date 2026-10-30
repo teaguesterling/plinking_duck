@@ -4,6 +4,8 @@
 
 require plinking_duck
 
+require parquet
+
 # ===========================================================================
 # FIXTURE — dense 2x2 grid: variants split by CHROM={1,2} (one shared .pvar each: 3 and 1 variants),
 # samples split by GROUP={A,B} (one shared .psam each: 2 samples). 4 cells data/CHROM=i/GROUP=j/cell.pgen,
@@ -411,3 +413,46 @@ statement error
 SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json', keys := {'ZZZ': ['x']});
 ----
 invalid predicate
+
+# FINDING E: a stale single-key 'values' array on a MULTI-key axis is ambiguous and must throw, not be ignored.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"stale","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3}]},{"name":"X","type":"enum"}],"blocks":[{"keys":{"CHROM":"1","X":"a"},"start":0,"stop":3}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":2}]}],"template":{"pfile":"c_{CHROM}_{X}_{GROUP}","pvar":"v_{CHROM}_{X}.pvar","psam":"s_{GROUP}.psam"}}')
+TO '{TEST_DIR}/stale_values.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/stale_values.pfile.json');
+----
+'values'
+
+# FINDING C: the unsupported-version message names BOTH supported versions.
+statement ok
+COPY (SELECT '{"pfile_catalog":9,"dataset":"x"}')
+TO '{TEST_DIR}/ver9.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/ver9.pfile.json');
+----
+supports versions 1 and 2
+
+# FINDING B: companions that exist ONLY as .pvar.parquet / .psam.parquet sidecars while the template names
+# the text spelling must verify (the 1-D reader would find the sidecar), not raise file-not-found.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/sc_1_A' (FORMAT pfile, samples ['S1', 'S2'], pvar '{TEST_DIR}/sc_throw.pvar', psam '{TEST_DIR}/sc_throw.psam');
+
+statement ok
+COPY (SELECT * FROM read_pvar('{TEST_DIR}/sc_throw.pvar')) TO '{TEST_DIR}/scv_1.pvar.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT * FROM read_psam('{TEST_DIR}/sc_throw.psam')) TO '{TEST_DIR}/scs_A.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"sidecar","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"}],"blocks":[{"keys":{"CHROM":"1"},"start":0,"stop":3}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":2}]}],"template":{"pfile":"sc_{CHROM}_{GROUP}","pvar":"scv_{CHROM}.pvar","psam":"scs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/sidecar.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+query TT
+SELECT verified, ends_with(pvar, 'scv_1.pvar.parquet') AND ends_with(psam, 'scs_A.psam.parquet')
+FROM read_pfile_catalog('{TEST_DIR}/sidecar.pfile.json');
+----
+true	true

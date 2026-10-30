@@ -147,3 +147,15 @@ statement error
 SELECT * FROM read_pfile_catalog('{TEST_DIR}/holes_notarr.pfile.json');
 ----
 must be an array
+
+# FINDING F: the companion-collision check is keyed to a block's FIRST PRESENT cell, not grid position (0,0).
+# Two variant-blocks (CHROM=1/P=a, CHROM=1/P=b) both resolve hv_{CHROM}.pvar -> hv_1.pvar; the hole removes the
+# first grid cell (a, A). Keyed to (0,0) the collision would go unseen; keyed to first-present it is caught.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"coll","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum"},{"name":"P","type":"enum"}],"blocks":[{"keys":{"CHROM":"1","P":"a"},"start":0,"stop":1},{"keys":{"CHROM":"1","P":"b"},"start":1,"stop":2}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum"}],"blocks":[{"keys":{"GROUP":"A"},"start":0,"stop":1},{"keys":{"GROUP":"B"},"start":1,"stop":2}]}],"holes":[{"CHROM":"1","P":"a","GROUP":"A"}],"template":{"pfile":"c_{CHROM}_{P}_{GROUP}","pvar":"hv_{CHROM}.pvar","psam":"hs_{GROUP}.psam"}}')
+TO '{TEST_DIR}/holes_collide.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/holes_collide.pfile.json');
+----
+the same .pvar

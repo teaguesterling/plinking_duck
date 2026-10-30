@@ -292,8 +292,8 @@ PfileCatalog ParseCatalog(FileSystem &fs, const string &path, const string &cont
 	}
 	if (version != PFILE_CATALOG_VERSION) {
 		throw InvalidInputException("read_pfile_catalog: catalog parse error: '%s' unsupported 'pfile_catalog' "
-		                            "version %lld (this reader supports %lld)",
-		                            path, (long long)version, (long long)PFILE_CATALOG_VERSION);
+		                            "version %lld (this reader supports versions 1 and 2)",
+		                            path, (long long)version);
 	}
 	cat.version = version;
 
@@ -903,6 +903,26 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		result->is_matrix = true;
 		result->dataset = mcat.dataset;
 		result->cells = BuildCells(mcat, fs);
+		// A templated companion that does not exist may exist as a `.pvar.parquet` / `.psam.parquet` sidecar;
+		// resolve it the way read_pfile does (parquet first), so verify and the emitted path agree with 1-D.
+		{
+			std::unordered_map<string, string> resolved;
+			auto resolve = [&](const string &p, const char *ext) {
+				if (fs.FileExists(p)) {
+					return p;
+				}
+				auto it = resolved.find(p);
+				if (it == resolved.end()) {
+					string found = FindCompanionFileWithParquet(context, fs, p, {ext});
+					it = resolved.emplace(p, found.empty() ? p : found).first;
+				}
+				return it->second;
+			};
+			for (auto &c : result->cells) {
+				c.pvar = resolve(c.pvar, ".pvar");
+				c.psam = resolve(c.psam, ".psam");
+			}
+		}
 
 		MatrixPredicates preds;
 		// ---- keys := MAP(VARCHAR, VARCHAR[]): enum membership, OR a 2-element [lo,hi] overlap on an
@@ -945,8 +965,13 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 					BoundPredicate bp;
 					bp.key_name = kname;
 					try {
-						bp.lo = std::stoll(vals[0]);
-						bp.hi = std::stoll(vals[1]);
+						// The whole string must be an integer: '15000abc' is an error, not 15000.
+						size_t used_lo = 0, used_hi = 0;
+						bp.lo = std::stoll(vals[0], &used_lo);
+						bp.hi = std::stoll(vals[1], &used_hi);
+						if (used_lo != vals[0].size() || used_hi != vals[1].size()) {
+							throw std::invalid_argument("trailing characters");
+						}
 					} catch (std::exception &) {
 						throw InvalidInputException("read_pfile_catalog: invalid predicate: keys['%s'] bound "
 						                            "[%s, %s] is not integer",
@@ -999,6 +1024,11 @@ static unique_ptr<FunctionData> PfileCatalogBind(ClientContext &context, TableFu
 		if (np_samples != input.named_parameters.end() && !np_samples->second.IsNull()) {
 			preds.has_samples = true;
 			for (auto &v : ListValue::GetChildren(np_samples->second)) {
+				if (v.type().id() == LogicalTypeId::VARCHAR) {
+					// A numeric IID string would otherwise be cast to a sample INDEX: a silent wrong cohort.
+					throw InvalidInputException("read_pfile_catalog: invalid predicate: samples by IID is not yet "
+					                            "supported; pass 0-based sample indices");
+				}
 				if (v.IsNull()) {
 					throw InvalidInputException("read_pfile_catalog: invalid predicate: samples contains a NULL index");
 				}
@@ -1247,7 +1277,7 @@ void RegisterPfileCatalogReader(ExtensionLoader &loader) {
 	                        {"region", LogicalType::VARCHAR},
 	                        {"variant_index", LogicalType::ANY},
 	                        {"sample_index", LogicalType::ANY},
-	                        {"samples", LogicalType::LIST(LogicalType::BIGINT)},
+	                        {"samples", LogicalType::LIST(LogicalType::ANY)},
 	                        {"verify_all", LogicalType::BOOLEAN}});
 	CompatSetCaptureArgumentAliases(fn);
 	RegisterTableWithDesc(

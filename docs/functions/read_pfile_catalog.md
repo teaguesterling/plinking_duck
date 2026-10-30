@@ -23,7 +23,7 @@ read_pfile_catalog(path VARCHAR
        variant_index := ANY,
        sample_index := ANY,
        keys := MAP(VARCHAR, VARCHAR[]),
-       samples := BIGINT[],
+       samples := ANY,
        verify_all := BOOLEAN]) -> TABLE
 ```
 
@@ -36,7 +36,7 @@ read_pfile_catalog(path VARCHAR
 | `variant_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the variants axis. Keeps shards whose `partition` overlaps the **inclusive** index predicate `[lo, hi]`. Valid **only** when `concat_dim = 'variants'`. |
 | `sample_index` | `ANY` (2-element list `[lo, hi]`) | *(none)* | Index prune on the samples axis, inclusive `[lo, hi]`. Valid **only** when `concat_dim = 'samples'`. |
 | `keys` | `MAP(VARCHAR, VARCHAR[])` | *(none)* | **Version 2 only.** Prune by key. See [Matrix catalogs](#matrix-catalogs-version-2). A version-1 catalog rejects it. |
-| `samples` | `BIGINT[]` | *(none)* | **Version 2 only.** Keep cells whose sample-block holds one of the listed sample indices. A version-1 catalog rejects it. |
+| `samples` | `ANY` (list of `BIGINT`) | *(none)* | **Version 2 only.** Keep cells whose sample-block holds one of the listed sample indices. Pass 0-based integer indices; a string (IID) element raises `invalid predicate`, because IID lookup is not supported yet. A version-1 catalog rejects it. |
 | `verify_all` | `BOOLEAN` | `false` | When `true`, verify **every** shard (counts + declared range) *before* pruning, closing the dropped-shard hole; otherwise only the survivors are verified. |
 
 !!! warning "`variant_index` is INCLUSIVE `[lo, hi]` — not `read_pfile`'s `variant_range`"
@@ -204,6 +204,10 @@ failure raises at bind. For each verified cell the reader checks:
 - the block's declared POS bound against the real `.pvar` POS extent, when the variants
   axis has an `ordinal_interval` over `POS`. A bound that does not cover the real extent
   is a `range under-claim`.
+
+The `verified` column does **not** cover `value_bin` key bounds. A `value_bin` bound
+(for example an age bin) has no stored column to check against, so `verify_all` cannot
+catch a stale bin. Only the `CHROM` and `POS` bounds above are checked against data.
 
 The errors use the same prefixes as in [Error taxonomy](#error-taxonomy).
 
