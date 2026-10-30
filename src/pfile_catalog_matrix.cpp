@@ -615,7 +615,7 @@ vector<MatrixCell> PruneCells(const MatrixCatalog &cat, const vector<MatrixCell>
 
 		// region: variant-axis CHROM membership (verbatim) + POS-window overlap against the POS key.
 		if (preds.has_region) {
-			string chrom = c.keys.size() ? cat.variants.blocks[c.variant_block].ValueOf("CHROM") : "";
+			string chrom = !c.keys.empty() ? cat.variants.blocks[c.variant_block].ValueOf("CHROM") : "";
 			if (chrom != preds.region_contig) {
 				keep = false;
 			} else if (pos_key) {
