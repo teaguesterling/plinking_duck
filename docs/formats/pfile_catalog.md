@@ -499,50 +499,75 @@ cohort/
   cells/CHROM=1/GROUP=A/cell.pgen, …           one .pgen per cell
 ```
 
-One query assembles the catalog. The two axes and their key names are literals. The
-`values` arrays come from the disk:
+One query assembles the catalog. The two axes and their key names are literals. The blocks
+of each axis come from the files on disk, and a running count turns each block's size into
+its contiguous `[start, stop)` ordinal span. The array order you emit **is** the axis order
+(the format tiles the blocks as listed), so each axis is ordered on purpose: the variant
+axis by an **explicit karyotypic contig order**, the sample axis by file order (groups have
+no canonical order).
 
 ```sql
 COPY (
   WITH
-  -- Variant blocks: CHROM is a column of the .pvar, so one GROUP BY counts them.
-  variant_blocks AS (
+  -- The contig order is EXPLICIT — one row per contig, in the order you want them tiled
+  -- (karyotypic here). Use your own contig names (a 'chr' prefix is fine, be consistent). A
+  -- contig absent from this table fails loud below, so none is silently dropped or misordered.
+  contig_order(value, rank) AS (VALUES
+    ('1',1),('2',2),('3',3),('4',4),('5',5),('6',6),('7',7),('8',8),('9',9),('10',10),
+    ('11',11),('12',12),('13',13),('14',14),('15',15),('16',16),('17',17),('18',18),
+    ('19',19),('20',20),('21',21),('22',22),('X',23),('Y',24),('XY',25),('MT',26)),
+  -- Variant blocks: read_pvar gives each contig and its count; contig_order fixes the order.
+  -- The LEFT JOIN + coalesce(…, error(…)) raises on any contig missing from contig_order.
+  variant_counts AS (
     SELECT CHROM AS value, count(*) AS n
     FROM read_pvar('cohort/variants/*.pvar') GROUP BY CHROM),
+  variant_ranked AS (
+    SELECT c.value, c.n,
+           coalesce(o.rank,
+             error('pfile_catalog: contig ' || c.value || ' is missing from contig_order')) AS rank
+    FROM variant_counts c LEFT JOIN contig_order o USING (value)),
   variant_vals AS (
-    SELECT value, (sum(n) OVER w) - n AS start, sum(n) OVER w AS stop
-    FROM variant_blocks WINDOW w AS (ORDER BY value ROWS UNBOUNDED PRECEDING)),
-  -- Sample blocks: GROUP is in the companion path, so read it from the filename.
-  sample_blocks AS (
+    SELECT value,
+           row_number() OVER w - 1      AS idx,    -- block position along the axis
+           (sum(n) OVER w)::BIGINT - n   AS start,  -- running ordinal: where this block begins
+           (sum(n) OVER w)::BIGINT       AS stop
+    FROM variant_ranked
+    WINDOW w AS (ORDER BY rank ROWS UNBOUNDED PRECEDING)),
+  -- Sample blocks: GROUP is in the companion path; glob fixes the order, read_csv counts.
+  sample_files AS (
+    SELECT file, regexp_extract(file, 'GROUP=([^/.]+)', 1) AS value
+    FROM glob('cohort/samples/*.psam')),
+  sample_counts AS (
     SELECT regexp_extract(filename, 'GROUP=([^/.]+)', 1) AS value, count(*) AS n
     FROM read_csv('cohort/samples/*.psam', filename := true, delim := '\t',
                   header := true, all_varchar := true)
     GROUP BY value),
   sample_vals AS (
-    SELECT value, (sum(n) OVER w) - n AS start, sum(n) OVER w AS stop
-    FROM sample_blocks WINDOW w AS (ORDER BY value ROWS UNBOUNDED PRECEDING)),
-  v AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY start) AS arr FROM variant_vals),
-  s AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY start) AS arr FROM sample_vals)
-  SELECT to_json({
-    'pfile_catalog': 2,
-    'dataset': 'cohort',
-    'axes': [
-      {'name': 'variants', 'keys': [{'name': 'CHROM', 'type': 'enum', 'values': v.arr}]},
-      {'name': 'samples',  'keys': [{'name': 'GROUP', 'type': 'enum', 'values': s.arr}]}
-    ],
-    'template': {
-      'pfile': 'cells/CHROM={CHROM}/GROUP={GROUP}/cell',
-      'pvar':  'variants/CHROM={CHROM}.pvar',
-      'psam':  'samples/GROUP={GROUP}.psam'
-    }
-  }) FROM v, s
-) TO 'cohort/cohort.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+    SELECT f.value,
+           row_number() OVER w - 1         AS idx,
+           (sum(c.n) OVER w)::BIGINT - c.n  AS start,
+           (sum(c.n) OVER w)::BIGINT        AS stop
+    FROM sample_files f JOIN sample_counts c USING (value)
+    WINDOW w AS (ORDER BY f.file ROWS UNBOUNDED PRECEDING)),
+  v AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY idx) AS arr FROM variant_vals),
+  s AS (SELECT list({'value': value, 'start': start, 'stop': stop} ORDER BY idx) AS arr FROM sample_vals)
+  SELECT
+    2        AS pfile_catalog,
+    'cohort' AS dataset,
+    [ {'name': 'variants', 'keys': [{'name': 'CHROM', 'type': 'enum', 'values': v.arr}]},
+      {'name': 'samples',  'keys': [{'name': 'GROUP', 'type': 'enum', 'values': s.arr}]} ] AS axes,
+    {'pfile': 'cells/CHROM={CHROM}/GROUP={GROUP}/cell',
+     'pvar':  'variants/CHROM={CHROM}.pvar',
+     'psam':  'samples/GROUP={GROUP}.psam'} AS template
+  FROM v, s
+) TO 'cohort/cohort.pfile.json' (FORMAT json);
 ```
 
-`to_json` builds the JSON from the struct. The `COPY … (FORMAT csv, QUOTE '', ESCAPE
-'')` options write the one JSON string to the file verbatim, with no CSV quoting. The
-window functions turn each block's count into a contiguous `[start, stop)` span, which
-the axis tiling requires. The result is a normal catalog:
+`COPY … (FORMAT json)` writes each result row as one JSON object, keyed by the column
+names — so this single row is the whole catalog object, with no quoting to undo. `idx` is
+each block's position on its axis and the running `sum` is its ordinal; `sum` returns a
+128-bit total, so the spans are cast to `BIGINT`, which the parser reads. The result is a
+normal catalog:
 
 ```sql
 SELECT keys['CHROM'] AS chrom, keys['GROUP'] AS grp,
@@ -551,8 +576,17 @@ SELECT keys['CHROM'] AS chrom, keys['GROUP'] AS grp,
 FROM read_pfile_catalog('cohort/cohort.pfile.json');
 ```
 
-Two notes:
+Three notes:
 
+- **Contig order is the author's job, and lexicographic order is wrong for it.** A variant
+  axis keyed by `CHROM` must tile in karyotypic order (`1, 2, …, 22, X, Y, XY, MT`). File or
+  lexicographic order puts `CHROM=10` before `CHROM=2`, so the variant ordinal stops tracking
+  genomic position. The example fixes the order with an explicit `contig_order` table — one row
+  per contig, written in your own contig names and in the order you want. A contig absent from
+  the table fails loud (the `coalesce(…, error(…))` guard), so none is silently dropped or
+  sorted to an undefined position. The sample axis has no canonical order, so file order is
+  fine there. `verified` checks each block's width against its own `.pvar` and that the blocks
+  tile with no gap or overlap; it does **not** check that the order is genomic. That is on you.
 - This is the single-`enum`-key form, where each block is one `value`. An
   `ordinal_interval` key (a `CHUNK` over `POS`) also needs per-block `bounds`. Compute
   them with `min(POS)` and `max(POS)` per block and emit the `blocks` form instead (see
