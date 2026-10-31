@@ -79,21 +79,27 @@ TO '{TEST_DIR}/sample_GROUP=B' (FORMAT pfile, samples ['SAMPLE3','SAMPLE4']);
 statement ok
 COPY (
   WITH
+  -- Contig order is EXPLICIT (one row per contig, in the order to tile). '2' precedes '10' —
+  -- the tick order IS the span order (§6). A contig absent here fails loud (statement error below).
+  contig_order(value, rank) AS (VALUES
+    ('1',1),('2',2),('3',3),('4',4),('5',5),('6',6),('7',7),('8',8),('9',9),('10',10),
+    ('11',11),('12',12),('13',13),('14',14),('15',15),('16',16),('17',17),('18',18),
+    ('19',19),('20',20),('21',21),('22',22),('X',23),('Y',24),('XY',25),('MT',26)),
   variant_counts AS (
     SELECT CHROM AS value, count(*) AS n
     FROM read_pvar('{TEST_DIR}/variant_CHROM=*.pvar') GROUP BY CHROM),
+  variant_ranked AS (
+    SELECT c.value, c.n,
+           coalesce(o.rank,
+             error('pfile_catalog: contig ' || c.value || ' is missing from contig_order')) AS rank
+    FROM variant_counts c LEFT JOIN contig_order o USING (value)),
   variant_vals AS (
     SELECT value,
            row_number() OVER w - 1      AS idx,
            (sum(n) OVER w)::BIGINT - n   AS start,
            (sum(n) OVER w)::BIGINT       AS stop
-    FROM variant_counts
-    -- KARYOTYPIC contig order, enumerated explicitly (NOT a sort of the value): the tick order IS
-    -- the span order (§6). list_position returns 1..N along the canonical list, so '2' precedes '10'.
-    WINDOW w AS (ORDER BY list_position(
-                   ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18',
-                    '19','20','21','22','X','Y','XY','MT'], value)
-                 ROWS UNBOUNDED PRECEDING)),
+    FROM variant_ranked
+    WINDOW w AS (ORDER BY rank ROWS UNBOUNDED PRECEDING)),
   sample_files AS (
     SELECT file, regexp_extract(file, 'GROUP=([^/.]+)', 1) AS value
     FROM glob('{TEST_DIR}/sample_GROUP=*.psam')),
@@ -163,3 +169,17 @@ ORDER BY source_ordinal;
 ----
 2	A
 2	B
+
+# FAIL-LOUD GUARD: a contig absent from contig_order must raise, never silently drop or misorder.
+# Here contig_order omits '10', so building the variant axis over the same fixture raises on it.
+statement error
+WITH contig_order(value, rank) AS (VALUES ('2', 2)),
+     variant_counts AS (
+       SELECT CHROM AS value, count(*) AS n
+       FROM read_pvar('{TEST_DIR}/variant_CHROM=*.pvar') GROUP BY CHROM)
+SELECT c.value,
+       coalesce(o.rank,
+         error('pfile_catalog: contig ' || c.value || ' is missing from contig_order')) AS rank
+FROM variant_counts c LEFT JOIN contig_order o USING (value);
+----
+contig 10 is missing from contig_order

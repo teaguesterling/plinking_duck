@@ -509,21 +509,30 @@ no canonical order).
 ```sql
 COPY (
   WITH
-  -- Variant blocks: read_pvar gives each contig and its variant count. Order the blocks by an
-  -- EXPLICIT karyotypic contig list — NOT file/lexicographic order, which puts '10' before '2'.
+  -- The contig order is EXPLICIT — one row per contig, in the order you want them tiled
+  -- (karyotypic here). Use your own contig names (a 'chr' prefix is fine, be consistent). A
+  -- contig absent from this table fails loud below, so none is silently dropped or misordered.
+  contig_order(value, rank) AS (VALUES
+    ('1',1),('2',2),('3',3),('4',4),('5',5),('6',6),('7',7),('8',8),('9',9),('10',10),
+    ('11',11),('12',12),('13',13),('14',14),('15',15),('16',16),('17',17),('18',18),
+    ('19',19),('20',20),('21',21),('22',22),('X',23),('Y',24),('XY',25),('MT',26)),
+  -- Variant blocks: read_pvar gives each contig and its count; contig_order fixes the order.
+  -- The LEFT JOIN + coalesce(…, error(…)) raises on any contig missing from contig_order.
   variant_counts AS (
     SELECT CHROM AS value, count(*) AS n
     FROM read_pvar('cohort/variants/*.pvar') GROUP BY CHROM),
+  variant_ranked AS (
+    SELECT c.value, c.n,
+           coalesce(o.rank,
+             error('pfile_catalog: contig ' || c.value || ' is missing from contig_order')) AS rank
+    FROM variant_counts c LEFT JOIN contig_order o USING (value)),
   variant_vals AS (
     SELECT value,
-           row_number() OVER w - 1       AS idx,    -- block position along the axis
-           (sum(n) OVER w)::BIGINT - n    AS start,  -- running ordinal: where this block begins
-           (sum(n) OVER w)::BIGINT        AS stop
-    FROM variant_counts
-    WINDOW w AS (ORDER BY list_position(
-                   ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18',
-                    '19','20','21','22','X','Y','XY','MT'], value)
-                 ROWS UNBOUNDED PRECEDING)),
+           row_number() OVER w - 1      AS idx,    -- block position along the axis
+           (sum(n) OVER w)::BIGINT - n   AS start,  -- running ordinal: where this block begins
+           (sum(n) OVER w)::BIGINT       AS stop
+    FROM variant_ranked
+    WINDOW w AS (ORDER BY rank ROWS UNBOUNDED PRECEDING)),
   -- Sample blocks: GROUP is in the companion path; glob fixes the order, read_csv counts.
   sample_files AS (
     SELECT file, regexp_extract(file, 'GROUP=([^/.]+)', 1) AS value
@@ -572,12 +581,12 @@ Three notes:
 - **Contig order is the author's job, and lexicographic order is wrong for it.** A variant
   axis keyed by `CHROM` must tile in karyotypic order (`1, 2, …, 22, X, Y, XY, MT`). File or
   lexicographic order puts `CHROM=10` before `CHROM=2`, so the variant ordinal stops tracking
-  genomic position. The example orders this axis by an explicit contig list with
-  `list_position`, matching PLINK's chromosome codes (X=23, Y=24, XY=25, MT=26). Contigs
-  outside the list — and `chr`-prefixed names — tile last; extend the list to place them. The
-  sample axis has no canonical order, so file order is fine there. `verified` checks each
-  block's width against its own `.pvar` and that the blocks tile with no gap or overlap; it
-  does **not** check that the order is genomic. That is on you.
+  genomic position. The example fixes the order with an explicit `contig_order` table — one row
+  per contig, written in your own contig names and in the order you want. A contig absent from
+  the table fails loud (the `coalesce(…, error(…))` guard), so none is silently dropped or
+  sorted to an undefined position. The sample axis has no canonical order, so file order is
+  fine there. `verified` checks each block's width against its own `.pvar` and that the blocks
+  tile with no gap or overlap; it does **not** check that the order is genomic. That is on you.
 - This is the single-`enum`-key form, where each block is one `value`. An
   `ordinal_interval` key (a `CHUNK` over `POS`) also needs per-block `bounds`. Compute
   them with `min(POS)` and `max(POS)` per block and emit the `blocks` form instead (see
