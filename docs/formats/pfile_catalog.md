@@ -499,30 +499,31 @@ cohort/
   cells/CHROM=1/GROUP=A/cell.pgen, …           one .pgen per cell
 ```
 
-One query assembles the catalog. The two axes and their key names are literals. Each
-axis's blocks come from the files on disk: `glob` lists them in file order, which fixes
-the block order (`idx`), and a running count turns each block's size into its contiguous
-`[start, stop)` ordinal span. The array order you emit **is** the axis order — the
-format tiles the blocks in the order they are listed.
+One query assembles the catalog. The two axes and their key names are literals. The blocks
+of each axis come from the files on disk, and a running count turns each block's size into
+its contiguous `[start, stop)` ordinal span. The array order you emit **is** the axis order
+(the format tiles the blocks as listed), so each axis is ordered on purpose: the variant
+axis by an **explicit karyotypic contig order**, the sample axis by file order (groups have
+no canonical order).
 
 ```sql
 COPY (
   WITH
-  -- Variant blocks: glob fixes the block ORDER (file position). read_pvar cannot report
-  -- a filename, so take CHROM from the path and the per-block counts from its column.
-  variant_files AS (
-    SELECT file, regexp_extract(file, 'CHROM=([^/.]+)', 1) AS value
-    FROM glob('cohort/variants/*.pvar')),
+  -- Variant blocks: read_pvar gives each contig and its variant count. Order the blocks by an
+  -- EXPLICIT karyotypic contig list — NOT file/lexicographic order, which puts '10' before '2'.
   variant_counts AS (
     SELECT CHROM AS value, count(*) AS n
     FROM read_pvar('cohort/variants/*.pvar') GROUP BY CHROM),
   variant_vals AS (
-    SELECT f.value,
-           row_number() OVER w - 1         AS idx,    -- block position along the axis
-           (sum(c.n) OVER w)::BIGINT - c.n  AS start,  -- running ordinal: where this block begins
-           (sum(c.n) OVER w)::BIGINT        AS stop
-    FROM variant_files f JOIN variant_counts c USING (value)
-    WINDOW w AS (ORDER BY f.file ROWS UNBOUNDED PRECEDING)),
+    SELECT value,
+           row_number() OVER w - 1       AS idx,    -- block position along the axis
+           (sum(n) OVER w)::BIGINT - n    AS start,  -- running ordinal: where this block begins
+           (sum(n) OVER w)::BIGINT        AS stop
+    FROM variant_counts
+    WINDOW w AS (ORDER BY list_position(
+                   ['1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18',
+                    '19','20','21','22','X','Y','XY','MT'], value)
+                 ROWS UNBOUNDED PRECEDING)),
   -- Sample blocks: GROUP is in the companion path; glob fixes the order, read_csv counts.
   sample_files AS (
     SELECT file, regexp_extract(file, 'GROUP=([^/.]+)', 1) AS value
@@ -554,10 +555,10 @@ COPY (
 ```
 
 `COPY … (FORMAT json)` writes each result row as one JSON object, keyed by the column
-names — so this single row is the whole catalog object, with no quoting to undo. The
-block order is the file order from `glob`, not a sort of `value`; `idx` is each block's
-position on the axis and the running `sum` is its ordinal. `sum` returns a 128-bit total,
-so the spans are cast to `BIGINT`, which the parser reads. The result is a normal catalog:
+names — so this single row is the whole catalog object, with no quoting to undo. `idx` is
+each block's position on its axis and the running `sum` is its ordinal; `sum` returns a
+128-bit total, so the spans are cast to `BIGINT`, which the parser reads. The result is a
+normal catalog:
 
 ```sql
 SELECT keys['CHROM'] AS chrom, keys['GROUP'] AS grp,
@@ -568,11 +569,15 @@ FROM read_pfile_catalog('cohort/cohort.pfile.json');
 
 Three notes:
 
-- The block order is whatever `glob` returns, which is **lexicographic by path**, not
-  genomic — `CHROM=10.pvar` sorts before `CHROM=2.pvar`. The format accepts any tiling
-  order: the span is a label, and `verified` checks each block's width against its own
-  `.pvar`, never a global row order. So this is a labelling choice, not a bug. For genomic
-  order, replace `ORDER BY f.file` with a contig rank (or any sort key) you supply.
+- **Contig order is the author's job, and lexicographic order is wrong for it.** A variant
+  axis keyed by `CHROM` must tile in karyotypic order (`1, 2, …, 22, X, Y, XY, MT`). File or
+  lexicographic order puts `CHROM=10` before `CHROM=2`, so the variant ordinal stops tracking
+  genomic position. The example orders this axis by an explicit contig list with
+  `list_position`, matching PLINK's chromosome codes (X=23, Y=24, XY=25, MT=26). Contigs
+  outside the list — and `chr`-prefixed names — tile last; extend the list to place them. The
+  sample axis has no canonical order, so file order is fine there. `verified` checks each
+  block's width against its own `.pvar` and that the blocks tile with no gap or overlap; it
+  does **not** check that the order is genomic. That is on you.
 - This is the single-`enum`-key form, where each block is one `value`. An
   `ordinal_interval` key (a `CHUNK` over `POS`) also needs per-block `bounds`. Compute
   them with `min(POS)` and `max(POS)` per block and emit the `blocks` form instead (see
