@@ -81,12 +81,21 @@ endif()
 # time if not already applied — `git apply --reverse --check` succeeds only when the
 # patch is already present, so re-running (or a fresh submodule) is safe. The drift
 # canary (scripts/check_vendored_drift.sh) treats these as the intended delta.
+#
+# A packager can apply the patches before CMake runs (Spack, a distro build). When the hook
+# is already in pgenlib_read.cc, skip this step, so that the build does not need git.
 set(PLINK_NG_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/plink-ng)
 file(GLOB PLINK_NG_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/patches/plink-ng/*.patch)
 list(SORT PLINK_NG_PATCHES)
-find_package(Git QUIET)
-if(PLINK_NG_PATCHES AND NOT Git_FOUND)
-    message(FATAL_ERROR "git is required to apply patches/plink-ng/*.patch but was not found")
+file(READ ${PGENLIB_DIR}/pgenlib_read.cc _pgenlib_read_src)
+if(_pgenlib_read_src MATCHES "plinking_pgen_fopen")
+    message(STATUS "plink-ng patches already applied; git is not needed")
+    set(PLINK_NG_PATCHES "")
+else()
+    find_package(Git QUIET)
+    if(PLINK_NG_PATCHES AND NOT Git_FOUND)
+        message(FATAL_ERROR "git is required to apply patches/plink-ng/*.patch but was not found")
+    endif()
 endif()
 foreach(_patch ${PLINK_NG_PATCHES})
     execute_process(
@@ -108,6 +117,7 @@ endforeach()
 # prove this (on a local path Path L and Path V produce identical output), so if
 # `git apply` ever silently no-ops in a CI checkout, THIS fails the build loudly
 # instead of shipping a feature-less binary that still passes every test.
+# Read the file again: the apply step above can have changed it.
 file(READ ${PGENLIB_DIR}/pgenlib_read.cc _pgenlib_read_src)
 if(NOT _pgenlib_read_src MATCHES "plinking_pgen_fopen")
     message(
