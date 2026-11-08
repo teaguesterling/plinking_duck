@@ -859,6 +859,13 @@ void VerifyMatrixCells(ClientContext &context, FileSystem &fs, const MatrixCatal
 
 } // namespace
 
+//! Public wrapper over the file-local ParseCatalog, so the ATTACH storage extension can resolve a
+//! v1 catalog's shards (prefix/pvar/psam) without re-implementing the parse. The reader's own
+//! callers keep using the anonymous-namespace ParseCatalog directly.
+PfileCatalog ParseV1Catalog(FileSystem &fs, const string &path, const string &content) {
+	return ParseCatalog(fs, path, content);
+}
+
 // ---------------------------------------------------------------------------
 // Bind / scan
 // ---------------------------------------------------------------------------

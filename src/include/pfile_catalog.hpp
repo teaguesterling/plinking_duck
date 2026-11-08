@@ -90,4 +90,10 @@ struct PfileCatalog {
 	vector<ShardEntry> files;
 };
 
+//! Parse + resolve a v1 catalog (single-fileset 'pfile' or multi-file 'concat_dim'+'files'),
+//! resolving prefix/pvar/psam (folding the shared companion). Public wrapper over the reader's
+//! file-local parser, for the ATTACH storage extension.
+class FileSystem;
+PfileCatalog ParseV1Catalog(FileSystem &fs, const string &path, const string &content);
+
 } // namespace duckdb

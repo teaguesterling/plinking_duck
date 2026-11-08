@@ -1,5 +1,6 @@
 #include "pfile_catalog_storage.hpp"
 #include "pfile_catalog_matrix.hpp"
+#include "pfile_catalog.hpp"
 #include "pfile_catalog_util.hpp"
 
 #include "duckdb/parser/parser.hpp"
@@ -112,6 +113,18 @@ static string BuildPsamUnionSql(const vector<string> &psams) {
 	return sql;
 }
 
+//! v1 block tiling. v1's manifest carries one concat axis of `partition_start/stop` + `concat_dim`;
+//! the other axis is shared (one block, extent not declared). `axis` is "variant" or "sample".
+static string BuildV1BlockSql(const string &path_sql, const string &concat_dim, const string &axis) {
+	bool axis_is_concat = (concat_dim == axis + "s") || (concat_dim.empty() && axis == "variant");
+	if (axis_is_concat) {
+		return "SELECT DISTINCT partition_start AS " + axis + "_start, partition_stop AS " + axis +
+		       "_stop FROM read_pfile_catalog(" + path_sql + ") ORDER BY 1";
+	}
+	// Shared axis: one block; the v1 manifest does not declare the shared-axis extent.
+	return "SELECT NULL::BIGINT AS " + axis + "_start, NULL::BIGINT AS " + axis + "_stop";
+}
+
 static string ReadWholeFile(FileSystem &fs, const string &path) {
 	string content;
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
@@ -134,46 +147,61 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	string catalog_path = info.path;
 	string content = ReadWholeFile(fs, catalog_path);
 
-	// Parse + resolve the surviving cell grid (opens no data files).
-	auto matrix = ParseMatrixCatalog(fs, catalog_path, content);
-	auto cells = BuildCells(matrix, fs, /*include_holes=*/false);
-
+	// Resolve the cell list (prefix/pvar/psam per surviving cell) for ANY catalog kind, plus the
+	// per-kind structural-view SQL. The matrix (v2) and v1 parsers already resolve + fold companions.
+	// Absolute catalog path so the lazy views (which re-parse the file) resolve the same regardless of
+	// the cwd at query time, matching the attach-time-resolved absolute cell prefixes.
+	string path_sql = SQLString::ToString(AbsPath(fs, catalog_path));
 	vector<string> cell_prefixes;
 	vector<string> pvar_paths;
 	vector<string> psam_paths;
-	for (auto &cell : cells) {
-		if (cell.present) {
-			cell_prefixes.push_back(cell.prefix);
-			PushUnique(pvar_paths, cell.pvar);
-			PushUnique(psam_paths, cell.psam);
+	string variant_blocks_sql;
+	string sample_blocks_sql;
+
+	auto take_cell = [&](const string &prefix, const string &pvar, const string &psam) {
+		// An omitted companion (a single-fileset sidecar may leave .pvar/.psam out) falls back to the
+		// conventional <prefix>.pvar / <prefix>.psam; read_pfile discovers its own for genotypes.
+		cell_prefixes.push_back(prefix);
+		PushUnique(pvar_paths, pvar.empty() ? prefix + ".pvar" : pvar);
+		PushUnique(psam_paths, psam.empty() ? prefix + ".psam" : psam);
+	};
+
+	if (IsMatrixCatalog(content)) {
+		auto matrix = ParseMatrixCatalog(fs, catalog_path, content);
+		for (auto &cell : BuildCells(matrix, fs, /*include_holes=*/false)) {
+			if (cell.present) {
+				take_cell(cell.prefix, cell.pvar, cell.psam);
+			}
 		}
+		variant_blocks_sql = BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop");
+		sample_blocks_sql = BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop");
+	} else {
+		auto cat = ParseV1Catalog(fs, catalog_path, content);
+		for (auto &e : cat.files) {
+			take_cell(e.prefix, e.pvar, e.psam);
+		}
+		variant_blocks_sql = BuildV1BlockSql(path_sql, cat.concat_dim, "variant");
+		sample_blocks_sql = BuildV1BlockSql(path_sql, cat.concat_dim, "sample");
 	}
 
-	// An all-holes catalog has no data to read. The shipped read_pfile/read_pvar reject an empty
-	// file list, so rather than fabricate reader schemas we fail loud here. (Consistency note:
-	// read_pfile_catalog returns empty for all-holes; giving read_pfile an empty-list path is a
-	// separate reader change — flagged in the ledger.)
+	// A catalog with no present cells has nothing to read (the shipped readers reject an empty list).
 	if (cell_prefixes.empty()) {
-		throw InvalidInputException("ATTACH pfile_catalog '%s': the catalog has no present cells "
-		                            "(all cells are holes); nothing to attach",
+		throw InvalidInputException("ATTACH pfile_catalog '%s': the catalog has no present cells; "
+		                            "nothing to attach",
 		                            catalog_path);
 	}
 
-	// Bake the per-relation SQL over the shipped readers. Use the ABSOLUTE catalog path so the
-	// lazy structural views (cells/blocks, which re-parse the file) resolve the same regardless of
-	// the cwd at query time, matching the attach-time-resolved absolute cell prefixes (finding 3).
-	string path_sql = SQLString::ToString(AbsPath(fs, catalog_path));
+	// Bake the per-relation SQL over the shipped readers (one builder per relation, so P13-006 can
+	// swap c.genotypes's backing to the pushdown cascade in one place).
 	vector<std::pair<Identifier, string>> views;
 	views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ")");
-	views.emplace_back(Identifier("cells"), "SELECT * FROM read_pfile_catalog(" + path_sql + ")");
-	views.emplace_back(Identifier("variant_blocks"),
-	                   BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop"));
-	views.emplace_back(Identifier("sample_blocks"),
-	                   BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop"));
-	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
-	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));
 	views.emplace_back(Identifier("genotypes_by_sample"),
 	                   "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ", orient := 'sample')");
+	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
+	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));
+	views.emplace_back(Identifier("cells"), "SELECT * FROM read_pfile_catalog(" + path_sql + ")");
+	views.emplace_back(Identifier("variant_blocks"), variant_blocks_sql);
+	views.emplace_back(Identifier("sample_blocks"), sample_blocks_sql);
 
 	// Build a native in-memory catalog seeded with those views. The backing storage is :memory:,
 	// which cannot be opened read-only — so force READ_WRITE here even if the user passed READ_ONLY;

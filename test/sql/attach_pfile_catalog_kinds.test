@@ -1,0 +1,51 @@
+# name: test/sql/attach_pfile_catalog_kinds.test
+# description: ATTACH (TYPE pfile_catalog) works for v1 single-fileset and multi-file catalogs, not only the v2 matrix
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ---------------------------------------------------------------------------
+# v1 single-fileset: the sidecar points at one fileset (test/data/large_example).
+# Before P13-005 this ATTACH raised "not a version-2 matrix catalog".
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/pfile_catalog_single.pfile.json' AS s (TYPE pfile_catalog);
+
+# c.genotypes = read_pfile over the one fileset (self-checking, no hardcoded count).
+query T
+SELECT (SELECT count(*) FROM s.genotypes) =
+       (SELECT count(*) FROM read_pfile('test/data/large_example'));
+----
+true
+
+# c.variants = read_pvar over the fileset's .pvar (companion discovered from the prefix).
+query T
+SELECT (SELECT count(*) FROM s.variants) =
+       (SELECT count(*) FROM read_pvar('test/data/large_example.pvar'));
+----
+true
+
+# c.samples is non-empty; c.cells is the one-row manifest.
+query T
+SELECT count(*) > 0 FROM s.samples;
+----
+true
+
+query I
+SELECT count(*) FROM s.cells;
+----
+1
+
+# genotypes_by_sample: same fileset, sample-oriented.
+query T
+SELECT (SELECT count(*) FROM s.genotypes_by_sample) =
+       (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'sample'));
+----
+true
+
+# read-only still holds for a v1 attach.
+statement error
+CREATE TABLE s.scratch AS SELECT 1;
+----
