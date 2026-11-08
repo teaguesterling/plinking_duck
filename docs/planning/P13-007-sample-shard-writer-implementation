@@ -1,0 +1,159 @@
+# P13-007 Sample-Sharding Writer — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (inline) to implement
+> this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** `COPY (…) TO 'out' (FORMAT pfile, shard_samples {label: [iids], …})` writes a sample-sharded
+cohort — one shared `.pvar`, per-shard `.pgen`/`.psam`, a `concat_dim:"samples"` catalog.
+
+**Architecture:** Extend `src/pfile_writer.cpp`'s `FORMAT pfile` bundle. Bind parses + validates the
+`shard_samples` map against the resolved IID list. The write path holds N per-shard sinks open over one
+row stream, writes the shared `.pvar` once and each shard's genotype slice to its own `.pgen`, writes
+each shard's `.psam` out-of-band from its IID slice, and emits the catalog last.
+
+**Tech Stack:** C++17, DuckDB v2.0 CopyFunction API, pgenlib (`STPgenWriter`), the existing
+pvar/pgen/psam sub-writers.
+
+**Spec:** `docs/planning/P13-007-sample-shard-writer` (this branch). Read it — it holds the inversion,
+the merge contract, the §4 decision (C), and the engineering.
+
+## Global Constraints
+
+- **v2.0.0-only.** Builds via Slurm: `srun -n 1 -c 12 --mem=32G -p batch -t 300 make` (cold worktree
+  build vendors DuckDB, long; incremental short). Set DuckDB `memory_limit` below `--mem` in any probe.
+- **Split spec = C (named IID groups), DECIDED.** `shard_samples {label: ['iid', …], …}`.
+- **New test file** `test/sql/write_pfile_sample_shard.test` — NOT the shared
+  `attach_pfile_catalog_kinds.test` (P13-008 edits that).
+- **Catalog = P13-008's tested fixture** `pfile_catalog_le_samples.pfile.json` on
+  `feature/P13-008-sample-concat`, field-for-field (`pfile_catalog:1`, `dataset`, `concat_dim:"samples"`,
+  `shared.pvar`, `files[].{prefix,psam,partition:{start,stop,source_ordinal}}`; partition = global
+  sample ordinals, half-open, contiguous `[0 … total)`).
+- **Do NOT lift the ATTACH `concat_dim=="samples"` reject** — P13-008 owns that edit.
+- **Variant-orient input only; no transpose.** Reject sample-orient input and a bare `TINYINT[N]` LIST
+  (no identity).
+- **No regression** to the plain single bundle or the variant `shard_by` path. Full suite
+  (`./build/release/test/unittest '[sql]'`, ~12k assertions) stays green.
+- Commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` + the `Claude-Session:` line.
+
+## Review Focus
+
+- **Mid-stream failure across N shards.** An upstream error (bad cast) or a per-shard write failure must
+  orphan NO staging across any of the N shards + shared `.pvar` + catalog. Test: force a failure after
+  some shards opened; assert no staging files and no final files remain. (Task 2.)
+- **Slice correctness across genotype shapes.** The per-shard slice must be right for a STRUCT genotypes
+  column (subset of struct fields) AND a `samples`-identified LIST (index range of the per-variant
+  vector). Test both shapes round-trip. (Task 2.)
+- **Contiguity / exact-partition enforcement.** A group that is non-contiguous in input sample order, or
+  that drops/duplicates/adds an IID, must be a clean BinderException — never a silent reorder (which
+  would make the catalog's global ordinals misdescribe the output). Test each. (Task 1.)
+- **Catalog partition ordinals.** `start/stop` are global sample ordinals, not per-shard counts; last
+  `stop` == total samples. Test the exact ranges. (Task 3.)
+- **Single-sample and single-shard edges.** A one-sample shard, and `shard_samples` with one group
+  (== the plain bundle but via the sharded path), both write valid filesets. (Task 2/3.)
+
+---
+
+### Task 1: `shard_samples` bind — parse, validate, gate
+
+**Files:**
+- Modify: `src/pfile_writer.cpp` (the `PfileWriteBindData` + `PfileCopyBind` region, ~1340–1520; add a
+  parser beside `TryParseSamplesOption`/`TryStructIidsFromSchema`)
+- Test: `test/sql/write_pfile_sample_shard.test` (new)
+
+**Interfaces:**
+- Consumes: `ResolveIdentity(input, struct_iids, is_struct)` → the ordered `vector<string>` of IIDs;
+  `input.info.options`; the `variant_fields {…}` STRUCT-option parse as the precedent for a map literal.
+- Produces: a `vector<SampleShard>` on `PfileWriteBindData`, where
+  `struct SampleShard { string label; idx_t lo; idx_t hi; };` — `[lo,hi)` is the shard's half-open
+  range of sample positions in the resolved IID order; `label` is the map key. Empty vector ⇒ not
+  sample-shard mode. Also a `bool sample_shard_mode`.
+
+- [ ] **Step 1: Write the failing error-path tests.** In the new `.test`, cases that fail at BIND
+  (before any file write), each `statement error` with a stable message substring:
+  - `shard_by` + `shard_samples` together → error naming the V2 grid follow-on.
+  - a group whose IIDs are not a contiguous run of the input order → "contiguous".
+  - groups that drop / duplicate / add an IID vs. the resolved set → "partition" / "every sample once".
+  - sample-orient input (no variant columns / `orient:='sample'` source) → rejected.
+  - a bare `TINYINT[N]` genotypes LIST (no identity) with `shard_samples` → the existing identity error.
+- [ ] **Step 2: Run them, verify they FAIL** (currently `shard_samples` is an unknown option / ignored).
+  Run: `srun -n 1 -c 12 --mem=32G -p ci -t 20 ./build/release/test/unittest 'test/sql/write_pfile_sample_shard.test'`
+  Expected: FAIL (option unrecognized or no error raised).
+- [ ] **Step 3: Implement `ParseSampleShards(input, iids) -> vector<SampleShard>`** in
+  `src/pfile_writer.cpp`. Parse the `shard_samples` STRUCT option (keys = labels, values = LIST of
+  VARCHAR), map each IID to its index in `iids`, require each group be a contiguous `[lo,hi)` run,
+  require the groups exactly tile `[0, iids.size())` with no gap/overlap/dup, preserve map order. Wire it
+  into `PfileCopyBind`: gate `shard_by` vs `shard_samples`, reject sample-orient + bare LIST (reuse the
+  existing identity checks), store the result on the bind data.
+- [ ] **Step 4: Run the tests, verify they PASS.** Same command. Expected: PASS.
+- [ ] **Step 5: Commit** (`feat(P13-007): shard_samples bind — parse + validate + gate`).
+
+### Task 2: the write path — N shards, slice, atomic finalize
+
+**Files:**
+- Modify: `src/pfile_writer.cpp` (`PfileWriteGlobalState`, `PfileCopyInitGlobal`, `PfileCopySink`,
+  `PfileCopyFinalize`, `CleanupPartial`/`PromoteStaging`)
+- Test: `test/sql/write_pfile_sample_shard.test`
+
+**Interfaces:**
+- Consumes: Task 1's `vector<SampleShard>` + `sample_shard_mode`; the existing `PvarWriteGlobalState`,
+  `PgenWriteGlobalState`, `WritePsamFromIids`.
+- Produces: N per-shard filesets under `out`'s hive layout (`out/<label>/…` or `out/<label>.pgen` —
+  match the variant sharder's `PfileBaseName`/hive convention) + one shared `out.pvar`. Catalog is Task 3.
+
+- [ ] **Step 1: Write the failing per-shard round-trip test.** `COPY (SELECT * FROM
+  read_pfile('test/data/large_example', genotypes:='struct')) TO '{TEST_DIR}/ss' (FORMAT pfile,
+  shard_samples {a: [<first IID>], b: [<next 2>], c: [<rest>]});` then, per shard,
+  `SELECT count(*) FROM read_pfile('{TEST_DIR}/ss/<label>', pvar := '{TEST_DIR}/ss.pvar')` equals the
+  source variant count, and the shard's genotypes equal the source projected to that shard's IIDs
+  (compare via `genotypes:='struct'` field subset). Also assert BOTH genotype input shapes: a second
+  COPY whose source is a `samples [...]`-identified LIST.
+- [ ] **Step 2: Run it, verify it FAILS** (sink ignores `shard_samples`; shards not written).
+  Expected: FAIL (missing files / count mismatch).
+- [ ] **Step 3: Implement the N-shard write path.** Global state holds a `vector` of per-shard sinks
+  (each: staging `.pgen` via `STPgenWriter`, staging `.psam` path, the `[lo,hi)` range) + one staging
+  shared `.pvar` + the shard IID slices. `InitGlobal`: open the shared `.pvar` staging + N `.pgen`
+  stagings; write each shard's `.psam` from its IID slice (out-of-band). `Sink`: write each variant row
+  to the shared `.pvar` once, then each shard's `.pgen` the genotype slice for `[lo,hi)`. `Finalize`:
+  promote `.pvar` → all `.psam` → all `.pgen` (each `.pgen` last within its shard). Extend
+  `CleanupPartial` to remove ALL N shards' staging + shared `.pvar` staging.
+- [ ] **Step 4: Run the test, verify it PASSES.** Expected: PASS.
+- [ ] **Step 5: Write the mid-stream-failure test** (Review Focus): a COPY whose SELECT throws partway
+  (e.g. a cast error after N rows) with `shard_samples` → `statement error`, then assert no `ss*` files
+  remain under `{TEST_DIR}` (no orphaned staging, no finals). Run → it should pass with the destructor
+  cleanup from Step 3; if not, fix cleanup (systematic-debugging).
+- [ ] **Step 6: Commit** (`feat(P13-007): N-shard write path — slice + atomic finalize`).
+
+### Task 3: catalog emission + shape verification
+
+**Files:**
+- Modify: `src/pfile_writer.cpp` (catalog write in `Finalize`, after all shard promotions)
+- Test: `test/sql/write_pfile_sample_shard.test`
+
+**Interfaces:**
+- Consumes: Task 2's promoted shard set + `vector<SampleShard>` (labels + ranges = partition ordinals).
+- Produces: `out.pfile.json` — `concat_dim:"samples"`, `shared.pvar` = the shared pvar basename, one
+  `files[]` entry per shard with `prefix`, `psam`, `partition:{start:lo, stop:hi, source_ordinal:i}`.
+
+- [ ] **Step 1: Verify the merge contract first (non-code).**
+  Run: `git show feature/P13-008-sample-concat:test/data/pfile_catalog_le_samples.pfile.json`
+  Confirm field names/nesting; note any divergence from the spec's §3 block and follow the fixture.
+- [ ] **Step 2: Write the failing catalog-shape test.** Over the Task-2 output:
+  `read_pfile_catalog_metadata('{TEST_DIR}/ss.pfile.json')` / `_layout` → `concat_dim='samples'`, one
+  shared pvar, 3 files; partition ranges exactly `[0,1),[1,3),[3,N)`; last `stop` == source sample count.
+- [ ] **Step 3: Run it, verify it FAILS** (no catalog emitted yet). Expected: FAIL (file not found).
+- [ ] **Step 4: Implement the catalog write** in `Finalize`, emitted LAST (after every shard promoted),
+  matching the fixture byte-shape. Staged + promoted last so a half-written cohort has no catalog.
+- [ ] **Step 5: Run the test, verify it PASSES.** Then run the FULL suite
+  `srun -n 1 -c 12 --mem=32G -p batch -t 120 ./build/release/test/unittest '[sql]'` — assert no
+  regression (plain bundle + variant `shard_by` still green).
+- [ ] **Step 6: Add the DEFERRED tests as commented TODO** in the `.test` file: the concatenate
+  round-trip (`combine_samples:='concatenate'`) and the ATTACH of the catalog, each with a note
+  "un-comment after P13-008 merges; do not lift the ATTACH reject here."
+- [ ] **Step 7: Commit** (`feat(P13-007): emit concat_dim:samples catalog`).
+
+---
+
+## Phasing after the build
+
+1. Fresh whole-branch review (most capable model), fix Critical/Important, PR.
+2. After P13-008 merges: rebase, un-comment the deferred concatenate + ATTACH tests, confirm green.
