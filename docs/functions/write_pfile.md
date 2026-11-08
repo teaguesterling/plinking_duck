@@ -235,8 +235,14 @@ shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar
   missing `CHROM` role.
 - **Not combinable** with `shard_by` (sharding both axes is a planned follow-on) or
   with `pvar`/`pgen`/`psam` path overrides (the layout generates every path).
-- **Memory:** every variant row goes to every shard, so N `.pgen` writers are open
-  at once. That is N times the single-writer memory. There is no cap on N.
+- **Memory and file handles.** Unlike `shard_by`, which keeps one writer open at a
+  time, every variant row goes to every shard, so all N `.pgen` writers are open
+  at once. Each one reserves about 1.5 bytes per variant of `variant_count` (about
+  25 MB at the default 2²⁴) and holds 2 file handles. So a COPY needs N times that
+  memory and 2N handles. To reduce it, pass a smaller `variant_count` (an upper
+  bound on the variants written), or use fewer groups. The COPY fails at bind,
+  before any file is created, when the estimate exceeds the host's memory or the
+  open-file limit (`ulimit -n`).
 - **Failure leaves nothing.** Files open on the first row. Any failure, including an
   upstream query error mid-stream, removes every staging file and every directory
   the COPY created (only if empty). On success the writer promotes the `.pvar`,

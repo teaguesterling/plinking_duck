@@ -175,9 +175,12 @@ Specify:
 - **Cleanup.** The destructor and the finalize-failure path remove **all N**
   shards' staging (`.pgen`/`.pgen.tmp`/`.psam`) + the shared `.pvar` staging +
   the catalog staging. Extend the existing `CleanupPartial` to loop N.
-- **Memory.** N open `STPgenWriter`s is N× the single-writer footprint. Document
-  it; do not cap in v1 (the variant sharder does not cap shard count either),
-  but note a cap as a follow-on if N is large.
+- **Memory.** N open `STPgenWriter`s is N× the single-writer footprint and 2N file
+  handles. This is NOT like the variant sharder, which rolls ONE writer at a time
+  (1× footprint). Each writer reserves ~1.5 bytes × `variant_count` (~25 MB at 2^24).
+  Built (2026-11-08, peer review relaying Teague's decision): documented, plus a
+  conservative bind-time guard that rejects an N exceeding the open-file limit or the
+  host's memory, naming `variant_count` / fewer groups.
 
 ## 7. Test plan
 

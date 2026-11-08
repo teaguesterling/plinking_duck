@@ -17,6 +17,9 @@
 #include <limits>
 #include <set>
 #include <unordered_map>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 namespace duckdb {
 
@@ -1907,9 +1910,12 @@ void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
 //   COPY (SELECT … ORDER BY CHROM, POS) TO 'out'
 //     (FORMAT pfile, shard_samples {a: ['s1'], b: ['s2', 's3'], …});
 //
-// The mirror of shard_by: every variant row goes to EVERY shard, each taking its own
-// contiguous slice of the per-sample calls, so N .pgen writers are open at once (N× the
-// single-writer memory; not capped, like shard_by). Layout (the catalog records it):
+// The mirror of shard_by — but NOT its cost model. shard_by rolls ONE open writer at a time;
+// here every variant row goes to EVERY shard, so all N .pgen writers are open AT ONCE. Each
+// reserves ~1.5 bytes x variant_count up front (~25 MB at the 2^24 default) and holds 2 file
+// handles (.pgen + pgenlib's .tmp): N x the memory and 2N handles for the whole COPY. Mitigate
+// with a smaller `variant_count` or fewer groups; CheckSampleShardResources rejects, at bind, an N
+// that cannot fit the handle limit or the host's memory. Layout (the catalog records it):
 //   out.pvar                  — the ONE shared .pvar (variants are identical across shards)
 //   out/<label>/data.pgen     — per shard
 //   out/<label>/data.psam     — per shard: its IID slice. It sits at <prefix>.psam so the reader
@@ -2030,6 +2036,39 @@ void ParseSampleShards(const Value &spec, const vector<string> &iids, PfileWrite
 		                      iids[cursor]);
 	}
 	bind.sample_shard_mode = true;
+}
+
+// Soft guard, at bind (before any file is created): N pgen writers are open at once, so reject an
+// N that would certainly fail mid-COPY — more file handles than the process may open (EMFILE), or
+// an estimated pgenlib reservation larger than the host's memory (OOM). Conservative: it only
+// rejects what cannot work, and names the two mitigations.
+void CheckSampleShardResources(idx_t shard_ct, uint32_t variant_ct_limit) {
+	// Per writer: ~1.5 bytes per variant of the bound (vrec-length + vrtype index), see
+	// kDefaultPgenVariantCtLimit. A lower bound on the real cost, so the guard never over-rejects.
+	const uint64_t per_writer = static_cast<uint64_t>(variant_ct_limit) * 3 / 2;
+	const uint64_t est_bytes = per_writer * shard_ct;
+	auto avail = FileSystem::GetAvailableMemory();
+	if (avail.IsValid() && est_bytes > avail.GetIndex()) {
+		throw BinderException(
+		    "write pfile: shard_samples opens all %llu .pgen writers at once, and each reserves ~1.5 bytes per "
+		    "variant of variant_count=%u: an estimated %llu MB, more than this host's %llu MB. Pass a smaller "
+		    "`variant_count N` (an upper bound on the variants written), or use fewer groups.",
+		    static_cast<unsigned long long>(shard_ct), variant_ct_limit,
+		    static_cast<unsigned long long>(est_bytes >> 20), static_cast<unsigned long long>(avail.GetIndex() >> 20));
+	}
+#ifndef _WIN32
+	// 2 handles per writer (.pgen + .tmp), + the shared .pvar, + headroom for DuckDB itself.
+	const uint64_t need_fds = 2 * static_cast<uint64_t>(shard_ct) + 1 + 64;
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+	    need_fds > static_cast<uint64_t>(rl.rlim_cur)) {
+		throw BinderException("write pfile: shard_samples opens all %llu .pgen writers at once (2 file handles "
+		                      "each), which needs ~%llu open files, but this process may open only %llu (ulimit "
+		                      "-n). Use fewer groups, or raise the open-file limit.",
+		                      static_cast<unsigned long long>(shard_ct), static_cast<unsigned long long>(need_fds),
+		                      static_cast<unsigned long long>(rl.rlim_cur));
+	}
+#endif
 }
 
 struct SampleShardWriter {
@@ -2371,6 +2410,7 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	// --- shard_samples: validate the partition against the resolved IID order ---
 	if (has_shard_samples) {
 		ParseSampleShards(shard_samples_spec, bind->iids, *bind);
+		CheckSampleShardResources(bind->shard_labels.size(), bind->pgen_bind->variant_ct_limit);
 		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
 			throw BinderException("write pfile: shard_samples target '%s' has no filename component for the shard "
 			                      "tree / dataset name — give the COPY target a name, e.g. TO 'out'",
