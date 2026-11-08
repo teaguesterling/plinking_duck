@@ -169,6 +169,11 @@ partition column).
   and the shared `.psam` are durable. A mid-run failure leaves no `.pfile.json`
   and no `.staging` residue; shards that already closed before the failure remain
   on disk, but without the catalog the set reads as incomplete-by-construction.
+- **Overwriting an existing target.** A prior run's `.pfile.json` is removed just
+  before the first shard is promoted, because from then on it would describe a mix
+  of new and old shards. A re-run that fails after that point leaves no catalog
+  (the cohort reads as absent), never a stale one. A re-run that fails earlier
+  leaves the prior cohort intact.
 - **`shard_by` cannot be combined with `pvar`/`pgen`/`psam` path overrides** (the
   sharded layout generates each shard's paths), and the key must be a scalar
   variant column (not the genotypes column). The whole tree is **local-only**, as
@@ -183,8 +188,10 @@ for free as it streams). The shared `.psam` is referenced once under `shared.psa
 
     A shard-key value must be **path-safe** — it becomes a real directory name
     `out/<col>=<value>`. Values with a path separator, `=`, whitespace, a control
-    character, or the names `.`/`..`/empty are rejected with an actionable error
-    (CHROM names and ordinary alphanumeric/`_`/`-` labels are fine).
+    character, a glob metacharacter (`* ? [ ] { }`, because the catalog reader treats
+    a shard prefix as a path pattern), or the names `.`/`..`/empty are rejected with
+    an actionable error (CHROM names, including contigs such as `GL000192.1`, and
+    ordinary alphanumeric/`_`/`-` labels are fine).
 
     Re-running a sharded write to an **existing** target that produces a
     **different** set of keys leaves the prior run's orphaned shard directories on
@@ -246,7 +253,10 @@ shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar
 - **Failure leaves nothing.** Files open on the first row. Any failure, including an
   upstream query error mid-stream, removes every staging file and every directory
   the COPY created (only if empty). On success the writer promotes the `.pvar`,
-  then every `.psam`, then every `.pgen`, then writes the catalog last.
+  then every `.psam`, then every `.pgen`, then writes the catalog last. When it
+  overwrites an existing target, it removes the prior catalog just before the
+  first promotion. A failure during promotion then leaves no catalog, never a
+  stale one, and a failure before promotion leaves the prior cohort intact.
 
 The emitted `.pfile.json` records `shared.pvar`, and per shard its `prefix`, its
 `psam`, and a global half-open `[start, stop)` **sample**-ordinal `partition` that

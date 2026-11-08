@@ -398,3 +398,48 @@ query I
 SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/st.pfile.json');
 ----
 2
+
+# ===========================================================================
+# OVERWRITE — a failure DURING promotion (a final path is blocked by a directory) must not leave the
+# OLD catalog describing a mix of new and old files: it is removed before the first promotion.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pr' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+# Block the final pr/c/data.pgen with a DIRECTORY (PER_THREAD_OUTPUT writes into a dir of that name).
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/pr/c' (FORMAT csv, PER_THREAD_OUTPUT);
+
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/pr/c/data.pgen' (FORMAT csv, PER_THREAD_OUTPUT);
+
+# The re-run promotes pr.pvar, the .psam files and a/data.pgen, then the c/data.pgen rename fails.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pr' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], c: ['SAMPLE3', 'SAMPLE4']});
+----
+rename
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/pr.pfile.json');
+----
+0
+
+# A re-run that fails BEFORE promotion (zero rows) keeps the old cohort and its catalog intact.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pr2' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') WHERE false)
+TO '__TEST_DIR__/pr2' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+----
+no rows
+
+query I
+SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/pr2.pfile.json');
+----
+2
+

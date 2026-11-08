@@ -374,3 +374,74 @@ SELECT (SELECT count(*) FROM glob('__TEST_DIR__/atom.pfile.json'))
      + (SELECT count(*) FROM glob('__TEST_DIR__/atom/CHROM=*/data.*.staging'));
 ----
 0
+
+# ===========================================================================
+# NEGATIVE — a shard-key value with a glob metacharacter (* ? [ ] { }) is rejected: the catalog
+# reader treats each prefix as a path pattern, so 'c[1]' wrote a cohort it could not read back.
+# '.' stays allowed (real contig names such as GL000192.1).
+# ===========================================================================
+
+statement error
+COPY (SELECT * REPLACE ('c[1]' AS CHROM) FROM read_pfile('test/data/pfile_example', genotypes := 'struct') WHERE CHROM = '1' ORDER BY CHROM, POS)
+TO '__TEST_DIR__/globkey' (FORMAT pfile, shard_by 'CHROM');
+----
+glob
+
+statement error
+COPY (SELECT * REPLACE ('chr*' AS CHROM) FROM read_pfile('test/data/pfile_example', genotypes := 'struct') WHERE CHROM = '1' ORDER BY CHROM, POS)
+TO '__TEST_DIR__/globkey' (FORMAT pfile, shard_by 'CHROM');
+----
+glob
+
+statement ok
+COPY (SELECT * REPLACE ('GL000192.1' AS CHROM) FROM read_pfile('test/data/pfile_example', genotypes := 'struct') WHERE CHROM = '1' ORDER BY CHROM, POS)
+TO '__TEST_DIR__/dotkey' (FORMAT pfile, shard_by 'CHROM');
+
+query I
+SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/dotkey.pfile.json');
+----
+1
+
+# ===========================================================================
+# OVERWRITE — once a re-run starts replacing shards, the OLD catalog no longer describes the files
+# on disk, so it is removed before the first shard is promoted. A re-run that fails after that
+# point leaves NO catalog (the cohort reads as absent), never a stale one over mixed shards.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/ov' (FORMAT pfile, shard_by 'CHROM');
+
+query I
+SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/ov.pfile.json');
+----
+2
+
+# Unsorted re-run: CHROM=1 is promoted (replacing the old shard), then '1' reappears -> error.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY POS)
+TO '__TEST_DIR__/ov' (FORMAT pfile, shard_by 'CHROM');
+----
+reappears
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/ov.pfile.json');
+----
+0
+
+# A re-run that fails BEFORE any shard is promoted (here: at bind) keeps the old cohort intact.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/ov2' (FORMAT pfile, shard_by 'CHROM');
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/ov2' (FORMAT pfile, shard_by 'NOPE');
+----
+not in the input
+
+query I
+SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/ov2.pfile.json');
+----
+2
+

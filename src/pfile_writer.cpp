@@ -1582,6 +1582,17 @@ string JsonEscape(const string &s) {
 	return out;
 }
 
+// An overwrite is about to replace files that a PRIOR run's catalog describes. From that moment
+// the old catalog would describe a mix of new and old files, so remove it first: a failure after
+// this point leaves the cohort absent (no catalog), never stale. Called right before the first
+// promotion, so a failure BEFORE any promotion still leaves the prior cohort intact and readable.
+// No-op when there is no prior catalog.
+void RemoveStaleCatalog(FileSystem &fs, const string &catalog_path) {
+	if (fs.FileExists(catalog_path)) {
+		fs.RemoveFile(catalog_path);
+	}
+}
+
 struct PfileShardedGlobalState : public GlobalFunctionData {
 	// resolved config (InitGlobal)
 	string shard_dir_root;     //! the shard-tree dir, e.g. "<dir>/out"
@@ -1687,6 +1698,11 @@ void ValidateShardKeyValue(const string &col, const string &key) {
 		if (c == '=') {
 			reject("contains '=' (the hive label separator)");
 		}
+		if (c == '*' || c == '?' || c == '[' || c == ']' || c == '{' || c == '}') {
+			// The catalog reader resolves each shard prefix as a path PATTERN, so a glob metacharacter
+			// would write a cohort it cannot read back. '.' stays allowed (contigs like GL000192.1).
+			reject("contains a glob metacharacter ('*', '?', '[', ']', '{', '}')");
+		}
 		if (c < 0x20 || c == 0x7f) {
 			reject("contains a control character");
 		}
@@ -1760,6 +1776,9 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 	// rename of a just-created .staging file on a local fs) and harmless — PfileShardClose running
 	// at all means we are mid-COPY, so the .pfile.json (written only at finalize, after every shard)
 	// never lands, and the loader keys off the catalog, so it never sees the orphaned .pvar.
+	if (g.entries.empty()) {
+		RemoveStaleCatalog(fs, g.catalog_path); // the first shard promotion of this COPY
+	}
 	fs.MoveFile(g.cur_pvar_staging, g.cur_pvar_final);
 	fs.MoveFile(g.cur_pgen_staging, g.cur_pgen_final); // LAST
 
@@ -2301,7 +2320,9 @@ void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g
 		}
 		// Promote: the shared .pvar, then every .psam, then every .pgen (each .pgen after its shard's
 		// .psam, as in the bundle), then the catalog LAST. Not atomic as a group — a failure between
-		// renames leaves no catalog, so read_pfile_catalog / ATTACH see the cohort as absent.
+		// renames leaves no catalog (a prior run's catalog is removed first, see RemoveStaleCatalog),
+		// so read_pfile_catalog / ATTACH see the cohort as absent, never stale.
+		RemoveStaleCatalog(fs, g.catalog_path);
 		fs.MoveFile(g.pvar_g.path, g.pvar_final);
 		for (auto &sh : g.shards) {
 			fs.MoveFile(sh.psam_staging, sh.psam_final);
