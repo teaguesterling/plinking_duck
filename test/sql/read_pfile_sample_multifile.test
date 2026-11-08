@@ -83,10 +83,7 @@ SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient 
 ----
 not yet implemented
 
-statement error
-SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], orient := 'sample', combine_samples := 'concatenate');
-----
-not yet implemented
+# combine_samples := 'concatenate' (sample-sharded) is covered in read_pfile_sample_concat.test.
 
 statement error
 SELECT count(*) FROM read_pfile(['test/data/shard1'], orient := 'sample', combine_samples := 'nonsense');

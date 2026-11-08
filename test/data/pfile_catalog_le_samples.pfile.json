@@ -1,0 +1,23 @@
+{
+  "pfile_catalog": 1,
+  "dataset": "le_sampleshards",
+  "concat_dim": "samples",
+  "shared": { "pvar": "large_example.pvar" },
+  "files": [
+    {
+      "prefix": "le_cat_a",
+      "psam": "le_cat_a.psam",
+      "partition": { "start": 0, "stop": 1, "source_ordinal": 0 }
+    },
+    {
+      "prefix": "le_cat_b",
+      "psam": "le_cat_b.psam",
+      "partition": { "start": 1, "stop": 3, "source_ordinal": 1 }
+    },
+    {
+      "prefix": "le_cat_c",
+      "psam": "le_cat_c.psam",
+      "partition": { "start": 3, "stop": 8, "source_ordinal": 2 }
+    }
+  ]
+}

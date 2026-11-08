@@ -117,6 +117,32 @@ rm -f dosage_example.vcf
 #     cp pgen_example.psam pgen_split.psam
 # (pgen_compress writes pgen_split.pgen + the derived pgen_split.pgen.pgi.)
 
+# Sample-sharded fixtures (P13-008, combine_samples := 'concatenate'): each source
+# fileset split by CONTIGUOUS sample ranges with --keep, so the shards share the same
+# variants and concatenating them in order reproduces the original. The source is the
+# test oracle (test/sql/read_pfile_sample_concat.test).
+#   pca_cat_{a,b}:     pca_example samples [0,37) + [37,250) — 37 is not a multiple of 32,
+#                      so the 2-bit/1-bit appends cross word boundaries. pca_cat_b.pvar is
+#                      deleted on purpose: only shard 0's .pvar (or pvar :=) is read.
+#   le_cat_{a,b,c}:    large_example [0,1) + [1,3) + [3,8) — a one-sample shard, 3 shards.
+#   phased_cat_{a,b}:  phased_example [0,1) + [1,4) (phase is kept by --make-pgen).
+#   dosage_cat_{a,b}:  dosage_example [0,1) + [1,4) (dosages are kept by --make-pgen).
+split_by_samples() { # <src> <out> <first 1-based row> <last row>
+    grep -v '^#' "$1.psam" | sed -n "$3,$4p" | cut -f1 > "$2.keep"
+    "$PLINK2" --pfile "$1" --keep "$2.keep" --make-pgen --out "$2" --silent
+    rm -f "$2.keep" "$2.log"
+}
+split_by_samples pca_example pca_cat_a 1 37
+split_by_samples pca_example pca_cat_b 38 250
+rm -f pca_cat_b.pvar
+split_by_samples large_example le_cat_a 1 1
+split_by_samples large_example le_cat_b 2 3
+split_by_samples large_example le_cat_c 4 8
+split_by_samples phased_example phased_cat_a 1 1
+split_by_samples phased_example phased_cat_b 2 4
+split_by_samples dosage_example dosage_cat_a 1 1
+split_by_samples dosage_example dosage_cat_b 2 4
+
 echo "Test data generated successfully."
 echo "Generated files:"
 ls -la pgen_example.pgen pgen_example.pvar pgen_example.psam \

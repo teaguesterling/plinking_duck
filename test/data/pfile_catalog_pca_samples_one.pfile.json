@@ -1,0 +1,13 @@
+{
+  "pfile_catalog": 1,
+  "dataset": "pca_one_sampleshard",
+  "concat_dim": "samples",
+  "shared": { "pvar": "pca_example.pvar" },
+  "files": [
+    {
+      "prefix": "pca_cat_b",
+      "psam": "pca_cat_b.psam",
+      "partition": { "start": 0, "stop": 213, "source_ordinal": 0 }
+    }
+  ]
+}

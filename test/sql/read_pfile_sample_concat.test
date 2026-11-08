@@ -1,0 +1,464 @@
+# name: test/sql/read_pfile_sample_concat.test
+# description: combine_samples := 'concatenate' — sample-sharded filesets (same variants, disjoint samples) read as one cohort. Oracle: concatenating the contiguous sample splits reproduces the unsplit fileset in every mode.
+# group: [sql]
+
+require plinking_duck
+
+# Fixtures (test/data/generate_test_data.sh, split_by_samples): each *_cat_* shard is a
+# contiguous sample range of its source fileset, written by plink2 --keep --make-pgen.
+#   pca_cat_a + pca_cat_b              = pca_example    (37 + 213 samples, 500 variants)
+#   le_cat_a + le_cat_b + le_cat_c     = large_example  (1 + 2 + 5 samples, 3000 variants)
+#   phased_cat_a + phased_cat_b        = phased_example (1 + 3 samples)
+#   dosage_cat_a + dosage_cat_b        = dosage_example (1 + 3 samples)
+# pca_cat_b has NO .pvar on purpose: only shard 0's .pvar (or pvar :=) is read.
+# Each comparison prints (symmetric EXCEPT ALL difference, row count); 0 = identical multisets.
+
+# --- Shape: shared variants, Σ samples, IIDs in shard order ---
+query III
+SELECT count(*), min(len(genotypes)), max(len(genotypes))
+FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate');
+----
+500	250	250
+
+# genotypes := 'columns' names one column per IID, in output sample order (after CHROM..ALT).
+query TTTT
+SELECT c[6], c[42], c[43], c[255] FROM (
+  SELECT list(column_name) AS c FROM (DESCRIBE SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'columns'))
+);
+----
+per0	per36	per37	per249
+
+# Value-level: the first 37 genotypes of each variant are shard a's, the rest shard b's.
+query I
+SELECT count(*) FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate') c
+JOIN read_pfile('test/data/pca_cat_a') a USING (ID)
+JOIN read_pfile('test/data/pca_cat_b', pvar := 'test/data/pca_cat_a.pvar') b USING (ID)
+WHERE c.genotypes::TINYINT[] IS DISTINCT FROM (a.genotypes::TINYINT[] || b.genotypes::TINYINT[]);
+----
+0
+
+# variant orient, default array
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate')));
+----
+0	500
+
+# variant orient, list
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'list') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'list'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'list') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'list'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'list')));
+----
+0	500
+
+# variant orient, columns (one column per IID across both shards)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'columns') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'columns'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'columns') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'columns'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'columns')));
+----
+0	500
+
+# variant orient, struct
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'struct') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'struct'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'struct') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'struct'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'struct')));
+----
+0	500
+
+# variant orient, counts (summed across shards)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'counts') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'counts'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'counts') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'counts'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'counts')));
+----
+0	500
+
+# variant orient, stats
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'stats') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'stats'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'stats') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'stats'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotypes := 'stats')));
+----
+0	500
+
+# sample subset spanning both shards (indices on both sides of the 37 boundary)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [0, 5, 36, 37, 38, 100, 249]) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', samples := [0, 5, 36, 37, 38, 100, 249]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', samples := [0, 5, 36, 37, 38, 100, 249]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [0, 5, 36, 37, 38, 100, 249]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [0, 5, 36, 37, 38, 100, 249])));
+----
+0	500
+
+# sample subset entirely inside shard b (shard a is skipped)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [40, 41, 200]) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', samples := [40, 41, 200]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', samples := [40, 41, 200]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [40, 41, 200]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [40, 41, 200])));
+----
+0	500
+
+# sample subset entirely inside shard a (shard b is skipped)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [1, 2]) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', samples := [1, 2]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', samples := [1, 2]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [1, 2]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := [1, 2])));
+----
+0	500
+
+# sample subset by IID
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := ['per3', 'per36', 'per37', 'per249']) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', samples := ['per3', 'per36', 'per37', 'per249']))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', samples := ['per3', 'per36', 'per37', 'per249']) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := ['per3', 'per36', 'per37', 'per249']))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', samples := ['per3', 'per36', 'per37', 'per249'])));
+----
+0	500
+
+# af_range uses whole-cohort counts
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', af_range := {min: 0.2, max: 0.4}) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', af_range := {min: 0.2, max: 0.4}))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', af_range := {min: 0.2, max: 0.4}) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', af_range := {min: 0.2, max: 0.4}))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', af_range := {min: 0.2, max: 0.4})));
+----
+0	true
+
+# ac_range uses whole-cohort counts
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', ac_range := {min: 100, max: 150}) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', ac_range := {min: 100, max: 150}))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', ac_range := {min: 100, max: 150}) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', ac_range := {min: 100, max: 150}))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', ac_range := {min: 100, max: 150})));
+----
+0	true
+
+# af_range + sample subset
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', af_range := {min: 0.1, max: 0.5}, samples := [0, 36, 37, 249]) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', af_range := {min: 0.1, max: 0.5}, samples := [0, 36, 37, 249]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', af_range := {min: 0.1, max: 0.5}, samples := [0, 36, 37, 249]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', af_range := {min: 0.1, max: 0.5}, samples := [0, 36, 37, 249]))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', af_range := {min: 0.1, max: 0.5}, samples := [0, 36, 37, 249])));
+----
+0	true
+
+# include_genotypes (any_pass + per-element null-out)
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', include_genotypes := ['hom_alt']) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', include_genotypes := ['hom_alt']))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', include_genotypes := ['hom_alt']) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', include_genotypes := ['hom_alt']))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', include_genotypes := ['hom_alt'])));
+----
+0	true
+
+# include_genotypes + missing
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', include_genotypes := ['het', 'missing']) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', include_genotypes := ['het', 'missing']))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', include_genotypes := ['het', 'missing']) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', include_genotypes := ['het', 'missing']))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', include_genotypes := ['het', 'missing'])));
+----
+0	true
+
+# genotype_range alias + subset
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotype_range := {min: 2, max: 2}, samples := [10, 36, 37, 60]) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', genotype_range := {min: 2, max: 2}, samples := [10, 36, 37, 60]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', genotype_range := {min: 2, max: 2}, samples := [10, 36, 37, 60]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotype_range := {min: 2, max: 2}, samples := [10, 36, 37, 60]))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', genotype_range := {min: 2, max: 2}, samples := [10, 36, 37, 60])));
+----
+0	true
+
+# region on the shared variant axis
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', region := '1:1-30000000') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', region := '1:1-30000000'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', region := '1:1-30000000') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', region := '1:1-30000000'))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', region := '1:1-30000000')));
+----
+0	true
+
+# variants := [...] on the shared variant axis
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', variants := [0, 7, 499]) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', variants := [0, 7, 499]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', variants := [0, 7, 499]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', variants := [0, 7, 499]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', variants := [0, 7, 499])));
+----
+0	3
+
+# variant_range on the shared variant axis
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', variant_range := [10, 20]) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', variant_range := [10, 20]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', variant_range := [10, 20]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', variant_range := [10, 20]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', variant_range := [10, 20])));
+----
+0	10
+
+# with_ordinal
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', with_ordinal := true) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', with_ordinal := true))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', with_ordinal := true) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', with_ordinal := true))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', with_ordinal := true)));
+----
+0	500
+
+# genotype orient (all psam columns per row)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'genotype'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'genotype'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'genotype')));
+----
+0	125000
+
+# genotype orient + subset + include_genotypes
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'genotype', samples := [0, 36, 37, 249], include_genotypes := ['het']) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'genotype', samples := [0, 36, 37, 249], include_genotypes := ['het']))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'genotype', samples := [0, 36, 37, 249], include_genotypes := ['het']) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'genotype', samples := [0, 36, 37, 249], include_genotypes := ['het']))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'genotype', samples := [0, 36, 37, 249], include_genotypes := ['het'])));
+----
+0	true
+
+# sample orient (union of the shards' sample rows)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample')));
+----
+0	250
+
+# sample orient + subset + include_genotypes
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', samples := [0, 36, 37, 249], include_genotypes := ['hom_alt']) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', samples := [0, 36, 37, 249], include_genotypes := ['hom_alt']))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', samples := [0, 36, 37, 249], include_genotypes := ['hom_alt']) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', samples := [0, 36, 37, 249], include_genotypes := ['hom_alt']))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', samples := [0, 36, 37, 249], include_genotypes := ['hom_alt'])));
+----
+0	true
+
+# sample orient + af_range (bind-time count filter)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', af_range := {min: 0.2, max: 0.4}) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', af_range := {min: 0.2, max: 0.4}))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', af_range := {min: 0.2, max: 0.4}) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', af_range := {min: 0.2, max: 0.4}))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', af_range := {min: 0.2, max: 0.4})));
+----
+0	250
+
+# sample orient, counts (streaming scan)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', genotypes := 'counts'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', genotypes := 'counts') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts')));
+----
+0	250
+
+# sample orient, stats (streaming scan)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'stats') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', genotypes := 'stats'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', genotypes := 'stats') EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'stats'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'stats')));
+----
+0	250
+
+# sample orient, counts + include_genotypes (streaming keep list)
+query IT
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts', include_genotypes := ['hom_alt']) EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', genotypes := 'counts', include_genotypes := ['hom_alt']))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', genotypes := 'counts', include_genotypes := ['hom_alt']) EXCEPT ALL SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts', include_genotypes := ['hom_alt']))),
+       (SELECT count(*) > 0 FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts', include_genotypes := ['hom_alt'])));
+----
+0	true
+
+# three shards incl. a one-sample shard, variant orient (3000 variants, multi-batch)
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate') EXCEPT ALL SELECT * FROM read_pfile('test/data/large_example'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/large_example') EXCEPT ALL SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate')));
+----
+0	3000
+
+# three shards, sample orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile('test/data/large_example', orient := 'sample'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/large_example', orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'sample'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'sample')));
+----
+0	8
+
+# three shards, genotype orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'genotype'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'genotype')));
+----
+0	24000
+
+# three shards, subset skipping the middle shard
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', samples := [0, 3, 7]) EXCEPT ALL SELECT * FROM read_pfile('test/data/large_example', samples := [0, 3, 7]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/large_example', samples := [0, 3, 7]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', samples := [0, 3, 7]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate', samples := [0, 3, 7])));
+----
+0	3000
+
+# phased, variant orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true) EXCEPT ALL SELECT * FROM read_pfile('test/data/phased_example', phased := true))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/phased_example', phased := true) EXCEPT ALL SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true)));
+----
+0	4
+
+# phased, genotype orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/phased_example', phased := true, orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, orient := 'genotype'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, orient := 'genotype')));
+----
+0	16
+
+# phased, sample orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/phased_example', phased := true, orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, orient := 'sample'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, orient := 'sample')));
+----
+0	4
+
+# phased + subset
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, samples := [0, 2]) EXCEPT ALL SELECT * FROM read_pfile('test/data/phased_example', phased := true, samples := [0, 2]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/phased_example', phased := true, samples := [0, 2]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, samples := [0, 2]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/phased_cat_a','test/data/phased_cat_b'], combine_samples := 'concatenate', phased := true, samples := [0, 2])));
+----
+0	4
+
+# dosages, variant orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true) EXCEPT ALL SELECT * FROM read_pfile('test/data/dosage_example', dosages := true))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/dosage_example', dosages := true) EXCEPT ALL SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true)));
+----
+0	4
+
+# dosages, genotype orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile('test/data/dosage_example', dosages := true, orient := 'genotype'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/dosage_example', dosages := true, orient := 'genotype') EXCEPT ALL SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, orient := 'genotype'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, orient := 'genotype')));
+----
+0	16
+
+# dosages, sample orient
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile('test/data/dosage_example', dosages := true, orient := 'sample'))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/dosage_example', dosages := true, orient := 'sample') EXCEPT ALL SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, orient := 'sample'))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, orient := 'sample')));
+----
+0	4
+
+# dosages + subset
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, samples := [0, 3]) EXCEPT ALL SELECT * FROM read_pfile('test/data/dosage_example', dosages := true, samples := [0, 3]))) + (SELECT count(*) FROM (SELECT * FROM read_pfile('test/data/dosage_example', dosages := true, samples := [0, 3]) EXCEPT ALL SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, samples := [0, 3]))),
+       (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/dosage_cat_a','test/data/dosage_cat_b'], combine_samples := 'concatenate', dosages := true, samples := [0, 3])));
+----
+0	4
+
+# --- Parallel scan over the three-shard cohort ---
+statement ok
+SET threads = 4;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate') EXCEPT ALL SELECT * FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b','test/data/le_cat_c'], combine_samples := 'concatenate'));
+----
+0	3000
+
+# --- Sparse (difflist) sample-orient counts: concat uses the dense path, same answer ---
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example', orient := 'sample', genotypes := 'counts'))),
+       (SELECT count(*) FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', orient := 'sample', genotypes := 'counts'));
+----
+0	250
+
+statement ok
+RESET plinking_sample_counts_sparse;
+
+# --- localize copies every shard's .pgen ---
+statement ok
+SET plinking_pgen_io = 'localize';
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example'))),
+       (SELECT count(*) FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate'));
+----
+0	500
+
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+query I
+SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example'));
+----
+0
+
+statement ok
+RESET plinking_pgen_io;
+
+# --- pvar := is the shared .pvar for every shard (allowed only with concatenate) ---
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', pvar := 'test/data/pca_example.pvar') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example'))),
+       (SELECT count(*) FROM read_pfile(['test/data/pca_cat_a','test/data/pca_cat_b'], combine_samples := 'concatenate', pvar := 'test/data/pca_example.pvar'));
+----
+0	500
+
+# Shard 0 without a .pvar needs pvar := ...
+statement error
+SELECT count(*) FROM read_pfile(['test/data/pca_cat_b','test/data/pca_cat_a'], combine_samples := 'concatenate');
+----
+cannot find .pvar
+
+# ... and with it, the sample order follows the list order (b's samples first).
+query IIT
+SELECT count(*), max(len(genotypes)),
+       (SELECT list(column_name)[6] FROM (DESCRIBE SELECT * FROM read_pfile(['test/data/pca_cat_b','test/data/pca_cat_a'], combine_samples := 'concatenate', pvar := 'test/data/pca_example.pvar', genotypes := 'columns')))
+FROM read_pfile(['test/data/pca_cat_b','test/data/pca_cat_a'], combine_samples := 'concatenate', pvar := 'test/data/pca_example.pvar');
+----
+500	250	per37
+
+# The variant-sharded default still rejects pvar := on a list.
+statement error
+SELECT count(*) FROM read_pfile(['test/data/shard1','test/data/shard2'], pvar := 'test/data/shard1.pvar');
+----
+pgen/pvar overrides cannot be combined with a multi-file list
+
+# --- A one-element list with concatenate reads the fileset normally ---
+query I
+SELECT count(*) FROM (SELECT * FROM read_pfile(['test/data/pca_example'], combine_samples := 'concatenate') EXCEPT ALL SELECT * FROM read_pfile('test/data/pca_example'));
+----
+0
+
+# --- Rejected inputs ---
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b'], combine_samples := 'concatenate', psam := 'test/data/large_example.psam');
+----
+psam override cannot be combined with combine_samples := 'concatenate'
+
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b'], combine_samples := 'concatenate', pgen := 'test/data/le_cat_a.pgen');
+----
+pgen override cannot be combined with a multi-file list
+
+# Different variant counts: not the same variant set.
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_a','test/data/pca_cat_a'], combine_samples := 'concatenate');
+----
+variant count mismatch across sample shards
+
+# Different .psam columns: le_cat_b has (#IID, SEX); a writer-made shard has #IID only.
+# The orients that emit psam columns (genotype, sample) check the headers match.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/le_cat_a', genotypes := 'struct'))
+TO '__TEST_DIR__/cat_iidonly' (FORMAT pfile);
+
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_b','__TEST_DIR__/cat_iidonly'], combine_samples := 'concatenate', orient := 'genotype');
+----
+.psam columns differ across sample shards
+
+# --- IID uniqueness is NOT checked (positional trust, like 'implicit') ---
+# A duplicated shard reads (5 + 5 = 10 genotypes per variant) ...
+query II
+SELECT count(*), max(len(genotypes)) FROM read_pfile(['test/data/le_cat_c','test/data/le_cat_c'], combine_samples := 'concatenate');
+----
+3000	10
+
+# ... but modes that name columns after IIDs fail on the duplicate name.
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_c','test/data/le_cat_c'], combine_samples := 'concatenate', genotypes := 'columns');
+----
+duplicate
+
+# union / intersect stay unimplemented.
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b'], combine_samples := 'union');
+----
+not yet implemented
+
+# A parquet .psam companion is not supported in concat mode yet (fail loud, never shard-0-only).
+require parquet
+
+statement ok
+COPY (SELECT * FROM read_psam('__TEST_DIR__/cat_iidonly.psam')) TO '__TEST_DIR__/cat_iidonly.psam.parquet' (FORMAT parquet);
+
+statement error
+SELECT count(*) FROM read_pfile(['__TEST_DIR__/cat_iidonly','test/data/le_cat_b'], combine_samples := 'concatenate');
+----
+parquet .psam
+
+statement ok
+SET plinking_use_parquet_companions = false;
+
+query I
+SELECT count(*) FROM read_pfile(['__TEST_DIR__/cat_iidonly','__TEST_DIR__/cat_iidonly'], combine_samples := 'concatenate');
+----
+3000
+
+statement ok
+RESET plinking_use_parquet_companions;
