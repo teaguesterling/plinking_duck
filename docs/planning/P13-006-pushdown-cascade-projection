@@ -77,14 +77,44 @@ Spike: confirm a table function can read the pushed `TableFilterSet` at bind/ini
 for `read_pfile`) and that re-deriving prune params from it is clean. If a filter is not
 translatable, the cell is conservatively kept (correctness over cell-skip).
 
-## 5. Projection-driven columns (spike)
+## 5. Projection-driven columns, and a WHERE-coherent surface
 
-`c.genotypes`'s superset is one relation; the engine pushes the projected `column_ids`
-(`pfile_reader.cpp` already loads psam columns projection-aware). The new part is the **derived
-counts** (`het`, `hom_alt`, `missing`, `n_alt`): when only those are projected, compute them per
-variant **without materializing the full genotype list** — the same counts `plink_freq` /
-`plink_missing` / `plink_hardy` already compute. Spike: can the cascade reader reuse those
-count kernels on the pushed projection, or is a shared count path needed?
+**The problem (raised in review).** `read_pfile`'s genotype SHAPE is set by PARAMS —
+`genotypes := 'columns'|'struct'|'counts'|'stats'` and `include_genotypes := [...]`
+(`pfile_reader.cpp:1288,1402`). A param does not flow through a view or a `WHERE`. So a baked
+`c.genotypes` view freezes one shape, and a user cannot ask for counts vs full genotypes by
+projecting or filtering. `WHERE include_genotypes = ['het']` is not expressible SQL.
+
+**The fix — columns, not params.** `c.genotypes` exposes the derived aggregates as scalar
+COLUMNS, reusing the names the `plink_*` functions already emit, so one concept has one name
+across the extension:
+
+| Column(s) | Already emitted by |
+|---|---|
+| `HET_CT`, `HOM_ALT_CT`, `HOM_REF_CT` | `plink_hardy` |
+| `MISSING_CT`, `OBS_CT`, `F_MISS` | `plink_missing` |
+| `ALT_FREQ` | `plink_freq` |
+| the raw per-sample calls (a LIST) | `read_pfile` — name it `GT`, not `genotypes`, to avoid `c.genotypes.genotypes` |
+
+Then `WHERE HET_CT > 100 AND ALT_FREQ < 0.01` is coherent SQL and `SELECT HET_CT` is a projection.
+
+**This reinforces A1 (§3): the backing must be a smart FUNCTION, not a baked view.** Only a
+function with projection pushdown can translate "the query projected `HET_CT` only" into
+`read_pfile`'s `counts` mode (the decode-free fast-path), and "the query projected `GT`" into a
+full decode. A view cannot. So the projection fast-path and the WHERE-coherent column surface are
+the same requirement — and both require A1 = the new function.
+
+**Macros and short views — considered, declined.** With the aggregates as columns, the common
+filter needs no macro; a helper like `only_genotypes(GT, ['het'])` earns its place only for a
+per-sample predicate over the raw `GT` list that SQL cannot express — reserve macros for that, not
+for naming. Short synonym views (`c.g`, `gt`) are declined: a second name per concept fights the
+house one-term rule and doubles the surface; per-query aliasing (`FROM c.genotypes AS g`) gives
+brevity without it. The coherence win is **one name per concept, shared with `plink_*`** — not
+shorter names.
+
+Spike: confirm the cascade reader can reuse the `plink_freq`/`missing`/`hardy` count kernels on the
+pushed projection (the `genotypes := 'counts'` path already streams them), rather than a new count
+path.
 
 ## 6. Open scope / non-goals
 
