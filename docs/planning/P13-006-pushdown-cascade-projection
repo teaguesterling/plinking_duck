@@ -1,0 +1,114 @@
+# P13-006: pushdown cascade + projection-driven genotypes
+
+Make a `WHERE` on `c.genotypes` **skip whole cells** (not just row groups inside already-opened
+cells), and make projecting a derived column (`het`, `missing`, `n_alt`, …) avoid a full genotype
+decode. This is the performance layer P13-003 deferred, with **predicate pushdown into the catalog
+prune** as the core (Teague's original thrust).
+
+Supersedes the "P13-004" placeholder that earlier docs used for cascade + projection — this is that
+work, plus pushdown. Depends on: P13-003 (ATTACH, merged #82) and P13-005 (ATTACH all kinds). The
+writer path is now **P13-007** (penciled, separate).
+
+## Status
+
+- [ ] Owner decision A1: the cascade mechanism — a new table function vs extend `read_pfile` (§3)
+- [ ] Spike: translate a pushed `TableFilter` into catalog prune params (§4)
+- [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing` internals? (§5)
+- [ ] Implementation plan + build + review
+
+## The gap
+
+P13-003/005 bake `c.genotypes` as `read_pfile([all surviving cells])`. A `WHERE CHROM='17'`
+reaches **`read_pfile`'s** filter pushdown, which skips **row groups inside every opened cell** —
+but every cell is still opened. On a large sparse grid (7.5M sample × 170M variant → an M×N cell
+tiling), that is most of the cost. The shipped `read_pfile_catalog(path, region := …, keys := …,
+samples := …)` already returns only the **surviving cells** for a predicate — it is just not wired
+to a `WHERE`.
+
+## 2. The three pieces
+
+1. **Pushdown cascade (headline).** A `WHERE` on `c.genotypes` routes into the catalog prune →
+   only surviving cells open. Row-group pruning inside them is the existing `read_pfile` behaviour;
+   this adds the cell-skip layer above it.
+2. **Projection-driven columns.** `c.genotypes` exposes a superset — `genotype`, `dosage`, `het`,
+   `hom_alt`, `missing`, `n_alt`. Projecting only `het` (or the other counts) takes a decode-free
+   count path; projecting `genotype`/`dosage` decodes as today.
+3. **Integration.** `c.genotypes` stops being a baked `read_pfile(...)` view and becomes a view
+   over the cascade reader (below). The other six relations are unchanged.
+
+## 3. The cascade mechanism — owner decision A1
+
+A baked view has a fixed cell list, so cell-skip needs a reader that sees the predicate at scan
+time. Two shapes:
+
+- **A — a new table function** `read_pfile_catalog_genotypes(path [, orient])` that implements
+  DuckDB filter pushdown: it receives the pushed `TableFilterSet`, derives the catalog prune (§4),
+  asks `read_pfile_catalog` for the surviving cells, then drives `read_pfile`'s reader over them
+  with the same filters for row-group pruning + projection. `c.genotypes` = a view over it. Keeps
+  `read_pfile` untouched; the bridge is new.
+- **B — extend `read_pfile`** to accept a `catalog := 'path'` input: given a catalog, it prunes
+  cells from its own pushed filters before scanning, reusing all of its filter/projection
+  machinery. Less new surface, but touches the core reader and its contract.
+
+Both reuse the shipped cell-prune and the shipped row-group/projection pushdown. **A1 is which
+one.** Recommendation to confirm: **A** — it isolates the new logic (catalog-aware cell selection)
+from the stable `read_pfile` scan, and matches the fleet pattern of one function per concern.
+
+## 4. The core: translate a pushed filter into a catalog prune (spike)
+
+`read_pfile` already receives a `TableFilterSet` on its columns (`pfile_reader.cpp`:
+`residual_filters`, `column_ids`, the v2.0 compat-planner shims). The cascade reader translates
+that set into `read_pfile_catalog`'s params:
+
+| Filter on | Becomes | Note |
+|---|---|---|
+| `CHROM` (+ `POS` range) | `region := 'CHROM:lo-hi'` | contiguous range → min/max prune |
+| a block-key column (`CHUNK`, `GROUP`, …) | `keys := {k: [v,…]}` | enum membership |
+| `sample_index` / sample IID | `samples := [...]` | **scattered set → keep the LIST**, not a min/max range |
+
+**Measured (P13-001, 2026-10-29; v2.0 re-measure owed):** a join's build-side min/max IS pushed
+as a dynamic filter; `BETWEEN ≡ >=/<`; a **contiguous** set prunes to ~100 rows, a **scattered**
+set collapses to a useless min/max (327k rows) — so a scattered selection must retain the LIST, a
+contiguous one uses a range. The translation follows that rule: range for `region`, LIST for
+`samples`.
+
+Spike: confirm a table function can read the pushed `TableFilterSet` at bind/init (the shims exist
+for `read_pfile`) and that re-deriving prune params from it is clean. If a filter is not
+translatable, the cell is conservatively kept (correctness over cell-skip).
+
+## 5. Projection-driven columns (spike)
+
+`c.genotypes`'s superset is one relation; the engine pushes the projected `column_ids`
+(`pfile_reader.cpp` already loads psam columns projection-aware). The new part is the **derived
+counts** (`het`, `hom_alt`, `missing`, `n_alt`): when only those are projected, compute them per
+variant **without materializing the full genotype list** — the same counts `plink_freq` /
+`plink_missing` / `plink_hardy` already compute. Spike: can the cascade reader reuse those
+count kernels on the pushed projection, or is a shared count path needed?
+
+## 6. Open scope / non-goals
+
+- **Scope:** `c.genotypes` (and `c.genotypes_by_sample`) cascade + projection. The structural and
+  axis relations are unchanged.
+- **Non-goal:** the analysis macros (`plink_*` over `c.*`) — still their own plan.
+- **Non-goal:** cross-cell per-variant aggregation across sample-blocks (howard §12.2) — the hard
+  reassembly; flagged, not solved here.
+
+## 7. Phasing
+
+1. Spike §4 (filter → prune translation) and settle A1 (§3).
+2. The cascade reader: cell-skip from a pushed range/LIST filter; correctness first (conservative
+   keep), then the measured prune.
+3. Projection-driven derived counts (§5).
+4. Wire `c.genotypes` / `c.genotypes_by_sample` to the cascade reader in the ATTACH surface.
+5. Measure: cells opened before/after on a real M×N grid; the number is the point.
+6. Tests + docs; update the "does not do yet" list in `pfile_catalog.md`.
+
+## 8. Risks
+
+- The cascade reinstates the complexity P13-003 kept out. Gate the build on the §4 spike: if the
+  filter→prune translation is not clean, the feature is not worth the reader surface.
+- A wrong translation that **over**-prunes (drops a surviving cell) is a correctness bug, not a
+  perf miss. Conservative keep is the default; every prune needs a test that the dropped cells
+  truly hold no matching row.
+- The v2.0 pushdown re-measure (P13-001's facts were on v1.5.x) is owed before trusting the
+  min/max vs LIST rule.
