@@ -93,6 +93,11 @@ raw)` → absolute `.pfile.json` path, or a marker that it is a bare fileset (Ta
 `ParseMatrixCatalog`/`BuildCells` block in `attach` with the helper, for `c.genotypes`,
 `c.genotypes_by_sample`, `c.variants`, `c.samples`.
 
+**Forward-compat (P13-006 coherence):** build each relation's view SQL through its own small helper
+(one per relation, e.g. a `genotypes` SQL builder taking the resolved cell list), so P13-006 can
+swap `c.genotypes`'s backing to the pushdown cascade reader in one place without touching the other
+six. Do not inline the six view strings in one block. See P13-006 §9.
+
 - [ ] Step 1: Failing test — `ATTACH` a **single-fileset** and a **multi-file** catalog; each
       `c.genotypes` equals the equivalent `read_pfile` call; `c.variants`/`c.samples` match.
 - [ ] Step 2: Run, verify fail ("not a version-2 matrix catalog" today).

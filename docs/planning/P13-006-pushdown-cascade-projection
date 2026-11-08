@@ -12,6 +12,7 @@ writer path is now **P13-007** (penciled, separate).
 ## Status
 
 - [ ] Owner decision A1: the cascade mechanism — a new table function vs extend `read_pfile` (§3)
+- [ ] Owner decision A2: uniform `c.genotypes` backing across kinds vs per-kind backing (§9)
 - [ ] Spike: translate a pushed `TableFilter` into catalog prune params (§4)
 - [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing` internals? (§5)
 - [ ] Implementation plan + build + review
@@ -102,6 +103,45 @@ count kernels on the pushed projection, or is a shared count path needed?
 4. Wire `c.genotypes` / `c.genotypes_by_sample` to the cascade reader in the ATTACH surface.
 5. Measure: cells opened before/after on a real M×N grid; the number is the point.
 6. Tests + docs; update the "does not do yet" list in `pfile_catalog.md`.
+
+## 9. Coherence across the surface (the pressure test)
+
+Pushdown must read as one story across every relation and every kind, not a special case bolted
+onto `c.genotypes`. Three things make it coherent:
+
+**Two layers, always in the same order.**
+
+- **Layer 1 — row-group skip.** Shipped. `read_pfile` / `read_pvar` / `read_psam` consume the
+  pushed `TableFilterSet` and skip row groups inside any opened file. Every kind and relation has
+  this already (P13-003/005).
+- **Layer 2 — cell/file skip.** P13-006. Route the same filter into `read_pfile_catalog`'s prune so
+  non-surviving cells/files never open. Applies to any relation whose rows span several cells/files.
+
+**One translation layer, three relations.** The filter→prune mapping (§4) is a single mechanism,
+reused wherever a `WHERE` can skip cells — not only genotypes:
+
+- `c.genotypes` / `c.genotypes_by_sample` — `CHROM`/`POS`/sample filters → prune cells.
+- `c.variants` — `CHROM`/`POS` → prune the variant-block `.pvar` files, by the catalog's
+  variant-block bounds.
+- `c.samples` — a sample-key filter → prune the sample-block `.psam` files.
+
+So the measured min/max-vs-LIST rule (§4) is applied in exactly one place and inherited by all
+three. The structural relations (`c.cells`, `c.*_blocks`) read small metadata and need no cascade.
+
+**Uniform backing (decision A2).** `c.genotypes` should have ONE backing across kinds, so the
+surface behaves the same whether you attached a matrix, a single-fileset catalog, or a bare
+fileset. The cascade reader takes **either** a catalog path **or** a direct one-cell list (the
+bare fileset, P13-005 D1), and when there is a single cell it simply does Layer-1 pushdown with
+no cell-skip to perform. The alternative — a cascade function for catalogs plus a baked
+`read_pfile` view for bare filesets — works, but makes `c.genotypes`'s behaviour kind-dependent.
+Recommendation: **uniform**.
+
+**Interaction with P13-005.** P13-005 bakes `c.genotypes` as `read_pfile([cells])` — the correct
+interim and the single-cell path. P13-006 swaps the multi-cell backing to the cascade reader. The
+P13-005 plan centralizes where `c.genotypes`'s SQL is generated, so the swap is one place. The
+column set evolves **additively** — P13-005 exposes `read_pfile`'s native genotype columns;
+P13-006 adds the derived-count superset (`het`/`hom_alt`/`missing`/`n_alt`) — so no P13-005 query
+breaks.
 
 ## 8. Risks
 
