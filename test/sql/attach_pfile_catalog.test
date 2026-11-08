@@ -116,3 +116,36 @@ SELECT "GROUP", sample_start, sample_stop FROM c.sample_blocks ORDER BY sample_s
 ----
 A	0	2
 B	2	4
+
+# ---------------------------------------------------------------------------
+# Task 3: axis relations — c.variants, c.samples, c.genotypes_by_sample
+# ---------------------------------------------------------------------------
+
+# c.variants: pvar union over the two distinct variant-block .pvar (read_pvar takes a LIST).
+query T
+SELECT (SELECT count(*) FROM c.variants) =
+       (SELECT count(*) FROM read_pvar(['{TEST_DIR}/refv/CHROM=1/blk.pvar',
+                                         '{TEST_DIR}/refv/CHROM=2/blk.pvar']));
+----
+true
+
+# c.samples: psam union over the two distinct sample-block .psam (read_psam is single-file,
+# so the view is a UNION ALL BY NAME).
+query T
+SELECT (SELECT count(*) FROM c.samples) =
+       (SELECT count(*) FROM (
+          SELECT * FROM read_psam('{TEST_DIR}/refs/GROUP=A/blk.psam')
+          UNION ALL BY NAME
+          SELECT * FROM read_psam('{TEST_DIR}/refs/GROUP=B/blk.psam')));
+----
+true
+
+# c.genotypes_by_sample: the same cells, sample-oriented.
+query T
+SELECT (SELECT count(*) FROM c.genotypes_by_sample) =
+       (SELECT count(*) FROM read_pfile([
+          '{TEST_DIR}/data/CHROM=1/GROUP=A/cell', '{TEST_DIR}/data/CHROM=1/GROUP=B/cell',
+          '{TEST_DIR}/data/CHROM=2/GROUP=A/cell', '{TEST_DIR}/data/CHROM=2/GROUP=B/cell'],
+          orient := 'sample'));
+----
+true

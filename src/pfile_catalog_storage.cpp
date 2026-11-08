@@ -84,6 +84,31 @@ static string BuildBlockViewSql(const AxisDef &axis, const string &path_sql, con
 	return sql;
 }
 
+//! Append `s` to `v` only if non-empty and not already present (small N, order preserved).
+static void PushUnique(vector<string> &v, const string &s) {
+	if (s.empty()) {
+		return;
+	}
+	for (auto &e : v) {
+		if (e == s) {
+			return;
+		}
+	}
+	v.push_back(s);
+}
+
+//! c.samples: read_psam is single-file, so union the distinct sample-block .psam BY NAME.
+static string BuildPsamUnionSql(const vector<string> &psams) {
+	string sql;
+	for (idx_t i = 0; i < psams.size(); i++) {
+		if (i > 0) {
+			sql += " UNION ALL BY NAME ";
+		}
+		sql += "SELECT * FROM read_psam(" + SQLString::ToString(psams[i]) + ")";
+	}
+	return sql;
+}
+
 static string ReadWholeFile(FileSystem &fs, const string &path) {
 	string content;
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
@@ -107,9 +132,13 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	auto cells = BuildCells(matrix, fs, /*include_holes=*/false);
 
 	vector<string> cell_prefixes;
+	vector<string> pvar_paths;
+	vector<string> psam_paths;
 	for (auto &cell : cells) {
 		if (cell.present) {
 			cell_prefixes.push_back(cell.prefix);
+			PushUnique(pvar_paths, cell.pvar);
+			PushUnique(psam_paths, cell.psam);
 		}
 	}
 
@@ -122,6 +151,10 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	                   BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop"));
 	views.emplace_back(Identifier("sample_blocks"),
 	                   BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop"));
+	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
+	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));
+	views.emplace_back(Identifier("genotypes_by_sample"),
+	                   "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ", orient := 'sample')");
 
 	// Build a native in-memory catalog seeded with those views.
 	info.path = ":memory:";
