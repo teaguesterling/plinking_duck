@@ -192,8 +192,8 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	return std::move(catalog);
 }
 
-static unique_ptr<TransactionManager>
-PfileCatalogTransactionManager(optional_ptr<StorageExtensionInfo> storage_info, AttachedDatabase &db, Catalog &catalog) {
+static unique_ptr<TransactionManager> PfileCatalogTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
+                                                                     AttachedDatabase &db, Catalog &catalog) {
 	return make_uniq<DuckTransactionManager>(db);
 }
 
