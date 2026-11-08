@@ -149,3 +149,77 @@ SELECT (SELECT count(*) FROM c.genotypes_by_sample) =
           orient := 'sample'));
 ----
 true
+
+# ---------------------------------------------------------------------------
+# Task 4: behaviour gates — pushdown, read-only, discoverability, detach
+# ---------------------------------------------------------------------------
+
+# WHERE on c.genotypes rides read_pfile's pushdown and returns the correct subset.
+query T
+SELECT (SELECT count(*) FROM c.genotypes WHERE CHROM = '1') =
+       (SELECT count(*) FROM read_pfile([
+          '{TEST_DIR}/data/CHROM=1/GROUP=A/cell', '{TEST_DIR}/data/CHROM=1/GROUP=B/cell',
+          '{TEST_DIR}/data/CHROM=2/GROUP=A/cell', '{TEST_DIR}/data/CHROM=2/GROUP=B/cell'])
+        WHERE CHROM = '1');
+----
+true
+
+# read-only: a write to the attached catalog errors.
+statement error
+CREATE TABLE c.scratch AS SELECT 1 AS x;
+----
+
+# discoverability: the seven relations are listed under database c.
+query I
+SELECT count(*) FROM (SHOW ALL TABLES) WHERE database = 'c';
+----
+7
+
+# detach, then re-attach the same name.
+statement ok
+DETACH c;
+
+statement ok
+ATTACH '{TEST_DIR}/matrix_dense.pfile.json' AS c (TYPE pfile_catalog);
+
+query T
+SELECT count(*) > 0 FROM c.genotypes;
+----
+true
+
+# ---------------------------------------------------------------------------
+# Task 4b: holes and the empty (all-holes) catalog — reuse the data/refv/refs above
+# ---------------------------------------------------------------------------
+
+# A hole at (CHROM=2, GROUP=B): three present cells.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"holed","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"},"holes":[{"CHROM":"2","GROUP":"B"}]}')
+TO '{TEST_DIR}/matrix_hole.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement ok
+ATTACH '{TEST_DIR}/matrix_hole.pfile.json' AS h (TYPE pfile_catalog);
+
+# the hole drops one cell: three present in c.cells.
+query I
+SELECT count(*) FROM h.cells;
+----
+3
+
+# h.genotypes reads only the three present cells.
+query T
+SELECT (SELECT count(*) FROM h.genotypes) =
+       (SELECT count(*) FROM read_pfile([
+          '{TEST_DIR}/data/CHROM=1/GROUP=A/cell', '{TEST_DIR}/data/CHROM=1/GROUP=B/cell',
+          '{TEST_DIR}/data/CHROM=2/GROUP=A/cell']));
+----
+true
+
+# All cells are holes: ATTACH fails loud (no present cells to read), not a crash.
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"empty","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"},"holes":[{"CHROM":"1"},{"CHROM":"2"}]}')
+TO '{TEST_DIR}/matrix_empty.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement error
+ATTACH '{TEST_DIR}/matrix_empty.pfile.json' AS e (TYPE pfile_catalog);
+----
+no present cells

@@ -14,6 +14,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/exception.hpp"
 
 namespace duckdb {
 
@@ -123,6 +124,10 @@ static string ReadWholeFile(FileSystem &fs, const string &path) {
 static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                               AttachedDatabase &db, const string &name, AttachInfo &info,
                                               AttachOptions &options) {
+	// The catalog is a read-only view over the shipped readers. access_mode is already
+	// fixed before attach() runs, so force the read-only type here (rejects CREATE/INSERT/etc).
+	db.SetReadOnlyDatabase();
+
 	auto &fs = FileSystem::GetFileSystem(context);
 	string catalog_path = info.path;
 	string content = ReadWholeFile(fs, catalog_path);
@@ -140,6 +145,16 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 			PushUnique(pvar_paths, cell.pvar);
 			PushUnique(psam_paths, cell.psam);
 		}
+	}
+
+	// An all-holes catalog has no data to read. The shipped read_pfile/read_pvar reject an empty
+	// file list, so rather than fabricate reader schemas we fail loud here. (Consistency note:
+	// read_pfile_catalog returns empty for all-holes; giving read_pfile an empty-list path is a
+	// separate reader change — flagged in the ledger.)
+	if (cell_prefixes.empty()) {
+		throw InvalidInputException("ATTACH pfile_catalog '%s': the catalog has no present cells "
+		                            "(all cells are holes); nothing to attach",
+		                            catalog_path);
 	}
 
 	// Bake the per-relation SQL over the shipped readers.
