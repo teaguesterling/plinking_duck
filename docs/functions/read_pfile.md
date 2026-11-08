@@ -196,6 +196,13 @@ SELECT * FROM read_pfile(['/data/batch1', '/data/batch2'], combine_samples := 'c
 
 The variants come from the **first** shard's `.pvar`, or from a `pvar :=` override. The `.pvar` files of the other shards are not read, so a shard can have no `.pvar`. Each `.pgen` header must report the same variant count, or the read fails. Variant identity is not checked: alignment is positional, as with `'implicit'`.
 
+!!! warning "Use `'concatenate'` only for sample shards"
+
+    Only the variant **count** is checked. Variant-sharded files with equal counts (for example two
+    chromosome shards of the same size) are accepted with no error. Each output row then puts the
+    first shard's variant beside a different variant's genotypes from the other shards. For
+    variant-sharded files, use the default `'implicit'` or `'identical'`.
+
 Because there is one variant axis, `pvar :=`, `variants := [...]` and `variant_range` work with this mode. A `psam :=` or `pgen :=` override is an error, because each shard has its own.
 
 Each shard's `.psam` must have the same columns in `orient := 'genotype'` and `orient := 'sample'`. IID uniqueness across shards is not checked. A duplicate IID fails only in the modes that name columns after IIDs (`genotypes := 'columns'` / `'struct'`) or that look up a sample by IID.
