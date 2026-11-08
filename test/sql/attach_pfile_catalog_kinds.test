@@ -89,3 +89,32 @@ statement error
 ATTACH 'test/data/does_not_exist_anywhere' AS x (TYPE pfile_catalog);
 ----
 nothing found
+
+# ---------------------------------------------------------------------------
+# v1 multi-file (the sharded writer's own output): shard_by CHROM → a multi-file catalog.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sharded' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+ATTACH '{TEST_DIR}/sharded.pfile.json' AS m (TYPE pfile_catalog);
+
+# m.genotypes = all variants across the shards = the source cohort.
+query T
+SELECT (SELECT count(*) FROM m.genotypes) =
+       (SELECT count(*) FROM read_pfile('test/data/pfile_example'));
+----
+true
+
+# the shards are the cells; variant_blocks tiles the variant axis (one block per shard);
+# sample_blocks is one shared row.
+query T
+SELECT (SELECT count(*) FROM m.cells) = (SELECT count(*) FROM m.variant_blocks);
+----
+true
+
+query I
+SELECT count(*) FROM m.sample_blocks;
+----
+1

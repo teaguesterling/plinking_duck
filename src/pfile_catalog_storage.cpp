@@ -125,6 +125,26 @@ static string BuildV1BlockSql(const string &path_sql, const string &concat_dim, 
 	return "SELECT NULL::BIGINT AS " + axis + "_start, NULL::BIGINT AS " + axis + "_stop";
 }
 
+//! c.genotypes / c.genotypes_by_sample. When every cell shares ONE companion (a variant-sharded
+//! cohort shares its .psam; a sample-sharded one shares its .pvar), read_pfile cannot find a
+//! per-cell companion, so pass the shared one explicitly. A matrix (per-block companions, >1
+//! distinct) passes neither — each cell is self-contained.
+static string GenotypesSql(const vector<string> &prefixes, const vector<string> &pvars,
+                           const vector<string> &psams, bool by_sample) {
+	string sql = "SELECT * FROM read_pfile(" + SqlPathList(prefixes);
+	if (pvars.size() == 1) {
+		sql += ", pvar := " + SQLString::ToString(pvars[0]);
+	}
+	if (psams.size() == 1) {
+		sql += ", psam := " + SQLString::ToString(psams[0]);
+	}
+	if (by_sample) {
+		sql += ", orient := 'sample'";
+	}
+	sql += ")";
+	return sql;
+}
+
 static string ReadWholeFile(FileSystem &fs, const string &path) {
 	string content;
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
@@ -221,9 +241,9 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// Bake the per-relation SQL over the shipped readers (one builder per relation, so P13-006 can
 	// swap c.genotypes's backing to the pushdown cascade in one place).
 	vector<std::pair<Identifier, string>> views;
-	views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ")");
+	views.emplace_back(Identifier("genotypes"), GenotypesSql(cell_prefixes, pvar_paths, psam_paths, false));
 	views.emplace_back(Identifier("genotypes_by_sample"),
-	                   "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ", orient := 'sample')");
+	                   GenotypesSql(cell_prefixes, pvar_paths, psam_paths, true));
 	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
 	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));
 	views.emplace_back(Identifier("cells"), cells_sql);
