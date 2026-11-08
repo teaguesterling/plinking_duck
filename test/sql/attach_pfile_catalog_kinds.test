@@ -124,3 +124,33 @@ query I
 SELECT count(*) FROM m.sample_blocks;
 ----
 1
+
+# ---------------------------------------------------------------------------
+# v1 SAMPLE-SHARDED catalog (concat_dim='samples', one shared .pvar, per-shard .psam): the
+# genotype relations read through read_pfile(..., combine_samples := 'concatenate', pvar := shared).
+# le_cat_{a,b,c} are contiguous sample splits of large_example (1 + 2 + 5 samples), so the
+# unsplit fileset is the oracle. Before P13-008 this ATTACH raised "not supported yet".
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/pfile_catalog_le_samples.pfile.json' AS ss (TYPE pfile_catalog);
+
+query II
+SELECT (SELECT count(*) FROM (FROM ss.genotypes EXCEPT ALL FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM ss.genotypes);
+----
+0	3000
+
+query II
+SELECT (SELECT count(*) FROM (FROM ss.genotypes_by_sample EXCEPT ALL FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM ss.genotypes_by_sample);
+----
+0	8
+
+# c.samples unions the three shards' .psam rows; c.variants is the one shared .pvar.
+query II
+SELECT (SELECT count(*) FROM ss.samples), (SELECT count(*) FROM ss.variants);
+----
+8	3000
+
+statement ok
+DETACH ss;

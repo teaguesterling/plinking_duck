@@ -1,0 +1,156 @@
+# P13-008: `read_pfile` sample-concatenation (`combine_samples := 'concatenate'`)
+
+Read a **sample-sharded** cohort as one relation. The shards hold the **same variants in the
+same order** but **disjoint samples**. `read_pfile(['A','B'], combine_samples := 'concatenate')`
+returns the shared variants. Each variant's genotype vector is A's samples, then B's samples.
+
+Brief: `docs/briefs/2026-11-08-sample-concat-reader.md`. Branch: `feature/P13-008-sample-concat`
+(off `origin/main` 1647f0c, which already contains the PR #83 ATTACH work).
+
+## Status
+
+- [x] Design fork settled: layer at the per-variant read (§2)
+- [x] Interface decisions (§3)
+- [ ] Build test-first (plan: `P13-008-sample-concat-reader-implementation`)
+- [ ] Lift the ATTACH sample-sharded reject (§6)
+- [ ] Fresh whole-branch review, PR
+
+## 1. What is there today
+
+- The multi-file scan is variant-sharded. `PfileBindData.sources` holds one `PfileSource` per
+  shard, and `variant_offsets` maps a global variant position to (source, local position).
+- The sample model is one shared set, taken from `sources[0]`: `raw_sample_ct`,
+  `sample_info`, `sample_metadata`.
+- Every genotype decode is a direct pgenlib call on one `PgenReader`. There are 14 sites:
+
+| Site | Calls |
+|---|---|
+| bind, sample-orient count filter | `PgrGetCounts` |
+| bind, sample-orient pre-read | `PgrGetD`, `PgrGetP`, `PgrGet` |
+| `PfileDefaultScan` (variant orient) | `PgrGetCounts` (filter), `PgrGetD`, `PgrGetP`, `PgrGet`, `PgrGetCounts` (counts/stats) |
+| `PfileTidyScan` (genotype orient) | `PgrGetCounts`, `PgrGetD`, `PgrGetP`, `PgrGet` |
+| `PfileSampleOrientScan` (streaming counts/stats) | `PgrGet`, `PgrGetDifflistOrGenovec` |
+
+## 2. The design fork: layer at the per-variant read
+
+**Decision: (a), but with a narrow seam.** CONCATENATE does not get its own scan path. It
+replaces only the "decode variant v" and "count variant v" calls.
+
+In concat mode:
+
+- `sources` holds **one** `PfileSource`. It carries the shared variant metadata (shard 0's
+  `.pvar`, or the `pvar :=` override) and the effective variant list. So `variant_offsets =
+  {0, N}`, and all variant scheduling is the existing single-file scheduling. No source
+  switching happens.
+- A new `sample_shards` list holds each shard's `.pgen` path, its own sample count, and its
+  offset in the combined sample space.
+- `raw_sample_ct` is the **combined** count, Σ per-shard counts. To all code after the read
+  seam, the cohort looks like one `.pgen` with Σ samples.
+- A new `ConcatPgenReader` (`src/pgen_concat_reader.{hpp,cpp}`) owns one pgenlib reader per
+  shard. Its `Get`, `GetCounts`, `GetD` and `GetP` methods have the same output contract as the
+  pgenlib calls over the combined space. Each method reads every shard and writes each shard's
+  slice at its sample offset.
+- Each of the 14 sites becomes `concat ? concat->Get(...) : plink2::PgrGet(...)`.
+
+Why this beats a separate scan path (b):
+
+- The emit code is shared: array, list, columns, struct, counts, stats, phased, dosages, the
+  genotype filters, the count filters, and projection pushdown. A separate path either
+  duplicates about 500 lines of emit code per orient, or ships a subset of modes without a
+  reject for the rest.
+- All three orients come for free: `variant`, `genotype` and `sample`. For `sample`, the rows
+  are the union of the shards' sample rows, because the combined sample space is the
+  concatenation.
+- The variant-sharded path does not change. Concat code runs only when the mode is selected.
+
+### 2.1 The output contract of `ConcatPgenReader`
+
+The combined sample space is `[0, Σn)`. Shard k owns `[off_k, off_k + n_k)`.
+
+- `samples :=` resolves to sorted global indices, as today. The reader splits them into a
+  per-shard `SampleSubset` (local indices), with its own `pssi`. A shard with zero selected
+  samples is skipped. pgenlib is never called with `sample_ct = 0`.
+- pgenlib writes the selected samples in ascending order. The per-shard outputs, in shard
+  order, are therefore the global ascending order that the single-file path produces.
+- `Get`: each shard's 2-bit genovec is ORed into the zeroed output at bit offset
+  `2 × out_off_k`.
+- `GetCounts`: the four genocounts are **summed** across shards. The `af_range` / `ac_range`
+  filters and `include_genotypes` `any_pass` / `all_pass` then see whole-cohort counts. A
+  filter never uses one shard's counts.
+- `GetD`: the genovec and `dosage_present` bit arrays are appended at the shard's offset. The
+  `dosage_main` entries are appended in order, and `dosage_ct` is summed.
+- `GetP`: the genovec, `phasepresent` and `phaseinfo` are appended. `phasepresent_ct` is
+  summed. pgenlib does not write the phase buffers of a shard with `phasepresent_ct == 0`, so
+  the reader appends nothing for that shard (its slice stays zero).
+- The sparse difflist path (`PgrGetDifflistOrGenovec`) returns shard-relative sample ids. In
+  concat mode it is **disabled**. The streaming scan uses the dense `Get` path.
+
+The bit-append helper is the one new piece of bit arithmetic. The tests split fixtures at
+sample counts that are not multiples of 32, so the shifts cross word boundaries.
+
+### 2.2 What `raw_sample_ct` means at each use
+
+| Meaning in concat mode | Uses |
+|---|---|
+| **Combined** (Σ) | the psam-count check, `ResolveSelection`, the `ac_range` bound, `BuildSampleSubset` for the combined subset, every decode buffer (genovec, dosage, `genotype_bytes`), the matrix guard, `OutputSampleCt` |
+| **Per shard** (`sample_shards[k].raw_sample_ct`) | `PgfiInitPhase1` and the per-shard `SampleSubset`. Only `ConcatPgenReader` uses these. |
+
+The three non-concat `PgfiInitPhase1(..., raw_sample_ct, ...)` sites (bind count filter, bind
+pre-read, `OpenSourceReader`) do not run in concat mode. The reader opens the shards itself.
+
+## 3. Interface decisions
+
+| Question | Decision | Reason |
+|---|---|---|
+| `pvar :=` with a list | **Allowed** in concat mode. It is the shared `.pvar` for every shard. | The mirror of the `psam :=` override in variant-sharded mode. ATTACH needs it, because a sample-sharded catalog has one shared `.pvar`. |
+| `.pvar` of shards 1..K | **Not read.** Only the `.pgen` header. A `raw_variant_ct` that differs from shard 0 is a hard error. | Trust the caller (positional), the same as `implicit`. The count check costs nothing. |
+| `psam :=` | **Rejected** in concat mode. | Each shard has its own `.psam`. One override cannot say which samples belong to which shard. |
+| `pgen :=` | Rejected (unchanged). | It is the per-shard input. |
+| `variants :=`, `variant_range` | **Allowed** in concat mode. | There is one variant axis, so they resolve against the shared index without ambiguity. The variant-sharded reject message does not apply. |
+| Per-shard `.psam` headers | Column names must be equal in every shard. A difference is a hard error. | The output schema comes from the header. |
+| IID uniqueness across shards | **Not checked** (positional trust). Documented. | A check needs every IID loaded, also in variant orient, where only the count is loaded today. `genotypes := 'columns'` / `'struct'` with a duplicate IID errors in DuckDB's duplicate-name check (tested). |
+| `.parquet` psam companions | Supported only when **every** shard's psam is native text (`.psam`/`.fam`). A parquet psam in concat mode is a hard error that names `SET plinking_use_parquet_companions = false`. | `BuildProjectedPsamCdc` queries one `source_path`. Without this reject, only shard 0's metadata is emitted. A projection-aware multi-file parquet load is a follow-up. |
+| `localize` | Each shard's `.pgen` is localized. | Same guard as variant-sharded. |
+| One shard in a list, or no list | `concatenate` with one fileset reads it normally. | The degenerate case. |
+
+## 4. Costs
+
+- Each scan thread opens one reader per shard: file handles are threads × shards. Each
+  reader also holds scratch buffers sized to its shard's selected samples.
+- `GetCounts` reads every shard for every variant. That is the same total work as one large
+  `.pgen`, split across K files.
+
+## 5. Test oracle
+
+Split existing fixtures by **contiguous sample ranges** with plink2 (`--pfile X --keep ids
+--make-pgen`). Then for every mode, filter and orient:
+
+```sql
+read_pfile(['X_s0', 'X_s1'], combine_samples := 'concatenate')  ==  read_pfile('X')
+```
+
+- `large_example` (8 samples, 3000 variants, multi-batch) split 3 + 5, and 1 + 2 + 5 (a
+  one-sample shard).
+- `wes_chr10` (10000 samples) split at 37: the shifts cross many word boundaries. Built at
+  test time with `COPY … (FORMAT pfile, samples [...])` into `__TEST_DIR__`, so no 11 MB
+  fixture is committed.
+- `phased_example` and `dosage_example` split with plink2 (the COPY writer writes hardcalls
+  only).
+- A shared-pvar layout: shards without their own `.pvar`, read with `pvar :=`.
+- Each split shard is first checked against the original's sample slice, so the oracle does
+  not trust the fixture.
+
+## 6. ATTACH
+
+`src/pfile_catalog_storage.cpp` rejects `concat_dim == "samples"`. With this read mode the
+reject is lifted:
+
+- `GenotypesSql` passes `combine_samples := 'concatenate'` and `pvar := <shared pvar>`, and
+  no `psam :=` override.
+- The existing `pfile_catalog_samples.pfile.json` points both cells at `large_example` (the same
+  8 IIDs twice), so it is not a valid sample-sharded cohort. The ATTACH test uses a new
+  disjoint catalog over the split shards.
+
+## 7. Out of scope
+
+`union` and `intersect` stay "not yet implemented". `read_pgen` multi-file input is unchanged.

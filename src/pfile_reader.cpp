@@ -6,6 +6,7 @@
 #include "plink_common.hpp"
 #include "plink_profile.hpp"
 #include "pgen_vfs_opener.hpp"
+#include "pgen_concat_reader.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
@@ -370,15 +371,17 @@ struct PfileSource {
 	}
 };
 
-// How the sample sets of multiple sources are combined. Only IMPLICIT and
-// IDENTICAL are implemented; the others are reserved for real sample-set joins.
+// How the sample sets of multiple sources are combined. UNION and INTERSECT are
+// reserved for real sample-set joins (not yet implemented).
 //   IMPLICIT    - trust the caller: same samples, same order, positional (default,
 //                 matches the existing multi-file contract; no per-shard psam I/O).
 //   IDENTICAL   - verify every shard's IIDs are equal (same values, same order),
 //                 then combine positionally. A mismatch is a hard error.
 //   UNION       - outer-join samples across shards (not yet implemented).
 //   INTERSECT   - inner-join samples across shards (not yet implemented).
-//   CONCATENATE - stack DIFFERENT samples (sample-sharded) (not yet implemented).
+//   CONCATENATE - stack DIFFERENT samples (sample-sharded): the shards hold the same
+//                 variants; the output samples are the shards' samples in list order
+//                 (P13-008, docs/planning/P13-008-sample-concat-reader).
 enum class CombineSamplesMode : uint8_t { IMPLICIT, IDENTICAL, UNION, INTERSECT, CONCATENATE };
 
 static CombineSamplesMode ResolveCombineSamplesMode(const string &s) {
@@ -421,8 +424,22 @@ struct PfileBindData : public TableFunctionData {
 	// Full sample metadata (for genotype orient mode column output) — from sources[0]
 	PfileSampleMetadata sample_metadata;
 
-	// pgenlib header: sample count (shared — identical across all sources by contract)
+	// pgenlib header: sample count (shared — identical across all sources by contract).
+	// For a sample-sharded cohort (IsConcat) this is the COMBINED count, the sum over
+	// sample_shards: every decode buffer and the sample axis use the combined space.
 	uint32_t raw_sample_ct = 0;
+
+	// Sample-sharded cohort (combine_samples := 'concatenate' over more than one
+	// fileset): one entry per shard, in list order, with its .pgen, its own sample
+	// count and its offset in the combined sample space. Empty for every other read.
+	// When non-empty, `sources` holds exactly ONE PfileSource — the shared variant
+	// axis (shard 0's .pvar, or the pvar := override) — so variant scheduling is the
+	// single-file path, and every per-variant read goes through a ConcatPgenReader.
+	vector<PgenSampleShard> sample_shards;
+	vector<string> sample_shard_psam_paths; // parallel to sample_shards
+	bool IsConcat() const {
+		return !sample_shards.empty();
+	}
 
 	// Mode
 	OrientMode orient_mode = OrientMode::VARIANT;
@@ -677,6 +694,11 @@ struct PfileLocalState : public LocalTableFunctionState {
 
 	plink2::PgrSampleSubsetIndex pssi;
 
+	// Sample-sharded cohort (combine_samples := 'concatenate'): the per-variant reads go
+	// through this reader over every shard instead of pgr (which stays preinit'd, so the
+	// destructor's Cleanup* is a no-op). Null for every other read.
+	unique_ptr<ConcatPgenReader> concat;
+
 	bool initialized = false;
 
 	// Multi-file: index of the source this thread's pgr/pgfi are currently open on
@@ -731,12 +753,16 @@ struct PfileLocalState : public LocalTableFunctionState {
 //! Discover companion files, read the .pgen header, and load variant metadata for
 //! ONE source (shard). `override_*` supply explicit paths (single-file only; empty
 //! for shards in a list). `need_psam` gates .psam discovery — only the first source
-//! needs it (shared sample metadata). Outputs this file's sample count via
+//! needs it (shared sample metadata). `need_pvar` gates .pvar discovery + the
+//! variant-metadata load: a sample shard after the first (combine_samples :=
+//! 'concatenate') shares shard 0's variants, so only its .pgen header is read and
+//! `variants` stays empty. Outputs this file's sample count via
 //! `raw_sample_ct_out` for the caller's cross-source equality check.
 static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const string &prefix,
                                    const string &override_pgen, const string &override_pvar,
-                                   const string &override_psam, bool need_psam, const RegionFilter &region,
-                                   uint32_t &raw_sample_ct_out, PgenLocalizeGuard &localize_guard) {
+                                   const string &override_psam, bool need_psam, bool need_pvar,
+                                   const RegionFilter &region, uint32_t &raw_sample_ct_out,
+                                   PgenLocalizeGuard &localize_guard) {
 	PfileSource src;
 	// Resolve explicit overrides against file_search_path too (keep the literal
 	// if not found, so downstream open produces the natural error message).
@@ -779,7 +805,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	}
 
 	// Discover .pvar/.bim
-	if (src.pvar_path.empty()) {
+	if (need_pvar && src.pvar_path.empty()) {
 		if (!eff_prefix.empty()) {
 			src.pvar_path = FindCompanionFileWithParquet(context, fs, eff_prefix + ".pgen", {".pvar", ".bim"});
 			if (src.pvar_path.empty()) {
@@ -858,6 +884,10 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	plink2::CleanupPgfi(&pgfi, &cleanup_err);
 	if (err != plink2::kPglRetSuccess) {
 		throw IOException("read_pfile: failed to initialize '%s' (phase 2): %s", src.pgen_path, errstr_buf);
+	}
+
+	if (!need_pvar) {
+		return src; // a later sample shard: header counts only (see need_pvar)
 	}
 
 	// --- Load variant metadata (region pushdown for parquet) ---
@@ -959,6 +989,77 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 	}
 }
 
+//! Sample metadata of a sample-sharded cohort: every shard's .psam, concatenated in
+//! shard order (the same order as the combined genotype columns). `full_metadata`
+//! loads all psam columns (genotype/sample orient); otherwise IIDs only when
+//! `needs_iids`, else just the counts. Each shard's .psam count must equal its own
+//! .pgen's, or every later shard's samples would silently shift.
+static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind_data, bool full_metadata,
+                                     bool needs_iids) {
+	SampleInfo &out = bind_data.sample_info;
+	out = SampleInfo();
+	out.sample_ct = 0;
+	bool all_sexes = true;
+	for (idx_t k = 0; k < bind_data.sample_shards.size(); k++) {
+		const string &path = bind_data.sample_shard_psam_paths[k];
+		const auto &shard = bind_data.sample_shards[k];
+		// The projection-aware parquet psam path (BuildProjectedPsamCdc) reads ONE
+		// source; concatenating it is a follow-up. Fail loud rather than emit shard 0's
+		// metadata for every sample.
+		if (!IsNativePlinkFormat(path)) {
+			throw InvalidInputException(
+			    "read_pfile: combine_samples := 'concatenate' does not support a parquet .psam companion yet ('%s'); "
+			    "SET plinking_use_parquet_companions = false to read the text .psam/.fam",
+			    path);
+		}
+		SampleInfo part;
+		if (full_metadata) {
+			PfileSampleMetadata meta = LoadPfileSampleMetadata(context, path, part);
+			if (k == 0) {
+				bind_data.sample_metadata = std::move(meta);
+			} else {
+				auto &ref = bind_data.sample_metadata.header;
+				if (meta.header.column_names != ref.column_names || meta.header.column_types != ref.column_types) {
+					throw InvalidInputException(
+					    "read_pfile: .psam columns differ across sample shards: '%s' has (%s) but '%s' has (%s). "
+					    "combine_samples := 'concatenate' needs the same .psam columns in every shard.",
+					    path, StringUtil::Join(meta.header.column_names, ", "), bind_data.sample_shard_psam_paths[0],
+					    StringUtil::Join(ref.column_names, ", "));
+				}
+				for (auto &row : meta.rows) {
+					bind_data.sample_metadata.rows.push_back(std::move(row));
+				}
+			}
+		} else if (needs_iids) {
+			part = LoadSampleMetadata(context, path);
+		} else {
+			part = LoadSampleCount(context, path);
+		}
+		if (part.sample_ct != shard.raw_sample_ct) {
+			throw InvalidInputException("read_pfile: sample count mismatch: .pgen '%s' has %u samples, "
+			                            ".psam/.fam '%s' has %llu samples",
+			                            shard.pgen_path, shard.raw_sample_ct, path,
+			                            static_cast<unsigned long long>(part.sample_ct));
+		}
+		if (k > 0 && out.fids.empty() != part.fids.empty() && !out.iids.empty()) {
+			throw InvalidInputException("read_pfile: .psam columns differ across sample shards: '%s' and '%s' "
+			                            "disagree on the FID column",
+			                            path, bind_data.sample_shard_psam_paths[0]);
+		}
+		out.iids.insert(out.iids.end(), part.iids.begin(), part.iids.end());
+		out.fids.insert(out.fids.end(), part.fids.begin(), part.fids.end());
+		if (part.sexes.size() == part.sample_ct) {
+			out.sexes.insert(out.sexes.end(), part.sexes.begin(), part.sexes.end());
+		} else {
+			all_sexes = false;
+		}
+		out.sample_ct += part.sample_ct;
+	}
+	if (!all_sexes) {
+		out.sexes.clear();
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Bind function
 // ---------------------------------------------------------------------------
@@ -1041,12 +1142,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		    "read_pfile: with_ordinal := true is only supported with orient := 'variant' (the default)");
 	}
 
-	// Only IMPLICIT and IDENTICAL are implemented; the join modes are reserved.
+	// The sample-set join modes are reserved.
 	if (bind_data->combine_samples == CombineSamplesMode::UNION ||
-	    bind_data->combine_samples == CombineSamplesMode::INTERSECT ||
-	    bind_data->combine_samples == CombineSamplesMode::CONCATENATE) {
+	    bind_data->combine_samples == CombineSamplesMode::INTERSECT) {
 		throw InvalidInputException("read_pfile: combine_samples := '%s' is not yet implemented "
-		                            "(only 'implicit' and 'identical' are supported)",
+		                            "(only 'implicit', 'identical' and 'concatenate' are supported)",
 		                            StringUtil::Lower(input.named_parameters.at("combine_samples").GetValue<string>()));
 	}
 
@@ -1054,8 +1154,23 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		throw InvalidInputException("read_pfile: dosages and phased cannot both be true");
 	}
 
+	// A sample-sharded cohort: same variants, different samples per fileset. There is
+	// ONE variant axis, so pvar := (the shared .pvar), variants := and variant_range
+	// resolve unambiguously; only the per-shard pgen/psam overrides are rejected.
+	const bool concat = multi_file && bind_data->combine_samples == CombineSamplesMode::CONCATENATE;
+
 	// --- Multi-file guards (throw before loading anything) ---
-	if (multi_file) {
+	if (concat) {
+		if (!override_psam.empty()) {
+			throw InvalidInputException(
+			    "read_pfile: a psam override cannot be combined with combine_samples := 'concatenate' (each sample "
+			    "shard has its own .psam; the output samples are the shards' .psam rows in list order)");
+		}
+		if (!override_pgen.empty()) {
+			throw InvalidInputException("read_pfile: a pgen override cannot be combined with a multi-file list (the "
+			                            "list elements are the per-shard .pgen inputs)");
+		}
+	} else if (multi_file) {
 		// pgen/pvar overrides can't disambiguate across shards: the list elements
 		// ARE the per-shard pgens, and each shard has its own (different) variants.
 		// A psam override IS allowed — all shards share one sample set by contract,
@@ -1165,16 +1280,45 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// can compare IIDs below; otherwise only source 0's psam is needed. A psam
 		// override supplies one shared .psam for all shards, so there is nothing to
 		// discover or compare per shard.
-		bool need_psam =
-		    (si == 0) || (bind_data->combine_samples == CombineSamplesMode::IDENTICAL && override_psam.empty());
+		// combine_samples := 'concatenate' needs every shard's .psam (its own samples)
+		// but only shard 0's .pvar (the shared variant axis).
+		bool need_psam = (si == 0) || concat ||
+		                 (bind_data->combine_samples == CombineSamplesMode::IDENTICAL && override_psam.empty());
+		bool need_pvar = !(concat && si > 0);
 		PfileSource src = LoadPfileSource(context, fs, prefixes[si], si == 0 ? override_pgen : string(),
 		                                  si == 0 ? override_pvar : string(), si == 0 ? override_psam : string(),
-		                                  need_psam, bind_data->region, src_sample_ct, bind_data->localize_guard);
+		                                  need_psam, need_pvar, bind_data->region, src_sample_ct,
+		                                  bind_data->localize_guard);
 
-		// Free safety check: every shard's .pgen header reports its sample_ct. All
-		// shards share an identical .psam by contract; a genuine mismatch would
-		// silently overflow the per-thread sample buffers — reject it clearly.
-		if (si == 0) {
+		if (concat) {
+			// Sample shard: the samples add up; the variants must be the same set. Only
+			// the COUNT is checked (positional trust, like 'implicit'): shards 1..K's
+			// .pvar files are never read.
+			if (si > 0 && src.raw_variant_ct != bind_data->sources[0].raw_variant_ct) {
+				throw InvalidInputException(
+				    "read_pfile: variant count mismatch across sample shards: '%s' has %u variants, but '%s' has %u. "
+				    "combine_samples := 'concatenate' needs every shard to hold the same variants in the same order.",
+				    src.pgen_path, src.raw_variant_ct, bind_data->sources[0].pgen_path,
+				    bind_data->sources[0].raw_variant_ct);
+			}
+			if (static_cast<uint64_t>(bind_data->raw_sample_ct) + src_sample_ct > UINT32_MAX) {
+				throw InvalidInputException("read_pfile: combine_samples := 'concatenate' exceeds %u samples",
+				                            UINT32_MAX);
+			}
+			PgenSampleShard shard;
+			shard.pgen_path = src.pgen_path;
+			shard.raw_sample_ct = src_sample_ct;
+			shard.sample_offset = bind_data->raw_sample_ct;
+			bind_data->raw_sample_ct += src_sample_ct;
+			bind_data->sample_shards.push_back(std::move(shard));
+			bind_data->sample_shard_psam_paths.push_back(src.psam_path);
+			if (si > 0) {
+				continue; // a later shard contributes samples only, never a variant source
+			}
+		} else if (si == 0) {
+			// Free safety check: every shard's .pgen header reports its sample_ct. All
+			// shards share an identical .psam by contract; a genuine mismatch would
+			// silently overflow the per-thread sample buffers — reject it clearly.
 			bind_data->raw_sample_ct = src_sample_ct;
 		} else if (src_sample_ct != bind_data->raw_sample_ct) {
 			throw InvalidInputException(
@@ -1295,7 +1439,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 
 	bind_timer.Note("loading sample metadata (needs_iids=%s)", needs_iids ? "yes" : "no");
-	if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
+	if (bind_data->IsConcat()) {
+		LoadConcatSampleMetadata(
+		    context, *bind_data,
+		    bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE,
+		    needs_iids);
+	} else if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		bind_data->sample_metadata = LoadPfileSampleMetadata(context, psam_path, bind_data->sample_info);
 	} else if (needs_iids) {
 		bind_data->sample_info = LoadSampleMetadata(context, psam_path);
@@ -1495,62 +1644,72 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		if (bind_data->count_filter.HasFilter() || bind_data->genotype_filter.active) {
 			// Count-filter readers open .pgen — route through the VFS while active.
 			PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
+			// Sample-sharded cohort: count every shard (summed) through one reader.
+			unique_ptr<ConcatPgenReader> cf_cat;
+			if (bind_data->IsConcat()) {
+				cf_cat = make_uniq<ConcatPgenReader>();
+				cf_cat->Open(context, bind_data->use_vfs, bind_data->sample_shards, bind_data->Primary().raw_variant_ct,
+				             bind_data->has_sample_subset, bind_data->sample_indices);
+			}
 			for (auto &src : bind_data->sources) {
-				// Init temporary PgenReader for count filtering
+				// Init temporary PgenReader for count filtering (not opened when cf_cat
+				// reads a sample-sharded cohort; Cleanup* on a preinit'd reader is a no-op).
 				plink2::PgenFileInfo cf_pgfi;
 				plink2::PreinitPgfi(&cf_pgfi);
-
-				char cf_errstr[plink2::kPglErrstrBufBlen];
-				plink2::PgenHeaderCtrl cf_hdr;
-				uintptr_t cf_pgfi_alloc_ct = 0;
-
-				err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct,
-				                             bind_data->raw_sample_ct, &cf_hdr, &cf_pgfi, &cf_pgfi_alloc_ct, cf_errstr);
-				if (err != plink2::kPglRetSuccess) {
-					plink2::PglErr ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgfi(&cf_pgfi, &ce);
-					throw IOException("read_pfile: failed to init PgenReader for count filter: %s", cf_errstr);
-				}
-
-				AlignedBuffer cf_pgfi_alloc;
-				if (cf_pgfi_alloc_ct > 0) {
-					cf_pgfi_alloc.Allocate(cf_pgfi_alloc_ct * plink2::kCacheline);
-				}
-
-				uint32_t cf_max_vrec = 0;
-				uintptr_t cf_pgr_alloc_ct = 0;
-				err = plink2::PgfiInitPhase2(cf_hdr, 0, 0, 0, 0, cf_pgfi.raw_variant_ct, &cf_max_vrec, &cf_pgfi,
-				                             cf_pgfi_alloc.As<unsigned char>(), &cf_pgr_alloc_ct, cf_errstr);
-				if (err != plink2::kPglRetSuccess) {
-					plink2::PglErr ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgfi(&cf_pgfi, &ce);
-					throw IOException("read_pfile: count filter PgenReader init failed (phase 2): %s", cf_errstr);
-				}
-
 				plink2::PgenReader cf_pgr;
 				plink2::PreinitPgr(&cf_pgr);
+				AlignedBuffer cf_pgfi_alloc;
 				AlignedBuffer cf_pgr_alloc;
-				if (cf_pgr_alloc_ct > 0) {
-					cf_pgr_alloc.Allocate(cf_pgr_alloc_ct * plink2::kCacheline);
-				}
-
-				err = plink2::PgrInit(src.pgen_path.c_str(), cf_max_vrec, &cf_pgfi, &cf_pgr,
-				                      cf_pgr_alloc.As<unsigned char>());
-				if (err != plink2::kPglRetSuccess) {
-					plink2::PglErr ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgr(&cf_pgr, &ce);
-					ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgfi(&cf_pgfi, &ce);
-					throw IOException("read_pfile: PgrInit failed for count filter");
-				}
-
-				// Set up sample subsetting for PgrGetCounts
 				plink2::PgrSampleSubsetIndex cf_pssi;
-				if (bind_data->has_sample_subset && bind_data->count_filter_subset) {
-					plink2::PgrSetSampleSubsetIndex(bind_data->count_filter_subset->CumulativePopcounts(), &cf_pgr,
-					                                &cf_pssi);
-				} else {
-					plink2::PgrClearSampleSubsetIndex(&cf_pgr, &cf_pssi);
+				plink2::PgrClearSampleSubsetIndex(nullptr, &cf_pssi);
+				if (!cf_cat) {
+					char cf_errstr[plink2::kPglErrstrBufBlen];
+					plink2::PgenHeaderCtrl cf_hdr;
+					uintptr_t cf_pgfi_alloc_ct = 0;
+
+					err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct,
+					                             bind_data->raw_sample_ct, &cf_hdr, &cf_pgfi, &cf_pgfi_alloc_ct, cf_errstr);
+					if (err != plink2::kPglRetSuccess) {
+						plink2::PglErr ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgfi(&cf_pgfi, &ce);
+						throw IOException("read_pfile: failed to init PgenReader for count filter: %s", cf_errstr);
+					}
+
+					if (cf_pgfi_alloc_ct > 0) {
+						cf_pgfi_alloc.Allocate(cf_pgfi_alloc_ct * plink2::kCacheline);
+					}
+
+					uint32_t cf_max_vrec = 0;
+					uintptr_t cf_pgr_alloc_ct = 0;
+					err = plink2::PgfiInitPhase2(cf_hdr, 0, 0, 0, 0, cf_pgfi.raw_variant_ct, &cf_max_vrec, &cf_pgfi,
+					                             cf_pgfi_alloc.As<unsigned char>(), &cf_pgr_alloc_ct, cf_errstr);
+					if (err != plink2::kPglRetSuccess) {
+						plink2::PglErr ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgfi(&cf_pgfi, &ce);
+						throw IOException("read_pfile: count filter PgenReader init failed (phase 2): %s", cf_errstr);
+					}
+
+					if (cf_pgr_alloc_ct > 0) {
+						cf_pgr_alloc.Allocate(cf_pgr_alloc_ct * plink2::kCacheline);
+					}
+
+					err = plink2::PgrInit(src.pgen_path.c_str(), cf_max_vrec, &cf_pgfi, &cf_pgr,
+					                      cf_pgr_alloc.As<unsigned char>());
+					if (err != plink2::kPglRetSuccess) {
+						plink2::PglErr ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgr(&cf_pgr, &ce);
+						ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgfi(&cf_pgfi, &ce);
+						throw IOException("read_pfile: PgrInit failed for count filter");
+					}
+
+					// Set up sample subsetting for PgrGetCounts
+					if (bind_data->has_sample_subset && bind_data->count_filter_subset) {
+						plink2::PgrSetSampleSubsetIndex(bind_data->count_filter_subset->CumulativePopcounts(), &cf_pgr,
+						                                &cf_pssi);
+					} else {
+						plink2::PgrClearSampleSubsetIndex(&cf_pgr, &cf_pssi);
+					}
 				}
 
 				const uintptr_t *cf_si = (bind_data->has_sample_subset && bind_data->count_filter_subset)
@@ -1570,8 +1729,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[ev] : ev;
 
 					STD_ARRAY_DECL(uint32_t, 4, genocounts);
-					plink2::PglErr cf_err =
-					    plink2::PgrGetCounts(cf_si, cf_iv, cf_pssi, cf_sc, vidx, &cf_pgr, genocounts);
+					plink2::PglErr cf_err = cf_cat ? cf_cat->GetCounts(vidx, genocounts)
+					                               : plink2::PgrGetCounts(cf_si, cf_iv, cf_pssi, cf_sc, vidx, &cf_pgr,
+					                                                      genocounts);
 					if (cf_err != plink2::kPglRetSuccess) {
 						plink2::PglErr ce = plink2::kPglRetSuccess;
 						plink2::CleanupPgr(&cf_pgr, &ce);
@@ -1829,59 +1989,72 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			// occupies matrix rows [variant_offsets[src_idx], variant_offsets[src_idx+1]).
 			// The per-source readers open .pgen — route through the VFS while active.
 			PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
+			// Sample-sharded cohort (combine_samples := 'concatenate'): one reader over
+			// every shard, presenting the combined sample space. Nothing is opened per
+			// source below (there is exactly one source: the shared variant axis).
+			unique_ptr<ConcatPgenReader> pr_cat;
+			if (bind_data->IsConcat()) {
+				pr_cat = make_uniq<ConcatPgenReader>();
+				pr_cat->Open(context, bind_data->use_vfs, bind_data->sample_shards, bind_data->Primary().raw_variant_ct,
+				             bind_data->has_sample_subset, bind_data->sample_indices);
+			}
 			for (idx_t src_idx = 0; src_idx < bind_data->sources.size(); src_idx++) {
 				PfileSource &src = bind_data->sources[src_idx];
 				uint32_t global_offset = bind_data->variant_offsets[src_idx];
 
-				// Temporary PgenReader for THIS source.
+				// Temporary PgenReader for THIS source (unused, and never opened, when
+				// pr_cat reads a sample-sharded cohort; Cleanup* on a preinit'd reader is a no-op).
 				plink2::PgenFileInfo tmp_pgfi;
 				plink2::PreinitPgfi(&tmp_pgfi);
-				char errstr_buf2[plink2::kPglErrstrBufBlen];
-				plink2::PgenHeaderCtrl header_ctrl2;
-				uintptr_t pgfi_alloc_ct2 = 0;
-				err =
-				    plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data->raw_sample_ct,
-				                           &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
-				if (err != plink2::kPglRetSuccess) {
-					plink2::PglErr ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgfi(&tmp_pgfi, &ce);
-					throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read: %s",
-					                  errstr_buf2);
-				}
-				AlignedBuffer pgfi_alloc2;
-				if (pgfi_alloc_ct2 > 0) {
-					pgfi_alloc2.Allocate(pgfi_alloc_ct2 * plink2::kCacheline);
-				}
-				uint32_t max_vrec2 = 0;
-				uintptr_t pgr_alloc_ct2 = 0;
-				err = plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
-				                             pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
-				if (err != plink2::kPglRetSuccess) {
-					plink2::PglErr ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgfi(&tmp_pgfi, &ce);
-					throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
-					                  errstr_buf2);
-				}
 				plink2::PgenReader tmp_pgr;
 				plink2::PreinitPgr(&tmp_pgr);
+				AlignedBuffer pgfi_alloc2;
 				AlignedBuffer pgr_alloc2;
-				if (pgr_alloc_ct2 > 0) {
-					pgr_alloc2.Allocate(pgr_alloc_ct2 * plink2::kCacheline);
-				}
-				err = plink2::PgrInit(src.pgen_path.c_str(), max_vrec2, &tmp_pgfi, &tmp_pgr,
-				                      pgr_alloc2.As<unsigned char>());
-				if (err != plink2::kPglRetSuccess) {
-					plink2::PglErr ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgr(&tmp_pgr, &ce);
-					ce = plink2::kPglRetSuccess;
-					plink2::CleanupPgfi(&tmp_pgfi, &ce);
-					throw IOException("read_pfile: PgrInit failed for sample-orient pre-read");
-				}
 				plink2::PgrSampleSubsetIndex pssi2;
-				if (bind_data->has_sample_subset) {
-					plink2::PgrSetSampleSubsetIndex(preread_subset.CumulativePopcounts(), &tmp_pgr, &pssi2);
-				} else {
-					plink2::PgrClearSampleSubsetIndex(&tmp_pgr, &pssi2);
+				plink2::PgrClearSampleSubsetIndex(nullptr, &pssi2);
+				if (!pr_cat) {
+					char errstr_buf2[plink2::kPglErrstrBufBlen];
+					plink2::PgenHeaderCtrl header_ctrl2;
+					uintptr_t pgfi_alloc_ct2 = 0;
+					err =
+					    plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data->raw_sample_ct,
+					                           &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
+					if (err != plink2::kPglRetSuccess) {
+						plink2::PglErr ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgfi(&tmp_pgfi, &ce);
+						throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read: %s",
+						                  errstr_buf2);
+					}
+					if (pgfi_alloc_ct2 > 0) {
+						pgfi_alloc2.Allocate(pgfi_alloc_ct2 * plink2::kCacheline);
+					}
+					uint32_t max_vrec2 = 0;
+					uintptr_t pgr_alloc_ct2 = 0;
+					err = plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
+					                             pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
+					if (err != plink2::kPglRetSuccess) {
+						plink2::PglErr ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgfi(&tmp_pgfi, &ce);
+						throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
+						                  errstr_buf2);
+					}
+					if (pgr_alloc_ct2 > 0) {
+						pgr_alloc2.Allocate(pgr_alloc_ct2 * plink2::kCacheline);
+					}
+					err = plink2::PgrInit(src.pgen_path.c_str(), max_vrec2, &tmp_pgfi, &tmp_pgr,
+					                      pgr_alloc2.As<unsigned char>());
+					if (err != plink2::kPglRetSuccess) {
+						plink2::PglErr ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgr(&tmp_pgr, &ce);
+						ce = plink2::kPglRetSuccess;
+						plink2::CleanupPgfi(&tmp_pgfi, &ce);
+						throw IOException("read_pfile: PgrInit failed for sample-orient pre-read");
+					}
+					if (bind_data->has_sample_subset) {
+						plink2::PgrSetSampleSubsetIndex(preread_subset.CumulativePopcounts(), &tmp_pgr, &pssi2);
+					} else {
+						plink2::PgrClearSampleSubsetIndex(&tmp_pgr, &pssi2);
+					}
 				}
 
 				uint32_t src_effective_ct = src.EffectiveVariantCt();
@@ -1893,9 +2066,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 					if (bind_data->include_dosages) {
 						uint32_t dosage_ct = 0;
-						err = plink2::PgrGetD(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-						                      genovec_buf2.As<uintptr_t>(), preread_dosage_present.As<uintptr_t>(),
-						                      preread_dosage_main.As<uint16_t>(), &dosage_ct);
+						err = pr_cat ? pr_cat->GetD(vidx, genovec_buf2.As<uintptr_t>(),
+						                            preread_dosage_present.As<uintptr_t>(),
+						                            preread_dosage_main.As<uint16_t>(), &dosage_ct)
+						             : plink2::PgrGetD(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
+						                               genovec_buf2.As<uintptr_t>(), preread_dosage_present.As<uintptr_t>(),
+						                               preread_dosage_main.As<uint16_t>(), &dosage_ct);
 						if (err != plink2::kPglRetSuccess) {
 							plink2::PglErr ce = plink2::kPglRetSuccess;
 							plink2::CleanupPgr(&tmp_pgr, &ce);
@@ -1919,9 +2095,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 						uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
 						std::memset(preread_phasepresent.ptr, 0, phase_byte_ct);
 						std::memset(preread_phaseinfo.ptr, 0, phase_byte_ct);
-						err = plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-						                      genovec_buf2.As<uintptr_t>(), preread_phasepresent.As<uintptr_t>(),
-						                      preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct);
+						err = pr_cat ? pr_cat->GetP(vidx, genovec_buf2.As<uintptr_t>(),
+						                            preread_phasepresent.As<uintptr_t>(),
+						                            preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct)
+						             : plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
+						                               genovec_buf2.As<uintptr_t>(), preread_phasepresent.As<uintptr_t>(),
+						                               preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct);
 						if (err != plink2::kPglRetSuccess) {
 							plink2::PglErr ce = plink2::kPglRetSuccess;
 							plink2::CleanupPgr(&tmp_pgr, &ce);
@@ -1961,8 +2140,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 						bind_data->genotype_matrix[ev].assign(preread_phased_pairs.begin(),
 						                                      preread_phased_pairs.begin() + output_sample_ct * 2);
 					} else {
-						err = plink2::PgrGet(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-						                     genovec_buf2.As<uintptr_t>());
+						err = pr_cat ? pr_cat->Get(vidx, genovec_buf2.As<uintptr_t>())
+						             : plink2::PgrGet(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
+						                              genovec_buf2.As<uintptr_t>());
 						if (err != plink2::kPglRetSuccess) {
 							plink2::PglErr ce = plink2::kPglRetSuccess;
 							plink2::CleanupPgr(&tmp_pgr, &ce);
@@ -2663,7 +2843,9 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 			bool want_sparse = context.TryGetCurrentSetting("plinking_sample_counts_sparse", sparse_val) &&
 			                   sparse_val.GetValue<bool>();
 			bool filter_allows_hom_ref = bind_data.genotype_filter.active && bind_data.genotype_filter.AllowsCall(0.0);
-			if (want_sparse && !filter_allows_hom_ref) {
+			// A sample-sharded cohort decodes densely: the difflist's sample ids are
+			// shard-relative, and the concat reader only offers the dense Get.
+			if (want_sparse && !filter_allows_hom_ref && !bind_data.IsConcat()) {
 				state->smp_use_sparse = true;
 				state->smp_max_difflist_len = std::max<uint32_t>(1, osc / 8);
 			}
@@ -2797,6 +2979,19 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 static void OpenSourceReader(ClientContext &context, PfileLocalState &state, const PfileBindData &bind_data,
                              idx_t source_idx) {
 	if (state.initialized && state.current_source_idx == source_idx) {
+		return;
+	}
+	if (bind_data.IsConcat()) {
+		// One source (the shared variant axis); the reader spans every sample shard.
+		// pgfi/pgr are preinit'd only, so the destructor's Cleanup* calls are no-ops.
+		plink2::PreinitPgfi(&state.pgfi);
+		plink2::PreinitPgr(&state.pgr);
+		plink2::PgrClearSampleSubsetIndex(nullptr, &state.pssi);
+		state.concat = make_uniq<ConcatPgenReader>();
+		state.concat->Open(context, bind_data.use_vfs, bind_data.sample_shards, bind_data.Primary().raw_variant_ct,
+		                   bind_data.has_sample_subset, bind_data.sample_indices);
+		state.current_source_idx = source_idx;
+		state.initialized = true;
 		return;
 	}
 	if (state.initialized) {
@@ -2998,7 +3193,8 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			                             : nullptr;
 			uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
 			plink2::PglErr cf_err =
-			    plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx, &lstate.pgr, genocounts);
+			    lstate.concat ? lstate.concat->GetCounts(vidx, genocounts)
+			                  : plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx, &lstate.pgr, genocounts);
 			if (cf_err != plink2::kPglRetSuccess) {
 				throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 			}
@@ -3018,9 +3214,13 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			if (bind_data.include_dosages) {
 				uint32_t dosage_ct = 0;
 				plink2::PglErr err =
-				    plink2::PgrGetD(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-				                    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+				    lstate.concat
+				        ? lstate.concat->GetD(vidx, lstate.genovec_buf.As<uintptr_t>(),
+				                              lstate.dosage_present_buf.As<uintptr_t>(),
+				                              lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct)
+				        : plink2::PgrGetD(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                          lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+				                          lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetD failed for variant %u", vidx);
 				}
@@ -3038,9 +3238,13 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				std::memset(lstate.phasepresent_buf.ptr, 0, phase_byte_ct);
 				std::memset(lstate.phaseinfo_buf.ptr, 0, phase_byte_ct);
 				plink2::PglErr err =
-				    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
-				                    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
+				    lstate.concat
+				        ? lstate.concat->GetP(vidx, lstate.genovec_buf.As<uintptr_t>(),
+				                              lstate.phasepresent_buf.As<uintptr_t>(),
+				                              lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct)
+				        : plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                          lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
+				                          lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetP failed for variant %u", vidx);
 				}
@@ -3050,8 +3254,10 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
 				                      lstate.phased_pairs.data());
 			} else {
-				plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                                    lstate.genovec_buf.As<uintptr_t>());
+				plink2::PglErr err =
+				    lstate.concat ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
+				                  : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                                   lstate.genovec_buf.As<uintptr_t>());
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
 				}
@@ -3197,7 +3403,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					    bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
 
 					plink2::PglErr agg_err =
-					    plink2::PgrGetCounts(agg_si, agg_iv, lstate.pssi, agg_sc, vidx, &lstate.pgr, genocounts);
+					    lstate.concat
+					        ? lstate.concat->GetCounts(vidx, genocounts)
+					        : plink2::PgrGetCounts(agg_si, agg_iv, lstate.pssi, agg_sc, vidx, &lstate.pgr, genocounts);
 					if (agg_err != plink2::kPglRetSuccess) {
 						throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 					}
@@ -3644,7 +3852,8 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			                             : nullptr;
 			uint32_t cf_sc = bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
 			plink2::PglErr cf_err =
-			    plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx, &lstate.pgr, genocounts);
+			    lstate.concat ? lstate.concat->GetCounts(vidx, genocounts)
+			                  : plink2::PgrGetCounts(cf_si, cf_iv, lstate.pssi, cf_sc, vidx, &lstate.pgr, genocounts);
 			if (cf_err != plink2::kPglRetSuccess) {
 				throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 			}
@@ -3662,9 +3871,13 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			if (bind_data.include_dosages) {
 				uint32_t dosage_ct = 0;
 				plink2::PglErr err =
-				    plink2::PgrGetD(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                    lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
-				                    lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
+				    lstate.concat
+				        ? lstate.concat->GetD(vidx, lstate.genovec_buf.As<uintptr_t>(),
+				                              lstate.dosage_present_buf.As<uintptr_t>(),
+				                              lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct)
+				        : plink2::PgrGetD(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                          lstate.genovec_buf.As<uintptr_t>(), lstate.dosage_present_buf.As<uintptr_t>(),
+				                          lstate.dosage_main_buf.As<uint16_t>(), &dosage_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetD failed for variant %u", vidx);
 				}
@@ -3682,9 +3895,13 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				std::memset(lstate.phasepresent_buf.ptr, 0, phase_byte_ct);
 				std::memset(lstate.phaseinfo_buf.ptr, 0, phase_byte_ct);
 				plink2::PglErr err =
-				    plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                    lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
-				                    lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
+				    lstate.concat
+				        ? lstate.concat->GetP(vidx, lstate.genovec_buf.As<uintptr_t>(),
+				                              lstate.phasepresent_buf.As<uintptr_t>(),
+				                              lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct)
+				        : plink2::PgrGetP(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                          lstate.genovec_buf.As<uintptr_t>(), lstate.phasepresent_buf.As<uintptr_t>(),
+				                          lstate.phaseinfo_buf.As<uintptr_t>(), &lstate.phasepresent_ct);
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGetP failed for variant %u", vidx);
 				}
@@ -3694,8 +3911,10 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
 				                      lstate.phased_pairs.data());
 			} else {
-				plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                                    lstate.genovec_buf.As<uintptr_t>());
+				plink2::PglErr err =
+				    lstate.concat ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
+				                  : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
+				                                   lstate.genovec_buf.As<uintptr_t>());
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
 				}
@@ -4046,7 +4265,8 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 
 				if (!gstate.smp_use_sparse) {
 					plink2::PglErr perr =
-					    plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx, &lstate.pgr, genovec);
+					    lstate.concat ? lstate.concat->Get(vidx, genovec)
+					                  : plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx, &lstate.pgr, genovec);
 					if (perr != plink2::kPglRetSuccess) {
 						throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient aggregation",
 						                  vidx);
