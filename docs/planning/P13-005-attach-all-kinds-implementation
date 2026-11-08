@@ -1,0 +1,162 @@
+# P13-005 ATTACH any catalog kind — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
+> (or superpowers:executing-plans) to implement this plan task-by-task. Steps use
+> checkbox (`- [ ]`) syntax.
+
+**Goal:** Make `ATTACH ... (TYPE pfile_catalog)` work for every catalog kind — single-fileset
+(v1), multi-file (v1), matrix (v2) — and for a bare fileset with no sidecar; and accept a
+**prefix** (`dir/cohort` → `dir/cohort.pfile.json`) as well as a full `.pfile.json` path.
+
+**Architecture:** Extend `src/pfile_catalog_storage.cpp` (the P13-003 StorageExtension). A shared
+helper resolves the per-cell `(prefix, pvar, psam)` list for any kind; the four data views are
+baked from it, identically across kinds; the structural views (`c.cells`, `c.*_blocks`) vary by
+kind. Read-only and the lazy-view mechanism are unchanged from P13-003.
+
+**Tech Stack:** C++17, DuckDB v2.0.0 extension API, sqllogictest.
+
+**Spec:** `docs/planning/P13-005-attach-all-kinds` (owner-approved 2026-11-08; decisions D1 =
+synthesize bare fileset, D2 = all seven relations; spike = Approach B, a shared helper).
+
+## Global Constraints
+
+- **v2.0.0-only.** Read-only (`SetReadOnlyDatabase`, `access_mode = READ_WRITE` for `:memory:` — as P13-003).
+- **No new catalog format.** Read the three existing kinds (`ParseCatalog` v1, `ParseMatrixCatalog` v2); add none.
+- **No reader behaviour change.** If Task 1 extracts logic the reader uses, `read_pfile_catalog`'s
+  output must be byte-identical (impl-vs-tests: refactor behind its existing tests).
+- **Decisions:** all seven relations for every kind (D2); a bare fileset with a `.pgen` but no
+  `.pfile.json` synthesizes a one-cell catalog (D1).
+- **Conventions:** catalog extension is `.pfile.json`; bake paths with `SQLString`/`AbsPath`
+  (P13-003); tests are sqllogictest; docs ASD-STE100.
+
+## Review Focus
+
+- A **prefix that is also a `.pfile.json`** (`cohort.pfile.json` passed whole) must not double-suffix. → Task 2.
+- A prefix with **both** `<p>.pfile.json` and `<p>.pgen` resolves to the catalog, not the bare fileset. → Task 2.
+- A **single-fileset** catalog's degenerate `c.variant_blocks`/`c.sample_blocks` return one row, not an error. → Task 4.
+- A **bare fileset** with no `.pvar`/`.psam` companions errors the way `read_pfile` already does, not a crash. → Task 5.
+- **read-only, holes, all-holes** still behave as P13-003 for the matrix kind (no regression). → Task 6.
+
+## File Structure
+
+- Create `src/pfile_catalog_resolve.{cpp,hpp}` — `ResolveCatalogCellPaths(fs, path, content)` →
+  `vector<CellPaths>` for any kind (or add to `pfile_catalog_util`).
+- Modify `src/pfile_catalog_storage.cpp` — prefix resolution, kind-agnostic data views, per-kind
+  structural views, bare-fileset synthesis.
+- Modify `src/pfile_catalog_reader.cpp` — call the shared helper for its path columns (Task 1 only).
+- Create `test/sql/attach_pfile_catalog_kinds.test` — single-fileset, multi-file, prefix, bare fileset.
+- Modify `docs/formats/pfile_catalog.md` — the ATTACH section covers all kinds + prefix.
+
+---
+
+### Task 1: Extract `ResolveCatalogCellPaths` (shared, behind the reader's tests)
+
+**Files:** Create `src/pfile_catalog_resolve.{cpp,hpp}`; Modify `src/pfile_catalog_reader.cpp`,
+`CMakeLists.txt`. Tests: the existing `test/sql/read_pfile_catalog*.test` (unchanged).
+
+**Interfaces:**
+- Produces: `struct CellPaths { string prefix, pvar, psam; bool present; };`
+  `vector<CellPaths> ResolveCatalogCellPaths(FileSystem&, const string &path, const string &content);`
+  — v2: `ParseMatrixCatalog` + `BuildCells`; v1: `ParseCatalog` + fold `shared_pvar`/`shared_psam`
+  into each `ShardEntry` (the folding the reader bind does today).
+- Consumes (impl verification): `read_pfile_catalog`'s bind uses it for the `prefix`/`pvar`/`psam`
+  columns; it keeps its own spans/keys/verification.
+
+- [ ] Step 1: Run the reader suite — `read_pfile_catalog*.test` — and record GREEN (baseline).
+- [ ] Step 2: Write `ResolveCatalogCellPaths` + a direct unit assertion (a sqllogictest that the
+      helper's prefixes equal `read_pfile_catalog`'s `prefix` column for a v1 and a v2 fixture).
+- [ ] Step 3: Route the reader's path columns through the helper.
+- [ ] Step 4: Run `read_pfile_catalog*.test` — must be GREEN, unchanged. If the extraction is too
+      invasive, Ruling: keep the helper standalone (attach-only), reader untouched — note the
+      folding is then in two places.
+- [ ] Step 5: Commit.
+
+### Task 2: Prefix resolution + absolute path
+
+**Files:** Modify `src/pfile_catalog_storage.cpp`. Test: `test/sql/attach_pfile_catalog_kinds.test`.
+
+**Interfaces:** Consumes `AbsPath`, `FileSystem::FileExists`. Produces: a `ResolveAttachPath(fs,
+raw)` → absolute `.pfile.json` path, or a marker that it is a bare fileset (Task 5), by the §4 rule.
+
+- [ ] Step 1: Failing test — `ATTACH '<dir>/matrix_dense' (TYPE pfile_catalog)` (no extension)
+      attaches the same as the full `.pfile.json` path.
+- [ ] Step 2: Run, verify fail (file-not-found or parse error on the bare prefix).
+- [ ] Step 3: Implement: ends in `.pfile.json` → as-is; else append + `FileExists`; absolute-resolve.
+- [ ] Step 4: Run, verify pass. Add the double-suffix and both-exist assertions (Review Focus).
+- [ ] Step 5: Commit.
+
+### Task 3: Kind-agnostic data views
+
+**Files:** Modify `src/pfile_catalog_storage.cpp`. Test: extend `attach_pfile_catalog_kinds.test`.
+
+**Interfaces:** Consumes `ResolveCatalogCellPaths` (Task 1). Replaces the matrix-only
+`ParseMatrixCatalog`/`BuildCells` block in `attach` with the helper, for `c.genotypes`,
+`c.genotypes_by_sample`, `c.variants`, `c.samples`.
+
+- [ ] Step 1: Failing test — `ATTACH` a **single-fileset** and a **multi-file** catalog; each
+      `c.genotypes` equals the equivalent `read_pfile` call; `c.variants`/`c.samples` match.
+- [ ] Step 2: Run, verify fail ("not a version-2 matrix catalog" today).
+- [ ] Step 3: Implement: build the four data views from the helper's `(prefix, pvar, psam)` list.
+- [ ] Step 4: Run, verify pass; re-run the P13-003 matrix test — still GREEN (no regression).
+- [ ] Step 5: Commit.
+
+### Task 4: Per-kind structural views
+
+**Files:** Modify `src/pfile_catalog_storage.cpp`. Test: extend `attach_pfile_catalog_kinds.test`.
+
+**Interfaces:** `c.cells` = `read_pfile_catalog('<path>')` (all kinds). `c.variant_blocks` /
+`c.sample_blocks`: matrix = the P13-003 layout projection; multi-file = the shards on the concat
+axis (one block list, the other a single row); single-fileset = one row each.
+
+- [ ] Step 1: Failing test — a single-fileset's `c.variant_blocks`/`c.sample_blocks` each return one
+      row; a multi-file catalog's block list matches its shards.
+- [ ] Step 2: Run, verify fail.
+- [ ] Step 3: Implement the per-kind block SQL (the kind is known at attach from the parse).
+- [ ] Step 4: Run, verify pass.
+- [ ] Step 5: Commit.
+
+### Task 5: Bare-fileset synthesis (D1)
+
+**Files:** Modify `src/pfile_catalog_storage.cpp`. Test: extend `attach_pfile_catalog_kinds.test`.
+
+**Interfaces:** When Task 2's resolution finds no `.pfile.json` but `<prefix>.pgen` exists, supply a
+one-entry `CellPaths` list (`prefix` = the fileset, `pvar`/`psam` = its own companions) directly to
+the same view-baking path. No catalog file is read.
+
+- [ ] Step 1: Failing test — `ATTACH 'test/data/pfile_example' (TYPE pfile_catalog)` (a bare
+      fileset) attaches; `c.genotypes` equals `read_pfile('test/data/pfile_example')`; block views
+      return one row.
+- [ ] Step 2: Run, verify fail.
+- [ ] Step 3: Implement the synthetic one-cell path.
+- [ ] Step 4: Run, verify pass; a truly-absent prefix (no catalog, no `.pgen`) raises a clear error.
+- [ ] Step 5: Commit.
+
+### Task 6: Docs + full-suite gate
+
+**Files:** Modify `docs/formats/pfile_catalog.md`.
+
+- [ ] Step 1: Extend the ATTACH section: all three kinds + bare fileset + prefix form; ASD-STE100.
+- [ ] Step 2: Run the FULL suite (`test/sql/*`) — all GREEN (no regression across the extension).
+- [ ] Step 3: Commit.
+
+---
+
+## Self-Review
+
+1. **Spec coverage.** §4 resolution → Task 2; §4-B helper → Task 1; data views → Task 3; structural
+   views (D2) → Task 4; bare fileset (D1) → Task 5; docs → Task 6. Covered.
+2. **Step scan.** Each task is RED→GREEN with a named test; Task 1 is an impl-vs-tests refactor
+   (reader tests unchanged). No empty steps.
+3. **Type consistency.** `CellPaths{prefix,pvar,psam,present}`, `ResolveCatalogCellPaths`,
+   `ResolveAttachPath` used consistently. The exact reader-extraction surface is the one unknown —
+   Task 1 Step 3 confirms it; the standalone-helper fallback is a ledgered ruling.
+4. **Review Focus.** Double-suffix + both-exist → Task 2; degenerate blocks → Task 4; bare-fileset
+   missing companions → Task 5; matrix no-regression → Tasks 3,4,6.
+5. **Proportion.** Six tasks, one helper + edits to the existing storage file + one test file + docs
+   — proportional to extending a working feature, not a rewrite.
+
+## Build note
+
+Cold first build in a fresh worktree (vendors DuckDB) is long → Slurm
+`srun -n 1 -c 12 --mem=32G -p batch -t 300 make`; later incremental builds are short. Native
+execution (one warm build dir) is cheaper than a fresh build per subagent, as on P13-003.
