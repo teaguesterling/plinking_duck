@@ -1920,33 +1920,27 @@ void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
 // Promote order on success: .pvar → every .psam → every .pgen → catalog.
 // ===========================================================================
 
-// Reject a shard_samples label that cannot be a safe directory name (it becomes out/<label>/).
-// The same rules as a shard_by key value (see ValidateShardKeyValue): reject, never escape.
+// Reject a shard_samples label that is not a safe, LITERAL directory name (it becomes out/<label>/
+// and part of every catalog prefix). An ALLOWLIST — ASCII letters, digits, '_' and '-' — not a
+// denylist: the catalog reader treats a prefix as a path pattern, so a label with a glob
+// metacharacter ('[', '?', '*', …) would write a cohort that cannot be read back. Reject, never escape.
 void ValidateShardSampleLabel(const string &label) {
 	auto reject = [&](const char *why) {
 		throw BinderException(
 		    "write pfile: shard_samples label '%s' %s — a label becomes the shard's directory name and must be "
-		    "path-safe (letters, digits, '_', '-').",
+		    "path-safe: ASCII letters, digits, '_' and '-' only.",
 		    label, why);
 	};
 	if (label.empty()) {
 		reject("is empty");
 	}
-	if (label == "." || label == "..") {
-		reject("is a reserved path name");
-	}
 	for (unsigned char c : label) {
-		if (c == '/' || c == '\\') {
-			reject("contains a path separator ('/' or '\\\\')");
-		}
-		if (c == '=') {
-			reject("contains '='");
-		}
-		if (c < 0x20 || c == 0x7f) {
-			reject("contains a control character");
-		}
-		if (c == ' ') {
-			reject("contains whitespace");
+		bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+		if (!ok) {
+			if (c == '/' || c == '\\') {
+				reject("contains a path separator ('/' or '\\\\')");
+			}
+			reject("contains a character outside the allowed set");
 		}
 	}
 }
@@ -1996,6 +1990,11 @@ void ParseSampleShards(const Value &spec, const vector<string> &iids, PfileWrite
 			if (it == iid_pos.end()) {
 				throw BinderException("write pfile: shard_samples group '%s' names '%s', which is not an input sample",
 				                      label, iid);
+			}
+			if (owner[it->second] == g) {
+				throw BinderException("write pfile: sample '%s' is listed twice in group '%s' — shard_samples must "
+				                      "name every sample exactly once",
+				                      iid, label);
 			}
 			if (owner[it->second] != DConstants::INVALID_INDEX) {
 				throw BinderException("write pfile: sample '%s' is in more than one group ('%s' and '%s') — "
@@ -2068,6 +2067,11 @@ struct PfileSampleShardedGlobalState : public GlobalFunctionData {
 			return;
 		}
 		cleaned = true;
+		if (!opened) {
+			// Nothing was created yet (files open on the first row). The staging PATHS are already
+			// known, but a file at one of them is not ours — never remove it.
+			return;
+		}
 		if (pvar_g.handle) {
 			pvar_g.handle.reset();
 		}
@@ -2138,9 +2142,22 @@ unique_ptr<GlobalFunctionData> PfileSampleShardedInitGlobal(FileSystem &fs, cons
 void PfileSampleShardedOpen(PfileSampleShardedGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
 	g.opened = true; // from here on, cleanup owns whatever exists
 	// Record each directory we create (parent first), so cleanup can remove it again — only if empty.
-	if (!fs.DirectoryExists(g.base)) {
-		fs.CreateDirectoriesRecursive(g.base);
-		g.created_dirs.push_back(g.base);
+	// That includes every missing ANCESTOR of the shard tree, not only out/ itself.
+	{
+		vector<string> missing; // deepest first
+		string d = g.base;
+		while (!d.empty() && !fs.DirectoryExists(d)) {
+			missing.push_back(d);
+			auto slash = d.find_last_of("/\\");
+			if (slash == string::npos || slash == 0) {
+				break;
+			}
+			d = d.substr(0, slash);
+		}
+		for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+			fs.CreateDirectory(*it);
+			g.created_dirs.push_back(*it);
+		}
 	}
 	for (auto &sh : g.shards) {
 		if (!fs.DirectoryExists(sh.dir)) {

@@ -225,9 +225,10 @@ shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar
   the input order.** A gap, a reordered group, or groups listed out of order is an
   error. This keeps the catalog's sample ordinals correct: concatenating the shards
   in catalog order gives the input order back.
-- **A label becomes a directory name**, so it must be path-safe. The same rules as
-  a `shard_by` key apply. A label that is a SQL keyword must be quoted
-  (`{"all": […]}`).
+- **A label becomes a directory name** and part of every catalog prefix, so it may
+  contain only ASCII letters, digits, `_` and `-`. The catalog reader treats a
+  prefix as a path pattern, so a glob character such as `[` or `?` is rejected. A
+  label that is a SQL keyword must be quoted (`{"all": […]}`).
 - **Sample identity** is resolved as for the plain bundle: STRUCT field names, or
   `samples [...]`. A bare `TINYINT[N]` list is rejected.
 - **Variant-orient input only.** No transpose: a sample-orient stream fails on the

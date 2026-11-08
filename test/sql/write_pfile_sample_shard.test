@@ -262,6 +262,27 @@ TO '__TEST_DIR__/bad' (FORMAT pfile, samples ['SAMPLE1', 'SAMPLE2', 'SAMPLE3', '
 ----
 PHASED
 
+# A label with a glob metacharacter (the reader treats a prefix as a pattern) — only letters,
+# digits, '_' and '-' are allowed (review finding: 'b[1]' / 'q?' wrote an unreadable cohort).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {"b[1]": ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+path-safe
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {"q?": ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+path-safe
+
+# The same IID twice in ONE group names that group once, not "more than one group".
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP1'], b: ['SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+twice in group 'a'
+
 # None of the bind rejects wrote anything.
 query I
 SELECT count(*) FROM glob('__TEST_DIR__/bad*');
@@ -326,3 +347,45 @@ query I
 SELECT count(*) FROM glob('__TEST_DIR__/plain.*');
 ----
 3
+
+# ===========================================================================
+# NEGATIVE — cleanup touches only what THIS COPY created (review findings)
+# ===========================================================================
+
+# Missing parent directories (np/deep/) are created for the target; a mid-stream failure removes
+# them again. Proof without a directory listing: '__TEST_DIR__/np' can then be written as a FILE.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500' THEN error('boom in np') ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '__TEST_DIR__/np/deep/out' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+boom in np
+
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/np' (FORMAT csv);
+
+# A pre-existing *.staging file this COPY never created survives a failed (zero-row) COPY.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/st' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+statement ok
+COPY (SELECT 'not ours' AS x) TO '__TEST_DIR__/st/a/data.psam.staging' (FORMAT csv);
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') WHERE false)
+TO '__TEST_DIR__/st' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+----
+no rows
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/st/a/data.psam.staging');
+----
+1
+
+# ... and the earlier, complete cohort is still intact and readable.
+query I
+SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/st.pfile.json');
+----
+2
