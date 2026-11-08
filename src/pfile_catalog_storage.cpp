@@ -137,8 +137,12 @@ static string BuildV1BlockSql(const string &path_sql, const string &concat_dim, 
 static string GenotypesSql(const vector<string> &prefixes, const string &shared_psam, bool sample_concat,
                            const string &shared_pvar, bool by_sample) {
 	string sql = "SELECT * FROM read_pfile(" + SqlPathList(prefixes);
-	if (sample_concat && prefixes.size() > 1) {
-		sql += ", combine_samples := 'concatenate'";
+	if (sample_concat) {
+		// Also for ONE cell: its shard may have no .pvar of its own, and pvar := is valid
+		// single-file too (combine_samples on a one-element list reads the fileset normally).
+		if (prefixes.size() > 1) {
+			sql += ", combine_samples := 'concatenate'";
+		}
 		if (!shared_pvar.empty()) {
 			sql += ", pvar := " + SQLString::ToString(shared_pvar);
 		}
@@ -259,6 +263,8 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// psam across >1 cell = a variant-sharded cohort) is passed to read_pfile explicitly; a single
 	// fileset lets read_pfile discover its own companions.
 	string shared_psam = (cell_prefixes.size() > 1 && psam_paths.size() == 1) ? psam_paths[0] : "";
+	// A v1 sample-sharded catalog always shares one .pvar (the parser rejects a per-file pvar
+	// beside shared.pvar), so pvar_paths holds exactly that path.
 	string shared_pvar = (sample_concat && pvar_paths.size() == 1) ? pvar_paths[0] : "";
 	vector<std::pair<Identifier, string>> views;
 	views.emplace_back(Identifier("genotypes"),

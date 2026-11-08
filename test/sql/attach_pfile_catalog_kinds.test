@@ -154,3 +154,17 @@ SELECT (SELECT count(*) FROM ss.samples), (SELECT count(*) FROM ss.variants);
 
 statement ok
 DETACH ss;
+
+# A ONE-cell sample-sharded catalog whose shard has no .pvar of its own (pca_cat_b): the shared
+# .pvar must still reach read_pfile as pvar := (it is the only source of the variants).
+statement ok
+ATTACH 'test/data/pfile_catalog_pca_samples_one.pfile.json' AS p1 (TYPE pfile_catalog);
+
+query II
+SELECT (SELECT count(*) FROM (FROM p1.genotypes EXCEPT ALL FROM read_pfile('test/data/pca_cat_b', pvar := 'test/data/pca_example.pvar'))),
+       (SELECT count(*) FROM p1.genotypes);
+----
+0	500
+
+statement ok
+DETACH p1;
