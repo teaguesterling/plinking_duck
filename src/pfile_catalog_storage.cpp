@@ -67,6 +67,23 @@ static string SqlPathList(const vector<string> &paths) {
 	return out;
 }
 
+//! A double-quoted SQL identifier (internal quotes doubled).
+static string QuoteIdent(const string &name) {
+	return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+}
+
+//! Per-axis block tiling: DISTINCT (axis key values, span) over the layout reader
+//! (which includes holes, so the tiling is complete even if a block's cells are all holes).
+static string BuildBlockViewSql(const AxisDef &axis, const string &path_sql, const char *start_col,
+                                const char *stop_col) {
+	string sql = "SELECT DISTINCT ";
+	for (auto &key : axis.keys) {
+		sql += "keys[" + SQLString(key.name) + "] AS " + QuoteIdent(key.name) + ", ";
+	}
+	sql += string(start_col) + ", " + string(stop_col) + " FROM read_pfile_catalog_layout(" + path_sql + ")";
+	return sql;
+}
+
 static string ReadWholeFile(FileSystem &fs, const string &path) {
 	string content;
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
@@ -96,9 +113,15 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 		}
 	}
 
-	// Bake the per-relation SQL. Task 1 seeds only c.genotypes; later tasks add the rest.
+	// Bake the per-relation SQL over the shipped readers.
+	string path_sql = SQLString::ToString(catalog_path);
 	vector<std::pair<Identifier, string>> views;
 	views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ")");
+	views.emplace_back(Identifier("cells"), "SELECT * FROM read_pfile_catalog(" + path_sql + ")");
+	views.emplace_back(Identifier("variant_blocks"),
+	                   BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop"));
+	views.emplace_back(Identifier("sample_blocks"),
+	                   BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop"));
 
 	// Build a native in-memory catalog seeded with those views.
 	info.path = ":memory:";
