@@ -632,6 +632,34 @@ on the function page. In short:
 - A predicate that names an undeclared key, or the wrong axis, raises an error. It is
   never ignored.
 
+### Attaching a matrix (`TYPE pfile_catalog`)
+
+`ATTACH` exposes a matrix catalog as a read-only database. A cohort then reads as a
+schema of relations, not as function calls:
+
+```sql
+ATTACH 'cohort.pfile.json' AS c (TYPE pfile_catalog);
+SELECT count(*) FROM c.genotypes WHERE CHROM = '17';
+SELECT * FROM c.cells;
+```
+
+The attached database holds seven views. Each one is backed by a shipped reader:
+
+| Relation | Backed by |
+|---|---|
+| `c.variants` | the distinct variant-block `.pvar` (`read_pvar`) |
+| `c.samples` | the distinct sample-block `.psam` (`read_psam`) |
+| `c.genotypes` | `read_pfile` over every surviving cell, variant-oriented |
+| `c.genotypes_by_sample` | the same cells, sample-oriented |
+| `c.cells` | `read_pfile_catalog` — one row per surviving cell |
+| `c.variant_blocks`, `c.sample_blocks` | the per-axis block tiling |
+
+The catalog is **read-only**: a write to `c.*` raises. A `WHERE` on `c.genotypes`
+pushes into each cell's `read_pfile` scan, so it skips row groups by `CHROM` and
+`POS`. The attach opens **every** surviving cell. It does not yet skip a cell by
+predicate (see below). An all-holes catalog has no cell to read, so its `ATTACH`
+raises.
+
 ### Inspecting a matrix without reading it
 
 Two functions look at the catalog file alone and open no data file:
@@ -663,10 +691,12 @@ verifies every present cell first. Holes are never verified. See
 
 ### What version 2 does not do yet
 
-- **No `ATTACH`.** A matrix catalog cannot be attached as a database.
-- **No genotype cascade.** `read_pfile_catalog` returns cell metadata and resolved
-  paths. It does not scan genotypes across cells. A consumer reads each surviving cell
-  with [`read_pfile`](../functions/read_pfile.md).
+- **No cell-skip cascade.** `ATTACH` opens every surviving cell; a `WHERE` on
+  `c.genotypes` skips row groups inside each cell, but does not yet drop a whole cell by
+  predicate. `read_pfile_catalog` itself returns cell metadata, not genotypes.
+- **No projection fast-path.** `c.genotypes` exposes `read_pfile`'s native genotype
+  columns. The derived counts (het, hom_alt, missing, n_alt) are not a fast-path column
+  set yet.
 - **No analysis over the grid.** The `plink_*` analysis functions do not take a matrix
   catalog.
 - **No writer.** The sharded `COPY … shard_by` writer emits version 1 only. A matrix
