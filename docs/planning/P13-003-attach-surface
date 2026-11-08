@@ -12,8 +12,8 @@ v0.15.0 — the matrix format + typed-prune readers). Branch:
 ## Status
 
 - [x] Feasibility spike — DuckDB `StorageExtension` API (was the biggest unknown)
-- [ ] Owner decision: projection-driven genotype columns in P13-003 or P13-004 (§7)
-- [ ] Owner decision: the v1 relation set (§5) — confirm or trim
+- [x] Owner decision: projection-driven genotype columns → deferred to P13-004 (Teague 2026-11-07, §7)
+- [x] Owner decision: the v1 relation set → all seven confirmed (Teague 2026-11-07, §5)
 - [ ] Implementation plan (P13-004-... ? or P13-003-002)
 - [ ] Build
 
@@ -96,7 +96,7 @@ is fixed here; the exact reader call per relation is confirmed in implementation
 | `c.genotypes` | `read_pfile(<LIST of surviving cell prefixes>, orient := 'variant', …)` |
 | `c.genotypes_by_sample` | same, `orient := 'sample'` |
 
-## 5. Relation set (v1 — owner confirm or trim)
+## 5. Relation set (v1 — all seven, owner-confirmed 2026-11-07)
 
 Groups A + B from P13-001 §5:
 
@@ -129,7 +129,9 @@ whatever `read_pfile` emits, and the projection fast-path is `read_pfile`'s job,
 not the catalog's. So P13-003 would expose `read_pfile`'s native genotype columns;
 the superset + fast-path lands with the cascade in P13-004.
 
-**This needs the owner's call.** Default if unanswered: defer to P13-004.
+**RESOLVED (Teague 2026-11-07): defer to P13-004.** P13-003 exposes `read_pfile`'s
+native genotype columns; the superset + counts fast-path lands with the cascade in
+P13-004.
 
 ## 8. Testing
 
