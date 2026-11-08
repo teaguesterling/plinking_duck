@@ -60,6 +60,8 @@ target is stripped to the prefix, so `TO 'out'` and `TO 'out.pfile'` both write
 | `samples` | `LIST(VARCHAR)` | *(from STRUCT field names)* | Explicit sample IIDs when the genotypes column is a plain `LIST`/`ARRAY` (see [Sample identity](#sample-identity-contract)). |
 | `variant_count` | `INTEGER` | `16777216` (2²⁴) | Upper bound on the variant count (a pgenlib memory knob; see [below](#the-variant_count-bound)). |
 | `pvar` / `pgen` / `psam` | `VARCHAR` | `prefix.{pvar,pgen,psam}` | Per-file path overrides (symmetric with the reader's path overrides). |
+| `shard_by` | `VARCHAR` | *(none)* | Shard along the **variant** axis by a key column. See [Sharded output](#sharded-output-shard_by). |
+| `shard_samples` | `STRUCT` | *(none)* | Shard along the **sample** axis into named IID groups. See [Sample-sharded output](#sample-sharded-output-shard_samples). |
 
 Every input column not consumed by a `variant_fields` role (and not the genotypes
 column) is carried through into the `.pvar` as an extra column under its own name,
@@ -194,6 +196,55 @@ for free as it streams). The shared `.psam` is referenced once under `shared.psa
     stale shard could pair with a changed shared `.psam`. If you rely on globbing
     rather than the catalog, write to a fresh target (or clear it first).
 
+### Sample-sharded output (`shard_samples`)
+
+```sql
+COPY (SELECT * FROM read_pfile('cohort', genotypes := 'struct') ORDER BY CHROM, POS)
+TO 'out' (FORMAT pfile, shard_samples {batch1: ['s1', 's2'], batch2: ['s3', 's4', 's5']});
+```
+
+`shard_samples` splits the **sample** axis. Each named group becomes one fileset
+with its own `.pgen` and `.psam`. All the filesets share **one `.pvar`**, because
+the variants are the same in every shard. The layout is:
+
+```
+out.pvar                    # ONE shared .pvar
+out/<label>/data.pgen       # per shard
+out/<label>/data.psam       # per shard: that group's IIDs
+out.pfile.json             # the catalog (concat_dim "samples") — written LAST
+```
+
+[`read_pfile`](read_pfile.md) reads the shards back as one cohort with
+`combine_samples := 'concatenate'`. `ATTACH 'out.pfile.json' (TYPE pfile_catalog)`
+attaches the cohort. A shard has no `.pvar` of its own, so a direct read of one
+shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar')`.
+
+- **The groups must partition the input samples exactly.** Every sample must be
+  in exactly one group. An IID that is not an input sample is an error.
+- **Each group is a contiguous run of the input sample order, and the groups follow
+  the input order.** A gap, a reordered group, or groups listed out of order is an
+  error. This keeps the catalog's sample ordinals correct: concatenating the shards
+  in catalog order gives the input order back.
+- **A label becomes a directory name**, so it must be path-safe. The same rules as
+  a `shard_by` key apply. A label that is a SQL keyword must be quoted
+  (`{"all": […]}`).
+- **Sample identity** is resolved as for the plain bundle: STRUCT field names, or
+  `samples [...]`. A bare `TINYINT[N]` list is rejected.
+- **Variant-orient input only.** No transpose: a sample-orient stream fails on the
+  missing `CHROM` role.
+- **Not combinable** with `shard_by` (sharding both axes is a planned follow-on) or
+  with `pvar`/`pgen`/`psam` path overrides (the layout generates every path).
+- **Memory:** every variant row goes to every shard, so N `.pgen` writers are open
+  at once. That is N times the single-writer memory. There is no cap on N.
+- **Failure leaves nothing.** Files open on the first row. Any failure, including an
+  upstream query error mid-stream, removes every staging file and every directory
+  the COPY created (only if empty). On success the writer promotes the `.pvar`,
+  then every `.psam`, then every `.pgen`, then writes the catalog last.
+
+The emitted `.pfile.json` records `shared.pvar`, and per shard its `prefix`, its
+`psam`, and a global half-open `[start, stop)` **sample**-ordinal `partition` that
+tiles `[0, total)`.
+
 ## Standalone formats
 
 ### `FORMAT pvar`
@@ -317,9 +368,9 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
   reconstructed, so a round-trip is **value-equal, not byte-equal**.
 - **Position-sorted, chromosome-contiguous input is required** (the monotonicity
   check), and the whole fileset is **local-only**.
-- **Sharded output is `shard_by` a variant key only** (variant-shards over a
-  shared `.psam`, [above](#sharded-output-shard_by)). Sample-sharding (a shared
-  `.pvar` across sample batches) is a separate follow-on.
+- **One shard axis at a time.** `shard_by` (variant-shards over a shared `.psam`)
+  and `shard_samples` (sample-shards over a shared `.pvar`) cannot be combined; a
+  variants × samples grid is a follow-on.
 - **Parquet companions, `.pgi` split index, and PLINK-VCF export are deferred**
   (Phases D–E).
 

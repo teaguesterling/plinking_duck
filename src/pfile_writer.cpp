@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <set>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -812,112 +813,131 @@ unique_ptr<LocalFunctionData> PgenCopyInitLocal(ExecutionContext &, FunctionData
 	return make_uniq<PgenWriteLocalState>();
 }
 
+// Fetch one variant row's genotype cell after the row-level guards (best-effort
+// multiallelic ALT guard; a NULL cell). The returned Value owns the per-sample calls
+// (see GenotypeCalls). Shared by the bundle and the sample-sharded writer, so a row is
+// checked ONCE however many shard writers it feeds.
+Value PgenRowGenotypes(const PgenWriteBindData &bind, DataChunk &input, idx_t row) {
+	// --- best-effort multiallelic guard (only when ALT is in the stream) ---
+	// A genotypes-only input carries NO multiallelic signal (PgrGet collapses
+	// a multiallelic site to biallelic 0/1/2/missing). When the natural
+	// round-trip query carries ALT, a comma reveals it; reject those.
+	if (bind.has_alt) {
+		auto alt_val = input.GetValue(bind.alt_input_idx, row);
+		if (!alt_val.IsNull() && alt_val.ToString().find(',') != string::npos) {
+			throw InvalidInputException(
+			    "write pgen: variant has a multiallelic ALT ('%s') — multiallelic .pgen writing is not "
+			    "supported in this increment (biallelic hardcalls only)",
+			    alt_val.ToString());
+		}
+	}
+
+	// --- fetch the per-variant genotype list ---
+	auto geno_val = input.GetValue(bind.geno_input_idx, row);
+	if (geno_val.IsNull()) {
+		throw InvalidInputException(
+		    "write pgen: the genotypes cell is NULL for a variant — every variant needs a list of per-sample "
+		    "calls (use -9 or NULL *inside* the list for a missing call)");
+	}
+	return geno_val;
+}
+
+// The per-sample calls of a genotype cell: LIST/ARRAY children, or STRUCT field values
+// in field order (same positional per-sample semantics — the struct's field NAMES
+// carried the IIDs to the .psam at bind, the VALUES are the per-sample calls here).
+const vector<Value> &GenotypeCalls(const Value &geno_val) {
+	LogicalTypeId gtid = geno_val.type().id();
+	return (gtid == LogicalTypeId::ARRAY)    ? ArrayValue::GetChildren(geno_val)
+	       : (gtid == LogicalTypeId::STRUCT) ? StructValue::GetChildren(geno_val)
+	                                         : ListValue::GetChildren(geno_val);
+}
+
+// Pack calls[lo, hi) into a 2-bit genovec and append it as ONE variant to `g` (whose
+// writer must be inited with sample_ct == hi - lo). Guards the variant-count bound
+// (pgenlib does not) and the 0/1/2/-9 value range. A sample index in an error is the
+// INPUT position (lo + offset), so a shard writer names the same sample as the bundle.
+void PgenAppendCallRange(PgenWriteGlobalState &g, const vector<Value> &calls, idx_t lo, idx_t hi) {
+	// --- guard against exceeding the variant-count bound ---
+	// pgenlib does NOT bounds-check the append; overrunning corrupts the heap.
+	if (g.appended >= g.variant_ct_limit) {
+		throw InvalidInputException(
+		    "write pgen: the number of variants exceeds variant_count=%u. Pass `variant_count N` with an upper "
+		    "bound >= the number of variants being written.",
+		    g.variant_ct_limit);
+	}
+
+	// --- pack the int8 calls into a 2-bit genovec (sample 0 in low bits) ---
+	//   0 -> 0b00, 1 -> 0b01, 2 -> 0b10, (-9 | NULL) -> 0b11 (missing).
+	auto *genovec = g.genovec.As<uintptr_t>();
+	std::memset(genovec, 0, g.genovec_bytes);
+	for (idx_t s = lo; s < hi; s++) {
+		uintptr_t nyp;
+		const Value &c = calls[s];
+		if (c.IsNull()) {
+			nyp = 3; // missing
+		} else {
+			int64_t code = c.GetValue<int64_t>();
+			switch (code) {
+			case 0:
+				nyp = 0;
+				break;
+			case 1:
+				nyp = 1;
+				break;
+			case 2:
+				nyp = 2;
+				break;
+			case -9:
+				nyp = 3;
+				break;
+			default:
+				throw InvalidInputException(
+				    "write pgen: genotype value %lld (variant %llu, sample %llu) is out of range — a biallelic "
+				    "hardcall must be 0, 1, 2, or -9/NULL (missing)",
+				    static_cast<long long>(code), static_cast<unsigned long long>(g.appended),
+				    static_cast<unsigned long long>(s));
+			}
+		}
+		uint32_t out = static_cast<uint32_t>(s - lo);
+		uint32_t widx = out / plink2::kBitsPerWordD2;
+		uint32_t shift = 2 * (out % plink2::kBitsPerWordD2);
+		genovec[widx] |= nyp << shift;
+	}
+	plink2::ZeroTrailingBits(g.sample_ct * 2, genovec);
+
+	plink2::PglErr e = plink2::SpgwAppendBiallelicGenovec(genovec, &g.spgw);
+	if (e != plink2::kPglRetSuccess) {
+		throw IOException("write pgen: SpgwAppendBiallelicGenovec failed at variant %llu (pgenlib error %u)",
+		                  static_cast<unsigned long long>(g.appended), static_cast<uint32_t>(e));
+	}
+	g.appended++;
+}
+
 // Append one chunk of variant rows to the `.pgen` (deferred writer init on the
 // first row). Throws on a bad shape/value/overrun; the CALLER owns cleanup (so
 // the bundle removes all siblings). Shared by the standalone sink and the bundle.
 void PgenWriteChunk(const PgenWriteBindData &bind, PgenWriteGlobalState &g, DataChunk &input, idx_t row_begin,
                     idx_t row_end) {
-	{
-		input.Flatten();
-		for (idx_t row = row_begin; row < row_end; row++) {
-			// --- best-effort multiallelic guard (only when ALT is in the stream) ---
-			// A genotypes-only input carries NO multiallelic signal (PgrGet collapses
-			// a multiallelic site to biallelic 0/1/2/missing). When the natural
-			// round-trip query carries ALT, a comma reveals it; reject those.
-			if (bind.has_alt) {
-				auto alt_val = input.GetValue(bind.alt_input_idx, row);
-				if (!alt_val.IsNull() && alt_val.ToString().find(',') != string::npos) {
-					throw InvalidInputException(
-					    "write pgen: variant has a multiallelic ALT ('%s') — multiallelic .pgen writing is not "
-					    "supported in this increment (biallelic hardcalls only)",
-					    alt_val.ToString());
-				}
-			}
+	input.Flatten();
+	for (idx_t row = row_begin; row < row_end; row++) {
+		Value geno_val = PgenRowGenotypes(bind, input, row);
+		const vector<Value> &calls = GenotypeCalls(geno_val);
+		idx_t n = calls.size();
 
-			// --- fetch the per-variant genotype list ---
-			auto geno_val = input.GetValue(bind.geno_input_idx, row);
-			if (geno_val.IsNull()) {
-				throw InvalidInputException(
-				    "write pgen: the genotypes cell is NULL for a variant — every variant needs a list of per-sample "
-				    "calls (use -9 or NULL *inside* the list for a missing call)");
-			}
-			// LIST/ARRAY children, or STRUCT field values in field order (same
-			// positional per-sample semantics — the struct's field NAMES carried the
-			// IIDs to the .psam at bind, the VALUES are the per-sample calls here).
-			LogicalTypeId gtid = geno_val.type().id();
-			const vector<Value> &calls = (gtid == LogicalTypeId::ARRAY)    ? ArrayValue::GetChildren(geno_val)
-			                             : (gtid == LogicalTypeId::STRUCT) ? StructValue::GetChildren(geno_val)
-			                                                               : ListValue::GetChildren(geno_val);
-			idx_t n = calls.size();
-
-			// --- establish / validate the sample count ---
-			// Use the bind-known sample_ct (fixed ARRAY width) when we have it, else
-			// take it from this first row's list length (LIST input).
-			if (!g.writer_inited) {
-				uint32_t sc = g.sample_ct_known ? g.sample_ct : static_cast<uint32_t>(n);
-				PgenEnsureWriterInited(g, sc);
-			}
-			if (n != g.sample_ct) {
-				throw InvalidInputException(
-				    "write pgen: variant %llu has %llu genotypes but the sample count is %u — every variant must list "
-				    "the same number of samples",
-				    static_cast<unsigned long long>(g.appended), static_cast<unsigned long long>(n), g.sample_ct);
-			}
-
-			// --- guard against exceeding the variant-count bound ---
-			// pgenlib does NOT bounds-check the append; overrunning corrupts the heap.
-			if (g.appended >= g.variant_ct_limit) {
-				throw InvalidInputException(
-				    "write pgen: the number of variants exceeds variant_count=%u. Pass `variant_count N` with an upper "
-				    "bound >= the number of variants being written.",
-				    g.variant_ct_limit);
-			}
-
-			// --- pack the int8 calls into a 2-bit genovec (sample 0 in low bits) ---
-			//   0 -> 0b00, 1 -> 0b01, 2 -> 0b10, (-9 | NULL) -> 0b11 (missing).
-			auto *genovec = g.genovec.As<uintptr_t>();
-			std::memset(genovec, 0, g.genovec_bytes);
-			for (idx_t s = 0; s < n; s++) {
-				uintptr_t nyp;
-				const Value &c = calls[s];
-				if (c.IsNull()) {
-					nyp = 3; // missing
-				} else {
-					int64_t code = c.GetValue<int64_t>();
-					switch (code) {
-					case 0:
-						nyp = 0;
-						break;
-					case 1:
-						nyp = 1;
-						break;
-					case 2:
-						nyp = 2;
-						break;
-					case -9:
-						nyp = 3;
-						break;
-					default:
-						throw InvalidInputException(
-						    "write pgen: genotype value %lld (variant %llu, sample %llu) is out of range — a biallelic "
-						    "hardcall must be 0, 1, 2, or -9/NULL (missing)",
-						    static_cast<long long>(code), static_cast<unsigned long long>(g.appended),
-						    static_cast<unsigned long long>(s));
-					}
-				}
-				uint32_t widx = static_cast<uint32_t>(s) / plink2::kBitsPerWordD2;
-				uint32_t shift = 2 * (static_cast<uint32_t>(s) % plink2::kBitsPerWordD2);
-				genovec[widx] |= nyp << shift;
-			}
-			plink2::ZeroTrailingBits(g.sample_ct * 2, genovec);
-
-			plink2::PglErr e = plink2::SpgwAppendBiallelicGenovec(genovec, &g.spgw);
-			if (e != plink2::kPglRetSuccess) {
-				throw IOException("write pgen: SpgwAppendBiallelicGenovec failed at variant %llu (pgenlib error %u)",
-				                  static_cast<unsigned long long>(g.appended), static_cast<uint32_t>(e));
-			}
-			g.appended++;
+		// --- establish / validate the sample count ---
+		// Use the bind-known sample_ct (fixed ARRAY width) when we have it, else
+		// take it from this first row's list length (LIST input).
+		if (!g.writer_inited) {
+			uint32_t sc = g.sample_ct_known ? g.sample_ct : static_cast<uint32_t>(n);
+			PgenEnsureWriterInited(g, sc);
 		}
+		if (n != g.sample_ct) {
+			throw InvalidInputException(
+			    "write pgen: variant %llu has %llu genotypes but the sample count is %u — every variant must list "
+			    "the same number of samples",
+			    static_cast<unsigned long long>(g.appended), static_cast<unsigned long long>(n), g.sample_ct);
+		}
+		PgenAppendCallRange(g, calls, 0, n);
 	}
 }
 
@@ -1367,6 +1387,14 @@ struct PfileWriteBindData : public FunctionData {
 	idx_t shard_key_input_idx = 0; //! input chunk column index of the shard key
 	string shard_key_header;       //! the key column's name, used as the hive dir label (`<col>=<value>`)
 
+	//! `shard_samples {label: ['iid', …], …}` (P13-007) — split the SAMPLE axis: one .pgen/.psam per
+	//! group over ONE shared .pvar, plus a concat_dim "samples" catalog. Each group is a contiguous run
+	//! [lo, hi) of `iids`, and the groups tile [0, iids.size()) in order. Empty = not sample-shard mode.
+	bool sample_shard_mode = false;
+	vector<string> shard_labels;
+	vector<idx_t> shard_lo;
+	vector<idx_t> shard_hi;
+
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PfileWriteBindData>();
 		r->pvar_bind = unique_ptr_cast<FunctionData, PvarWriteBindData>(pvar_bind->Copy());
@@ -1378,6 +1406,10 @@ struct PfileWriteBindData : public FunctionData {
 		r->shard_by = shard_by;
 		r->shard_key_input_idx = shard_key_input_idx;
 		r->shard_key_header = shard_key_header;
+		r->sample_shard_mode = sample_shard_mode;
+		r->shard_labels = shard_labels;
+		r->shard_lo = shard_lo;
+		r->shard_hi = shard_hi;
 		return std::move(r);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -1385,7 +1417,9 @@ struct PfileWriteBindData : public FunctionData {
 		return pvar_bind->Equals(*o.pvar_bind) && pgen_bind->Equals(*o.pgen_bind) && iids == o.iids &&
 		       pvar_override == o.pvar_override && pgen_override == o.pgen_override &&
 		       psam_override == o.psam_override && shard_by == o.shard_by &&
-		       shard_key_input_idx == o.shard_key_input_idx && shard_key_header == o.shard_key_header;
+		       shard_key_input_idx == o.shard_key_input_idx && shard_key_header == o.shard_key_header &&
+		       sample_shard_mode == o.sample_shard_mode && shard_labels == o.shard_labels && shard_lo == o.shard_lo &&
+		       shard_hi == o.shard_hi;
 	}
 };
 
@@ -1866,10 +1900,373 @@ void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
 	}
 }
 
+// ===========================================================================
+// FORMAT pfile + shard_samples — the SAMPLE-sharded bundle (P13-007): one COPY splits the
+// sample axis into N filesets that share ONE .pvar, plus a concat_dim "samples" catalog.
+//
+//   COPY (SELECT … ORDER BY CHROM, POS) TO 'out'
+//     (FORMAT pfile, shard_samples {a: ['s1'], b: ['s2', 's3'], …});
+//
+// The mirror of shard_by: every variant row goes to EVERY shard, each taking its own
+// contiguous slice of the per-sample calls, so N .pgen writers are open at once (N× the
+// single-writer memory; not capped, like shard_by). Layout (the catalog records it):
+//   out.pvar                  — the ONE shared .pvar (variants are identical across shards)
+//   out/<label>/data.pgen     — per shard
+//   out/<label>/data.psam     — per shard: its IID slice. It sits at <prefix>.psam so the reader
+//                               (read_pfile combine_samples := 'concatenate', ATTACH) discovers it.
+//   out.pfile.json            — the catalog, written LAST (the completion marker)
+// Files are opened LAZILY on the first row, so a zero-row or bind-rejected COPY creates nothing.
+// On any failure every staging file is removed, and every directory this COPY created.
+// Promote order on success: .pvar → every .psam → every .pgen → catalog.
+// ===========================================================================
+
+// Reject a shard_samples label that cannot be a safe directory name (it becomes out/<label>/).
+// The same rules as a shard_by key value (see ValidateShardKeyValue): reject, never escape.
+void ValidateShardSampleLabel(const string &label) {
+	auto reject = [&](const char *why) {
+		throw BinderException(
+		    "write pfile: shard_samples label '%s' %s — a label becomes the shard's directory name and must be "
+		    "path-safe (letters, digits, '_', '-').",
+		    label, why);
+	};
+	if (label.empty()) {
+		reject("is empty");
+	}
+	if (label == "." || label == "..") {
+		reject("is a reserved path name");
+	}
+	for (unsigned char c : label) {
+		if (c == '/' || c == '\\') {
+			reject("contains a path separator ('/' or '\\\\')");
+		}
+		if (c == '=') {
+			reject("contains '='");
+		}
+		if (c < 0x20 || c == 0x7f) {
+			reject("contains a control character");
+		}
+		if (c == ' ') {
+			reject("contains whitespace");
+		}
+	}
+}
+
+// Parse + validate `shard_samples` against the resolved input IID order. Fills the bind's
+// labels and [lo, hi) ranges. Every rule is a BinderException, so nothing is written.
+void ParseSampleShards(const Value &spec, const vector<string> &iids, PfileWriteBindData &bind) {
+	if (spec.IsNull() || spec.type().id() != LogicalTypeId::STRUCT) {
+		throw BinderException("write pfile: shard_samples must be a STRUCT of IID lists, e.g. shard_samples "
+		                      "{a: ['id1'], b: ['id2', 'id3']} (got %s)",
+		                      spec.IsNull() ? string("NULL") : spec.type().ToString());
+	}
+	auto &child_types = StructType::GetChildTypes(spec.type());
+	auto &children = StructValue::GetChildren(spec);
+	if (children.empty()) {
+		throw BinderException("write pfile: shard_samples has no groups — name at least one, e.g. {a: ['id1']}");
+	}
+
+	std::unordered_map<string, idx_t> iid_pos;
+	for (idx_t i = 0; i < iids.size(); i++) {
+		iid_pos[iids[i]] = i;
+	}
+	vector<idx_t> owner(iids.size(), DConstants::INVALID_INDEX);
+	vector<vector<idx_t>> group_pos(children.size());
+	vector<string> labels;
+	for (idx_t g = 0; g < children.size(); g++) {
+		string label = CompatNameStr(child_types[g].first);
+		ValidateShardSampleLabel(label);
+		labels.push_back(label);
+		const Value &grp = children[g];
+		if (grp.IsNull() || grp.type().id() != LogicalTypeId::LIST) {
+			throw BinderException("write pfile: shard_samples group '%s' must be a LIST of IIDs (got %s)", label,
+			                      grp.IsNull() ? string("NULL") : grp.type().ToString());
+		}
+		auto &members = ListValue::GetChildren(grp);
+		if (members.empty()) {
+			throw BinderException("write pfile: shard_samples group '%s' is empty — every group needs at least one "
+			                      "sample",
+			                      label);
+		}
+		for (auto &m : members) {
+			if (m.IsNull()) {
+				throw BinderException("write pfile: shard_samples group '%s' contains a NULL IID", label);
+			}
+			string iid = m.ToString();
+			auto it = iid_pos.find(iid);
+			if (it == iid_pos.end()) {
+				throw BinderException("write pfile: shard_samples group '%s' names '%s', which is not an input sample",
+				                      label, iid);
+			}
+			if (owner[it->second] != DConstants::INVALID_INDEX) {
+				throw BinderException("write pfile: sample '%s' is in more than one group ('%s' and '%s') — "
+				                      "shard_samples must name every sample exactly once",
+				                      iid, labels[owner[it->second]], label);
+			}
+			owner[it->second] = g;
+			group_pos[g].push_back(it->second);
+		}
+	}
+
+	// Each group, in struct order, must be exactly the next run of the input order. This keeps the
+	// catalog's global sample ordinals true: concatenating the shards in file order IS the input order.
+	idx_t cursor = 0;
+	for (idx_t g = 0; g < group_pos.size(); g++) {
+		for (idx_t j = 0; j < group_pos[g].size(); j++) {
+			if (group_pos[g][j] != cursor + j) {
+				throw BinderException(
+				    "write pfile: shard_samples group '%s' is not a contiguous run of the input sample order: position "
+				    "%llu of the group is '%s', but the next input sample is '%s'. Each group must list consecutive "
+				    "input samples in input order, and the groups must follow the input order.",
+				    labels[g], static_cast<unsigned long long>(j), iids[group_pos[g][j]],
+				    cursor + j < iids.size() ? iids[cursor + j] : string("(none)"));
+			}
+		}
+		bind.shard_labels.push_back(labels[g]);
+		bind.shard_lo.push_back(cursor);
+		cursor += group_pos[g].size();
+		bind.shard_hi.push_back(cursor);
+	}
+	if (cursor != iids.size()) {
+		throw BinderException("write pfile: shard_samples must name every sample exactly once — '%s' is in no group",
+		                      iids[cursor]);
+	}
+	bind.sample_shard_mode = true;
+}
+
+struct SampleShardWriter {
+	string label;
+	idx_t lo = 0;
+	idx_t hi = 0;
+	string dir;
+	string pgen_final, pgen_staging;
+	string psam_final, psam_staging;
+	string rel_prefix, rel_psam; //! relative to the catalog's dir, e.g. "out/a/data(.psam)"
+	unique_ptr<PgenWriteGlobalState> pgen;
+};
+
+struct PfileSampleShardedGlobalState : public GlobalFunctionData {
+	string base;                 //! "<dir>/out" (the shard-tree dir)
+	string base_name;            //! "out" — dataset name + prefix of every relative catalog path
+	string pvar_final;           //! "<dir>/out.pvar"
+	string pvar_rel;             //! "out.pvar"
+	string catalog_path;         //! "<dir>/out.pfile.json"
+	PvarWriteGlobalState pvar_g; //! pvar_g.path = <pvar_final>.staging once opened
+	vector<SampleShardWriter> shards;
+	vector<string> created_dirs; //! dirs THIS COPY created, parent first (removed if empty on failure)
+	FileSystem *fs = nullptr;
+	bool opened = false;   //! files created (first row seen)
+	bool finished = false; //! catalog written — the destructor must not clean
+	bool cleaned = false;
+
+	// Remove everything this COPY created that is not a completed cohort: the shared .pvar staging,
+	// every shard's .pgen staging (+ pgenlib's .tmp, via its own CleanupPartial) and .psam staging,
+	// then the directories it created, deepest first and NON-recursively (SINGLE): a directory that
+	// still holds anything (a file promoted before a late finalize failure, or anything not ours) is
+	// left in place, so cleanup can never delete a file it did not stage. Idempotent; never throws.
+	void CleanupPartial(FileSystem &sysfs) {
+		if (cleaned) {
+			return;
+		}
+		cleaned = true;
+		if (pvar_g.handle) {
+			pvar_g.handle.reset();
+		}
+		for (auto &sh : shards) {
+			if (sh.pgen) {
+				sh.pgen->CleanupPartial(sysfs); // closes STPgenWriter + removes .pgen.staging(+.tmp)
+			}
+			try {
+				if (!sh.psam_staging.empty() && sysfs.FileExists(sh.psam_staging)) {
+					sysfs.RemoveFile(sh.psam_staging);
+				}
+			} catch (...) {
+			}
+		}
+		try {
+			if (!pvar_g.path.empty() && sysfs.FileExists(pvar_g.path)) {
+				sysfs.RemoveFile(pvar_g.path);
+			}
+		} catch (...) {
+		}
+		for (auto it = created_dirs.rbegin(); it != created_dirs.rend(); ++it) {
+			try {
+				RemoveDirectoryOptions single;
+				single.mode = RemoveDirectoryMode::SINGLE;
+				sysfs.RemoveDirectoryExtended(*it, single);
+			} catch (...) {
+			}
+		}
+	}
+
+	~PfileSampleShardedGlobalState() override {
+		if (!finished && fs) {
+			CleanupPartial(*fs);
+		}
+	}
+};
+
+unique_ptr<GlobalFunctionData> PfileSampleShardedInitGlobal(FileSystem &fs, const PfileWriteBindData &bind,
+                                                            const string &file_path) {
+	auto g = make_uniq<PfileSampleShardedGlobalState>();
+	g->base = PfilePrefix(file_path);
+	g->base_name = PfileBaseName(g->base);
+	g->pvar_final = g->base + ".pvar";
+	g->pvar_rel = g->base_name + ".pvar";
+	g->catalog_path = g->base + ".pfile.json";
+	g->fs = &fs;
+	for (idx_t i = 0; i < bind.shard_labels.size(); i++) {
+		SampleShardWriter sh;
+		sh.label = bind.shard_labels[i];
+		sh.lo = bind.shard_lo[i];
+		sh.hi = bind.shard_hi[i];
+		sh.dir = fs.JoinPath(g->base, sh.label);
+		sh.pgen_final = fs.JoinPath(sh.dir, "data.pgen");
+		sh.psam_final = fs.JoinPath(sh.dir, "data.psam");
+		sh.pgen_staging = sh.pgen_final + ".staging";
+		sh.psam_staging = sh.psam_final + ".staging";
+		sh.rel_prefix = g->base_name + "/" + sh.label + "/data";
+		sh.rel_psam = sh.rel_prefix + ".psam";
+		g->shards.push_back(std::move(sh));
+	}
+	// Nothing is created here: files open on the first row (PfileSampleShardedOpen).
+	return std::move(g);
+}
+
+// Create the shard tree + staging files on the first row: the shared .pvar staging + header, and
+// every shard's .psam staging (identity is out-of-band, fully known at bind). Each .pgen writer is
+// primed with its slice size; pgenlib init is deferred to its first append.
+void PfileSampleShardedOpen(PfileSampleShardedGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
+	g.opened = true; // from here on, cleanup owns whatever exists
+	// Record each directory we create (parent first), so cleanup can remove it again — only if empty.
+	if (!fs.DirectoryExists(g.base)) {
+		fs.CreateDirectoriesRecursive(g.base);
+		g.created_dirs.push_back(g.base);
+	}
+	for (auto &sh : g.shards) {
+		if (!fs.DirectoryExists(sh.dir)) {
+			fs.CreateDirectory(sh.dir);
+			g.created_dirs.push_back(sh.dir);
+		}
+	}
+	PvarOpenAndWriteHeader(g.pvar_g, fs, *bind.pvar_bind, g.pvar_final + ".staging");
+	for (auto &sh : g.shards) {
+		vector<string> slice(bind.iids.begin() + static_cast<std::ptrdiff_t>(sh.lo),
+		                     bind.iids.begin() + static_cast<std::ptrdiff_t>(sh.hi));
+		WritePsamFromIids(fs, sh.psam_staging, slice);
+		sh.pgen = make_uniq<PgenWriteGlobalState>();
+		sh.pgen->path = sh.pgen_staging;
+		sh.pgen->sample_ct_known = true;
+		sh.pgen->sample_ct = static_cast<uint32_t>(sh.hi - sh.lo);
+		sh.pgen->variant_ct_limit = bind.pgen_bind->variant_ct_limit;
+	}
+}
+
+void PfileSampleShardedSink(ExecutionContext &context, const PfileWriteBindData &bind, GlobalFunctionData &gstate,
+                            DataChunk &input) {
+	auto &g = gstate.Cast<PfileSampleShardedGlobalState>();
+	auto &fs = FileSystem::GetFileSystem(context.client);
+	try {
+		if (input.size() == 0) {
+			return;
+		}
+		if (!g.opened) {
+			PfileSampleShardedOpen(g, bind, fs);
+		}
+		input.Flatten();
+		// The shared .pvar first: its (CHROM, POS) monotonicity check fires before any .pgen append.
+		PvarWriteChunk(*bind.pvar_bind, g.pvar_g, input, 0, input.size());
+		const uint32_t total = static_cast<uint32_t>(bind.iids.size());
+		for (idx_t row = 0; row < input.size(); row++) {
+			Value geno_val = PgenRowGenotypes(*bind.pgen_bind, input, row);
+			const vector<Value> &calls = GenotypeCalls(geno_val);
+			if (calls.size() != total) {
+				throw InvalidInputException(
+				    "write pgen: variant %llu has %llu genotypes but the sample count is %u — every variant must list "
+				    "the same number of samples",
+				    static_cast<unsigned long long>(g.shards[0].pgen->appended),
+				    static_cast<unsigned long long>(calls.size()), total);
+			}
+			for (auto &sh : g.shards) {
+				if (!sh.pgen->writer_inited) {
+					PgenEnsureWriterInited(*sh.pgen, sh.pgen->sample_ct);
+				}
+				PgenAppendCallRange(*sh.pgen, calls, sh.lo, sh.hi);
+			}
+		}
+	} catch (...) {
+		g.CleanupPartial(fs);
+		throw;
+	}
+}
+
+// The concat_dim "samples" catalog, field-for-field the shape read_pfile_catalog / ATTACH parse
+// (test/data/pfile_catalog_le_samples.pfile.json): shared.pvar at the root, a per-file psam, NO
+// per-file pvar (the parser rejects one beside shared.pvar), and partition = global half-open
+// SAMPLE ordinals tiling [0, total) in file order.
+void PfileWriteSampleCatalog(PfileSampleShardedGlobalState &g, FileSystem &fs) {
+	string j = "{\n";
+	j += "  \"pfile_catalog\": 1,\n";
+	j += "  \"dataset\": \"" + JsonEscape(g.base_name) + "\",\n";
+	j += "  \"concat_dim\": \"samples\",\n";
+	j += "  \"shared\": { \"pvar\": \"" + JsonEscape(g.pvar_rel) + "\" },\n";
+	j += "  \"files\": [\n";
+	for (idx_t i = 0; i < g.shards.size(); i++) {
+		auto &sh = g.shards[i];
+		j += "    {\n";
+		j += "      \"prefix\": \"" + JsonEscape(sh.rel_prefix) + "\",\n";
+		j += "      \"psam\": \"" + JsonEscape(sh.rel_psam) + "\",\n";
+		j += "      \"partition\": { \"start\": " + std::to_string(sh.lo) + ", \"stop\": " + std::to_string(sh.hi) +
+		     ", \"source_ordinal\": " + std::to_string(i) + " }\n";
+		j += "    }";
+		if (i + 1 < g.shards.size()) {
+			j += ",";
+		}
+		j += "\n";
+	}
+	j += "  ]\n";
+	j += "}\n";
+	auto h = fs.OpenFile(g.catalog_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	h->Write(const_cast<char *>(j.data()), j.size());
+	h->Sync();
+	h.reset();
+}
+
+void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g) {
+	try {
+		if (!g.opened) {
+			throw IOException("write pfile: shard_samples produced no variants — the input query returned no rows");
+		}
+		for (auto &sh : g.shards) {
+			PgenFinish(*sh.pgen); // opened implies >= 1 appended row per shard
+		}
+		if (g.pvar_g.handle) {
+			g.pvar_g.handle->Sync();
+			g.pvar_g.handle.reset();
+		}
+		// Promote: the shared .pvar, then every .psam, then every .pgen (each .pgen after its shard's
+		// .psam, as in the bundle), then the catalog LAST. Not atomic as a group — a failure between
+		// renames leaves no catalog, so read_pfile_catalog / ATTACH see the cohort as absent.
+		fs.MoveFile(g.pvar_g.path, g.pvar_final);
+		for (auto &sh : g.shards) {
+			fs.MoveFile(sh.psam_staging, sh.psam_final);
+		}
+		for (auto &sh : g.shards) {
+			fs.MoveFile(sh.pgen_staging, sh.pgen_final);
+		}
+		PfileWriteSampleCatalog(g, fs);
+		g.finished = true;
+	} catch (...) {
+		g.CleanupPartial(fs);
+		throw;
+	}
+}
+
 unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindInput &input,
                                        const vector<CompatName> &names_in, const vector<LogicalType> &sql_types) {
 	const vector<string> names = CompatNameStrings(names_in);
 	auto bind = make_uniq<PfileWriteBindData>();
+	bool has_shard_samples = false;
+	Value shard_samples_spec;
 
 	// --- path overrides (reader symmetry), parsed first so the local-only check
 	//     below sees the EFFECTIVE target of each of the three files. ---
@@ -1883,7 +2280,21 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 			bind->pgen_override = opt.second[0].ToString();
 		} else if (key == "shard_by" && !opt.second.empty() && !opt.second[0].IsNull()) {
 			bind->shard_by = opt.second[0].ToString();
+		} else if (key == "shard_samples") {
+			has_shard_samples = true;
+			shard_samples_spec = opt.second.empty() ? Value() : opt.second[0];
 		}
+	}
+
+	// shard_by (variant axis) and shard_samples (sample axis) at once is the V2 grid — not built.
+	if (has_shard_samples && !bind->shard_by.empty()) {
+		throw BinderException("write pfile: shard_by and shard_samples cannot be combined — sharding both axes at "
+		                      "once (the variants x samples grid) is a planned follow-on. Use one of them.");
+	}
+	if (has_shard_samples &&
+	    (!bind->pvar_override.empty() || !bind->pgen_override.empty() || !bind->psam_override.empty())) {
+		throw BinderException("write pfile: shard_samples cannot be combined with pvar/pgen/psam path overrides — "
+		                      "the layout generates every path (one shared out.pvar, out/<label>/data.{pgen,psam})");
 	}
 
 	// --- local-only (the whole fileset): .pgen is written through a raw FILE* that
@@ -1940,6 +2351,16 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	bind->pgen_bind->sample_ct = static_cast<uint32_t>(bind->iids.size());
 	bind->pgen_bind->sample_ct_known = true;
 
+	// --- shard_samples: validate the partition against the resolved IID order ---
+	if (has_shard_samples) {
+		ParseSampleShards(shard_samples_spec, bind->iids, *bind);
+		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
+			throw BinderException("write pfile: shard_samples target '%s' has no filename component for the shard "
+			                      "tree / dataset name — give the COPY target a name, e.g. TO 'out'",
+			                      input.info.file_path);
+		}
+	}
+
 	// --- shard_by: resolve the key column + guard incompatible options ---
 	if (!bind->shard_by.empty()) {
 		if (!bind->pvar_override.empty() || !bind->pgen_override.empty() || !bind->psam_override.empty()) {
@@ -1986,6 +2407,9 @@ unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, Funct
                                                    const string &file_path) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (bind.sample_shard_mode) {
+		return PfileSampleShardedInitGlobal(fs, bind, file_path);
+	}
 	if (!bind.shard_by.empty()) {
 		return PfileShardedInitGlobal(fs, bind, file_path);
 	}
@@ -2030,6 +2454,10 @@ unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, FunctionDat
 void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
                    DataChunk &input) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
+	if (bind.sample_shard_mode) {
+		PfileSampleShardedSink(context, bind, gstate, input);
+		return;
+	}
 	if (!bind.shard_by.empty()) {
 		PfileShardedSink(context, bind, gstate, input);
 		return;
@@ -2053,6 +2481,10 @@ void PfileCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, 
 void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (bind.sample_shard_mode) {
+		PfileSampleShardedFinalize(fs, gstate.Cast<PfileSampleShardedGlobalState>());
+		return;
+	}
 	if (!bind.shard_by.empty()) {
 		PfileShardedFinalize(fs, gstate.Cast<PfileShardedGlobalState>());
 		return;

@@ -32,7 +32,16 @@ share **one `.pvar`** and split the `.psam`/`.pgen`, and emit the
 pins the catalog output to P13-008's tested fixture, specifies the N-open-writer
 engineering, and builds a test plan on today's oracles.
 
-**Result.** Nothing built yet. Design for review.
+**Result.** Built (2026-11-08), after P13-008 merged (#84), so the concatenated round-trip and
+the ATTACH test (§7 4–5) are live tests, not TODOs. Build-time deviations from this doc:
+- Per-shard `.psam` is `out/<label>/data.psam` (= `<prefix>.psam`), so the reader and ATTACH
+  discover it from the prefix; the catalog also records it per file.
+- Groups must be contiguous runs **in input order, and in struct order** (strict); a
+  within-group reorder is rejected too.
+- Files open lazily on the first row; cleanup removes staging and the directories this COPY
+  created, non-recursively (an empty directory only).
+- The `.pgen` row path is split into row guards (`PgenRowGenotypes`, once per row) and a range
+  packer (`PgenAppendCallRange`), so N shard writers do not repeat the row checks.
 
 ---
 
