@@ -1,0 +1,237 @@
+# P13-003 ATTACH surface — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
+> (or superpowers:executing-plans) to implement this plan task-by-task. Steps use
+> checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Expose a pfile_catalog matrix as a read-only attached database —
+`ATTACH 'cohort.pfile.json' AS c (TYPE pfile_catalog)` — with seven relations
+(`c.variants`, `c.samples`, `c.genotypes`, `c.genotypes_by_sample`, `c.cells`,
+`c.variant_blocks`, `c.sample_blocks`) that are baked views over the already-shipped
+`read_pfile_catalog` / `read_pfile` / `read_pvar` / `read_psam` readers.
+
+**Architecture:** A `StorageExtension` for TYPE `pfile_catalog`, modelled on DuckDB's
+own `OpenFileStorageExtension`. `attach` parses the catalog JSON once
+(`ParseMatrixCatalog`), resolves the surviving cells (`BuildCells`), bakes the
+resolved paths and schema into one `SELECT` string per relation, and seeds a native
+`DuckCatalog` with lazy views through a `DefaultGenerator`. `create_transaction_manager`
+returns a stock `DuckTransactionManager`. No custom `Catalog`/`TableCatalogEntry`.
+
+**Tech Stack:** C++17, DuckDB v2.0.0 extension API (vendored in-repo), sqllogictest.
+
+**Spec:** `docs/planning/P13-003-attach-surface` (this plan's design, owner-approved
+2026-11-07). Prior art: `P13-001-pfile-catalog-matrix` (§5 surface), `P13-002-...-implementation`
+(the shipped readers), `P11-001-attach-pfile-catalog` (superseded).
+
+## Global Constraints
+
+- **v2.0.0-only.** The v1.5.6 line is retired; CI runs v2.0.0.
+- **Read-only.** A write to `c.*` errors clearly (stock `DuckTransactionManager` path).
+- **No new capability** beyond the shipped readers — this is ergonomics. If a relation
+  needs a reader feature that does not exist, defer it, do not add it here.
+- **Decisions (owner 2026-11-07):** projection-driven genotype columns are DEFERRED to
+  P13-004 — `c.genotypes` exposes `read_pfile`'s native columns. Ship ALL SEVEN relations.
+- **Cell-skip cascade is P13-004.** `attach` bakes the full surviving-cell list; `WHERE`
+  rides each opened `read_pfile`'s existing row-group pushdown. Do not route predicates
+  into the catalog prune here.
+- **Conventions:** registration follows the `RegisterX(ExtensionLoader&)` idiom in
+  `src/plinking_duck_extension.cpp`; the StorageExtension body follows
+  `duckdb/src/storage/open_file_storage_extension.cpp`; tests are sqllogictest files in
+  `test/sql/` with the `# name:` / `# description:` / `# group: [sql]` header and
+  `require plinking_duck`; bake paths into SQL with proper escaping (`SQLString`, as the
+  template does). Docs prose follows ASD-STE100.
+
+## Review Focus
+
+Spec-implied inputs no happy-path test exercises — each pinned in the named task:
+
+- **A declared hole** contributes no rows to any relation and is not an error. → Task 2, Task 3.
+- **An empty surviving set** (all cells are holes, or the catalog resolves to zero cells)
+  yields empty relations, not a crash. → Task 1.
+- **`WHERE CHROM`/`POS` on `c.genotypes`** returns correct rows AND scans fewer row-groups
+  than a full read (pushdown rides). → Task 4.
+- **A write to `c.*`** (INSERT / CREATE TABLE / UPDATE) errors clearly, with no silent
+  no-op. → Task 4.
+- **DETACH then re-ATTACH** the same name succeeds, with no leaked catalog or assertion. → Task 4.
+
+---
+
+## File Structure
+
+- Create `src/pfile_catalog_storage.cpp` — the StorageExtension: `attach`,
+  `create_transaction_manager`, `Create`, `RegisterPfileCatalogStorage`, the
+  `DefaultGenerator` subclass, and the per-relation SQL builder.
+- Create `src/include/pfile_catalog_storage.hpp` — `void RegisterPfileCatalogStorage(ExtensionLoader &loader);`
+- Modify `src/plinking_duck_extension.cpp` — include the header; call
+  `RegisterPfileCatalogStorage(loader);` in the register block.
+- Modify `CMakeLists.txt` — add `src/pfile_catalog_storage.cpp` to the extension sources.
+- Create `test/sql/attach_pfile_catalog.test` — the smoke + relation tests.
+- Create `test/sql/attach_pfile_catalog_edges.test` — holes, empty, read-only, detach, pushdown.
+- Modify the pfile_catalog docs page — an ATTACH example (Task 5).
+
+---
+
+### Task 1: The ATTACH seam, end-to-end, with `c.genotypes` (feasibility gate)
+
+This is implementation test #1 from the design: prove a `DefaultGenerator`-seeded view
+whose SQL calls `read_pfile` over a baked literal `LIST` binds and runs under
+`ATTACH (TYPE pfile_catalog)`. Everything else builds on this seam.
+
+**Files:**
+- Create: `src/pfile_catalog_storage.cpp`, `src/include/pfile_catalog_storage.hpp`
+- Modify: `src/plinking_duck_extension.cpp`, `CMakeLists.txt`
+- Test: `test/sql/attach_pfile_catalog.test`
+
+**Interfaces:**
+- Consumes: `MatrixCatalog ParseMatrixCatalog(FileSystem&, const string &path, const string &content)`
+  and the cell builder (`BuildCells(catalog, /*include_holes=*/false) -> vector<MatrixCell>`;
+  confirm its exact name/signature in `pfile_catalog_matrix.*`). `MatrixCell` carries
+  `prefix` (`.pgen` path without extension), `pvar`, `psam`, spans, `present`,
+  `variant_block`, `sample_block`. `read_pfile` accepts a `LIST(VARCHAR)` of prefixes
+  (`pfile_reader.cpp`), row-concatenated. `ExtensionLoader::GetDatabaseInstance()` →
+  `DBConfig::GetConfig(db)` → `StorageExtension::Register(config, "pfile_catalog", ext)`.
+- Produces: `void RegisterPfileCatalogStorage(ExtensionLoader&)`; a `StorageExtension`
+  whose `attach` returns a native `DuckCatalog` seeded (this task) with one view,
+  `genotypes`, whose SQL is `SELECT * FROM read_pfile([<baked escaped prefixes>])`.
+
+- [ ] **Step 1: Write the failing test** `test/sql/attach_pfile_catalog.test`
+
+```
+# name: test/sql/attach_pfile_catalog.test
+# description: ATTACH (TYPE pfile_catalog) exposes a cohort as a schema of relations
+# group: [sql]
+require plinking_duck
+
+# <reuse the tiny matrix fixture that read_pfile_catalog_matrix.test attaches>
+statement ok
+ATTACH '<fixture>.pfile.json' AS c (TYPE pfile_catalog);
+
+# c.genotypes equals read_pfile over the same surviving cell prefixes
+query I
+SELECT count(*) FROM c.genotypes;
+----
+<N = count(*) from the equivalent read_pfile([cells]) call>
+```
+
+- [ ] **Step 2: Run it, verify it fails** — `ATTACH … (TYPE pfile_catalog)` errors
+  with unknown type (extension not registered). Run via the repo's test target
+  (`make test` / the extension test binary) over the one file.
+
+- [ ] **Step 3: Implement the skeleton.** In `pfile_catalog_storage.cpp`: a
+  `DefaultGenerator` subclass modelled on `OpenFileDefaultGenerator` that, for each
+  seeded view name, returns a `ViewCatalogEntry` from `CreateViewInfo::FromSelect` with
+  the baked SQL; `attach` = read the file, `ParseMatrixCatalog` + `BuildCells`, build the
+  `read_pfile([...])` SQL for `genotypes`, make `DuckCatalog`, `Initialize(false)`, set the
+  generator on the VIEW `CatalogSet`; `create_transaction_manager` returns
+  `make_uniq<DuckTransactionManager>(db)`; `Create()` wires both; `RegisterPfileCatalogStorage`
+  registers under `"pfile_catalog"`. Register it in `plinking_duck_extension.cpp` and add
+  the source to `CMakeLists.txt`.
+
+- [ ] **Step 4: Run the test, verify it passes.**
+
+- [ ] **Step 5: Add the empty-set assertion** (Review Focus): a catalog that resolves to
+  zero surviving cells yields `SELECT count(*) FROM c.genotypes` = 0, no error. Extend the
+  test; make it pass (an empty baked `LIST` must produce a valid empty-scan SQL).
+
+- [ ] **Step 6: Commit.**
+
+### Task 2: Grid relations — `c.cells`, `c.variant_blocks`, `c.sample_blocks`
+
+**Files:** Modify `src/pfile_catalog_storage.cpp`; Test: extend `test/sql/attach_pfile_catalog.test`.
+
+**Interfaces:**
+- Consumes: Task 1's seam + `read_pfile_catalog('<file>')` (one row per surviving cell,
+  already shipped) and `read_pfile_catalog_layout('<file>')` (the interpreted chunk map,
+  incl. holes). The baked file path is `info.path` captured at attach.
+- Produces: three more seeded views — `cells` = `SELECT * FROM read_pfile_catalog('<file>')`;
+  `variant_blocks` / `sample_blocks` = the per-axis projection of
+  `read_pfile_catalog_layout('<file>')`.
+
+- [ ] **Step 1: Write failing assertions** — `DESCRIBE c.cells` and a row-count of each
+  relation equal to the equivalent direct reader call; a fixture **hole** contributes no
+  `c.cells` row (Review Focus).
+- [ ] **Step 2: Run, verify fail** (views not seeded yet).
+- [ ] **Step 3: Implement** — add the three view names + baked SQL to the generator's set.
+- [ ] **Step 4: Run, verify pass.**
+- [ ] **Step 5: Commit.**
+
+### Task 3: Axis relations — `c.variants`, `c.samples`, `c.genotypes_by_sample`
+
+**Files:** Modify `src/pfile_catalog_storage.cpp`; Test: extend `test/sql/attach_pfile_catalog.test`.
+
+**Interfaces:**
+- Consumes: `read_pvar(LIST(VARCHAR))` (multi-file, confirmed `pvar_reader.cpp:253,328`) and
+  `read_psam` (verify it mirrors `read_pvar`'s `LIST` support; if absent, compose
+  `c.samples` from `read_pfile([cells], orient:='sample')` distinct samples instead).
+  Distinct `pvar` / `psam` paths come from the resolved `MatrixCell` list.
+- Produces: `variants` = `read_pvar([distinct pvar paths])`; `samples` =
+  `read_psam([distinct psam paths])`; `genotypes_by_sample` =
+  `read_pfile([cells], orient:='sample')`. Add the variant-axis and sample-axis block-key
+  columns from the catalog where cheap.
+  **Sub-decision (implementer's call, record it):** a reliable global `variant_index` /
+  `sample_index` column. `read_pvar`'s ordinal is an emission counter, not a stored global
+  index (`pfile_catalog_matrix` memory). Default: expose block-key columns now; defer a
+  reliable global index column to P13-004 if the reader does not already carry one.
+
+- [ ] **Step 1: Write failing assertions** — each relation's row count equals the
+  equivalent reader call; `genotypes_by_sample` row count matches `genotypes`; a hole adds
+  no rows.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement** the three views; resolve the index sub-decision and note it.
+- [ ] **Step 4: Run, verify pass.**
+- [ ] **Step 5: Commit.**
+
+### Task 4: Behaviour gates — pushdown, read-only, DETACH, SHOW TABLES
+
+**Files:** Create `test/sql/attach_pfile_catalog_edges.test`; fix `pfile_catalog_storage.cpp`
+only if a gate fails.
+
+**Interfaces:** Consumes the full seven-relation catalog from Tasks 1–3. No new surface.
+
+- [ ] **Step 1: Write the gate tests** (all Review Focus):
+  - `WHERE CHROM='<c>' AND POS BETWEEN a AND b` on `c.genotypes` returns the same rows as
+    the equivalent filtered `read_pfile`, and (if the harness exposes it) scans fewer than a
+    full read — at minimum, assert correctness; note the row-group count check if measurable.
+  - A write — `INSERT INTO c.genotypes …`, `CREATE TABLE c.x …` — fails with a clear error
+    (`statement error`).
+  - `DETACH c;` then re-`ATTACH … AS c` succeeds.
+  - `SHOW TABLES` (or `DESCRIBE`) from `c` lists the seven relations.
+- [ ] **Step 2: Run** — confirm each gate; a correct implementation passes most already.
+- [ ] **Step 3: Fix** only a gate that fails (e.g. a read-only error that is a crash, not a
+  clean message).
+- [ ] **Step 4: Run, verify pass.**
+- [ ] **Step 5: Commit.**
+
+### Task 5: Docs — the ATTACH example
+
+**Files:** Modify the pfile_catalog docs page (the one holding the glob/JSON catalog example).
+
+- [ ] **Step 1:** Add an ATTACH example that attaches a catalog and selects from
+  `c.variants` / `c.genotypes`, and one line that `WHERE` rides `read_pfile` pushdown while
+  cell-skip is P13-004. ASD-STE100. No test; prose only.
+- [ ] **Step 2: Commit.**
+
+---
+
+## Self-Review
+
+1. **Spec coverage.** Design §5 (seven relations) → Tasks 1–3. §6 deferral boundary → the
+   Global Constraints + Task 4 pushdown test. §7 decision (projection deferred) → Global
+   Constraints. §8 testing list → Tasks 1–4. Covered.
+2. **Step scan.** Each code step names a signature or a concrete view-SQL shape; bodies are
+   left to the implementer. No step decides nothing; no body is transcribed. OK.
+3. **Type consistency.** `MatrixCatalog`/`MatrixCell`, `ParseMatrixCatalog`, `BuildCells`,
+   `RegisterPfileCatalogStorage`, `read_pfile`/`read_pvar`/`read_psam` names are used
+   identically across tasks. `BuildCells` exact signature is the one unverified name —
+   Task 1 Step 3 confirms it against `pfile_catalog_matrix.*` before use.
+4. **Review Focus.** Hole → Tasks 2,3. Empty set → Task 1 Step 5. Pushdown → Task 4. Read-only
+   → Task 4. DETACH/re-ATTACH → Task 4. Each has a test in its owning task.
+5. **Proportion.** Five tasks, one new `.cpp`, two test files, one docs edit — proportional
+   to a storage-extension-shaped ergonomics feature. Not a transcript of the program.
+
+## Build note
+
+The extension vendors DuckDB; a fresh-worktree first build is long (route through Slurm:
+`srun -n 1 -c 16 --mem=24G -p batch -t 120`). Later incremental builds are shorter. Native
+execution (one warm build dir, rebuild per task) is cheaper here than a fresh build per
+subagent.
