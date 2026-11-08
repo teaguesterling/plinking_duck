@@ -144,51 +144,78 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	db.SetReadOnlyDatabase();
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	string catalog_path = info.path;
-	string content = ReadWholeFile(fs, catalog_path);
+	string raw_path = info.path;
 
-	// Resolve the cell list (prefix/pvar/psam per surviving cell) for ANY catalog kind, plus the
-	// per-kind structural-view SQL. The matrix (v2) and v1 parsers already resolve + fold companions.
-	// Absolute catalog path so the lazy views (which re-parse the file) resolve the same regardless of
-	// the cwd at query time, matching the attach-time-resolved absolute cell prefixes.
-	string path_sql = SQLString::ToString(AbsPath(fs, catalog_path));
+	// Resolve the ATTACH target: an explicit '.pfile.json', a prefix ('<p>.pfile.json'), or a bare
+	// fileset ('<p>.pgen' with no sidecar → synthesize a one-cell catalog, P13-005 D1).
+	string catalog_path; // the .pfile.json to parse; empty for a bare fileset
+	string bare_prefix;  // the fileset prefix; empty unless bare
+	if (StringUtil::EndsWith(raw_path, ".pfile.json")) {
+		catalog_path = raw_path;
+	} else if (fs.FileExists(raw_path + ".pfile.json")) {
+		catalog_path = raw_path + ".pfile.json";
+	} else if (fs.FileExists(raw_path + ".pgen")) {
+		bare_prefix = raw_path;
+	} else {
+		throw InvalidInputException("ATTACH pfile_catalog: nothing found at '%s' (looked for it, "
+		                            "'%s.pfile.json', and '%s.pgen')",
+		                            raw_path, raw_path, raw_path);
+	}
+
+	// Resolve the cell list (prefix/pvar/psam per surviving cell) and the per-kind structural-view
+	// SQL. Absolute paths so the lazy views resolve the same regardless of the cwd at query time.
 	vector<string> cell_prefixes;
 	vector<string> pvar_paths;
 	vector<string> psam_paths;
 	string variant_blocks_sql;
 	string sample_blocks_sql;
+	string cells_sql;
 
 	auto take_cell = [&](const string &prefix, const string &pvar, const string &psam) {
-		// An omitted companion (a single-fileset sidecar may leave .pvar/.psam out) falls back to the
-		// conventional <prefix>.pvar / <prefix>.psam; read_pfile discovers its own for genotypes.
+		// An omitted companion falls back to the conventional <prefix>.pvar / <prefix>.psam;
+		// read_pfile discovers its own for genotypes.
 		cell_prefixes.push_back(prefix);
 		PushUnique(pvar_paths, pvar.empty() ? prefix + ".pvar" : pvar);
 		PushUnique(psam_paths, psam.empty() ? prefix + ".psam" : psam);
 	};
 
-	if (IsMatrixCatalog(content)) {
-		auto matrix = ParseMatrixCatalog(fs, catalog_path, content);
-		for (auto &cell : BuildCells(matrix, fs, /*include_holes=*/false)) {
-			if (cell.present) {
-				take_cell(cell.prefix, cell.pvar, cell.psam);
-			}
-		}
-		variant_blocks_sql = BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop");
-		sample_blocks_sql = BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop");
+	if (!bare_prefix.empty()) {
+		// Bare fileset: one synthetic cell, no catalog file. read_pfile discovers its own companions.
+		string abs_prefix = AbsPath(fs, bare_prefix);
+		take_cell(abs_prefix, "", "");
+		variant_blocks_sql = "SELECT NULL::BIGINT AS variant_start, NULL::BIGINT AS variant_stop";
+		sample_blocks_sql = "SELECT NULL::BIGINT AS sample_start, NULL::BIGINT AS sample_stop";
+		cells_sql = "SELECT " + SQLString::ToString(abs_prefix) + " AS prefix, " +
+		            SQLString::ToString(abs_prefix + ".pvar") + " AS pvar, " +
+		            SQLString::ToString(abs_prefix + ".psam") + " AS psam";
 	} else {
-		auto cat = ParseV1Catalog(fs, catalog_path, content);
-		for (auto &e : cat.files) {
-			take_cell(e.prefix, e.pvar, e.psam);
+		string content = ReadWholeFile(fs, catalog_path);
+		string path_sql = SQLString::ToString(AbsPath(fs, catalog_path));
+		cells_sql = "SELECT * FROM read_pfile_catalog(" + path_sql + ")";
+		if (IsMatrixCatalog(content)) {
+			auto matrix = ParseMatrixCatalog(fs, catalog_path, content);
+			for (auto &cell : BuildCells(matrix, fs, /*include_holes=*/false)) {
+				if (cell.present) {
+					take_cell(cell.prefix, cell.pvar, cell.psam);
+				}
+			}
+			variant_blocks_sql = BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop");
+			sample_blocks_sql = BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop");
+		} else {
+			auto cat = ParseV1Catalog(fs, catalog_path, content);
+			for (auto &e : cat.files) {
+				take_cell(e.prefix, e.pvar, e.psam);
+			}
+			variant_blocks_sql = BuildV1BlockSql(path_sql, cat.concat_dim, "variant");
+			sample_blocks_sql = BuildV1BlockSql(path_sql, cat.concat_dim, "sample");
 		}
-		variant_blocks_sql = BuildV1BlockSql(path_sql, cat.concat_dim, "variant");
-		sample_blocks_sql = BuildV1BlockSql(path_sql, cat.concat_dim, "sample");
 	}
 
 	// A catalog with no present cells has nothing to read (the shipped readers reject an empty list).
 	if (cell_prefixes.empty()) {
 		throw InvalidInputException("ATTACH pfile_catalog '%s': the catalog has no present cells; "
 		                            "nothing to attach",
-		                            catalog_path);
+		                            raw_path);
 	}
 
 	// Bake the per-relation SQL over the shipped readers (one builder per relation, so P13-006 can
@@ -199,7 +226,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	                   "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ", orient := 'sample')");
 	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
 	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));
-	views.emplace_back(Identifier("cells"), "SELECT * FROM read_pfile_catalog(" + path_sql + ")");
+	views.emplace_back(Identifier("cells"), cells_sql);
 	views.emplace_back(Identifier("variant_blocks"), variant_blocks_sql);
 	views.emplace_back(Identifier("sample_blocks"), sample_blocks_sql);
 

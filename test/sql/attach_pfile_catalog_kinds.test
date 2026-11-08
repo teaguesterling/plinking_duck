@@ -49,3 +49,43 @@ true
 statement error
 CREATE TABLE s.scratch AS SELECT 1;
 ----
+
+# ---------------------------------------------------------------------------
+# Prefix resolution: ATTACH by prefix appends .pfile.json.
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/pfile_catalog_single' AS p (TYPE pfile_catalog);
+
+query T
+SELECT (SELECT count(*) FROM p.genotypes) = (SELECT count(*) FROM s.genotypes);
+----
+true
+
+# ---------------------------------------------------------------------------
+# Bare fileset (D1): no sidecar, but <prefix>.pgen exists → synthesize one cell.
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/large_example' AS b (TYPE pfile_catalog);
+
+query T
+SELECT (SELECT count(*) FROM b.genotypes) =
+       (SELECT count(*) FROM read_pfile('test/data/large_example'));
+----
+true
+
+query I
+SELECT count(*) FROM b.cells;
+----
+1
+
+query T
+SELECT (SELECT count(*) FROM b.variants) =
+       (SELECT count(*) FROM read_pvar('test/data/large_example.pvar'));
+----
+true
+
+# A target with neither a catalog nor a .pgen raises clearly.
+statement error
+ATTACH 'test/data/does_not_exist_anywhere' AS x (TYPE pfile_catalog);
+----
+nothing found
