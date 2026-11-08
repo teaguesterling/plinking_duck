@@ -1,0 +1,137 @@
+# P13-005: ATTACH any catalog kind, by prefix or path
+
+Make `ATTACH ... (TYPE pfile_catalog)` work for **every** catalog kind — single-fileset
+(v1), multi-file / sharded (v1), and matrix (v2) — and let the path be a **prefix**, not
+only the full `.pfile.json`. So `ATTACH 'dir/cohort'` finds `dir/cohort.pfile.json`, and a
+plain sharded cohort or a single fileset attaches as the same schema of relations the matrix
+already exposes.
+
+Depends on: P13-003 (the matrix ATTACH surface, merged as #82 — `src/pfile_catalog_storage.cpp`).
+Revives P11-001 (attach a single fileset), which P13-003 superseded for the matrix only.
+Branch: `feature/P13-005-attach-all-kinds`.
+
+## Status
+
+- [ ] Owner decision D1: a bare fileset with no `.pfile.json` sidecar (§6)
+- [ ] Owner decision D2: the relation set for the degenerate kinds (§5)
+- [ ] Feasibility spike: resolve cell prefixes inside `attach` (§4) — my call, before the plan
+- [ ] Implementation plan + build + review
+
+## Why — the gap P13-003 left
+
+P13-003's `attach` calls `ParseMatrixCatalog`, which validates `pfile_catalog == 2`.
+**Measured 2026-11-07:** `ATTACH 'test/data/pfile_catalog_single.pfile.json' (TYPE pfile_catalog)`
+raises `read_pfile_catalog: catalog parse error: ... is not a version-2 matrix catalog`, and
+the database is not attached. So the kinds a user most often has — a single fileset with a
+sidecar, and the sharded writer's own output — cannot be attached. Only hand-written matrix
+catalogs can.
+
+The catalog extension is always **`.pfile.json`** (docs/formats/pfile_catalog.md:41), for all
+three kinds. A single-fileset sidecar sits beside one fileset as `cohort.pfile.json` next to
+`cohort.{pgen,pvar,psam}` — exactly the prefix case this plan serves.
+
+## The insight — the data views are already kind-agnostic
+
+`read_pfile_catalog` routes v1 (`ParseCatalog` → `PfileCatalog`) vs v2 (`ParseMatrixCatalog`
+→ `MatrixCatalog`) and emits **different** output schemas (v1: dataset/prefix/pvar/psam/spans;
+v2: adds the `keys` MAP and per-axis spans). **But both carry `prefix`, `pvar`, `psam`** — the
+only fields the data views need:
+
+- `c.genotypes` / `c.genotypes_by_sample` — `read_pfile` over the cell/shard `prefix`es.
+- `c.variants` — `read_pvar` over the distinct `pvar`s.
+- `c.samples` — `read_psam` over the distinct `psam`s.
+
+So the data views are built the same way for every kind, once the per-cell `(prefix, pvar,
+psam)` list is resolved. Only the **structural** views differ by kind (§5).
+
+The v1 `PfileCatalog` (`src/include/pfile_catalog.hpp:80`) holds `vector<ShardEntry> files`,
+each `ShardEntry` with `prefix`/`pvar`/`psam` (`:26`); `is_single` marks the one-fileset case;
+`concat_dim` ("variants" | "samples" | empty) names the 1-D shard axis. The v2 `MatrixCell`
+(`pfile_catalog_matrix.hpp`) is the 2-D generalization. Both resolve + fold shared companions
+in the reader's bind.
+
+## 4. Resolving the cell list inside `attach` (the feasibility spike)
+
+`attach` must bake the per-cell `prefix`/`pvar`/`psam` into the view SQL (the readers take
+constant path lists). Two ways to get that list for any kind:
+
+- **A — run the reader (recommended, pending spike).** `attach` executes
+  `SELECT prefix, pvar, psam FROM read_pfile_catalog('<abs path>')` through an internal
+  connection. Both schemas share those three column names, so one query is kind-agnostic, and
+  it reuses the reader's companion-folding, resolution, and verification. **Unknown:** whether
+  a query can run inside the `attach` callback (it executes within `ATTACH`'s transaction).
+  This is the spike — a source read + a tiny probe, like P13-003's StorageExtension spike.
+- **B — parse in C++ (fallback).** `attach` calls `ParseCatalog` / `ParseMatrixCatalog`
+  directly and reads the structs. Avoids a nested query, but re-implements the companion
+  folding the reader already does, and risks drift.
+
+Recommendation: spike A first; fall back to B if a nested query is not viable.
+
+### Prefix resolution rule
+
+Given the `ATTACH` path, before anything else:
+
+1. If it ends in `.pfile.json`, use it as-is.
+2. Else append `.pfile.json`. If `<path>.pfile.json` exists, use it.
+3. Else → D1 (§6).
+
+Resolve to an absolute path first (`AbsPath`, as P13-003's review fix already does for the
+structural views).
+
+## 5. The relation set per kind (owner decision D2)
+
+The four data views are identical across kinds. The structural views differ:
+
+| Relation | matrix (v2) | multi-file (v1) | single-fileset (v1) |
+|---|---|---|---|
+| `c.variants`, `c.samples`, `c.genotypes`, `c.genotypes_by_sample` | yes | yes | yes |
+| `c.cells` | M×N cells | the shards | one row |
+| `c.variant_blocks` | per-CHROM etc. | shards (if `concat_dim='variants'`) | one row |
+| `c.sample_blocks` | per-GROUP etc. | shards (if `concat_dim='samples'`) | one row |
+
+**D2:** expose **all seven** for every kind (the block views degenerate to the shard list or a
+single row), so one query runs against any attached catalog — OR expose a **reduced set** per
+kind (drop the block views where they are degenerate). Default if unanswered: all seven, so the
+surface is uniform.
+
+## 6. The bare fileset — D1
+
+If the `ATTACH` path resolves to no `.pfile.json`, but `<prefix>.pgen` exists:
+
+- **Option "synthesize" (fuller ergonomic):** `attach` synthesizes a one-cell catalog from the
+  bare fileset — `c.genotypes` = `read_pfile('<prefix>')`, `c.variants`/`c.samples` from its own
+  `.pvar`/`.psam`. This makes `ATTACH 'cohort'` work on ANY fileset, the full P11 dream. Cost: a
+  fileset has no declared bounds, so there is nothing to verify, and `c.cells`/blocks are a thin
+  single synthetic row.
+- **Option "require sidecar":** attach only when a `.pfile.json` exists; a bare fileset raises a
+  clear "no catalog found at '<prefix>.pfile.json'".
+
+Default if unanswered: require sidecar (smaller surface; the bare-fileset case can be a later
+increment). D1 is the one call that most changes scope.
+
+## 7. Phasing & build order
+
+1. Spike §4-A (nested query in `attach`) — settle A vs B.
+2. Prefix resolution + absolute-path resolve.
+3. Kind-agnostic data views from the resolved `(prefix, pvar, psam)` list (replaces the
+   matrix-only `ParseMatrixCatalog`/`BuildCells` path; the matrix path stays for the v2 structural
+   views).
+4. Per-kind structural views (`c.cells` always = `read_pfile_catalog`; blocks per D2).
+5. (If D1 = synthesize) the bare-fileset path.
+6. Tests per kind + docs.
+
+## 8. Testing (shape)
+
+- `ATTACH` a single-fileset, a multi-file, and a matrix catalog by **full path**; each `c.genotypes`
+  equals the equivalent `read_pfile` call; `c.variants`/`c.samples` match.
+- `ATTACH` the same three by **prefix**; identical result to the full-path attach.
+- Read-only, holes, and all-holes behave as in P13-003.
+- (D1 = synthesize) `ATTACH 'bare_prefix'` with no sidecar works; (D1 = require) it raises clearly.
+
+## 9. Risks
+
+- The §4 nested-query spike is the real unknown; B is the proven fallback.
+- A prefix that matches both `<prefix>.pfile.json` AND a bare `<prefix>.pgen` resolves to the
+  catalog (step 1-2 win); documented, not ambiguous.
+- Verification cost: `read_pfile_catalog` verifies cells; attaching a large multi-file catalog
+  pays that at attach. P13-003 already inherits this for the matrix; no worse here.
