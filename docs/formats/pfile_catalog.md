@@ -632,16 +632,23 @@ on the function page. In short:
 - A predicate that names an undeclared key, or the wrong axis, raises an error. It is
   never ignored.
 
-### Attaching a matrix (`TYPE pfile_catalog`)
+### Attaching a catalog (`TYPE pfile_catalog`)
 
-`ATTACH` exposes a matrix catalog as a read-only database. A cohort then reads as a
-schema of relations, not as function calls:
+`ATTACH` exposes **any** catalog kind — a single fileset, a multi-file (sharded)
+cohort, or a matrix — as a read-only database, and the target may be a full
+`.pfile.json` path, a **prefix**, or even a **bare fileset** with no sidecar:
 
 ```sql
-ATTACH 'cohort.pfile.json' AS c (TYPE pfile_catalog);
+ATTACH 'cohort.pfile.json' AS c (TYPE pfile_catalog);  -- an explicit catalog
+ATTACH 'cohort'            AS c (TYPE pfile_catalog);  -- a prefix → cohort.pfile.json
+ATTACH 'plainfileset'      AS c (TYPE pfile_catalog);  -- plainfileset.pgen, no sidecar → one cell
 SELECT * FROM c.cells;
 SELECT CHROM, POS, ID, REF, ALT FROM c.variants WHERE CHROM = '17';
 ```
+
+The path resolves in order: a literal `.pfile.json` is used as-is; otherwise
+`<path>.pfile.json` if it exists; otherwise `<path>.pgen` as a bare fileset (one
+synthetic cell); otherwise `ATTACH` raises.
 
 The attached database holds seven views. Each one is backed by a shipped reader:
 
@@ -653,6 +660,12 @@ The attached database holds seven views. Each one is backed by a shipped reader:
 | `c.genotypes_by_sample` | the same cells, sample-oriented |
 | `c.cells` | `read_pfile_catalog` — one row per surviving cell |
 | `c.variant_blocks`, `c.sample_blocks` | the per-axis block tiling |
+
+The four data views are the same for every kind. The structural views vary: `c.cells` is
+the kind's own manifest; the block views carry each kind's structure — a matrix's typed
+per-key tiling, a multi-file cohort's shards on its concat axis, or one row for a single
+fileset. A v1 cohort's non-concat (shared) axis has no declared extent, so that block row
+carries `NULL` spans.
 
 The catalog is **read-only**: a write to `c.*` raises. Do not pass `READ_ONLY` to
 `ATTACH`; the catalog is always read-only, and the storage is in-memory. A `WHERE`
