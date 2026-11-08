@@ -1,0 +1,157 @@
+# P13-003: ATTACH surface (TYPE pfile_catalog)
+
+Expose a pfile_catalog matrix as an attachable read-only database, so a cohort
+reads like a schema of relations:
+`ATTACH 'cohort.pfile.json' AS c (TYPE pfile_catalog)` →
+`SELECT * FROM c.variants`, `c.samples`, `c.genotypes`, `c.cells`, …
+
+Depends on: P13-001 (matrix design, owner-approved 2026-10-29), P13-002 (shipped
+v0.15.0 — the matrix format + typed-prune readers). Branch:
+`feature/P13-003-attach-surface`.
+
+## Status
+
+- [x] Feasibility spike — DuckDB `StorageExtension` API (was the biggest unknown)
+- [x] Owner decision: projection-driven genotype columns → deferred to P13-004 (Teague 2026-11-07, §7)
+- [x] Owner decision: the v1 relation set → all seven confirmed (Teague 2026-11-07, §5)
+- [ ] Implementation plan (P13-004-... ? or P13-003-002)
+- [ ] Build
+
+## Decisions carried forward (from P13-001, owner 2026-10-29)
+
+- **ATTACH is the primary surface** (§5, groups A/B/D). This supersedes P11-001's
+  "ship a view/macro helper first" skepticism: P13-001 is the later owner
+  decision, and it chose ATTACH-primary. P11-001 stays as history.
+- Grid is **sparse** (holes legal). Build order: parse → typed-prune → **ATTACH
+  surface (this doc)** → cascade.
+- Analysis macros (surface C — `freq`/`score`/`pca`/`glm` over the grid) are a
+  **separate plan**, not P13-003.
+
+## The spike result (feasibility — PROVEN by DuckDB's own code)
+
+The question was: must ATTACH implement a custom `Catalog` + `TableCatalogEntry`
+(the DuckLake / postgres_scanner weight), or can it hand back a native catalog of
+views (the light path P11-001 feared it could not)?
+
+**It can be light.** DuckDB's own `OpenFileStorageExtension`
+(`duckdb/src/storage/open_file_storage_extension.cpp`) is the exact template for
+`ATTACH 'file.db'`, and it:
+
+1. returns `make_uniq<DuckCatalog>(db)` after `catalog->Initialize(false)` — a
+   **native** catalog, no custom `Catalog`/`TableCatalogEntry`;
+2. seeds views **lazily** with a `DefaultGenerator` on the VIEW `CatalogSet`:
+   `CreateDefaultEntry` builds a `CreateViewInfo` from `CreateViewInfo::FromSelect`
+   whose `sql` is a plain `SELECT … FROM <source>`, returned as a
+   `ViewCatalogEntry`;
+3. returns a stock `make_uniq<DuckTransactionManager>(db)`.
+
+A loadable extension can register a `StorageExtension` for a TYPE name:
+`StorageExtension::Register(config, "pfile_catalog", ext)`. DuckLake (a loadable
+extension attached as `ATTACH 'ducklake:…' (TYPE ducklake)`) does exactly this on
+this box, so the registration path is confirmed, not inferred.
+
+**Conclusion:** P13-003 is one new `.cpp` modeled on `open_file_storage_extension.cpp`,
+plus the per-view SQL. No custom catalog machinery. Low risk.
+
+**One runtime detail the source cannot settle** (→ implementation test #1): that a
+`DefaultGenerator`-seeded view whose SQL calls `read_pfile` over a *baked literal
+`LIST(VARCHAR)`* of cell prefixes binds and runs under `ATTACH (TYPE
+pfile_catalog)`. `read_pfile` already documents `LIST(VARCHAR)` multi-source,
+row-concatenated input (`pfile_reader.cpp:342,408`), so confidence is high; the
+first test pins it before the rest of the build.
+
+## Design
+
+### Attach callback
+
+`attach(info, …)` receives `info.path` = the catalog `.json`. It:
+
+1. parses the catalog with the **shipped** parser (the same one `read_pfile_catalog`
+   uses) — this reads the JSON only, opens no data files;
+2. resolves the cell grid (variant-blocks × sample-blocks, holes excluded) into the
+   per-relation path lists and the declared schema;
+3. makes a `DuckCatalog`, installs a `DefaultGenerator` that returns one
+   `ViewCatalogEntry` per relation name in §5, each with **baked** SQL over the
+   resolved paths;
+4. returns the catalog; `create_transaction_manager` returns stock
+   `DuckTransactionManager`. Read-only: a write errors through the stock path.
+
+The paths are baked at attach time (the full grid). This is the **light**
+realization: it does not prune *which* cells a query opens — that is the cascade,
+deferred to P13-004 (§6).
+
+### The baked SQL composes shipped readers
+
+Each view is `SELECT … FROM <shipped reader>(<baked paths/args>)`. The composition
+is fixed here; the exact reader call per relation is confirmed in implementation
+(multi-file support of `read_pvar`/`read_psam` is to-verify; `read_pfile`
+`LIST(VARCHAR)` fan-out is confirmed):
+
+| Relation | Composition |
+|---|---|
+| `c.cells` | `read_pfile_catalog('<file>')` directly — one row per surviving cell (already shipped) |
+| `c.variant_blocks` / `c.sample_blocks` | `read_pfile_catalog_layout('<file>')` projected per axis |
+| `c.variants` | pvar union over the distinct variant-block `.pvar` paths + synthesized `variant_index` and variant-axis block keys |
+| `c.samples` | psam union over the distinct sample-block `.psam` paths + `sample_index`, sample-axis block keys, and the id→block map (§3.3 of P13-001) |
+| `c.genotypes` | `read_pfile(<LIST of surviving cell prefixes>, orient := 'variant', …)` |
+| `c.genotypes_by_sample` | same, `orient := 'sample'` |
+
+## 5. Relation set (v1 — all seven, owner-confirmed 2026-11-07)
+
+Groups A + B from P13-001 §5:
+
+- **A (data):** `c.variants`, `c.samples`, `c.genotypes`, `c.genotypes_by_sample`
+- **B (grid):** `c.cells`, `c.variant_blocks`, `c.sample_blocks`
+- **D (lower layer):** no new relation — the non-ATTACH `read_pfile_catalog(…)` +
+  `read_pfile` path already shipped; a prune-then-fan-out table macro is optional
+  sugar, not required for ATTACH.
+
+## 6. The deferral boundary (what is NOT in P13-003)
+
+The light realization opens **every** surviving cell for a genotype query; each
+opened `read_pfile` still self-prunes row-groups via its existing
+`DYNAMIC_FILTER` (so `WHERE CHROM='17' AND POS BETWEEN …` is not a full read).
+What it does **not** do is skip non-surviving cells by routing the `WHERE` into the
+catalog prune. That cell-skip **cascade** is **P13-004**, consistent with
+P13-001's build order (ATTACH step 3 → cascade step 4). Correct now; inefficient
+on large sparse grids until P13-004.
+
+## 7. Open decision — projection-driven genotype columns
+
+**Conflict to resolve, not average.** P13-001 §5 puts "projection-driven columns"
+(one `c.genotypes` with a superset {genotype, dosage, het, hom_alt, missing,
+n_alt}, where projecting `het` takes the counts fast-path) **in the ATTACH
+surface**. The release-roadmap note lists projection-driven columns under
+**P13-004** instead.
+
+The light realization favors **deferring to P13-004**: a baked view exposes
+whatever `read_pfile` emits, and the projection fast-path is `read_pfile`'s job,
+not the catalog's. So P13-003 would expose `read_pfile`'s native genotype columns;
+the superset + fast-path lands with the cascade in P13-004.
+
+**RESOLVED (Teague 2026-11-07): defer to P13-004.** P13-003 exposes `read_pfile`'s
+native genotype columns; the superset + counts fast-path lands with the cascade in
+P13-004.
+
+## 8. Testing
+
+- `ATTACH … (TYPE pfile_catalog)` then `SELECT` from each §5 relation returns the
+  same rows as the equivalent `read_pfile_catalog` / `read_pfile` call (test #1
+  pins the view-binding first, with one relation, before the rest).
+- `WHERE CHROM/POS` on `c.genotypes` returns correct rows and scans fewer
+  row-groups than a full read (rides `read_pfile` pushdown; not the cascade).
+- `SHOW TABLES` / `DESCRIBE c.genotypes` list the §5 relations with correct schema.
+- Sparse grid: a hole contributes no rows and is not an error.
+- Read-only: a write to `c.*` errors clearly.
+
+## 9. Risks / skepticism (recorded)
+
+- ATTACH remains an **ergonomics** feature — it adds no capability the shipped
+  readers lack. The light realization keeps its cost proportional to that; if the
+  build proves heavier than the spike implies, stop and reconsider the macro
+  helper P11-001 described.
+- `read_pvar`/`read_psam` multi-file union is **to-verify** in implementation; if
+  absent, `c.variants`/`c.samples` compose through `read_pfile` variant/sample
+  orient instead.
+- Baking the full path list at attach time is fine for the current 2-axis grids;
+  very large grids wait on the P13-004 cascade for cell-skip.

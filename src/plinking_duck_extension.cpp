@@ -7,6 +7,7 @@
 #include "pgen_reader.hpp"
 #include "pfile_reader.hpp"
 #include "pfile_catalog_reader.hpp"
+#include "pfile_catalog_storage.hpp"
 #include "plink_freq.hpp"
 #include "plink_hardy.hpp"
 #include "plink_missing.hpp"
@@ -95,6 +96,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	RegisterPgenReader(loader);
 	RegisterPfileReader(loader);
 	RegisterPfileCatalogReader(loader);
+	RegisterPfileCatalogStorage(loader);
 	RegisterPlinkFreq(loader);
 	RegisterPlinkHardy(loader);
 	RegisterPlinkMissing(loader);
