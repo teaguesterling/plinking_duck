@@ -11,10 +11,11 @@ writer path is now **P13-007** (penciled, separate).
 
 ## Status
 
-- [ ] Owner decision A1: the cascade mechanism — a new table function vs extend `read_pfile` (§3)
-- [ ] Owner decision A2: uniform `c.genotypes` backing across kinds vs per-kind backing (§9)
-- [ ] Spike: translate a pushed `TableFilter` into catalog prune params (§4)
-- [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing` internals? (§5)
+- [ ] Owner decision A1: cascade mechanism — **recommend B, a `catalog :=` input on the existing
+      readers** (covers every orientation + genotype shape); A2 (uniform backing) folds into it (§3)
+- [ ] Spike: a reader with a `catalog :=` input prunes its sources from pushed filters via
+      `pushdown_complex_filter` (so cell-skip reflects the `WHERE`, not just explicit params) (§4)
+- [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing`/`hardy` count kernels (§5)
 - [ ] Implementation plan + build + review
 
 ## The gap
@@ -40,20 +41,29 @@ to a `WHERE`.
 ## 3. The cascade mechanism — owner decision A1
 
 A baked view has a fixed cell list, so cell-skip needs a reader that sees the predicate at scan
-time. Two shapes:
+time. The cascade must cover **everything `read_pfile` covers** — both orientations (variant,
+sample) and every genotype shape (`columns`, `struct`, `counts`, `stats`, the raw list) — not one
+"genotypes" output. That completeness requirement decides the shape:
 
-- **A — a new table function** `read_pfile_catalog_genotypes(path [, orient])` that implements
-  DuckDB filter pushdown: it receives the pushed `TableFilterSet`, derives the catalog prune (§4),
-  asks `read_pfile_catalog` for the surviving cells, then drives `read_pfile`'s reader over them
-  with the same filters for row-group pruning + projection. `c.genotypes` = a view over it. Keeps
-  `read_pfile` untouched; the bridge is new.
-- **B — extend `read_pfile`** to accept a `catalog := 'path'` input: given a catalog, it prunes
-  cells from its own pushed filters before scanning, reusing all of its filter/projection
-  machinery. Less new surface, but touches the core reader and its contract.
+- **A — a new table function** (e.g. `read_pfile_catalog_genotypes`). To stay coherent it would
+  have to re-expose `read_pfile`'s whole surface (`orient`, `genotypes` mode, `include_genotypes`,
+  the filters) over a catalog, and then drift from it. An orientation-pinned function is worse
+  (it cannot serve both `c.genotypes` and `c.genotypes_by_sample`). **Rejected on completeness.**
+- **B — a `catalog :=` input on the EXISTING readers (recommended).** `read_pfile` — and the same
+  pattern on `read_pvar` / `read_psam` — gains a `catalog := 'path'` input. Given a catalog, the
+  reader prunes its own sources from the pushed filters (one shared helper, §4), then scans as it
+  always does, **inheriting every orientation, every genotype shape, the filters, and the
+  projection fast-path for free.** The stable scan is untouched; only source-selection is new, and
+  it lives in the shared prune helper, so it is isolated without a second function.
 
-Both reuse the shipped cell-prune and the shipped row-group/projection pushdown. **A1 is which
-one.** Recommendation to confirm: **A** — it isolates the new logic (catalog-aware cell selection)
-from the stable `read_pfile` scan, and matches the fleet pattern of one function per concern.
+**Recommendation (revised): B.** It is the only shape that stays coherent with `read_pfile`'s full
+surface — which is exactly the completeness the column/shape surface (§5) demands.
+
+**A2 folds into A1 = B.** `read_pfile` accepts a catalog **or** a path (or a one-cell bare-fileset
+prefix), so `c.genotypes` is `read_pfile(catalog := '<path>', orient := 'variant')` for a catalog
+and `read_pfile('<prefix>')` for a bare fileset — one uniform backing across every kind, with no
+separate per-kind decision. `c.genotypes_by_sample` is the same with `orient := 'sample'`;
+`c.variants` / `c.samples` are `read_pvar` / `read_psam` with `catalog :=`.
 
 ## 4. The core: translate a pushed filter into a catalog prune (spike)
 
@@ -73,9 +83,11 @@ set collapses to a useless min/max (327k rows) — so a scattered selection must
 contiguous one uses a range. The translation follows that rule: range for `region`, LIST for
 `samples`.
 
-Spike: confirm a table function can read the pushed `TableFilterSet` at bind/init (the shims exist
-for `read_pfile`) and that re-deriving prune params from it is clean. If a filter is not
-translatable, the cell is conservatively kept (correctness over cell-skip).
+Spike: with a `catalog :=` input, the reader prunes its sources in the `pushdown_complex_filter`
+hook — it runs during planning, receives the filters, and rewrites the source list to the
+surviving cells, so cell-skip reflects the `WHERE`, not only explicit params. Confirm that hook is
+usable on `read_pfile` in v2.0 (the compat-planner shims already handle `TableFilterSet`). If a
+filter is not translatable, the cell is conservatively kept (correctness over cell-skip).
 
 ## 5. Projection-driven columns, and a WHERE-coherent surface
 
@@ -158,13 +170,13 @@ reused wherever a `WHERE` can skip cells — not only genotypes:
 So the measured min/max-vs-LIST rule (§4) is applied in exactly one place and inherited by all
 three. The structural relations (`c.cells`, `c.*_blocks`) read small metadata and need no cascade.
 
-**Uniform backing (decision A2).** `c.genotypes` should have ONE backing across kinds, so the
-surface behaves the same whether you attached a matrix, a single-fileset catalog, or a bare
-fileset. The cascade reader takes **either** a catalog path **or** a direct one-cell list (the
-bare fileset, P13-005 D1), and when there is a single cell it simply does Layer-1 pushdown with
-no cell-skip to perform. The alternative — a cascade function for catalogs plus a baked
-`read_pfile` view for bare filesets — works, but makes `c.genotypes`'s behaviour kind-dependent.
-Recommendation: **uniform**.
+**Uniform backing (automatic under A1 = B).** Because `read_pfile` itself accepts a catalog or a
+path, `c.genotypes` is `read_pfile(...)` for every kind — a matrix, a single-fileset catalog, and a
+bare fileset all route through the same reader, which does Layer-2 cell-skip when a catalog has more
+than one cell and only Layer-1 otherwise. No per-kind backing split, and the same orientation and
+genotype-shape surface everywhere — `orient := 'sample'` for `c.genotypes_by_sample`, the derived
+count columns (§5) on both. The cascade is one capability on the readers, exposed identically by
+every relation.
 
 **Interaction with P13-005.** P13-005 bakes `c.genotypes` as `read_pfile([cells])` — the correct
 interim and the single-cell path. P13-006 swaps the multi-cell backing to the cascade reader. The
