@@ -488,6 +488,43 @@ SELECT count(*) FROM read_pfile(['test/data/le_cat_a','test/data/le_cat_b'], com
 ----
 psam override cannot be combined with combine_samples
 
+# disjoint in a psam-column orient over text shards (genotype orient).
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_c','test/data/le_cat_c'], combine_samples := 'disjoint', orient := 'genotype');
+----
+appears in both
+
+# A duplicate WITHIN one shard is named as such (writer-made shard over a hand-written .psam).
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/le_cat_b', genotypes := 'struct'))
+TO '__TEST_DIR__/dup2' (FORMAT pfile);
+
+statement ok
+COPY (SELECT '#IID' AS h UNION ALL SELECT 'SAMP9' UNION ALL SELECT 'SAMP9') TO '__TEST_DIR__/dup2.psam' (FORMAT csv, HEADER false, QUOTE '');
+
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_a','__TEST_DIR__/dup2'], combine_samples := 'disjoint');
+----
+appears twice in
+
+# A ONE-element list still honours 'disjoint' (a glob or pathmacro: may expand to one fileset):
+# the IIDs of that one .psam must be unique.
+statement error
+SELECT count(*) FROM read_pfile(['__TEST_DIR__/dup2'], combine_samples := 'disjoint');
+----
+appears twice in
+
+query I
+SELECT count(*) FROM read_pfile(['test/data/le_cat_c'], combine_samples := 'disjoint');
+----
+3000
+
+# The whole cohort must be disjoint: a samples := subset does not narrow the check.
+statement error
+SELECT count(*) FROM read_pfile(['test/data/le_cat_c','test/data/le_cat_c'], combine_samples := 'disjoint', samples := [0]);
+----
+appears in both
+
 # ===========================================================================
 # PARQUET .psam companions in concat mode. Each shard gets a .psam.parquet (with SEX and PHENO1)
 # beside its .pgen, which companion discovery prefers. The oracle reads each shard alone (the
@@ -579,6 +616,43 @@ statement error
 SELECT count(*) FROM read_pfile(['__TEST_DIR__/pq_a','__TEST_DIR__/pq_c'], combine_samples := 'concatenate', orient := 'sample');
 ----
 .psam columns differ across sample shards
+
+# disjoint through the parquet full-metadata path (sample + genotype orient): the IIDs come from
+# the multi-source parquet query.
+statement error
+SELECT count(*) FROM read_pfile(['__TEST_DIR__/pq_a','__TEST_DIR__/pq_a'], combine_samples := 'disjoint', orient := 'sample');
+----
+appears in both
+
+statement error
+SELECT count(*) FROM read_pfile(['__TEST_DIR__/pq_a','__TEST_DIR__/pq_a'], combine_samples := 'disjoint', orient := 'genotype');
+----
+appears in both
+
+query I
+SELECT count(*) FROM read_pfile(['__TEST_DIR__/pq_a','__TEST_DIR__/pq_b'], combine_samples := 'disjoint', orient := 'sample');
+----
+250
+
+# A psam column that collides with the internal ordering columns is rejected clearly at bind.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pca_cat_a', genotypes := 'struct'))
+TO '__TEST_DIR__/pq_x' (FORMAT pfile);
+
+statement ok
+COPY (SELECT *, 7 AS file_row_number FROM read_psam('test/data/pca_cat_a.psam')) TO '__TEST_DIR__/pq_x.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pca_cat_b', pvar := 'test/data/pca_example.pvar', genotypes := 'struct'))
+TO '__TEST_DIR__/pq_y' (FORMAT pfile);
+
+statement ok
+COPY (SELECT *, 7 AS file_row_number FROM read_psam('test/data/pca_cat_b.psam')) TO '__TEST_DIR__/pq_y.psam.parquet' (FORMAT parquet);
+
+statement error
+SELECT count(*) FROM read_pfile(['__TEST_DIR__/pq_x','__TEST_DIR__/pq_y'], combine_samples := 'concatenate', orient := 'sample');
+----
+reserved
 
 # Turning companions off reads the writer's text .psam files instead (IID only).
 statement ok

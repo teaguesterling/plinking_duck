@@ -1099,6 +1099,19 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 		if (full_metadata) {
 			PfileSampleMetadata meta = parquet_full ? LoadPfileSampleMetadataFromSource(context, path, part)
 			                                        : LoadPfileSampleMetadata(context, path, part);
+			if (parquet_full && k == 0 && paths.size() > 1) {
+				// PsamSelectSql adds these two columns to read the shards in order.
+				for (auto &name : meta.header.column_names) {
+					auto lower = StringUtil::Lower(name);
+					if (lower == "file_row_number" || lower == "__plinking_shard") {
+						throw InvalidInputException(
+						    "read_pfile: .psam column '%s' in '%s' uses a name reserved for reading a sample-sharded "
+						    "parquet cohort in order. Rename the column, or SET plinking_use_parquet_companions = "
+						    "false.",
+						    name, path);
+					}
+				}
+			}
 			if (k == 0) {
 				bind_data.sample_metadata = std::move(meta);
 			} else {
@@ -1585,6 +1598,31 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		                            ".psam/.fam '%s' has %llu samples",
 		                            bind_data->raw_sample_ct, psam_path,
 		                            static_cast<unsigned long long>(bind_data->sample_info.sample_ct));
+	}
+
+	// combine_samples := 'disjoint' on ONE fileset (a one-element list, or a glob / pathmacro: that
+	// expanded to one): there is no second shard, but the mode still promises unique IIDs, so check
+	// that one .psam. (The multi-shard check runs in LoadConcatSampleMetadata.)
+	if (bind_data->combine_samples == CombineSamplesMode::DISJOINT && !bind_data->IsConcat()) {
+		vector<string> owned;
+		const vector<string> *iids = &bind_data->sample_info.iids;
+		if (iids->empty()) {
+			if (bind_data->sample_metadata.from_parquet) {
+				EnsureSourceIids(context, bind_data->sample_metadata, bind_data->sample_info);
+			} else {
+				owned = LoadSampleMetadata(context, psam_path).iids;
+				iids = &owned;
+			}
+		}
+		std::unordered_set<string> seen;
+		seen.reserve(iids->size());
+		for (auto &iid : *iids) {
+			if (!seen.insert(iid).second) {
+				throw InvalidInputException("read_pfile: combine_samples := 'disjoint' but sample '%s' appears twice "
+				                            "in '%s'. IIDs must be unique across the whole cohort.",
+				                            iid, psam_path);
+			}
+		}
 	}
 
 	// combine_samples := 'identical': verify every shard carries the SAME IIDs in
