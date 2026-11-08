@@ -125,18 +125,16 @@ static string BuildV1BlockSql(const string &path_sql, const string &concat_dim, 
 	return "SELECT NULL::BIGINT AS " + axis + "_start, NULL::BIGINT AS " + axis + "_stop";
 }
 
-//! c.genotypes / c.genotypes_by_sample. When every cell shares ONE companion (a variant-sharded
-//! cohort shares its .psam; a sample-sharded one shares its .pvar), read_pfile cannot find a
-//! per-cell companion, so pass the shared one explicitly. A matrix (per-block companions, >1
-//! distinct) passes neither — each cell is self-contained.
-static string GenotypesSql(const vector<string> &prefixes, const vector<string> &pvars,
-                           const vector<string> &psams, bool by_sample) {
+//! c.genotypes / c.genotypes_by_sample.
+//! A multi-file cohort that shares one .psam (variant-sharded) must pass it explicitly — read_pfile
+//! applies it to the first source as the shared sample metadata. A single fileset passes NOTHING:
+//! read_pfile discovers its own companions (incl. .pvar.parquet / .bim / .fam). A pvar override is
+//! never passed — read_pfile rejects it on a multi-file list, and each cell/shard already carries
+//! its own co-located .pvar.
+static string GenotypesSql(const vector<string> &prefixes, const string &shared_psam, bool by_sample) {
 	string sql = "SELECT * FROM read_pfile(" + SqlPathList(prefixes);
-	if (pvars.size() == 1) {
-		sql += ", pvar := " + SQLString::ToString(pvars[0]);
-	}
-	if (psams.size() == 1) {
-		sql += ", psam := " + SQLString::ToString(psams[0]);
+	if (prefixes.size() > 1 && !shared_psam.empty()) {
+		sql += ", psam := " + SQLString::ToString(shared_psam);
 	}
 	if (by_sample) {
 		sql += ", orient := 'sample'";
@@ -171,6 +169,9 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	string catalog_path; // the .pfile.json to parse; empty for a bare fileset
 	string bare_prefix;  // the fileset prefix; empty unless bare
 	if (StringUtil::EndsWith(raw_path, ".pfile.json")) {
+		if (!fs.FileExists(raw_path)) {
+			throw InvalidInputException("ATTACH pfile_catalog: catalog file not found: '%s'", raw_path);
+		}
 		catalog_path = raw_path;
 	} else if (fs.FileExists(raw_path + ".pfile.json")) {
 		catalog_path = raw_path + ".pfile.json";
@@ -192,8 +193,10 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	string cells_sql;
 
 	auto take_cell = [&](const string &prefix, const string &pvar, const string &psam) {
-		// An omitted companion falls back to the conventional <prefix>.pvar / <prefix>.psam;
-		// read_pfile discovers its own for genotypes.
+		// pvar_paths/psam_paths feed c.variants (read_pvar) and c.samples (read_psam), which need an
+		// explicit path. A catalog that omits a companion falls back to the conventional
+		// <prefix>.pvar / <prefix>.psam. (A .bim/.fam/.parquet-only fileset is not covered for those
+		// two relations; c.genotypes still discovers it, since GenotypesSql passes no per-cell path.)
 		cell_prefixes.push_back(prefix);
 		PushUnique(pvar_paths, pvar.empty() ? prefix + ".pvar" : pvar);
 		PushUnique(psam_paths, psam.empty() ? prefix + ".psam" : psam);
@@ -223,6 +226,16 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 			sample_blocks_sql = BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop");
 		} else {
 			auto cat = ParseV1Catalog(fs, catalog_path, content);
+			if (cat.concat_dim == "samples") {
+				// Sample-sharded genotypes need read_pfile's sample-concat (CONCATENATE), which is not
+				// implemented, and a pvar override on the shared .pvar is rejected on a multi-file list.
+				// Fail loud with a kind-specific message rather than a cryptic reader error on query.
+				throw InvalidInputException(
+				    "ATTACH pfile_catalog '%s': sample-sharded cohorts are not supported yet — the "
+				    "genotype relations need read_pfile's sample-concat, which is not implemented. "
+				    "Variant-sharded, single-fileset, and matrix catalogs attach.",
+				    raw_path);
+			}
 			for (auto &e : cat.files) {
 				take_cell(e.prefix, e.pvar, e.psam);
 			}
@@ -239,11 +252,13 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	}
 
 	// Bake the per-relation SQL over the shipped readers (one builder per relation, so P13-006 can
-	// swap c.genotypes's backing to the pushdown cascade in one place).
+	// swap c.genotypes's backing to the pushdown cascade in one place). A shared .psam (one distinct
+	// psam across >1 cell = a variant-sharded cohort) is passed to read_pfile explicitly; a single
+	// fileset lets read_pfile discover its own companions.
+	string shared_psam = (cell_prefixes.size() > 1 && psam_paths.size() == 1) ? psam_paths[0] : "";
 	vector<std::pair<Identifier, string>> views;
-	views.emplace_back(Identifier("genotypes"), GenotypesSql(cell_prefixes, pvar_paths, psam_paths, false));
-	views.emplace_back(Identifier("genotypes_by_sample"),
-	                   GenotypesSql(cell_prefixes, pvar_paths, psam_paths, true));
+	views.emplace_back(Identifier("genotypes"), GenotypesSql(cell_prefixes, shared_psam, false));
+	views.emplace_back(Identifier("genotypes_by_sample"), GenotypesSql(cell_prefixes, shared_psam, true));
 	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
 	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));
 	views.emplace_back(Identifier("cells"), cells_sql);

@@ -90,6 +90,12 @@ ATTACH 'test/data/does_not_exist_anywhere' AS x (TYPE pfile_catalog);
 ----
 nothing found
 
+# A literal .pfile.json that doesn't exist raises clearly (not a raw OpenFile IO error).
+statement error
+ATTACH 'test/data/no_such_catalog.pfile.json' AS z (TYPE pfile_catalog);
+----
+not found
+
 # ---------------------------------------------------------------------------
 # v1 multi-file (the sharded writer's own output): shard_by CHROM → a multi-file catalog.
 # ---------------------------------------------------------------------------
