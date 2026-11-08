@@ -1,0 +1,126 @@
+# name: test/sql/attach_pfile_catalog_kinds.test
+# description: ATTACH (TYPE pfile_catalog) works for v1 single-fileset and multi-file catalogs, not only the v2 matrix
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ---------------------------------------------------------------------------
+# v1 single-fileset: the sidecar points at one fileset (test/data/large_example).
+# Before P13-005 this ATTACH raised "not a version-2 matrix catalog".
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/pfile_catalog_single.pfile.json' AS s (TYPE pfile_catalog);
+
+# c.genotypes = read_pfile over the one fileset (self-checking, no hardcoded count).
+query T
+SELECT (SELECT count(*) FROM s.genotypes) =
+       (SELECT count(*) FROM read_pfile('test/data/large_example'));
+----
+true
+
+# c.variants = read_pvar over the fileset's .pvar (companion discovered from the prefix).
+query T
+SELECT (SELECT count(*) FROM s.variants) =
+       (SELECT count(*) FROM read_pvar('test/data/large_example.pvar'));
+----
+true
+
+# c.samples is non-empty; c.cells is the one-row manifest.
+query T
+SELECT count(*) > 0 FROM s.samples;
+----
+true
+
+query I
+SELECT count(*) FROM s.cells;
+----
+1
+
+# genotypes_by_sample: same fileset, sample-oriented.
+query T
+SELECT (SELECT count(*) FROM s.genotypes_by_sample) =
+       (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'sample'));
+----
+true
+
+# read-only still holds for a v1 attach.
+statement error
+CREATE TABLE s.scratch AS SELECT 1;
+----
+
+# ---------------------------------------------------------------------------
+# Prefix resolution: ATTACH by prefix appends .pfile.json.
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/pfile_catalog_single' AS p (TYPE pfile_catalog);
+
+query T
+SELECT (SELECT count(*) FROM p.genotypes) = (SELECT count(*) FROM s.genotypes);
+----
+true
+
+# ---------------------------------------------------------------------------
+# Bare fileset (D1): no sidecar, but <prefix>.pgen exists → synthesize one cell.
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/large_example' AS b (TYPE pfile_catalog);
+
+query T
+SELECT (SELECT count(*) FROM b.genotypes) =
+       (SELECT count(*) FROM read_pfile('test/data/large_example'));
+----
+true
+
+query I
+SELECT count(*) FROM b.cells;
+----
+1
+
+query T
+SELECT (SELECT count(*) FROM b.variants) =
+       (SELECT count(*) FROM read_pvar('test/data/large_example.pvar'));
+----
+true
+
+# A target with neither a catalog nor a .pgen raises clearly.
+statement error
+ATTACH 'test/data/does_not_exist_anywhere' AS x (TYPE pfile_catalog);
+----
+nothing found
+
+# A literal .pfile.json that doesn't exist raises clearly (not a raw OpenFile IO error).
+statement error
+ATTACH 'test/data/no_such_catalog.pfile.json' AS z (TYPE pfile_catalog);
+----
+not found
+
+# ---------------------------------------------------------------------------
+# v1 multi-file (the sharded writer's own output): shard_by CHROM → a multi-file catalog.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sharded' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+ATTACH '{TEST_DIR}/sharded.pfile.json' AS m (TYPE pfile_catalog);
+
+# m.genotypes = all variants across the shards = the source cohort.
+query T
+SELECT (SELECT count(*) FROM m.genotypes) =
+       (SELECT count(*) FROM read_pfile('test/data/pfile_example'));
+----
+true
+
+# the shards are the cells; variant_blocks tiles the variant axis (one block per shard);
+# sample_blocks is one shared row.
+query T
+SELECT (SELECT count(*) FROM m.cells) = (SELECT count(*) FROM m.variant_blocks);
+----
+true
+
+query I
+SELECT count(*) FROM m.sample_blocks;
+----
+1

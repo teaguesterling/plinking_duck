@@ -1,0 +1,196 @@
+# P13-006: pushdown cascade + projection-driven genotypes
+
+Make a `WHERE` on `c.genotypes` **skip whole cells** (not just row groups inside already-opened
+cells), and make projecting a derived column (`het`, `missing`, `n_alt`, …) avoid a full genotype
+decode. This is the performance layer P13-003 deferred, with **predicate pushdown into the catalog
+prune** as the core (Teague's original thrust).
+
+Supersedes the "P13-004" placeholder that earlier docs used for cascade + projection — this is that
+work, plus pushdown. Depends on: P13-003 (ATTACH, merged #82) and P13-005 (ATTACH all kinds). The
+writer path is now **P13-007** (penciled, separate).
+
+## Status
+
+- [ ] Owner decision A1: cascade mechanism — **recommend B, a `catalog :=` input on the existing
+      readers** (covers every orientation + genotype shape); A2 (uniform backing) folds into it (§3)
+- [ ] Spike: a reader with a `catalog :=` input prunes its sources from pushed filters via
+      `pushdown_complex_filter` (so cell-skip reflects the `WHERE`, not just explicit params) (§4)
+- [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing`/`hardy` count kernels (§5)
+- [ ] Implementation plan + build + review
+
+## The gap
+
+P13-003/005 bake `c.genotypes` as `read_pfile([all surviving cells])`. A `WHERE CHROM='17'`
+reaches **`read_pfile`'s** filter pushdown, which skips **row groups inside every opened cell** —
+but every cell is still opened. On a large sparse grid (7.5M sample × 170M variant → an M×N cell
+tiling), that is most of the cost. The shipped `read_pfile_catalog(path, region := …, keys := …,
+samples := …)` already returns only the **surviving cells** for a predicate — it is just not wired
+to a `WHERE`.
+
+## 2. The three pieces
+
+1. **Pushdown cascade (headline).** A `WHERE` on `c.genotypes` routes into the catalog prune →
+   only surviving cells open. Row-group pruning inside them is the existing `read_pfile` behaviour;
+   this adds the cell-skip layer above it.
+2. **Projection-driven columns.** `c.genotypes` exposes a superset — `genotype`, `dosage`, `het`,
+   `hom_alt`, `missing`, `n_alt`. Projecting only `het` (or the other counts) takes a decode-free
+   count path; projecting `genotype`/`dosage` decodes as today.
+3. **Integration.** `c.genotypes` stops being a baked `read_pfile(...)` view and becomes a view
+   over the cascade reader (below). The other six relations are unchanged.
+
+## 3. The cascade mechanism — owner decision A1
+
+A baked view has a fixed cell list, so cell-skip needs a reader that sees the predicate at scan
+time. The cascade must cover **everything `read_pfile` covers** — both orientations (variant,
+sample) and every genotype shape (`columns`, `struct`, `counts`, `stats`, the raw list) — not one
+"genotypes" output. That completeness requirement decides the shape:
+
+- **A — a new table function** (e.g. `read_pfile_catalog_genotypes`). To stay coherent it would
+  have to re-expose `read_pfile`'s whole surface (`orient`, `genotypes` mode, `include_genotypes`,
+  the filters) over a catalog, and then drift from it. An orientation-pinned function is worse
+  (it cannot serve both `c.genotypes` and `c.genotypes_by_sample`). **Rejected on completeness.**
+- **B — a `catalog :=` input on the EXISTING readers (recommended).** `read_pfile` — and the same
+  pattern on `read_pvar` / `read_psam` — gains a `catalog := 'path'` input. Given a catalog, the
+  reader prunes its own sources from the pushed filters (one shared helper, §4), then scans as it
+  always does, **inheriting every orientation, every genotype shape, the filters, and the
+  projection fast-path for free.** The stable scan is untouched; only source-selection is new, and
+  it lives in the shared prune helper, so it is isolated without a second function.
+
+**Recommendation (revised): B.** It is the only shape that stays coherent with `read_pfile`'s full
+surface — which is exactly the completeness the column/shape surface (§5) demands.
+
+**A2 folds into A1 = B.** `read_pfile` accepts a catalog **or** a path (or a one-cell bare-fileset
+prefix), so `c.genotypes` is `read_pfile(catalog := '<path>', orient := 'variant')` for a catalog
+and `read_pfile('<prefix>')` for a bare fileset — one uniform backing across every kind, with no
+separate per-kind decision. `c.genotypes_by_sample` is the same with `orient := 'sample'`;
+`c.variants` / `c.samples` are `read_pvar` / `read_psam` with `catalog :=`.
+
+## 4. The core: translate a pushed filter into a catalog prune (spike)
+
+`read_pfile` already receives a `TableFilterSet` on its columns (`pfile_reader.cpp`:
+`residual_filters`, `column_ids`, the v2.0 compat-planner shims). The cascade reader translates
+that set into `read_pfile_catalog`'s params:
+
+| Filter on | Becomes | Note |
+|---|---|---|
+| `CHROM` (+ `POS` range) | `region := 'CHROM:lo-hi'` | contiguous range → min/max prune |
+| a block-key column (`CHUNK`, `GROUP`, …) | `keys := {k: [v,…]}` | enum membership |
+| `sample_index` / sample IID | `samples := [...]` | **scattered set → keep the LIST**, not a min/max range |
+
+**Measured (P13-001, 2026-10-29; v2.0 re-measure owed):** a join's build-side min/max IS pushed
+as a dynamic filter; `BETWEEN ≡ >=/<`; a **contiguous** set prunes to ~100 rows, a **scattered**
+set collapses to a useless min/max (327k rows) — so a scattered selection must retain the LIST, a
+contiguous one uses a range. The translation follows that rule: range for `region`, LIST for
+`samples`.
+
+Spike: with a `catalog :=` input, the reader prunes its sources in the `pushdown_complex_filter`
+hook — it runs during planning, receives the filters, and rewrites the source list to the
+surviving cells, so cell-skip reflects the `WHERE`, not only explicit params. Confirm that hook is
+usable on `read_pfile` in v2.0 (the compat-planner shims already handle `TableFilterSet`). If a
+filter is not translatable, the cell is conservatively kept (correctness over cell-skip).
+
+## 5. Projection-driven columns, and a WHERE-coherent surface
+
+**The problem (raised in review).** `read_pfile`'s genotype SHAPE is set by PARAMS —
+`genotypes := 'columns'|'struct'|'counts'|'stats'` and `include_genotypes := [...]`
+(`pfile_reader.cpp:1288,1402`). A param does not flow through a view or a `WHERE`. So a baked
+`c.genotypes` view freezes one shape, and a user cannot ask for counts vs full genotypes by
+projecting or filtering. `WHERE include_genotypes = ['het']` is not expressible SQL.
+
+**The fix — columns, not params.** `c.genotypes` exposes the derived aggregates as scalar
+COLUMNS, reusing the names the `plink_*` functions already emit, so one concept has one name
+across the extension:
+
+| Column(s) | Already emitted by |
+|---|---|
+| `HET_CT`, `HOM_ALT_CT`, `HOM_REF_CT` | `plink_hardy` |
+| `MISSING_CT`, `OBS_CT`, `F_MISS` | `plink_missing` |
+| `ALT_FREQ` | `plink_freq` |
+| the raw per-sample calls (a LIST) | `read_pfile` — name it `GT`, not `genotypes`, to avoid `c.genotypes.genotypes` |
+
+Then `WHERE HET_CT > 100 AND ALT_FREQ < 0.01` is coherent SQL and `SELECT HET_CT` is a projection.
+
+**This reinforces A1 (§3): the backing must be a smart FUNCTION, not a baked view.** Only a
+function with projection pushdown can translate "the query projected `HET_CT` only" into
+`read_pfile`'s `counts` mode (the decode-free fast-path), and "the query projected `GT`" into a
+full decode. A view cannot. So the projection fast-path and the WHERE-coherent column surface are
+the same requirement — and both require A1 = the new function.
+
+**Macros and short views — considered, declined.** With the aggregates as columns, the common
+filter needs no macro; a helper like `only_genotypes(GT, ['het'])` earns its place only for a
+per-sample predicate over the raw `GT` list that SQL cannot express — reserve macros for that, not
+for naming. Short synonym views (`c.g`, `gt`) are declined: a second name per concept fights the
+house one-term rule and doubles the surface; per-query aliasing (`FROM c.genotypes AS g`) gives
+brevity without it. The coherence win is **one name per concept, shared with `plink_*`** — not
+shorter names.
+
+Spike: confirm the cascade reader can reuse the `plink_freq`/`missing`/`hardy` count kernels on the
+pushed projection (the `genotypes := 'counts'` path already streams them), rather than a new count
+path.
+
+## 6. Open scope / non-goals
+
+- **Scope:** `c.genotypes` (and `c.genotypes_by_sample`) cascade + projection. The structural and
+  axis relations are unchanged.
+- **Non-goal:** the analysis macros (`plink_*` over `c.*`) — still their own plan.
+- **Non-goal:** cross-cell per-variant aggregation across sample-blocks (howard §12.2) — the hard
+  reassembly; flagged, not solved here.
+
+## 7. Phasing
+
+1. Spike §4 (filter → prune translation) and settle A1 (§3).
+2. The cascade reader: cell-skip from a pushed range/LIST filter; correctness first (conservative
+   keep), then the measured prune.
+3. Projection-driven derived counts (§5).
+4. Wire `c.genotypes` / `c.genotypes_by_sample` to the cascade reader in the ATTACH surface.
+5. Measure: cells opened before/after on a real M×N grid; the number is the point.
+6. Tests + docs; update the "does not do yet" list in `pfile_catalog.md`.
+
+## 9. Coherence across the surface (the pressure test)
+
+Pushdown must read as one story across every relation and every kind, not a special case bolted
+onto `c.genotypes`. Three things make it coherent:
+
+**Two layers, always in the same order.**
+
+- **Layer 1 — row-group skip.** Shipped. `read_pfile` / `read_pvar` / `read_psam` consume the
+  pushed `TableFilterSet` and skip row groups inside any opened file. Every kind and relation has
+  this already (P13-003/005).
+- **Layer 2 — cell/file skip.** P13-006. Route the same filter into `read_pfile_catalog`'s prune so
+  non-surviving cells/files never open. Applies to any relation whose rows span several cells/files.
+
+**One translation layer, three relations.** The filter→prune mapping (§4) is a single mechanism,
+reused wherever a `WHERE` can skip cells — not only genotypes:
+
+- `c.genotypes` / `c.genotypes_by_sample` — `CHROM`/`POS`/sample filters → prune cells.
+- `c.variants` — `CHROM`/`POS` → prune the variant-block `.pvar` files, by the catalog's
+  variant-block bounds.
+- `c.samples` — a sample-key filter → prune the sample-block `.psam` files.
+
+So the measured min/max-vs-LIST rule (§4) is applied in exactly one place and inherited by all
+three. The structural relations (`c.cells`, `c.*_blocks`) read small metadata and need no cascade.
+
+**Uniform backing (automatic under A1 = B).** Because `read_pfile` itself accepts a catalog or a
+path, `c.genotypes` is `read_pfile(...)` for every kind — a matrix, a single-fileset catalog, and a
+bare fileset all route through the same reader, which does Layer-2 cell-skip when a catalog has more
+than one cell and only Layer-1 otherwise. No per-kind backing split, and the same orientation and
+genotype-shape surface everywhere — `orient := 'sample'` for `c.genotypes_by_sample`, the derived
+count columns (§5) on both. The cascade is one capability on the readers, exposed identically by
+every relation.
+
+**Interaction with P13-005.** P13-005 bakes `c.genotypes` as `read_pfile([cells])` — the correct
+interim and the single-cell path. P13-006 swaps the multi-cell backing to the cascade reader. The
+P13-005 plan centralizes where `c.genotypes`'s SQL is generated, so the swap is one place. The
+column set evolves **additively** — P13-005 exposes `read_pfile`'s native genotype columns;
+P13-006 adds the derived-count superset (`het`/`hom_alt`/`missing`/`n_alt`) — so no P13-005 query
+breaks.
+
+## 8. Risks
+
+- The cascade reinstates the complexity P13-003 kept out. Gate the build on the §4 spike: if the
+  filter→prune translation is not clean, the feature is not worth the reader surface.
+- A wrong translation that **over**-prunes (drops a surviving cell) is a correctness bug, not a
+  perf miss. Conservative keep is the default; every prune needs a test that the dropped cells
+  truly hold no matching row.
+- The v2.0 pushdown re-measure (P13-001's facts were on v1.5.x) is owed before trusting the
+  min/max vs LIST rule.
