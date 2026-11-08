@@ -1285,10 +1285,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		bool need_psam = (si == 0) || concat ||
 		                 (bind_data->combine_samples == CombineSamplesMode::IDENTICAL && override_psam.empty());
 		bool need_pvar = !(concat && si > 0);
-		PfileSource src = LoadPfileSource(context, fs, prefixes[si], si == 0 ? override_pgen : string(),
-		                                  si == 0 ? override_pvar : string(), si == 0 ? override_psam : string(),
-		                                  need_psam, need_pvar, bind_data->region, src_sample_ct,
-		                                  bind_data->localize_guard);
+		PfileSource src =
+		    LoadPfileSource(context, fs, prefixes[si], si == 0 ? override_pgen : string(),
+		                    si == 0 ? override_pvar : string(), si == 0 ? override_psam : string(), need_psam,
+		                    need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard);
 
 		if (concat) {
 			// Sample shard: the samples add up; the variants must be the same set. Only
@@ -1442,8 +1442,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	if (bind_data->IsConcat()) {
 		LoadConcatSampleMetadata(
 		    context, *bind_data,
-		    bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE,
-		    needs_iids);
+		    bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE, needs_iids);
 	} else if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		bind_data->sample_metadata = LoadPfileSampleMetadata(context, psam_path, bind_data->sample_info);
 	} else if (needs_iids) {
@@ -1668,7 +1667,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					uintptr_t cf_pgfi_alloc_ct = 0;
 
 					err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct,
-					                             bind_data->raw_sample_ct, &cf_hdr, &cf_pgfi, &cf_pgfi_alloc_ct, cf_errstr);
+					                             bind_data->raw_sample_ct, &cf_hdr, &cf_pgfi, &cf_pgfi_alloc_ct,
+					                             cf_errstr);
 					if (err != plink2::kPglRetSuccess) {
 						plink2::PglErr ce = plink2::kPglRetSuccess;
 						plink2::CleanupPgfi(&cf_pgfi, &ce);
@@ -1729,9 +1729,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[ev] : ev;
 
 					STD_ARRAY_DECL(uint32_t, 4, genocounts);
-					plink2::PglErr cf_err = cf_cat ? cf_cat->GetCounts(vidx, genocounts)
-					                               : plink2::PgrGetCounts(cf_si, cf_iv, cf_pssi, cf_sc, vidx, &cf_pgr,
-					                                                      genocounts);
+					plink2::PglErr cf_err =
+					    cf_cat ? cf_cat->GetCounts(vidx, genocounts)
+					           : plink2::PgrGetCounts(cf_si, cf_iv, cf_pssi, cf_sc, vidx, &cf_pgr, genocounts);
 					if (cf_err != plink2::kPglRetSuccess) {
 						plink2::PglErr ce = plink2::kPglRetSuccess;
 						plink2::CleanupPgr(&cf_pgr, &ce);
@@ -2016,9 +2016,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					char errstr_buf2[plink2::kPglErrstrBufBlen];
 					plink2::PgenHeaderCtrl header_ctrl2;
 					uintptr_t pgfi_alloc_ct2 = 0;
-					err =
-					    plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data->raw_sample_ct,
-					                           &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
+					err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct,
+					                             bind_data->raw_sample_ct, &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2,
+					                             errstr_buf2);
 					if (err != plink2::kPglRetSuccess) {
 						plink2::PglErr ce = plink2::kPglRetSuccess;
 						plink2::CleanupPgfi(&tmp_pgfi, &ce);
@@ -2030,13 +2030,15 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					}
 					uint32_t max_vrec2 = 0;
 					uintptr_t pgr_alloc_ct2 = 0;
-					err = plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
-					                             pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
+					err =
+					    plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
+					                           pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
 					if (err != plink2::kPglRetSuccess) {
 						plink2::PglErr ce = plink2::kPglRetSuccess;
 						plink2::CleanupPgfi(&tmp_pgfi, &ce);
-						throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
-						                  errstr_buf2);
+						throw IOException(
+						    "read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
+						    errstr_buf2);
 					}
 					if (pgr_alloc_ct2 > 0) {
 						pgr_alloc2.Allocate(pgr_alloc_ct2 * plink2::kCacheline);
@@ -2070,7 +2072,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 						                            preread_dosage_present.As<uintptr_t>(),
 						                            preread_dosage_main.As<uint16_t>(), &dosage_ct)
 						             : plink2::PgrGetD(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-						                               genovec_buf2.As<uintptr_t>(), preread_dosage_present.As<uintptr_t>(),
+						                               genovec_buf2.As<uintptr_t>(),
+						                               preread_dosage_present.As<uintptr_t>(),
 						                               preread_dosage_main.As<uint16_t>(), &dosage_ct);
 						if (err != plink2::kPglRetSuccess) {
 							plink2::PglErr ce = plink2::kPglRetSuccess;
@@ -2095,12 +2098,13 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 						uintptr_t phase_byte_ct = plink2::BitCtToAlignedWordCt(output_sample_ct) * sizeof(uintptr_t);
 						std::memset(preread_phasepresent.ptr, 0, phase_byte_ct);
 						std::memset(preread_phaseinfo.ptr, 0, phase_byte_ct);
-						err = pr_cat ? pr_cat->GetP(vidx, genovec_buf2.As<uintptr_t>(),
-						                            preread_phasepresent.As<uintptr_t>(),
-						                            preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct)
-						             : plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
-						                               genovec_buf2.As<uintptr_t>(), preread_phasepresent.As<uintptr_t>(),
-						                               preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct);
+						err =
+						    pr_cat
+						        ? pr_cat->GetP(vidx, genovec_buf2.As<uintptr_t>(), preread_phasepresent.As<uintptr_t>(),
+						                       preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct)
+						        : plink2::PgrGetP(si_ptr, pssi2, output_sample_ct, vidx, &tmp_pgr,
+						                          genovec_buf2.As<uintptr_t>(), preread_phasepresent.As<uintptr_t>(),
+						                          preread_phaseinfo.As<uintptr_t>(), &phasepresent_ct);
 						if (err != plink2::kPglRetSuccess) {
 							plink2::PglErr ce = plink2::kPglRetSuccess;
 							plink2::CleanupPgr(&tmp_pgr, &ce);
@@ -3254,10 +3258,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 				                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
 				                      lstate.phased_pairs.data());
 			} else {
-				plink2::PglErr err =
-				    lstate.concat ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
-				                  : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                                   lstate.genovec_buf.As<uintptr_t>());
+				plink2::PglErr err = lstate.concat ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
+				                                   : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx,
+				                                                    &lstate.pgr, lstate.genovec_buf.As<uintptr_t>());
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
 				}
@@ -3402,10 +3405,9 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 					uint32_t agg_sc =
 					    bind_data.has_sample_subset ? bind_data.subset_sample_ct : bind_data.raw_sample_ct;
 
-					plink2::PglErr agg_err =
-					    lstate.concat
-					        ? lstate.concat->GetCounts(vidx, genocounts)
-					        : plink2::PgrGetCounts(agg_si, agg_iv, lstate.pssi, agg_sc, vidx, &lstate.pgr, genocounts);
+					plink2::PglErr agg_err = lstate.concat ? lstate.concat->GetCounts(vidx, genocounts)
+					                                       : plink2::PgrGetCounts(agg_si, agg_iv, lstate.pssi, agg_sc,
+					                                                              vidx, &lstate.pgr, genocounts);
 					if (agg_err != plink2::kPglRetSuccess) {
 						throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
 					}
@@ -3911,10 +3913,9 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				                      lstate.phaseinfo_buf.As<uintptr_t>(), output_sample_ct,
 				                      lstate.phased_pairs.data());
 			} else {
-				plink2::PglErr err =
-				    lstate.concat ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
-				                  : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx, &lstate.pgr,
-				                                   lstate.genovec_buf.As<uintptr_t>());
+				plink2::PglErr err = lstate.concat ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
+				                                   : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx,
+				                                                    &lstate.pgr, lstate.genovec_buf.As<uintptr_t>());
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
 				}
@@ -4264,9 +4265,9 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 				uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[lev] : lev;
 
 				if (!gstate.smp_use_sparse) {
-					plink2::PglErr perr =
-					    lstate.concat ? lstate.concat->Get(vidx, genovec)
-					                  : plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx, &lstate.pgr, genovec);
+					plink2::PglErr perr = lstate.concat ? lstate.concat->Get(vidx, genovec)
+					                                    : plink2::PgrGet(si_ptr, lstate.pssi, output_sample_ct, vidx,
+					                                                     &lstate.pgr, genovec);
 					if (perr != plink2::kPglRetSuccess) {
 						throw IOException("read_pfile: PgrGet failed for variant %u during sample-orient aggregation",
 						                  vidx);
