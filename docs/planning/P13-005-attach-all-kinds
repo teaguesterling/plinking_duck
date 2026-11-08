@@ -14,7 +14,7 @@ Branch: `feature/P13-005-attach-all-kinds`.
 
 - [x] Owner decision D1: **synthesize** a 1-cell catalog from a bare fileset (Teague 2026-11-08, §6)
 - [x] Owner decision D2: expose **all seven** relations for every kind (Teague 2026-11-08, §5)
-- [ ] Feasibility spike: resolve cell prefixes inside `attach` (§4) — my call, before the plan
+- [x] Feasibility spike: resolve cell prefixes inside `attach` → **Approach B via a shared helper** (2026-11-08, §4)
 - [ ] Implementation plan + build + review
 
 ## Why — the gap P13-003 left
@@ -65,7 +65,25 @@ constant path lists). Two ways to get that list for any kind:
   directly and reads the structs. Avoids a nested query, but re-implements the companion
   folding the reader already does, and risks drift.
 
-Recommendation: spike A first; fall back to B if a nested query is not viable.
+**Spike outcome (2026-11-08): Approach B, via a shared helper.** A has no in-tree precedent and
+would run inside `ATTACH`'s `MetaTransaction` (reentrancy risk) — unverified without a build, and
+not measured here. B is proven (P13-003 already calls `ParseMatrixCatalog` inside `attach`). B's
+only drawback — duplicating the reader's shared-companion folding (done today in the
+`read_pfile_catalog` bind, not in `ParseCatalog`) — is removed by **extracting** a shared helper:
+
+```
+// used by BOTH read_pfile_catalog's bind AND the storage attach, so no drift:
+vector<CellPaths> ResolveCatalogCellPaths(FileSystem &fs, const string &path, const string &content);
+//   CellPaths = { prefix, pvar, psam }   (the only fields the data views need)
+//   v2 matrix  → ParseMatrixCatalog + BuildCells, map each MatrixCell
+//   v1 single/multi → ParseCatalog + fold shared_pvar/shared_psam into each ShardEntry
+//   bare fileset (D1) → a single synthetic entry from the prefix
+```
+
+So B-with-extraction gets A's cleanliness (one folding path, reused) without A's risk. The
+implementation plan's first task is that extraction + a test that the reader's output is
+unchanged by it (an impl-vs-tests split: refactor behind existing tests first, then build the
+attach on top).
 
 ### Prefix resolution rule
 
