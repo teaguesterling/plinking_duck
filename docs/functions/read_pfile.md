@@ -22,7 +22,7 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | `pvar` | `VARCHAR` | `prefix.pvar` | Explicit `.pvar` or `.bim` path |
 | `psam` | `VARCHAR` | `prefix.psam` | Explicit `.psam` or `.fam` path |
 | `orient` | `VARCHAR` | `'variant'` | Output orientation: `'variant'`, `'genotype'`, or `'sample'` |
-| `combine_samples` | `VARCHAR` | `'implicit'` | Multi-file only: how shards' samples combine — `'implicit'` (positional trust), `'identical'` (verify IIDs), or `'concatenate'` (sample-sharded: same variants, different samples). See [Multi-File Input](#multi-file-input) |
+| `combine_samples` | `VARCHAR` | `'implicit'` | Multi-file only: how shards' samples combine — `'implicit'` (positional trust), `'identical'` (verify IIDs), `'concatenate'` (sample-sharded: same variants, different samples), or `'disjoint'` (`'concatenate'` + verify IIDs are unique across shards). See [Multi-File Input](#multi-file-input) |
 | `genotypes` | `VARCHAR` | `'array'` | Genotype output: `'array'`, `'list'`, `'columns'`, `'struct'`, or the aggregate modes `'counts'` / `'stats'` (per-sample summaries in sample orient) |
 | `phased` | `BOOLEAN` | `false` | Output phased haplotype pairs instead of dosage counts |
 | `dosages` | `BOOLEAN` | `false` | Output dosage values instead of hard calls |
@@ -174,6 +174,7 @@ Metadata is taken from the first file only (identical by contract). Row order ac
 - `'implicit'` *(default)* — trust positional alignment; no per-shard IID check, no extra I/O. This is the contract above.
 - `'identical'` — verify every shard carries the **same IIDs in the same order** (one `.psam` parse per shard); a mismatch is a hard error naming the differing sample. Use it when you aren't certain the shards are aligned.
 - `'concatenate'` — the **sample-sharded** layout. See [Sample-sharded input](#sample-sharded-input-combine_samples-concatenate) below.
+- `'disjoint'` — `'concatenate'`, and also verify that every IID is unique across the shards (one IID load per shard). A duplicate is a hard error naming the IID and both `.psam` files. It is the verifying mate of `'concatenate'`, as `'identical'` is of `'implicit'`.
 - `'union'` / `'intersect'` — reserved for real sample-set joins; **not yet implemented** (they error).
 
 A **`psam` override is allowed** with a multi-file list — it names the single shared `.psam` used for every shard (the common layout of per-shard `.pgen`/`.pvar` with one `.psam` kept elsewhere). `pgen`/`pvar` overrides remain single-file only (they can't disambiguate per shard). The one exception is `pvar :=` with `combine_samples := 'concatenate'` (see below). The `.psam` sample count must still match every shard's `.pgen`.
@@ -205,9 +206,9 @@ The variants come from the **first** shard's `.pvar`, or from a `pvar :=` overri
 
 Because there is one variant axis, `pvar :=`, `variants := [...]` and `variant_range` work with this mode. A `psam :=` or `pgen :=` override is an error, because each shard has its own.
 
-Each shard's `.psam` must have the same columns in `orient := 'genotype'` and `orient := 'sample'`. IID uniqueness across shards is not checked. A duplicate IID fails only in the modes that name columns after IIDs (`genotypes := 'columns'` / `'struct'`) or that look up a sample by IID.
+Each shard's `.psam` must have the same columns in `orient := 'genotype'` and `orient := 'sample'`. `'concatenate'` does not check IID uniqueness across shards. A duplicate IID then fails only in the modes that name columns after IIDs (`genotypes := 'columns'` / `'struct'`) or that look up a sample by IID. Use `'disjoint'` to check it.
 
-A `.psam.parquet` companion is not supported in this mode yet. Use `SET plinking_use_parquet_companions = false` to read the text `.psam`.
+`.psam.parquet` companions work in this mode. In `orient := 'genotype'` and `orient := 'sample'`, the psam columns are read lazily from every shard's parquet file, in shard order. These orients need one kind of `.psam` for every shard: all text or all parquet. A mix is an error. Variant orient reads only counts or IIDs, so it accepts a mix.
 
 The list of prefixes can come from anywhere: a literal list, a **glob** (`read_pfile('data/chr*.pgen')`), or a **catalog macro** returning a `VARCHAR[]` of shard prefixes — e.g. the scalarfs `pathmacro:` protocol, which `read_pfile` resolves to local shard paths and reads directly: `read_pfile('pathmacro:cohort?gene=BRCA1')`.
 

@@ -10,6 +10,8 @@
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
+#include <unordered_map>
+
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -121,6 +123,9 @@ struct PfileSampleMetadata {
 	//! Source path for the parquet/non-native path — the projected column data is
 	//! (re-)queried from here at InitGlobal, not materialized at bind. Empty for text.
 	string source_path;
+	//! Sample-sharded cohort over parquet companions: every shard's .psam.parquet, in shard
+	//! order (source_paths[0] == source_path). Empty for a single source. See PsamSelectSql.
+	vector<string> source_paths;
 
 	//! IID / FID column positions in the header (for the parquet path).
 	idx_t iid_col_idx = DConstants::INVALID_INDEX;
@@ -135,6 +140,26 @@ struct PfileSampleMetadata {
 	//! in `rows`; the scan reads it from the projection-aware CDC in the global state.
 	bool from_parquet = false;
 };
+
+//! The query that reads `cols` from a parquet/non-native psam, in sample order. One source:
+//! `SELECT cols FROM '<path>'`. A sample-sharded cohort (source_paths): the shards' parquet files
+//! as one relation in SHARD order then FILE order — each tagged with its shard index and its
+//! parquet row number, and an outer ORDER BY on both, so row k is combined sample k exactly.
+static string PsamSelectSql(const PfileSampleMetadata &meta, const string &cols) {
+	auto lit = [](const string &p) {
+		return "'" + StringUtil::Replace(p, "'", "''") + "'";
+	};
+	if (meta.source_paths.size() <= 1) {
+		return "SELECT " + cols + " FROM " + lit(meta.source_path);
+	}
+	string u;
+	for (idx_t k = 0; k < meta.source_paths.size(); k++) {
+		u += (k ? " UNION ALL " : "");
+		u += "SELECT *, " + std::to_string(k) + " AS __plinking_shard FROM read_parquet(" + lit(meta.source_paths[k]) +
+		     ", file_row_number := true)";
+	}
+	return "SELECT " + cols + " FROM (" + u + ") ORDER BY __plinking_shard, file_row_number";
+}
 
 //! Missing value sentinels (same as psam_reader)
 static bool PfileIsMissingValue(const string &val) {
@@ -228,7 +253,6 @@ static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
-	auto escaped = StringUtil::Replace(meta.source_path, "'", "''");
 	const bool has_fid = meta.fid_col_idx != DConstants::INVALID_INDEX;
 	auto quote = [](const string &n) {
 		return "\"" + StringUtil::Replace(n, "\"", "\"\"") + "\"";
@@ -237,7 +261,7 @@ static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &
 	if (has_fid) {
 		cols += ", " + quote(meta.header.column_names[meta.fid_col_idx]);
 	}
-	auto result = conn.Query("SELECT " + cols + " FROM '" + escaped + "'");
+	auto result = conn.Query(PsamSelectSql(meta, cols));
 	if (result->HasError()) {
 		throw IOException("read_pfile: failed to load IIDs from source '%s': %s", meta.source_path, result->GetError());
 	}
@@ -381,8 +405,28 @@ struct PfileSource {
 //   INTERSECT   - inner-join samples across shards (not yet implemented).
 //   CONCATENATE - stack DIFFERENT samples (sample-sharded): the shards hold the same
 //                 variants; the output samples are the shards' samples in list order
-//                 (P13-008, docs/planning/P13-008-sample-concat-reader).
-enum class CombineSamplesMode : uint8_t { IMPLICIT, IDENTICAL, UNION, INTERSECT, CONCATENATE };
+//                 (P13-008, docs/planning/P13-008-sample-concat-reader). Trusts the caller.
+//   DISJOINT    - CONCATENATE, and verify the IIDs are unique across shards (one .psam
+//                 IID load per shard) — the verifying mate, as IDENTICAL is to IMPLICIT.
+enum class CombineSamplesMode : uint8_t { IMPLICIT, IDENTICAL, UNION, INTERSECT, CONCATENATE, DISJOINT };
+
+static const char *CombineSamplesModeName(CombineSamplesMode m) {
+	switch (m) {
+	case CombineSamplesMode::IMPLICIT:
+		return "implicit";
+	case CombineSamplesMode::IDENTICAL:
+		return "identical";
+	case CombineSamplesMode::UNION:
+		return "union";
+	case CombineSamplesMode::INTERSECT:
+		return "intersect";
+	case CombineSamplesMode::CONCATENATE:
+		return "concatenate";
+	case CombineSamplesMode::DISJOINT:
+		return "disjoint";
+	}
+	return "?";
+}
 
 static CombineSamplesMode ResolveCombineSamplesMode(const string &s) {
 	string v = StringUtil::Lower(s);
@@ -402,8 +446,11 @@ static CombineSamplesMode ResolveCombineSamplesMode(const string &s) {
 	if (v == "concatenate") {
 		return CombineSamplesMode::CONCATENATE;
 	}
+	if (v == "disjoint") {
+		return CombineSamplesMode::DISJOINT;
+	}
 	throw InvalidInputException("read_pfile: unknown combine_samples := '%s' (expected 'implicit', 'identical', "
-	                            "'union', 'intersect', or 'concatenate')",
+	                            "'union', 'intersect', 'concatenate', or 'disjoint')",
 	                            s);
 }
 
@@ -994,27 +1041,64 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 //! loads all psam columns (genotype/sample orient); otherwise IIDs only when
 //! `needs_iids`, else just the counts. Each shard's .psam count must equal its own
 //! .pgen's, or every later shard's samples would silently shift.
+//!
+//! Parquet companions: the count / IID loads work per shard for either kind (so a
+//! variant-orient read may even mix them). The full-metadata orients read psam COLUMNS
+//! lazily at InitGlobal from one source schema, so there the shards must be all text
+//! (rows concatenated here) or all parquet (source_paths -> PsamSelectSql); a mix errors.
+//!
+//! `verify_unique` (combine_samples := 'disjoint'): load every shard's IIDs and require
+//! them unique across the cohort — a duplicate is a hard error naming both shards.
 static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind_data, bool full_metadata,
-                                     bool needs_iids) {
+                                     bool needs_iids, bool verify_unique) {
 	SampleInfo &out = bind_data.sample_info;
 	out = SampleInfo();
 	out.sample_ct = 0;
+	if (verify_unique) {
+		needs_iids = true;
+	}
+	const char *mode = CombineSamplesModeName(bind_data.combine_samples);
+	const auto &paths = bind_data.sample_shard_psam_paths;
+
+	// Full metadata: one schema source — all text or all parquet.
+	bool parquet_full = false;
+	if (full_metadata) {
+		idx_t n_native = 0;
+		for (auto &p : paths) {
+			if (IsNativePlinkFormat(p)) {
+				n_native++;
+			} else if (!IsParquetFile(p)) {
+				throw InvalidInputException("read_pfile: combine_samples := '%s' cannot read the .psam source '%s' "
+				                            "(expected a .psam/.fam or a .psam.parquet companion)",
+				                            mode, p);
+			}
+		}
+		if (n_native != 0 && n_native != paths.size()) {
+			idx_t t = 0, q = 0;
+			for (idx_t k = 0; k < paths.size(); k++) {
+				if (IsNativePlinkFormat(paths[k])) {
+					t = k;
+				} else {
+					q = k;
+				}
+			}
+			throw InvalidInputException(
+			    "read_pfile: combine_samples := '%s' mixes text and parquet .psam companions ('%s' is text, '%s' is "
+			    "parquet). The orients that emit .psam columns need one kind for every shard: give every shard a "
+			    ".psam.parquet, or SET plinking_use_parquet_companions = false to read the text .psam files.",
+			    mode, paths[t], paths[q]);
+		}
+		parquet_full = (n_native == 0);
+	}
+
 	bool all_sexes = true;
 	for (idx_t k = 0; k < bind_data.sample_shards.size(); k++) {
-		const string &path = bind_data.sample_shard_psam_paths[k];
+		const string &path = paths[k];
 		const auto &shard = bind_data.sample_shards[k];
-		// The projection-aware parquet psam path (BuildProjectedPsamCdc) reads ONE
-		// source; concatenating it is a follow-up. Fail loud rather than emit shard 0's
-		// metadata for every sample.
-		if (!IsNativePlinkFormat(path)) {
-			throw InvalidInputException(
-			    "read_pfile: combine_samples := 'concatenate' does not support a parquet .psam companion yet ('%s'); "
-			    "SET plinking_use_parquet_companions = false to read the text .psam/.fam",
-			    path);
-		}
 		SampleInfo part;
 		if (full_metadata) {
-			PfileSampleMetadata meta = LoadPfileSampleMetadata(context, path, part);
+			PfileSampleMetadata meta = parquet_full ? LoadPfileSampleMetadataFromSource(context, path, part)
+			                                        : LoadPfileSampleMetadata(context, path, part);
 			if (k == 0) {
 				bind_data.sample_metadata = std::move(meta);
 			} else {
@@ -1022,13 +1106,16 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 				if (meta.header.column_names != ref.column_names || meta.header.column_types != ref.column_types) {
 					throw InvalidInputException(
 					    "read_pfile: .psam columns differ across sample shards: '%s' has (%s) but '%s' has (%s). "
-					    "combine_samples := 'concatenate' needs the same .psam columns in every shard.",
-					    path, StringUtil::Join(meta.header.column_names, ", "), bind_data.sample_shard_psam_paths[0],
-					    StringUtil::Join(ref.column_names, ", "));
+					    "combine_samples := '%s' needs the same .psam columns in every shard.",
+					    path, StringUtil::Join(meta.header.column_names, ", "), paths[0],
+					    StringUtil::Join(ref.column_names, ", "), mode);
 				}
 				for (auto &row : meta.rows) {
 					bind_data.sample_metadata.rows.push_back(std::move(row));
 				}
+			}
+			if (parquet_full) {
+				bind_data.sample_metadata.source_paths.push_back(path);
 			}
 		} else if (needs_iids) {
 			part = LoadSampleMetadata(context, path);
@@ -1044,7 +1131,7 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 		if (k > 0 && out.fids.empty() != part.fids.empty() && !out.iids.empty()) {
 			throw InvalidInputException("read_pfile: .psam columns differ across sample shards: '%s' and '%s' "
 			                            "disagree on the FID column",
-			                            path, bind_data.sample_shard_psam_paths[0]);
+			                            path, paths[0]);
 		}
 		out.iids.insert(out.iids.end(), part.iids.begin(), part.iids.end());
 		out.fids.insert(out.fids.end(), part.fids.begin(), part.fids.end());
@@ -1057,6 +1144,42 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 	}
 	if (!all_sexes) {
 		out.sexes.clear();
+	}
+
+	if (verify_unique) {
+		// The parquet full-metadata path loads IIDs lazily; the check needs them now (all shards,
+		// in shard order, through the same multi-source query the scan uses).
+		EnsureSourceIids(context, bind_data.sample_metadata, out);
+		if (out.iids.size() != out.sample_ct) {
+			throw InternalException("read_pfile: 'disjoint' loaded %llu IIDs for %llu samples",
+			                        static_cast<unsigned long long>(out.iids.size()),
+			                        static_cast<unsigned long long>(out.sample_ct));
+		}
+		auto shard_of = [&](idx_t pos) {
+			idx_t k = 0;
+			while (k + 1 < bind_data.sample_shards.size() && bind_data.sample_shards[k + 1].sample_offset <= pos) {
+				k++;
+			}
+			return k;
+		};
+		std::unordered_map<string, idx_t> first_pos;
+		first_pos.reserve(out.iids.size());
+		for (idx_t i = 0; i < out.iids.size(); i++) {
+			auto ins = first_pos.emplace(out.iids[i], i);
+			if (!ins.second) {
+				idx_t a = shard_of(ins.first->second), b = shard_of(i);
+				if (a == b) {
+					throw InvalidInputException("read_pfile: combine_samples := 'disjoint' but sample '%s' appears "
+					                            "twice in '%s'. IIDs must be unique across the whole cohort.",
+					                            out.iids[i], paths[a]);
+				}
+				throw InvalidInputException(
+				    "read_pfile: combine_samples := 'disjoint' but sample '%s' appears in both '%s' (shard %llu) and "
+				    "'%s' (shard %llu). IIDs must be unique across shards (use 'concatenate' to trust the caller).",
+				    out.iids[i], paths[a], static_cast<unsigned long long>(a), paths[b],
+				    static_cast<unsigned long long>(b));
+			}
+		}
 	}
 }
 
@@ -1146,7 +1269,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	if (bind_data->combine_samples == CombineSamplesMode::UNION ||
 	    bind_data->combine_samples == CombineSamplesMode::INTERSECT) {
 		throw InvalidInputException("read_pfile: combine_samples := '%s' is not yet implemented "
-		                            "(only 'implicit', 'identical' and 'concatenate' are supported)",
+		                            "(only 'implicit', 'identical', 'concatenate' and 'disjoint' are supported)",
 		                            StringUtil::Lower(input.named_parameters.at("combine_samples").GetValue<string>()));
 	}
 
@@ -1157,14 +1280,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// A sample-sharded cohort: same variants, different samples per fileset. There is
 	// ONE variant axis, so pvar := (the shared .pvar), variants := and variant_range
 	// resolve unambiguously; only the per-shard pgen/psam overrides are rejected.
-	const bool concat = multi_file && bind_data->combine_samples == CombineSamplesMode::CONCATENATE;
+	const bool concat = multi_file && (bind_data->combine_samples == CombineSamplesMode::CONCATENATE ||
+	                                   bind_data->combine_samples == CombineSamplesMode::DISJOINT);
 
 	// --- Multi-file guards (throw before loading anything) ---
 	if (concat) {
 		if (!override_psam.empty()) {
 			throw InvalidInputException(
-			    "read_pfile: a psam override cannot be combined with combine_samples := 'concatenate' (each sample "
-			    "shard has its own .psam; the output samples are the shards' .psam rows in list order)");
+			    "read_pfile: a psam override cannot be combined with combine_samples := '%s' (each sample "
+			    "shard has its own .psam; the output samples are the shards' .psam rows in list order)",
+			    CombineSamplesModeName(bind_data->combine_samples));
 		}
 		if (!override_pgen.empty()) {
 			throw InvalidInputException("read_pfile: a pgen override cannot be combined with a multi-file list (the "
@@ -1297,9 +1422,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			if (si > 0 && src.raw_variant_ct != bind_data->sources[0].raw_variant_ct) {
 				throw InvalidInputException(
 				    "read_pfile: variant count mismatch across sample shards: '%s' has %u variants, but '%s' has %u. "
-				    "combine_samples := 'concatenate' needs every shard to hold the same variants in the same order.",
+				    "combine_samples := '%s' needs every shard to hold the same variants in the same order.",
 				    src.pgen_path, src.raw_variant_ct, bind_data->sources[0].pgen_path,
-				    bind_data->sources[0].raw_variant_ct);
+				    bind_data->sources[0].raw_variant_ct, CombineSamplesModeName(bind_data->combine_samples));
 			}
 			if (static_cast<uint64_t>(bind_data->raw_sample_ct) + src_sample_ct > UINT32_MAX) {
 				throw InvalidInputException("read_pfile: combine_samples := 'concatenate' exceeds %u samples",
@@ -1440,9 +1565,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 	bind_timer.Note("loading sample metadata (needs_iids=%s)", needs_iids ? "yes" : "no");
 	if (bind_data->IsConcat()) {
-		LoadConcatSampleMetadata(
-		    context, *bind_data,
-		    bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE, needs_iids);
+		LoadConcatSampleMetadata(context, *bind_data,
+		                         bind_data->orient_mode == OrientMode::GENOTYPE ||
+		                             bind_data->orient_mode == OrientMode::SAMPLE,
+		                         needs_iids, bind_data->combine_samples == CombineSamplesMode::DISJOINT);
 	} else if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		bind_data->sample_metadata = LoadPfileSampleMetadata(context, psam_path, bind_data->sample_info);
 	} else if (needs_iids) {
@@ -2372,8 +2498,7 @@ static void BuildProjectedPsamCdc(ClientContext &context, const PfileBindData &b
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
-	auto escaped = StringUtil::Replace(meta.source_path, "'", "''");
-	auto result = conn.Query("SELECT " + cols + " FROM '" + escaped + "'");
+	auto result = conn.Query(PsamSelectSql(meta, cols));
 	if (result->HasError()) {
 		throw IOException("read_pfile: failed to load psam columns from '%s': %s", meta.source_path,
 		                  result->GetError());

@@ -1,0 +1,68 @@
+# P13-009: sample-concat follow-ups — parquet `.psam` companions, `combine_samples := 'disjoint'`
+
+The two follow-ups P13-008 (#84) left open, for `read_pfile([...], combine_samples := 'concatenate')`.
+Branch: `feature/P13-009-concat-parquet-disjoint` (off `origin/main` a5ad067).
+
+## Status
+
+- [x] Owner decision: spell the IID check as a new mode `'disjoint'` (Teague, 2026-11-08)
+- [x] Build test-first, review, PR
+
+## 1. Parquet `.psam` companions
+
+P13-008 rejected a `.psam.parquet` companion in concat mode. The measured gap was narrower:
+
+- **Variant orient** loads only counts (`LoadSampleCount`) or IIDs (`LoadSampleMetadata`). Both
+  already dispatch on parquet per file, so only the blanket reject blocked them. Variant orient
+  now works over parquet shards, and over a mix of text and parquet shards.
+- **Genotype / sample orient** read psam COLUMNS lazily, at InitGlobal, from one `source_path`
+  (`BuildProjectedPsamCdc`, and `EnsureSourceIids` for a VARCHAR `samples :=`). For an
+  all-parquet cohort, `PfileSampleMetadata.source_paths` holds every shard's file in shard
+  order. `PsamSelectSql` reads them as one relation in sample order:
+
+  ```sql
+  SELECT <cols> FROM (
+    SELECT *, 0 AS __plinking_shard FROM read_parquet('<shard0>', file_row_number := true)
+    UNION ALL
+    SELECT *, 1 AS __plinking_shard FROM read_parquet('<shard1>', file_row_number := true) ...
+  ) ORDER BY __plinking_shard, file_row_number
+  ```
+
+  The explicit shard index (not `filename`) keeps a duplicated shard correct. The outer
+  `ORDER BY` makes row k equal combined sample k without relying on scan order.
+- A **mix** of text and parquet `.psam` in these orients is an error: the column values come
+  from one source kind. The message names both files and the
+  `plinking_use_parquet_companions = false` escape.
+- The headers (names and types) must match across shards, as for text.
+
+## 2. `combine_samples := 'disjoint'`
+
+`'concatenate'` trusts the caller. In variant orient it loads only sample counts, and at biobank
+scale the `.psam` parse is the main cost, so a uniqueness check must be opt-in. The existing modes
+already pair a trusting mode with a verifying one (`'implicit'` / `'identical'`), so the
+verifying mate is a mode, not a flag:
+
+- `'disjoint'` = `'concatenate'` + load every shard's IIDs + require them unique across the
+  cohort. It shares concatenate's interface rules (`pvar :=` allowed; `psam :=`/`pgen :=`
+  rejected).
+- A duplicate is a hard error naming the IID and both `.psam` files, or "appears twice in" when
+  both copies are in one shard.
+- For parquet shards in the psam-column orients, the IIDs come from the same multi-source query
+  (`EnsureSourceIids`).
+- ATTACH keeps `'concatenate'` (trusting).
+
+## 3. Tests (`test/sql/read_pfile_sample_concat.test`)
+
+- **Parquet oracle.** Read each shard alone (the single-file parquet path) and union the results;
+  the concatenated read must equal that union. It pairs IID + SEX + PHENO1 + genotypes, so a
+  misordered metadata load fails the check.
+  - Sensitivity, measured: reversing the shard order in `PsamSelectSql` fails the sample-orient
+    oracle (line 514).
+- **Coverage.**
+  - genotype orient, and a projection of one psam column
+  - a VARCHAR subset across both shards
+  - variant orient over mixed text and parquet shards
+  - the mixed-kind error, the header mismatch, and companions turned off
+- **disjoint.** It equals concatenate on disjoint shards; a duplicated shard errors in every
+  orient (the count-only variant orient too); a duplicated parquet shard errors; it follows the
+  same interface rules as concatenate.
