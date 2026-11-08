@@ -639,8 +639,8 @@ schema of relations, not as function calls:
 
 ```sql
 ATTACH 'cohort.pfile.json' AS c (TYPE pfile_catalog);
-SELECT count(*) FROM c.genotypes WHERE CHROM = '17';
 SELECT * FROM c.cells;
+SELECT CHROM, POS, ID, REF, ALT FROM c.variants WHERE CHROM = '17';
 ```
 
 The attached database holds seven views. Each one is backed by a shipped reader:
@@ -654,11 +654,20 @@ The attached database holds seven views. Each one is backed by a shipped reader:
 | `c.cells` | `read_pfile_catalog` — one row per surviving cell |
 | `c.variant_blocks`, `c.sample_blocks` | the per-axis block tiling |
 
-The catalog is **read-only**: a write to `c.*` raises. A `WHERE` on `c.genotypes`
-pushes into each cell's `read_pfile` scan, so it skips row groups by `CHROM` and
-`POS`. The attach opens **every** surviving cell. It does not yet skip a cell by
-predicate (see below). An all-holes catalog has no cell to read, so its `ATTACH`
-raises.
+The catalog is **read-only**: a write to `c.*` raises. Do not pass `READ_ONLY` to
+`ATTACH`; the catalog is always read-only, and the storage is in-memory. A `WHERE`
+on `c.genotypes` pushes into each cell's `read_pfile` scan, so it skips row groups by
+`CHROM` and `POS`. The attach opens **every** surviving cell. It does not yet skip a
+cell by predicate (see below). An all-holes catalog has no cell to read, so its
+`ATTACH` raises.
+
+**`c.genotypes` fans out per cell.** Each cell holds one sample-block's genotypes for
+one variant-block. So a variant that spans several sample-blocks returns **one row
+per sample-block**, and the `genotypes` list on each row covers only that cell's
+samples. `count(*) FROM c.genotypes` is therefore variants × sample-blocks, not
+variants. The rows do not yet carry a column that names the source cell or
+sample-block; that reassembly (and the derived count columns) is P13-004. For a
+per-variant count, use `c.variants`.
 
 ### Inspecting a matrix without reading it
 

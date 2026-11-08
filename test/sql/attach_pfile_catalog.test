@@ -187,6 +187,20 @@ SELECT count(*) > 0 FROM c.genotypes;
 ----
 true
 
+# An explicit READ_ONLY attach also works (and is still read-only). The catalog is always
+# read-only, so passing READ_ONLY must not fail with ":memory: read-only" (review finding 1).
+statement ok
+ATTACH '{TEST_DIR}/matrix_dense.pfile.json' AS cro (TYPE pfile_catalog, READ_ONLY);
+
+query T
+SELECT count(*) > 0 FROM cro.genotypes;
+----
+true
+
+statement error
+CREATE TABLE cro.scratch AS SELECT 1 AS x;
+----
+
 # ---------------------------------------------------------------------------
 # Task 4b: holes and the empty (all-holes) catalog — reuse the data/refv/refs above
 # ---------------------------------------------------------------------------

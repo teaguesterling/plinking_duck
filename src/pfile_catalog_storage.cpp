@@ -1,5 +1,6 @@
 #include "pfile_catalog_storage.hpp"
 #include "pfile_catalog_matrix.hpp"
+#include "pfile_catalog_util.hpp"
 
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -15,6 +16,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/enums/access_mode.hpp"
 
 namespace duckdb {
 
@@ -157,8 +159,10 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 		                            catalog_path);
 	}
 
-	// Bake the per-relation SQL over the shipped readers.
-	string path_sql = SQLString::ToString(catalog_path);
+	// Bake the per-relation SQL over the shipped readers. Use the ABSOLUTE catalog path so the
+	// lazy structural views (cells/blocks, which re-parse the file) resolve the same regardless of
+	// the cwd at query time, matching the attach-time-resolved absolute cell prefixes (finding 3).
+	string path_sql = SQLString::ToString(AbsPath(fs, catalog_path));
 	vector<std::pair<Identifier, string>> views;
 	views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ")");
 	views.emplace_back(Identifier("cells"), "SELECT * FROM read_pfile_catalog(" + path_sql + ")");
@@ -171,8 +175,11 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	views.emplace_back(Identifier("genotypes_by_sample"),
 	                   "SELECT * FROM read_pfile(" + SqlPathList(cell_prefixes) + ", orient := 'sample')");
 
-	// Build a native in-memory catalog seeded with those views.
+	// Build a native in-memory catalog seeded with those views. The backing storage is :memory:,
+	// which cannot be opened read-only — so force READ_WRITE here even if the user passed READ_ONLY;
+	// the catalog's read-only guarantee comes from SetReadOnlyDatabase() above, not the storage mode.
 	info.path = ":memory:";
+	options.access_mode = AccessMode::READ_WRITE;
 	auto catalog = make_uniq<DuckCatalog>(db);
 	catalog->Initialize(false);
 
