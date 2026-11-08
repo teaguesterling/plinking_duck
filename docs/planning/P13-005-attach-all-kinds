@@ -12,8 +12,8 @@ Branch: `feature/P13-005-attach-all-kinds`.
 
 ## Status
 
-- [ ] Owner decision D1: a bare fileset with no `.pfile.json` sidecar (§6)
-- [ ] Owner decision D2: the relation set for the degenerate kinds (§5)
+- [x] Owner decision D1: **synthesize** a 1-cell catalog from a bare fileset (Teague 2026-11-08, §6)
+- [x] Owner decision D2: expose **all seven** relations for every kind (Teague 2026-11-08, §5)
 - [ ] Feasibility spike: resolve cell prefixes inside `attach` (§4) — my call, before the plan
 - [ ] Implementation plan + build + review
 
@@ -73,7 +73,9 @@ Given the `ATTACH` path, before anything else:
 
 1. If it ends in `.pfile.json`, use it as-is.
 2. Else append `.pfile.json`. If `<path>.pfile.json` exists, use it.
-3. Else → D1 (§6).
+3. Else, if `<path>.pgen` exists, synthesize a one-cell catalog from the bare fileset (D1 =
+   synthesize, §6).
+4. Else raise a clear "no catalog or fileset found at '<path>'".
 
 Resolve to an absolute path first (`AbsPath`, as P13-003's review fix already does for the
 structural views).
@@ -89,25 +91,21 @@ The four data views are identical across kinds. The structural views differ:
 | `c.variant_blocks` | per-CHROM etc. | shards (if `concat_dim='variants'`) | one row |
 | `c.sample_blocks` | per-GROUP etc. | shards (if `concat_dim='samples'`) | one row |
 
-**D2:** expose **all seven** for every kind (the block views degenerate to the shard list or a
-single row), so one query runs against any attached catalog — OR expose a **reduced set** per
-kind (drop the block views where they are degenerate). Default if unanswered: all seven, so the
-surface is uniform.
+**D2 (RESOLVED, Teague 2026-11-08): all seven** for every kind. The block views degenerate to
+the shard list or a single row, so one query runs against any attached catalog — a single
+fileset, a sharded cohort, or a matrix all answer `SELECT * FROM c.variant_blocks`.
 
 ## 6. The bare fileset — D1
 
-If the `ATTACH` path resolves to no `.pfile.json`, but `<prefix>.pgen` exists:
+**D1 (RESOLVED, Teague 2026-11-08): synthesize.** If the `ATTACH` path resolves to no
+`.pfile.json` but `<prefix>.pgen` exists, `attach` synthesizes a one-cell catalog from the bare
+fileset — `c.genotypes` = `read_pfile('<prefix>')`, `c.variants`/`c.samples` from its own
+`.pvar`/`.psam`. So `ATTACH 'cohort'` works on ANY fileset — the full P11 dream.
 
-- **Option "synthesize" (fuller ergonomic):** `attach` synthesizes a one-cell catalog from the
-  bare fileset — `c.genotypes` = `read_pfile('<prefix>')`, `c.variants`/`c.samples` from its own
-  `.pvar`/`.psam`. This makes `ATTACH 'cohort'` work on ANY fileset, the full P11 dream. Cost: a
-  fileset has no declared bounds, so there is nothing to verify, and `c.cells`/blocks are a thin
-  single synthetic row.
-- **Option "require sidecar":** attach only when a `.pfile.json` exists; a bare fileset raises a
-  clear "no catalog found at '<prefix>.pfile.json'".
-
-Default if unanswered: require sidecar (smaller surface; the bare-fileset case can be a later
-increment). D1 is the one call that most changes scope.
+Notes for the plan: a bare fileset has no declared bounds, so there is nothing to verify (unlike
+a catalog's cells), and `c.cells` / the block views are a single synthetic row. The synthetic
+one-cell path can reuse the same baked-view machinery — it just supplies the `(prefix, pvar,
+psam)` list directly (one entry) instead of reading a catalog.
 
 ## 7. Phasing & build order
 
@@ -117,7 +115,7 @@ increment). D1 is the one call that most changes scope.
    matrix-only `ParseMatrixCatalog`/`BuildCells` path; the matrix path stays for the v2 structural
    views).
 4. Per-kind structural views (`c.cells` always = `read_pfile_catalog`; blocks per D2).
-5. (If D1 = synthesize) the bare-fileset path.
+5. The bare-fileset synthesis path (D1) — a prefix with a `.pgen` but no `.pfile.json`.
 6. Tests per kind + docs.
 
 ## 8. Testing (shape)
@@ -126,7 +124,8 @@ increment). D1 is the one call that most changes scope.
   equals the equivalent `read_pfile` call; `c.variants`/`c.samples` match.
 - `ATTACH` the same three by **prefix**; identical result to the full-path attach.
 - Read-only, holes, and all-holes behave as in P13-003.
-- (D1 = synthesize) `ATTACH 'bare_prefix'` with no sidecar works; (D1 = require) it raises clearly.
+- `ATTACH 'bare_prefix'` with no sidecar synthesizes a one-cell attach; `c.genotypes` equals
+  `read_pfile('bare_prefix')`, and the block views each return one row.
 
 ## 9. Risks
 
