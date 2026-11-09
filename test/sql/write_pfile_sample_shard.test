@@ -1,0 +1,445 @@
+# name: test/sql/write_pfile_sample_shard.test
+# description: COPY ... (FORMAT pfile, shard_samples {label: [iids], ...}) — split a cohort along the SAMPLE axis into per-shard .pgen/.psam over one shared .pvar, plus a concat_dim:"samples" catalog (P13-007). Oracle: the source fileset.
+# group: [sql]
+
+require plinking_duck
+
+# Layout written by shard_samples into TO '<dir>/<name>':
+#   <dir>/<name>.pvar                  — the ONE shared .pvar
+#   <dir>/<name>/<label>/data.pgen     — per shard
+#   <dir>/<name>/<label>/data.psam     — per shard (its IID slice)
+#   <dir>/<name>.pfile.json            — the catalog, written LAST
+# Shards carry no .pvar: a direct read of one shard needs pvar := '<dir>/<name>.pvar'.
+# large_example: 3000 variants x 8 samples (SAMP1..SAMP8). pca_example: 500 x 250 (per0..per249).
+
+# ===========================================================================
+# POSITIVE — STRUCT input, 3 shards incl. a one-sample shard
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/ss' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# The layout: one shared .pvar + a catalog at the root; data.pgen + data.psam per shard, no shard .pvar.
+query III
+SELECT (SELECT count(*) FROM glob('__TEST_DIR__/ss.pvar')),
+       (SELECT count(*) FROM glob('__TEST_DIR__/ss.pfile.json')),
+       (SELECT count(*) FROM glob('__TEST_DIR__/ss/*/data.*'));
+----
+1	1	6
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/ss/*/data.pvar');
+----
+0
+
+# Each shard's .psam is its IID slice, in order.
+query T
+SELECT string_agg(IID, ',') FROM read_psam('__TEST_DIR__/ss/b/data.psam');
+----
+SAMP2,SAMP3
+
+query I
+SELECT count(*) FROM read_psam('__TEST_DIR__/ss/c/data.psam');
+----
+5
+
+# Per-shard round trip: each shard equals the source projected to that shard's samples.
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('__TEST_DIR__/ss/a/data', pvar := '__TEST_DIR__/ss.pvar')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [0]))),
+       (SELECT count(*) FROM read_pfile('__TEST_DIR__/ss/a/data', pvar := '__TEST_DIR__/ss.pvar'));
+----
+0	3000
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('__TEST_DIR__/ss/b/data', pvar := '__TEST_DIR__/ss.pvar')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [1, 2]))),
+       (SELECT count(*) FROM read_pfile('__TEST_DIR__/ss/b/data', pvar := '__TEST_DIR__/ss.pvar'));
+----
+0	3000
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('__TEST_DIR__/ss/c/data', pvar := '__TEST_DIR__/ss.pvar')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [3, 4, 5, 6, 7]))),
+       (SELECT count(*) FROM read_pfile('__TEST_DIR__/ss/c/data', pvar := '__TEST_DIR__/ss.pvar'));
+----
+0	3000
+
+# Concatenated round trip (P13-008's reader): the shards in catalog order reproduce the source.
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile(['__TEST_DIR__/ss/a/data', '__TEST_DIR__/ss/b/data', '__TEST_DIR__/ss/c/data'], combine_samples := 'concatenate', pvar := '__TEST_DIR__/ss.pvar')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(['__TEST_DIR__/ss/a/data', '__TEST_DIR__/ss/b/data', '__TEST_DIR__/ss/c/data'], combine_samples := 'concatenate', pvar := '__TEST_DIR__/ss.pvar'));
+----
+0	3000
+
+# ===========================================================================
+# CATALOG — concat_dim 'samples', shared .pvar, per-file psam, global sample ordinals
+# ===========================================================================
+
+query TTT
+SELECT dataset, concat_dim, string_agg(partition_start || '-' || partition_stop || '@' || source_ordinal, ',' ORDER BY source_ordinal)
+FROM read_pfile_catalog('__TEST_DIR__/ss.pfile.json') GROUP BY ALL;
+----
+ss	samples	0-1@0,1-3@1,3-8@2
+
+query TT
+SELECT bool_and(ends_with(pvar, '/ss.pvar')), bool_and(ends_with(psam, '/data.psam'))
+FROM read_pfile_catalog('__TEST_DIR__/ss.pfile.json');
+----
+true	true
+
+# The raw JSON: shared pvar, a per-file psam, NO per-file pvar (the parser rejects one beside shared.pvar).
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('__TEST_DIR__/ss.pfile.json'))
+WHERE contains(c, '"pfile_catalog": 1')
+  AND contains(c, '"concat_dim": "samples"')
+  AND contains(c, '"shared": { "pvar": "ss.pvar" }')
+  AND contains(c, '"prefix": "ss/a/data"')
+  AND contains(c, '"psam": "ss/a/data.psam"')
+  AND contains(c, '"partition": { "start": 3, "stop": 8, "source_ordinal": 2 }')
+  AND NOT contains(c, '"pvar": "ss/');
+----
+1
+
+# ATTACH the written catalog: the genotype relations equal the source (both directions).
+statement ok
+ATTACH '__TEST_DIR__/ss.pfile.json' AS ssw (TYPE pfile_catalog);
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM ssw.genotypes EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example')))
+     + (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example') EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM ssw.genotypes)),
+       (SELECT count(*) FROM ssw.samples);
+----
+0	8
+
+query I
+SELECT count(*) FROM (SELECT IID, genotypes FROM ssw.genotypes_by_sample EXCEPT ALL SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample'));
+----
+0
+
+statement ok
+DETACH ssw;
+
+# ===========================================================================
+# POSITIVE — a samples-identified LIST input, and a > 32-sample shard (2-bit word crossing)
+# ===========================================================================
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/sl' (FORMAT pfile, samples ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8'],
+                      shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile(['__TEST_DIR__/sl/lo/data', '__TEST_DIR__/sl/hi/data'], combine_samples := 'concatenate', pvar := '__TEST_DIR__/sl.pvar')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile('__TEST_DIR__/sl/hi/data', pvar := '__TEST_DIR__/sl.pvar'));
+----
+0	3000
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pca_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/sp' (FORMAT pfile, shard_samples {x: ['per0', 'per1', 'per2', 'per3', 'per4', 'per5', 'per6', 'per7', 'per8', 'per9', 'per10', 'per11', 'per12', 'per13', 'per14', 'per15', 'per16', 'per17', 'per18', 'per19', 'per20', 'per21', 'per22', 'per23', 'per24', 'per25', 'per26', 'per27', 'per28', 'per29', 'per30', 'per31', 'per32', 'per33', 'per34', 'per35', 'per36'], y: ['per37', 'per38', 'per39', 'per40', 'per41', 'per42', 'per43', 'per44', 'per45', 'per46', 'per47', 'per48', 'per49', 'per50', 'per51', 'per52', 'per53', 'per54', 'per55', 'per56', 'per57', 'per58', 'per59', 'per60', 'per61', 'per62', 'per63', 'per64', 'per65', 'per66', 'per67', 'per68', 'per69', 'per70', 'per71', 'per72', 'per73', 'per74', 'per75', 'per76', 'per77', 'per78', 'per79', 'per80', 'per81', 'per82', 'per83', 'per84', 'per85', 'per86', 'per87', 'per88', 'per89', 'per90', 'per91', 'per92', 'per93', 'per94', 'per95', 'per96', 'per97', 'per98', 'per99', 'per100', 'per101', 'per102', 'per103', 'per104', 'per105', 'per106', 'per107', 'per108', 'per109', 'per110', 'per111', 'per112', 'per113', 'per114', 'per115', 'per116', 'per117', 'per118', 'per119', 'per120', 'per121', 'per122', 'per123', 'per124', 'per125', 'per126', 'per127', 'per128', 'per129', 'per130', 'per131', 'per132', 'per133', 'per134', 'per135', 'per136', 'per137', 'per138', 'per139', 'per140', 'per141', 'per142', 'per143', 'per144', 'per145', 'per146', 'per147', 'per148', 'per149', 'per150', 'per151', 'per152', 'per153', 'per154', 'per155', 'per156', 'per157', 'per158', 'per159', 'per160', 'per161', 'per162', 'per163', 'per164', 'per165', 'per166', 'per167', 'per168', 'per169', 'per170', 'per171', 'per172', 'per173', 'per174', 'per175', 'per176', 'per177', 'per178', 'per179', 'per180', 'per181', 'per182', 'per183', 'per184', 'per185', 'per186', 'per187', 'per188', 'per189', 'per190', 'per191', 'per192', 'per193', 'per194', 'per195', 'per196', 'per197', 'per198', 'per199', 'per200', 'per201', 'per202', 'per203', 'per204', 'per205', 'per206', 'per207', 'per208', 'per209', 'per210', 'per211', 'per212', 'per213', 'per214', 'per215', 'per216', 'per217', 'per218', 'per219', 'per220', 'per221', 'per222', 'per223', 'per224', 'per225', 'per226', 'per227', 'per228', 'per229', 'per230', 'per231', 'per232', 'per233', 'per234', 'per235', 'per236', 'per237', 'per238', 'per239', 'per240', 'per241', 'per242', 'per243', 'per244', 'per245', 'per246', 'per247', 'per248', 'per249']});
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile(['__TEST_DIR__/sp/x/data', '__TEST_DIR__/sp/y/data'], combine_samples := 'concatenate', pvar := '__TEST_DIR__/sp.pvar')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pca_example'))),
+       (SELECT count(*) FROM read_psam('__TEST_DIR__/sp/y/data.psam'));
+----
+0	213
+
+# A single group is a valid one-shard cohort (the sharded path, not the plain bundle).
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/one' (FORMAT pfile, shard_samples {whole: ['SAMPLE1', 'SAMPLE2', 'SAMPLE3', 'SAMPLE4']});
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('__TEST_DIR__/one/whole/data', pvar := '__TEST_DIR__/one.pvar')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pgen_example'))),
+       (SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/one.pfile.json'));
+----
+0	1
+
+# ===========================================================================
+# NEGATIVE — bind-time rejects (no file is written)
+# ===========================================================================
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+shard_by and shard_samples cannot be combined
+
+# A group that is not a contiguous run of the input sample order.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP3'], b: ['SAMP2', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+contiguous
+
+# A group in a different order than the input samples (within the group).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP2', 'SAMP1'], b: ['SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+contiguous
+
+# Groups listed out of input order (each group is a run, but b comes before a in the input).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8'], a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4']});
+----
+contiguous
+
+# A sample missing from every group.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7']});
+----
+every sample exactly once
+
+# A sample in two groups.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2'], b: ['SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+more than one group
+
+# An IID that is not an input sample.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP1', 'NOPE'], b: ['SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+not an input sample
+
+# An empty group.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: [], b: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+empty
+
+# Not a STRUCT of IID lists.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples ['SAMP1']);
+----
+shard_samples must be a STRUCT
+
+# A label that is not a safe directory name.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {"a/b": ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+path separator
+
+# Path overrides cannot be combined (the layout generates every path).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, psam '__TEST_DIR__/x.psam', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+shard_samples cannot be combined with pvar/pgen/psam path overrides
+
+# A bare TINYINT[N] LIST carries no sample identity (the existing identity error).
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+needs sample identity
+
+# Sample-orient input (rows are samples, no variant columns): the existing missing-role error.
+statement error
+COPY (SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample'))
+TO '__TEST_DIR__/bad' (FORMAT pfile, samples ['SAMP1'], shard_samples {a: ['SAMP1']});
+----
+CHROM
+
+# Phased input stays rejected (hardcalls only).
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/phased_example', phased := true) ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, samples ['SAMPLE1', 'SAMPLE2', 'SAMPLE3', 'SAMPLE4'], shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+----
+PHASED
+
+# A label with a glob metacharacter (the reader treats a prefix as a pattern) — only letters,
+# digits, '_' and '-' are allowed (review finding: 'b[1]' / 'q?' wrote an unreadable cohort).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {"b[1]": ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+path-safe
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {"q?": ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+path-safe
+
+# The same IID twice in ONE group names that group once, not "more than one group".
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP1'], b: ['SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+twice in group 'a'
+
+# Resource guard: N writers are open AT ONCE, each reserving ~1.5 bytes x variant_count, plus 2
+# file handles. 250 one-sample groups at variant_count 2e9 reserve ~750 GB — more than any host —
+# so the COPY fails at BIND (before any file), naming the mitigations.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/bad' (FORMAT pfile, variant_count 2000000000, shard_samples {g0: ['per0'], g1: ['per1'], g2: ['per2'], g3: ['per3'], g4: ['per4'], g5: ['per5'], g6: ['per6'], g7: ['per7'], g8: ['per8'], g9: ['per9'], g10: ['per10'], g11: ['per11'], g12: ['per12'], g13: ['per13'], g14: ['per14'], g15: ['per15'], g16: ['per16'], g17: ['per17'], g18: ['per18'], g19: ['per19'], g20: ['per20'], g21: ['per21'], g22: ['per22'], g23: ['per23'], g24: ['per24'], g25: ['per25'], g26: ['per26'], g27: ['per27'], g28: ['per28'], g29: ['per29'], g30: ['per30'], g31: ['per31'], g32: ['per32'], g33: ['per33'], g34: ['per34'], g35: ['per35'], g36: ['per36'], g37: ['per37'], g38: ['per38'], g39: ['per39'], g40: ['per40'], g41: ['per41'], g42: ['per42'], g43: ['per43'], g44: ['per44'], g45: ['per45'], g46: ['per46'], g47: ['per47'], g48: ['per48'], g49: ['per49'], g50: ['per50'], g51: ['per51'], g52: ['per52'], g53: ['per53'], g54: ['per54'], g55: ['per55'], g56: ['per56'], g57: ['per57'], g58: ['per58'], g59: ['per59'], g60: ['per60'], g61: ['per61'], g62: ['per62'], g63: ['per63'], g64: ['per64'], g65: ['per65'], g66: ['per66'], g67: ['per67'], g68: ['per68'], g69: ['per69'], g70: ['per70'], g71: ['per71'], g72: ['per72'], g73: ['per73'], g74: ['per74'], g75: ['per75'], g76: ['per76'], g77: ['per77'], g78: ['per78'], g79: ['per79'], g80: ['per80'], g81: ['per81'], g82: ['per82'], g83: ['per83'], g84: ['per84'], g85: ['per85'], g86: ['per86'], g87: ['per87'], g88: ['per88'], g89: ['per89'], g90: ['per90'], g91: ['per91'], g92: ['per92'], g93: ['per93'], g94: ['per94'], g95: ['per95'], g96: ['per96'], g97: ['per97'], g98: ['per98'], g99: ['per99'], g100: ['per100'], g101: ['per101'], g102: ['per102'], g103: ['per103'], g104: ['per104'], g105: ['per105'], g106: ['per106'], g107: ['per107'], g108: ['per108'], g109: ['per109'], g110: ['per110'], g111: ['per111'], g112: ['per112'], g113: ['per113'], g114: ['per114'], g115: ['per115'], g116: ['per116'], g117: ['per117'], g118: ['per118'], g119: ['per119'], g120: ['per120'], g121: ['per121'], g122: ['per122'], g123: ['per123'], g124: ['per124'], g125: ['per125'], g126: ['per126'], g127: ['per127'], g128: ['per128'], g129: ['per129'], g130: ['per130'], g131: ['per131'], g132: ['per132'], g133: ['per133'], g134: ['per134'], g135: ['per135'], g136: ['per136'], g137: ['per137'], g138: ['per138'], g139: ['per139'], g140: ['per140'], g141: ['per141'], g142: ['per142'], g143: ['per143'], g144: ['per144'], g145: ['per145'], g146: ['per146'], g147: ['per147'], g148: ['per148'], g149: ['per149'], g150: ['per150'], g151: ['per151'], g152: ['per152'], g153: ['per153'], g154: ['per154'], g155: ['per155'], g156: ['per156'], g157: ['per157'], g158: ['per158'], g159: ['per159'], g160: ['per160'], g161: ['per161'], g162: ['per162'], g163: ['per163'], g164: ['per164'], g165: ['per165'], g166: ['per166'], g167: ['per167'], g168: ['per168'], g169: ['per169'], g170: ['per170'], g171: ['per171'], g172: ['per172'], g173: ['per173'], g174: ['per174'], g175: ['per175'], g176: ['per176'], g177: ['per177'], g178: ['per178'], g179: ['per179'], g180: ['per180'], g181: ['per181'], g182: ['per182'], g183: ['per183'], g184: ['per184'], g185: ['per185'], g186: ['per186'], g187: ['per187'], g188: ['per188'], g189: ['per189'], g190: ['per190'], g191: ['per191'], g192: ['per192'], g193: ['per193'], g194: ['per194'], g195: ['per195'], g196: ['per196'], g197: ['per197'], g198: ['per198'], g199: ['per199'], g200: ['per200'], g201: ['per201'], g202: ['per202'], g203: ['per203'], g204: ['per204'], g205: ['per205'], g206: ['per206'], g207: ['per207'], g208: ['per208'], g209: ['per209'], g210: ['per210'], g211: ['per211'], g212: ['per212'], g213: ['per213'], g214: ['per214'], g215: ['per215'], g216: ['per216'], g217: ['per217'], g218: ['per218'], g219: ['per219'], g220: ['per220'], g221: ['per221'], g222: ['per222'], g223: ['per223'], g224: ['per224'], g225: ['per225'], g226: ['per226'], g227: ['per227'], g228: ['per228'], g229: ['per229'], g230: ['per230'], g231: ['per231'], g232: ['per232'], g233: ['per233'], g234: ['per234'], g235: ['per235'], g236: ['per236'], g237: ['per237'], g238: ['per238'], g239: ['per239'], g240: ['per240'], g241: ['per241'], g242: ['per242'], g243: ['per243'], g244: ['per244'], g245: ['per245'], g246: ['per246'], g247: ['per247'], g248: ['per248'], g249: ['per249']});
+----
+fewer groups
+
+# None of the bind rejects wrote anything.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/bad*');
+----
+0
+
+# ===========================================================================
+# NEGATIVE — failures after files open: nothing is orphaned
+# ===========================================================================
+
+# An UPSTREAM error in the second chunk (row 2500 of 3000), after the first chunk has been written
+# to every shard: no catalog, no finals, no staging left behind. The error() is in a projection
+# OVER the sorted subquery, so it fires while rows stream into the sink — not during the sort.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500' THEN error('boom at var2500') ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '__TEST_DIR__/mid' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+boom at var2500
+
+query II
+SELECT (SELECT count(*) FROM glob('__TEST_DIR__/mid*')),
+       (SELECT count(*) FROM glob('__TEST_DIR__/mid/**'));
+----
+0	0
+
+# A sink-side error (an out-of-range call) mid-stream: same guarantee.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500' THEN struct_pack(SAMP1 := 7::TINYINT, SAMP2 := 0::TINYINT, SAMP3 := 0::TINYINT, SAMP4 := 0::TINYINT, SAMP5 := 0::TINYINT, SAMP6 := 0::TINYINT, SAMP7 := 0::TINYINT, SAMP8 := 0::TINYINT) ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '__TEST_DIR__/sinkerr' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+out of range
+
+query II
+SELECT (SELECT count(*) FROM glob('__TEST_DIR__/sinkerr*')),
+       (SELECT count(*) FROM glob('__TEST_DIR__/sinkerr/**'));
+----
+0	0
+
+# Zero rows: no shards to finish; nothing written.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE false)
+TO '__TEST_DIR__/zero' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+no rows
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/zero*');
+----
+0
+
+# The plain bundle and the variant shard_by path are untouched (covered in write_pfile.test /
+# write_pfile_sharded.test); here only confirm a plain bundle still writes after this file's COPYs.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/plain' (FORMAT pfile);
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/plain.*');
+----
+3
+
+# ===========================================================================
+# NEGATIVE — cleanup touches only what THIS COPY created (review findings)
+# ===========================================================================
+
+# Missing parent directories (np/deep/) are created for the target; a mid-stream failure removes
+# them again. Proof without a directory listing: '__TEST_DIR__/np' can then be written as a FILE.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500' THEN error('boom in np') ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '__TEST_DIR__/np/deep/out' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+boom in np
+
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/np' (FORMAT csv);
+
+# A pre-existing *.staging file this COPY never created survives a failed (zero-row) COPY.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/st' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+statement ok
+COPY (SELECT 'not ours' AS x) TO '__TEST_DIR__/st/a/data.psam.staging' (FORMAT csv);
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') WHERE false)
+TO '__TEST_DIR__/st' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+----
+no rows
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/st/a/data.psam.staging');
+----
+1
+
+# ... and the earlier, complete cohort is still intact and readable.
+query I
+SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/st.pfile.json');
+----
+2
+
+# ===========================================================================
+# OVERWRITE — a failure DURING promotion (a final path is blocked by a directory) must not leave the
+# OLD catalog describing a mix of new and old files: it is removed before the first promotion.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pr' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+# Block the final pr/c/data.pgen with a DIRECTORY (PER_THREAD_OUTPUT writes into a dir of that name).
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/pr/c' (FORMAT csv, PER_THREAD_OUTPUT);
+
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/pr/c/data.pgen' (FORMAT csv, PER_THREAD_OUTPUT);
+
+# The re-run promotes pr.pvar, the .psam files and a/data.pgen, then the c/data.pgen rename fails.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pr' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], c: ['SAMPLE3', 'SAMPLE4']});
+----
+rename
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/pr.pfile.json');
+----
+0
+
+# A re-run that fails BEFORE promotion (zero rows) keeps the old cohort and its catalog intact.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '__TEST_DIR__/pr2' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') WHERE false)
+TO '__TEST_DIR__/pr2' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+----
+no rows
+
+query I
+SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/pr2.pfile.json');
+----
+2
+

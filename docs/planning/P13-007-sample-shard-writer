@@ -1,0 +1,234 @@
+# P13-007: the sample-sharding writer
+
+**Goal.** Add `COPY (…) TO 'out' (FORMAT pfile, shard_samples …)` — a writer that
+splits one cohort along the **sample** axis into several filesets that share one
+`.pvar` (same variants, same order) and each carry their own `.psam` + `.pgen`,
+plus a `concat_dim: "samples"` catalog. This is the write-side mate of P13-008's
+`read_pfile(…, combine_samples := 'concatenate')` reader and the P13-005 ATTACH
+of a sample-sharded catalog.
+
+**Spec/parent:** P13 arc. Depends on nothing to BUILD (its tests use oracles
+that exist on `origin/main` today); its concatenated round-trip test and ATTACH
+test are added after P13-008 merges (§7). Writer file: `src/pfile_writer.cpp`.
+Collision-free with P13-008 (that branch touches `pfile_reader.cpp` only).
+
+---
+
+## STAR
+
+**Situation.** `plinking_duck` writes PLINK filesets from SQL with
+`COPY … (FORMAT pfile)`. It already shards along the **variant** axis
+(`shard_by '<col>'`): an ordered COPY rolls one `.pgen`/`.pvar` per contiguous
+key value, over **one shared `.psam`** (samples constant across variant-shards),
+and emits a `concat_dim: "variants"` catalog. There is **no** way to shard along
+the sample axis, so a sample-sharded cohort (same variants, disjoint samples)
+can only be built by hand — which is what P13-008's test fixtures do today.
+
+**Task.** Build the symmetric writer: split the sample axis into shards that
+share **one `.pvar`** and split the `.psam`/`.pgen`, and emit the
+`concat_dim: "samples"` catalog that P13-005 ATTACH and P13-008's reader consume.
+
+**Action.** This doc. It settles the one fork (how the split is specified),
+pins the catalog output to P13-008's tested fixture, specifies the N-open-writer
+engineering, and builds a test plan on today's oracles.
+
+**Result.** Built (2026-11-08), after P13-008 merged (#84), so the concatenated round-trip and
+the ATTACH test (§7 4–5) are live tests, not TODOs. Build-time deviations from this doc:
+- Per-shard `.psam` is `out/<label>/data.psam` (= `<prefix>.psam`), so the reader and ATTACH
+  discover it from the prefix; the catalog also records it per file.
+- Groups must be contiguous runs **in input order, and in struct order** (strict); a
+  within-group reorder is rejected too.
+- Files open lazily on the first row; cleanup removes staging and the directories this COPY
+  created, non-recursively (an empty directory only).
+- The `.pgen` row path is split into row guards (`PgenRowGenotypes`, once per row) and a range
+  packer (`PgenAppendCallRange`), so N shard writers do not repeat the row checks.
+
+---
+
+## 1. The inversion
+
+| | variant-shard (`shard_by`, shipped) | **sample-shard (`shard_samples`, this)** |
+|---|---|---|
+| rows of the input | variants | variants (unchanged) |
+| split axis | variants (rows) | **samples (genotype columns)** |
+| shared companion | one root `.psam` | **one root `.pvar`** |
+| per-shard files | `.pgen` + `.pvar` | **`.pgen` + `.psam`** |
+| `concat_dim` | `"variants"` | `"samples"` |
+| how rows map to shards | a row's key column value | **every row goes to every shard**, sliced to that shard's sample columns |
+
+The key engineering difference falls out of the last row: a variant-shard holds
+**one** open writer and rolls to the next on a key change; a sample-shard holds
+**N** writers open at once and feeds **every** variant row to all N, each taking
+its own sample slice (§6).
+
+## 2. Input contract
+
+- **Variant-orient input only.** Rows are variants; the genotypes column holds
+  all N samples. Reject sample-orient input with an error — this writer does
+  **no transpose** (`.pgen` is variant-major; a transpose is out of scope).
+- **Sample identity = the ordered IID list**, resolved exactly as the plain
+  bundle does (`ResolveIdentity`, `pfile_writer.cpp:1141`): STRUCT genotypes →
+  field names are the IIDs; else a `samples ['id1', …]` option; a bare
+  `TINYINT[N]` LIST is rejected (no identity). The split partitions **this
+  list**.
+- **The slice** must handle each genotype shape the bundle accepts: a STRUCT
+  column (slice = a contiguous subset of struct fields), and a LIST/`samples`
+  column (slice = a contiguous index range of the per-variant genotype vector).
+  Check `TryStructIidsFromSchema` / `ResolveIdentity` for the accepted set.
+- `shard_samples` present ⇒ sample-shard mode. `shard_by` present ⇒ variant
+  mode (shipped). **Both present ⇒ reject**, with an error naming the V2 grid
+  follow-on (§8). Neither ⇒ the plain single bundle.
+
+## 3. The catalog output — the merge contract
+
+Emit **exactly** the shape P13-008's reader is tested against
+(`test/data/pfile_catalog_le_samples.pfile.json` on `feature/P13-008-sample-concat`),
+not only the prose in `docs/formats/pfile_catalog.md`:
+
+```json
+{
+  "pfile_catalog": 1,
+  "dataset": "<name>",
+  "concat_dim": "samples",
+  "shared": { "pvar": "<shared>.pvar" },
+  "files": [
+    { "prefix": "<shard>", "psam": "<shard>.psam",
+      "partition": { "start": <lo>, "stop": <hi>, "source_ordinal": <i> } }
+  ]
+}
+```
+
+- `partition.start`/`stop` are **global sample-axis ordinals** (half-open:
+  shard i covers `[start, stop)`; the first shard starts at 0; `stop` of the
+  last = total sample count). Contiguous and gap-free, in file order.
+- `shared.pvar` is the one `.pvar` written once.
+- Each `files[i].psam` is that shard's own `.psam` (its IID slice).
+- `.pgen` is implied by `prefix` (the per-shard `.pgen`), as in the v1 variant
+  catalog.
+
+**Open sub-question (settle against the fixture at build, not now):** whether
+`files[i]` also carries an explicit `pvar` omission vs. relying on `shared`.
+The fixture omits per-file `pvar`; match it. Verify field-for-field with
+`git show feature/P13-008-sample-concat:test/data/pfile_catalog_le_samples.pfile.json`
+as the first build step.
+
+## 4. THE SPLIT SPEC — DECIDED: C, named IID groups (Teague, 2026-11-08)
+
+> **Decision.** `shard_samples {label: ['iid', …], …}` — a map of shard label →
+> IID list. The key is the shard's directory/prefix label (mirroring the variant
+> sharder's `<col>=<value>` hive dirs). The IID lists must partition the input
+> sample set **exactly** (every IID once, none missing/extra) and each must be a
+> **contiguous run** of the input sample order; a gap, overlap, reorder, or
+> missing/extra IID is a clean BinderException. The recommendation below stands
+> as the rationale.
+
+There is **no sample attribute** to shard *by*: the `.psam` is IID-only today
+(`sample_fields {sex,…}` is an explicit "not yet supported" error). So the split
+is an **explicit, contiguous partition of the ordered IID list**. Three
+candidates, separated by three constraints — a per-shard **directory/prefix
+label**, **self-checking** against the IIDs, and **contiguity** (the catalog's
+partition ranges are global ordinals; a non-contiguous group would reorder the
+output samples and break the round-trip):
+
+| option | form | label | self-check | verdict |
+|---|---|---|---|---|
+| **A. sizes** | `shard_samples [1, 2, 5]` | invented (`shard0…`) | none (a size list can't catch an off-by-one vs. the IIDs) | weakest |
+| **B. IID groups** | `shard_samples [['s1'], ['s2','s3'], …]` | invented | **exact** (must partition the IID set) | ok, no labels |
+| **C. named IID groups** (recommend) | `shard_samples {a: ['s1'], b: ['s2','s3'], c: […]}` | **the key** (`<label>=`-style, like the hive variant dirs) | **exact** | best |
+
+**Recommendation: C** — named IID groups. It gives real directory/prefix labels
+(mirroring the variant sharder's `<col>=<value>` hive dirs), partitions the IID
+set exactly (self-checking against `ResolveIdentity`'s list), and the writer
+enforces contiguity (each group's IIDs must be a contiguous run in the input
+order; else a clear error). **Default if unspecified:** none — `shard_samples`
+has no safe default split, so it is required when sample-shard mode is entered
+(exactly as `shard_by` names its column).
+
+## 5. Non-goals
+
+- No transpose; no sample-orient input.
+- No `sample_fields` metadata in the per-shard `.psam` (still IID-only; the
+  "not yet supported" error stands). Attribute-driven sharding waits on that.
+- No V2 grid (both axes at once) — §8, the next pencil-in.
+- `union`/`intersect` are a reader concern, not here.
+
+## 6. The engineering — N writers open at once
+
+`PfileWriteGlobalState` today stages **one** fileset (one `PvarWriteGlobalState`
++ one `PgenWriteGlobalState` + one `.psam`), promotes with `.pgen` last, and
+cleans that one on failure. Sample-shard mode needs **N `.pgen` writers + N
+staging `.psam` + one shared `.pvar`**, all open across the whole row stream.
+Specify:
+
+- **State.** A vector of N per-shard sink states (each a staging `.pgen` +
+  staging `.psam` + the sample-column index range), plus one staging `.pvar`
+  (written from the row stream once, not per shard) and the catalog path.
+- **Sink.** For each input chunk, write the variant row to the shared `.pvar`
+  once, then to each shard's `.pgen` the genotype sub-vector for that shard's
+  sample range. (The `.psam` files are out-of-band from the IID slices, written
+  at init like the plain bundle.)
+- **Promote order.** All staging promoted only on full success:
+  `.pvar` → every shard's `.psam` → every shard's `.pgen` (**each `.pgen`
+  last within its shard**, matching the shipped single-shard ordering) → the
+  `.pfile.json` catalog **last of all** (so a half-written cohort has no
+  catalog → ATTACH/`read_pfile_catalog` sees "not there", never half-new).
+- **Cleanup.** The destructor and the finalize-failure path remove **all N**
+  shards' staging (`.pgen`/`.pgen.tmp`/`.psam`) + the shared `.pvar` staging +
+  the catalog staging. Extend the existing `CleanupPartial` to loop N.
+- **Memory.** N open `STPgenWriter`s is N× the single-writer footprint and 2N file
+  handles. This is NOT like the variant sharder, which rolls ONE writer at a time
+  (1× footprint). Each writer reserves ~1.5 bytes × `variant_count` (~25 MB at 2^24).
+  Built (2026-11-08, peer review relaying Teague's decision): documented, plus a
+  conservative bind-time guard that rejects an N exceeding the open-file limit or the
+  host's memory, naming `variant_count` / fewer groups.
+
+## 7. Test plan
+
+**Golden rule:** a new `.test` file (`test/sql/write_pfile_sample_shard.test`),
+not the shared `attach_pfile_catalog_kinds.test` (P13-008 already edits that).
+
+**Independent of P13-008 (build these now):**
+1. **Per-shard round-trip.** `COPY … (FORMAT pfile, shard_samples {…})`, then for
+   each shard: `read_pfile('<shard>', pvar := '<shared>.pvar')` equals the source
+   projected to that shard's IIDs (via `genotypes := 'struct'` + struct-field
+   slice). `pvar :=` is accepted on a single file (reject is multi-file-only,
+   `pfile_reader.cpp:1066`), and is **required** here — a shard has no own `.pvar`.
+2. **Catalog shape.** `read_pfile_catalog_layout` / `_metadata` over the emitted
+   `.pfile.json`: `concat_dim = 'samples'`, one `shared.pvar`, N files, partition
+   ranges contiguous `[0 … total)`, sample counts matching the group sizes.
+3. **Error paths.** sample-orient input rejected; `shard_by` + `shard_samples`
+   rejected (names the V2 follow-on); a non-contiguous or non-partitioning IID
+   group rejected; a bare LIST (no identity) rejected.
+
+**Deferred to a rebase step after P13-008 merges (write as a TODO in the test):**
+4. **Concatenated round-trip.** `read_pfile([all shards], combine_samples :=
+   'concatenate')` equals the source. (Throws on `origin/main` today.)
+5. **ATTACH.** `ATTACH '<cohort>.pfile.json' … (TYPE pfile_catalog)` of the
+   sample-sharded catalog. (Rejected on `origin/main` today; P13-008 lifts the
+   reject — **do not lift it here**, P13-008 owns that edit.)
+
+## 8. V2 compatibility (the next pencil-in)
+
+Shape the fan-out so the V2 grid (variants × samples) is **the variant roll
+composed with a sample fan-out inside each variant shard**: the sample fan-out
+state of §6 becomes the inner loop of the existing variant roll. Keeping
+`shard_by` + `shard_samples` mutually exclusive in v1 (with an error naming the
+follow-on) reserves the combined syntax for V2 without committing to it now.
+
+## 9. Phasing
+
+1. Verify the catalog shape field-for-field against P13-008's fixture (§3).
+2. Settle §4 (Teague).
+3. Build test-first (§7 1–3), then the writer (§2, §6), then catalog emission (§3).
+4. Fresh whole-branch review, PR.
+5. After P13-008 merges: rebase, add §7 4–5.
+
+## 10. Risks
+
+- **The N-writer staging/cleanup is the real risk** — a mid-stream failure must
+  orphan nothing across N shards. Every error path gets a test.
+- **Catalog drift from P13-008.** Mitigated by pinning to the tested fixture
+  (§3), not the prose format doc, and verifying first.
+- **Contiguity vs. input order.** If the IID groups are not contiguous runs of
+  the input sample order, either reject (recommended) or the catalog's global
+  ordinals would misdescribe the output. Reject keeps the round-trip exact.
