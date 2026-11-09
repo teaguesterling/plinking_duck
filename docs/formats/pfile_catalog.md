@@ -183,12 +183,13 @@ extent of each shard). A genomic `range` prunes nothing on this axis — the var
 are identical across sample-shards — so sample-shards prune on `sample_index` via
 `partition` instead, and typically carry no `range`.
 
-!!! note "PlinkingDuck's writer emits variant-shards only"
+!!! note "Which form each writer emits"
 
-    The sharded `COPY … shard_by` writer produces the **variant-sharded** form
-    (a shared `.psam`, `concat_dim: "variants"`). The sample-sharded form is a valid
-    catalog that `read_pfile_catalog` reads, but writing it is a separate
-    follow-on.
+    `COPY … shard_by` produces the **variant-sharded** form (a shared `.psam`,
+    `concat_dim: "variants"`). `COPY … shard_samples` produces the **sample-sharded**
+    form (a shared `.pvar`, `concat_dim: "samples"`). Both ship. Giving both options
+    at once writes a [version-2 matrix](#version-2-the-matrix-form) instead. See
+    [Writing filesets](../functions/write_pfile.md).
 
 ### Example — a single fileset (`cohort.pfile.json`)
 
@@ -736,8 +737,12 @@ verifies every present cell first. Holes are never verified. See
   set yet.
 - **No analysis over the grid.** The `plink_*` analysis functions do not take a matrix
   catalog.
-- **No writer.** The sharded `COPY … shard_by` writer emits version 1 only. A matrix
-  catalog is written by hand or by other tooling.
+- **The writer emits the common grid, not every form.** `COPY … (FORMAT pfile,
+  shard_by '<vcol>', shard_samples {…})` writes a version-2 matrix — see
+  [Matrix output](../functions/write_pfile.md#matrix-output-shard_by--shard_samples).
+  It emits two variant keys (`CHROM` plus a `CHUNK` `ordinal_interval` over `POS`) and
+  one sample `enum`. A richer axis — a `value_bin`, extra sample keys, or `holes` — is
+  still written by hand or by other tooling, in the shapes on this page.
 - **Two axes only.** The format names `variants` and `samples`. Other axes are not
   supported.
 - **`region` needs a `CHROM` key.** `region` matches its contig against a variants-axis
@@ -749,6 +754,6 @@ verifies every present cell first. Holes are never verified. See
 - [`read_pfile_catalog`](../functions/read_pfile_catalog.md) — read, verify, and prune a catalog in SQL
 - [`read_pfile_catalog_metadata`](../functions/read_pfile_catalog_metadata.md) — the catalog's literal declared schema
 - [`read_pfile_catalog_layout`](../functions/read_pfile_catalog_layout.md) — the catalog's interpreted chunk map (holes included, no file I/O)
-- [Writing filesets (`COPY … TO`)](../functions/write_pfile.md#sharded-output-shard_by) — emit a catalog with the sharded writer
+- [Writing filesets (`COPY … TO`)](../functions/write_pfile.md) — emit a v1 catalog ([`shard_by`](../functions/write_pfile.md#sharded-output-shard_by) or [`shard_samples`](../functions/write_pfile.md#sample-sharded-output-shard_samples)) or a [v2 matrix](../functions/write_pfile.md#matrix-output-shard_by--shard_samples)
 - [`read_pfile`](../functions/read_pfile.md) — read a single fileset (how a surviving shard is scanned)
 - [File Formats](../file-formats.md) — the underlying `.pgen` / `.pvar` / `.psam` fileset

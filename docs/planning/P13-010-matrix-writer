@@ -28,7 +28,13 @@ variant sharder's roll (one variant-block at a time) and replace its single `.pg
 P13-007's N sample-shard writers. It settles the one fork (variant-axis key richness) with the v2
 prune path measured, and reuses P13-007's resource guard, cleanup guarantee, and identity handling.
 
-**Result.** Nothing built. Design for review.
+**Result.** Built and merged in v0.16.0 (PR #89, 2026-11-09); the templated-companion
+read fix followed in #90. The writer emits the compound-key variant axis (fork B:
+`CHROM` enum + `CHUNK` `ordinal_interval` over `POS`) this doc decided. One reader gap
+remains: `c.genotypes_by_sample` over a writer matrix needs the 2-D read (P13-006); the
+variant-oriented `c.genotypes`, the structural relations, and `read_pfile_catalog` are
+correct. See `test/sql/write_pfile_matrix.test` (the contract) and
+`docs/functions/write_pfile.md#matrix-output-shard_by--shard_samples` (the user doc).
 
 ---
 
