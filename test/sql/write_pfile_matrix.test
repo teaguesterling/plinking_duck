@@ -75,6 +75,14 @@ TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'c{x}', shard_samples {a: ['SAMP1', 
 ----
 brace
 
+# The COPY target's basename is also a template literal (the grid root): a brace there would write a
+# catalog the reader cannot parse, so it is rejected at bind too.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad}x' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+brace
+
 # None of the bind rejects wrote anything.
 query I
 SELECT count(*) FROM glob('{TEST_DIR}/bad*');
@@ -249,10 +257,12 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '3:
 # ---------------------------------------------------------------------------
 # GRID ROUND TRIP — every (variant, IID, call) of the M x N cells equals the source, both directions.
 # Each cell is read through the templated companions (its block's .pvar + its sample-block's .psam).
-# NOTE: ATTACH's v2 genotype relations (m.genotypes / m.genotypes_by_sample) are NOT asserted here:
-# they read read_pfile([every cell prefix]) — a variant-axis concat with co-located companions — which
-# cannot assemble a grid with more than one sample-block. That is a pre-existing reader gap (see the
-# P13-010 PR); the writer's output is verified by verify_all + this oracle instead.
+# NOTE: ATTACH's v2 genotype relations (m.genotypes / m.genotypes_by_sample) are NOT asserted here.
+# They read read_pfile([every cell prefix]) with no pvar/psam overrides, so they (1) need a .pvar
+# co-located with each cell's .pgen — this layout shares one .pvar per variant-block, so they error for
+# EVERY matrix written here, N=1 included — and (2) concatenate along the variant axis, which cannot
+# assemble more than one sample-block. A pre-existing reader gap (see the P13-010 PR); the writer's
+# output is verified by verify_all + this oracle instead.
 # ---------------------------------------------------------------------------
 
 query III
@@ -379,6 +389,44 @@ SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM re
        (SELECT count(*) FROM read_pfile('{TEST_DIR}/n1/CHROM=2/GROUP=every/data', pvar := '{TEST_DIR}/n1/CHROM=2/variants.pvar', psam := '{TEST_DIR}/n1/GROUP=every/samples.psam'));
 ----
 0	1
+
+# Both edges are VALID matrices: every cell verifies.
+query II
+SELECT (SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/m1.pfile.json', verify_all := true)),
+       (SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', verify_all := true));
+----
+2	2
+
+# PER-BLOCK POS bounds (large_example's CHROMs all share one extent, so this grid is the discriminating
+# one): CHROM 1 spans [10000, 30000], CHROM 2 is the single POS 15000.
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('{TEST_DIR}/n1.pfile.json'))
+WHERE contains(c, '{ "keys": { "CHROM": "1", "CHUNK": "0" }, "start": 0, "stop": 3, "bounds": { "CHUNK": { "min": 10000, "max": 30000 } } }')
+  AND contains(c, '{ "keys": { "CHROM": "2", "CHUNK": "0" }, "start": 3, "stop": 4, "bounds": { "CHUNK": { "min": 15000, "max": 15000 } } }');
+----
+1
+
+# A window inside CHROM 1's extent but below CHROM 2's single POS: CHROM 2 drops, CHROM 1 keeps.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '2:10000-14999');
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '1:10000-14999');
+----
+1
+
+# CHROM 1's exact max keeps it; one past drops it.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '1:30000-30000');
+----
+1
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '1:30001-40000');
+----
+0
 
 # ===========================================================================
 # NEGATIVE — failures after files open: nothing is orphaned across the whole grid

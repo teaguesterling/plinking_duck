@@ -2818,6 +2818,14 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		CheckSampleShardResources(bind->shard_labels.size(), bind->pgen_bind->variant_ct_limit);
 		if (bind->matrix_mode) {
 			bind->sample_shard_mode = false; // the matrix owns dispatch, not the single-axis sample path
+			// The target basename is the grid root, a literal in every catalog template: a brace there
+			// would open/close a placeholder and make the catalog unparseable.
+			if (PfileBaseName(PfilePrefix(input.info.file_path)).find_first_of("{}") != string::npos) {
+				throw BinderException(
+				    "write pfile: shard_by + shard_samples target '%s' — the name contains a brace "
+				    "('{' or '}'), which the matrix catalog template cannot carry. Rename the target.",
+				    input.info.file_path);
+			}
 		}
 		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
 			throw BinderException("write pfile: shard_samples target '%s' has no filename component for the shard "

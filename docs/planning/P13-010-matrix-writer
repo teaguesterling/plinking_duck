@@ -170,3 +170,20 @@ genomic contig). **Default if unspecified: B.**
   only the prose format doc.
 - **Fork-B bounds correctness** — the per-block POS `{min,max}` must be inclusive and exact (the
   reader prunes on them); reuse the roller's `pos_min/pos_max` and test a POS-window prune.
+
+---
+
+## As built (P13-010 build, 2026-11-09)
+
+- **Layout uses hive labels**, not bare values, so a CHROM dir cannot alias a label dir (CHROM `X` vs
+  label `X`). The catalog templates are the contract:
+  `out/<vcol>=<v>/variants.pvar` (M), `out/GROUP=<label>/samples.psam` (N),
+  `out/<vcol>=<v>/GROUP=<label>/data.pgen` (M·N).
+- **CHUNK = `"0"`** per block (one chunk per `<vcol>` value); CHUNK is not in the paths.
+- **Reserved names:** `shard_by` GROUP / CHUNK (case-insensitive) is rejected; a `{`/`}` in the
+  `shard_by` column name or the target basename is rejected (both are template literals).
+- **§6 ATTACH round-trip not asserted for genotypes.** ATTACH's v2 `genotypes` bakes
+  `read_pfile([every cell])` with no per-cell `pvar`, so it cannot read this layout (the v2 template
+  allows only one shared `.pvar` per variant-block); `genotypes_by_sample` additionally stacks
+  sample-blocks. Reader-side follow-on (resolve the templates per cell). The writer is verified by
+  `verify_all` + a genotype-orient oracle over all M·N cells.
