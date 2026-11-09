@@ -156,6 +156,34 @@ static string GenotypesSql(const vector<string> &prefixes, const string &shared_
 	return sql;
 }
 
+//! c.genotypes for a v2 MATRIX: the documented per-cell fan-out (one row per variant x sample
+//! block), read one cell at a time with the cell's TEMPLATE-resolved companions. The v2 template
+//! names one .pvar per variant block and one .psam per sample block, so a cell has no sibling
+//! .pvar of its own; a list read of the bare cell prefixes cannot discover them. Each cell is read
+//! with read_pfile's own genotype mode ('auto' = a fixed ARRAY for the cell's sample count). When
+//! the sample blocks differ in width, those ARRAYs differ in size and cannot union, so every cell is
+//! read with genotypes := 'list' — read_pfile's ARRAY-or-LIST rule, lifted to the grid.
+static string MatrixGenotypesSql(const vector<MatrixCell> &cells) {
+	bool uniform = true;
+	for (auto &c : cells) {
+		if (c.sample_stop - c.sample_start != cells[0].sample_stop - cells[0].sample_start) {
+			uniform = false;
+			break;
+		}
+	}
+	string sql;
+	for (idx_t i = 0; i < cells.size(); i++) {
+		sql += (i ? " UNION ALL " : "");
+		sql += "SELECT * FROM read_pfile(" + SQLString::ToString(cells[i].prefix) +
+		       ", pvar := " + SQLString::ToString(cells[i].pvar) + ", psam := " + SQLString::ToString(cells[i].psam);
+		if (!uniform) {
+			sql += ", genotypes := 'list'";
+		}
+		sql += ")";
+	}
+	return sql;
+}
+
 static string ReadWholeFile(FileSystem &fs, const string &path) {
 	string content;
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
@@ -204,8 +232,9 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	string variant_blocks_sql;
 	string sample_blocks_sql;
 	string cells_sql;
-	bool sample_concat = false; // a v1 concat_dim='samples' catalog
-	bool is_matrix = false;     // a v2 matrix catalog
+	bool sample_concat = false;      // a v1 concat_dim='samples' catalog
+	bool is_matrix = false;          // a v2 matrix catalog
+	vector<MatrixCell> matrix_cells; // its present cells, template-resolved (is_matrix only)
 
 	auto take_cell = [&](const string &prefix, const string &pvar, const string &psam) {
 		// pvar_paths/psam_paths feed c.variants (read_pvar) and c.samples (read_psam), which need an
@@ -236,6 +265,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 			for (auto &cell : BuildCells(matrix, fs, /*include_holes=*/false)) {
 				if (cell.present) {
 					take_cell(cell.prefix, cell.pvar, cell.psam);
+					matrix_cells.push_back(cell);
 				}
 			}
 			variant_blocks_sql = BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop");
@@ -269,8 +299,12 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// beside shared.pvar), so pvar_paths holds exactly that path.
 	string shared_pvar = (sample_concat && pvar_paths.size() == 1) ? pvar_paths[0] : "";
 	vector<std::pair<Identifier, string>> views;
-	views.emplace_back(Identifier("genotypes"),
-	                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false));
+	if (is_matrix) {
+		views.emplace_back(Identifier("genotypes"), MatrixGenotypesSql(matrix_cells));
+	} else {
+		views.emplace_back(Identifier("genotypes"),
+		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false));
+	}
 	// A matrix whose present cells span MORE THAN ONE sample block needs a 2-D read for the
 	// SAMPLE-oriented view. read_pfile combines one axis per call, so a sample-oriented read of
 	// every cell takes the samples from one block and concatenates every cell's genotypes under
