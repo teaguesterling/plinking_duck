@@ -17,6 +17,9 @@ writer path is now **P13-007** (penciled, separate).
       `pushdown_complex_filter` (so cell-skip reflects the `WHERE`, not just explicit params) (§4)
 - [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing`/`hardy` count kernels (§5)
 - [ ] Implementation plan + build + review
+- [x] Refresh against current `read_pfile` (post #84/#85/#86), 2026-11-09 — §10. It changes the
+      §4 spike (the hook runs AFTER bind), adds a prerequisite (§10.2, a 2-D read), and puts a new
+      owner fork: §10.4, **(i) lazy bind** vs **(ii) catalog-at-bind**.
 
 ## The gap
 
@@ -194,3 +197,118 @@ breaks.
   truly hold no matching row.
 - The v2.0 pushdown re-measure (P13-001's facts were on v1.5.x) is owed before trusting the
   min/max vs LIST rule.
+
+## 10. Refresh (2026-11-09): read against the current `read_pfile`
+
+Written by the session that owns `read_pfile`'s bind (P13-008 #84, P13-009 #86, P13-007 #85), at the
+request of the homelab session. Every fact below is from `main` @ 576034b unless it says
+"inferred". The original §1–§9 stay as written; this section corrects them where they disagree.
+
+### 10.1 Measured facts the cascade must build on
+
+1. **The per-cell cost is at BIND, not at scan.** `PfileBind`'s source loop calls `LoadPfileSource`
+   for every source: the `.pgen` header plus the FULL `.pvar` (a parquet `.pvar` is region-pushed
+   only when `region :=` is a param). A 10 000-cell list loads 10 000 `.pvar` files before any
+   filter is seen.
+2. **The scan already skips a source that pruning empties.** `PfileInitGlobal` builds batches from
+   `ScanCount`, the pruned per-source count, so a source pruned to zero gets no batch and is never
+   opened. The exception is source 0: `PfileInitLocal` opens it on every thread. So §9's "Layer 1 opens
+   every cell" is true at bind and false at scan.
+3. **`pushdown_complex_filter` runs after bind.** DuckDB `d54cbbe`,
+   `src/optimizer/pushdown/pushdown_get.cpp:134`: the optimizer calls
+   `pushdown_complex_filter(context, get, get.bind_data.get(), expressions)` on the bound
+   `LogicalGet`. The hook may mutate `bind_data`, but it cannot undo fact 1. The expressions it
+   leaves in place are regenerated and then become the `TableFilterSet`
+   (`pushdown_get.cpp:139-152`). So the hook can prune cells and still leave every filter in
+   place, which keeps the residual applicator correct.
+4. **The hook gets bound `Expression`s, not a `TableFilterSet`.** The existing recognizers
+   (`BuildPrunePlan`, `PruneCollect*`) do not apply there. A second extractor must walk the
+   `Expression` trees and fill the same `PfilePrunePlan`.
+5. **The output schema is fixed at bind from the cohort SHAPE.** After bind, the hook may only drop
+   cells along an axis that maps to ROWS:
+
+| orient | the schema depends on | variant cells droppable after bind? | sample cells droppable after bind? |
+|---|---|---|---|
+| `variant` | sample count (`ARRAY(OutputSampleCt)`), and IIDs for `columns` / `struct` | yes (rows) | **no** |
+| `genotype` | `.psam` columns only | yes (rows) | yes (rows) |
+| `sample` | variant count (`ARRAY(effective variants)`), and variant IDs for `columns` / `struct` | **no** | yes (rows) |
+
+   This is the restriction `BuildPrunePlan` already has (variant / genotype orient only), extended
+   to the sample axis.
+6. **In concat mode, a sample shard with no selected sample is never opened.**
+   `ConcatPgenReader::Open` skips members with `out_ct == 0`. So in genotype / sample orient,
+   narrowing `sample_indices` after bind already skips whole sample shards' `.pgen` I/O. Each
+   shard's `.psam` is still parsed at bind.
+
+### 10.2 A prerequisite: `read_pfile` cannot read a 2-D grid, and one ATTACH view was wrong
+
+`read_pfile` combines ONE axis per call: a variant-sharded list (implicit / identical) or a
+sample-sharded list (concatenate / disjoint). A matrix catalog with more than one sample block needs
+both at once. ATTACH bakes both genotype views as `read_pfile([every cell])` in the default
+implicit mode.
+
+**Measured on `main` (2026-11-09)**, with the 2×2 fixture of `test/sql/attach_pfile_catalog.test`.
+CHROM {1, 2} × GROUP {A, B}, built from `pfile_example`. The truth is 4 variants × 4 samples:
+
+| relation | `main` returns | verdict |
+|---|---|---|
+| `c.genotypes` | 8 rows: one per variant × sample block, each with that block's 2 samples | **correct as documented** (the per-cell fan-out in `docs/formats/pfile_catalog.md`), but no column names the block |
+| `c.genotypes_by_sample` | 2 rows (S1, S2), each with 8 calls; S1's row includes S3's calls from block B | **silently wrong** |
+| `c.samples` | 4 | correct |
+
+A first draft of this section called `c.genotypes` wrong too. That was my error: it matches the
+documented fan-out. The interim fix (`fix/attach-matrix-genotypes`) therefore guards only
+`c.genotypes_by_sample`: on a matrix with more than one sample block, it errors. The P13-010 matrix
+writer will produce exactly these grids, so the exposure grows.
+
+So a `catalog :=` input over a matrix needs a **2-D read** first. The natural shape on today's bind:
+each variant source carries the shared sample split (`sample_shards`) and reads its cells through a
+`ConcatPgenReader`. A matrix declares one sample-block axis for every variant block, so one split
+serves every source. A matrix may have HOLES (absent cells; `BuildCells(…, include_holes)`), and
+the 2-D read must decide what a hole means for its rows (an error, or missing calls) — an open
+design point. With the 2-D read, `c.genotypes` can also return one row per variant across all
+sample blocks, in place of the fan-out.
+
+### 10.3 Corrections to the original text
+
+- **§5 contradicts §3.** §3 recommends **B** (a `catalog :=` input on the existing readers). §5 ends
+  "both require A1 = the new function", which is option **A**. B is the live recommendation: the
+  readers keep projection pushdown, so the decode-free count path is reachable through B too. §5's
+  closing sentence is stale.
+- **§4 "the compat-planner shims already handle `TableFilterSet`"** is true for `filter_pushdown`,
+  but the hook §4 proposes receives `Expression`s (fact 4).
+- **§9 Layer 1 is not "row-group skip" for `read_pfile`.** It is variant-set pruning
+  (`BuildPrunePlan`), plus "a source pruned to zero is never opened at scan" (fact 2). The parquet
+  row-group wording fits `read_pvar` / `read_psam` / parquet companions.
+
+### 10.4 Owner decision (new): where cell-skip happens
+
+The hook runs after bind (fact 3), and bind loads every cell (fact 1). So "skip a cell" must mean
+"bind never loaded it", and that needs bind to know the cells without opening them. The catalog
+holds that knowledge: per-cell partitions (the variant and sample ordinal ranges), and in a v1 catalog
+the `range` block (CHROM, POS min/max). Two ways to use it:
+
+| | **(i) lazy bind + the hook** | **(ii) catalog-at-bind** |
+|---|---|---|
+| What bind does | Reads the catalog. Takes the schema from the catalog (sample count from the sample blocks; variant count from the partitions, for sample orient). Defers each cell's `.pvar` load to InitGlobal. | Reads the catalog, applies the EXPLICIT params (`region :=`, `samples :=`, `keys :=`) to the cell table, and runs `LoadPfileSource` only for surviving cells. |
+| Skips from a `WHERE` | yes: the hook drops cells from the extracted constraints, on the axes fact 5 allows; InitGlobal loads only survivors | **no**: a `WHERE` is not visible at bind |
+| Skips through ATTACH views | yes (the view's `WHERE` reaches the hook) | only if the view itself passes params, which a static view cannot |
+| New code | catalog input; catalog-derived schema; lazy `.pvar` load; Expression extractor; hook | catalog input; cell filter from params; bind loop over survivors |
+| Risk | The hook mutating `bind_data` after bind is new for this reader. Bind's schema must come from the catalog and agree with the data. `read_pfile_catalog` already rejects a partition width that disagrees with its `.psam` (fixture `pfile_catalog_width_mismatch.pfile.json`); the lazy `.pvar` load needs the same check for variant counts. | Low. It is today's bind with a shorter source list. |
+
+**Recommendation: (i), staged so its first stage IS (ii).**
+
+1. The 2-D read (§10.2). It lifts the interim `c.genotypes_by_sample` guard and can replace the
+   `c.genotypes` fan-out with one row per variant.
+2. `catalog :=` on `read_pfile`: cells from the catalog, explicit params prune at bind, and only
+   surviving cells' `.pvar` files load. This is (ii) on its own, and it is useful immediately
+   (`read_pfile(catalog := …, region := …)`).
+3. A catalog-derived schema, and the `.pvar` load moved to InitGlobal.
+4. The `pushdown_complex_filter` hook plus the Expression extractor, so a `WHERE`, including one
+   through an ATTACH view, drops cells on the axes fact 5 allows. Conservative keep for anything
+   untranslatable. Every filter stays in place for the residual applicator.
+
+Only stage 4 delivers the doc's headline (a `WHERE` on `c.genotypes` skips cells). Stages 1–3 are
+each correct and shippable alone. If the owner wants the smallest path, stop after stage 2: that is
+(ii).
+
