@@ -1,0 +1,172 @@
+# P13-010: the V2 matrix writer (variants × samples grid)
+
+**Goal.** `COPY (…) TO 'out' (FORMAT pfile, shard_by '<vcol>', shard_samples {label:[iids],…})` —
+shard BOTH axes at once into a `pfile_catalog: 2` matrix: a grid of `.pgen` cells, M variant-blocks ×
+N sample-blocks, M `.pvar` + N `.psam` + M·N `.pgen`. Lifts the P13-007 reject
+(`pfile_writer.cpp:2368`, "shard_by and shard_samples cannot be combined").
+
+**Spec/parent:** P13 arc. Builds directly on P13-007 (sample fan-out, merged #85) and the shipped
+variant sharder (`shard_by`). Depends on nothing new to build. Writer file: `src/pfile_writer.cpp`.
+The v2 matrix catalog it emits is consumed by the existing reader (`pfile_catalog_matrix.{hpp,cpp}`,
+`ParseMatrixCatalog`/`BuildCells`) and ATTACH (P13-003).
+
+---
+
+## STAR
+
+**Situation.** `plinking_duck`'s `COPY … (FORMAT pfile)` can shard one cohort along ONE axis:
+`shard_by '<col>'` (variants → `concat_dim:"variants"`, shipped) or `shard_samples {…}` (samples →
+`concat_dim:"samples"`, P13-007/#85). The two are mutually exclusive today, and the combined call is
+rejected with "the variants × samples grid is a planned follow-on."
+
+**Task.** Build that follow-on: shard both axes at once into the v2 **matrix** catalog the reader
+already parses (`pfile_catalog: 2`, two axes, a grid of cells). This closes the pfile_catalog
+format's write side — the reader has had v2 since P13 (matrix PR #76); nothing writes it.
+
+**Action.** This design. The grid is the **variant roll composed with the sample fan-out**: reuse the
+variant sharder's roll (one variant-block at a time) and replace its single `.pgen` writer with
+P13-007's N sample-shard writers. It settles the one fork (variant-axis key richness) with the v2
+prune path measured, and reuses P13-007's resource guard, cleanup guarantee, and identity handling.
+
+**Result.** Nothing built. Design for review.
+
+---
+
+## 1. The composition — variant roll ∘ sample fan-out
+
+Two shipped mechanisms compose exactly:
+
+- **Variant roll** (`shard_by`, `PfileSharded*`): input is `ORDER BY <vcol>, POS`; on each `<vcol>`
+  transition the roller finalizes the current variant-block's `.pgen`+`.pvar` and opens the next. ONE
+  writer open at a time → 1× footprint.
+- **Sample fan-out** (`shard_samples`, P13-007 `PfileSampleSharded*`): every variant row goes to N
+  `.pgen` writers, each taking its sample slice `[lo,hi)`; N writers open at once.
+
+**The grid = the roll with the fan-out inside each variant-block.** At any moment: **N** `.pgen`
+writers (one per sample-block) + 1 `.pvar`, all for the CURRENT variant-block. On a `<vcol>`
+transition, finalize those N `.pgen` + the 1 `.pvar`, open the next block's N+1. The N `.psam` are
+constant across variant-blocks (the sample split does not change), so they are written ONCE.
+
+| | per variant-block | total grid |
+|---|---|---|
+| `.pvar` | 1 | **M** (one per variant-block) |
+| `.psam` | shared | **N** (one per sample-block, written once) |
+| `.pgen` | N (the fan-out) | **M·N** (one per cell) |
+| writers open at once | — | **N** (the sample dimension) |
+
+**Resource footprint = N**, not M·N — so P13-007's `CheckSampleShardResources` guard applies
+unchanged (check it against N, with M·N only affecting fd count at promote, not concurrently).
+
+## 2. The v2 catalog it emits — the merge contract
+
+A `pfile_catalog: 2` matrix the reader parses (`pfile_catalog_matrix.cpp`). Two axes:
+
+- **variants axis** — keyed by the `shard_by` column. See §4 for the key-richness fork. M blocks,
+  one per contiguous `<vcol>` value.
+- **samples axis** — ONE `enum` key (the `shard_samples` labels). N blocks, one per label.
+- **templates** — `template.pfile` (uses ≥1 key of EACH axis), `template.pvar` (variants keys only),
+  `template.psam` (samples keys only), each with `{KEY}` placeholders the reader resolves per cell.
+- **dense — NO `holes`.** Every variant row reaches every sample-block, so every (variant-block,
+  sample-block) cell has data. The grid is complete; the writer emits no `holes` array.
+
+**Layout** (satisfies the template rules — pvar uses only a variant key, psam only a sample key):
+```
+out.pfile.json                    — the v2 catalog (written LAST)
+out/<vkey>/variants.pvar          — M, one per variant-block     (template.pvar = out/{CHROM}/variants.pvar)
+out/<skey>/samples.psam           — N, one per sample-block       (template.psam = out/{GROUP}/samples.psam)
+out/<vkey>/<skey>/data.pgen       — M·N cells                     (template.pfile = out/{CHROM}/{GROUP}/data)
+```
+Verify field-for-field against the fixture `read_pfile_catalog_matrix_compound` builds (first build
+step), as P13-007 did against `le_samples`.
+
+## 3. Input contract
+
+- **Variant-orient, `ORDER BY <vcol>, POS`** (the variant roll's existing contract). Reject
+  sample-orient input (no transpose), reuse P13-007's checks.
+- **Sample identity** = the ordered IID list from STRUCT genotypes field names or a `samples [...]`
+  option (`ResolveIdentity`); a bare LIST is rejected. `shard_samples` partitions this list exactly
+  and contiguously (reuse `ParseSampleShards`).
+- `shard_by` present + `shard_samples` present ⇒ **this feature** (lift the reject). Either alone ⇒
+  the shipped single-axis path. Neither ⇒ the plain bundle.
+
+## 4. THE FORK — variant-axis key richness (Teague's call; measured)
+
+**Measured fact:** the v2 reader prunes cells on BOTH CHROM (the enum `ContigKey`,
+`k.type==ENUM && k.over=="CHROM"`, `pfile_catalog_matrix.cpp:586`) AND POS (an
+`ordinal_interval`-over-`POS` key's per-block bounds, `:580`). A v1 variant-sharded catalog of the
+same data carries `range.POS` per shard; the roller already computes `pos_min`/`pos_max` per block.
+
+| option | variant axis keys | pushdown | cost |
+|---|---|---|---|
+| **A. enum only** | `CHROM` (enum, `over:"CHROM"`) | CHROM cell-skip only — **loses POS cell-skip vs v1** | trivial |
+| **B. compound** (recommend) | `CHROM` (enum, `over:"CHROM"`) + `CHUNK` (`ordinal_interval` over `POS`, per-block `bounds:{min,max}`) | CHROM **and** POS cell-skip (≥ v1) | ~zero — bounds already computed by the roller |
+
+**Recommendation: B.** It matches the reader's own `matrix_compound` example, avoids a pushdown
+regression against v1, costs almost nothing (the roller computes the POS extent at shard-close
+today), and keeps V2 coherent with P13-006's cell-skip cascade. Compound keys ⇒ the **blocks** form
+(not the one-enum short form). The `over:"CHROM"` is emitted only when `<vcol>` IS `CHROM`; for a
+non-CHROM `shard_by` the enum key carries no `over` (no contig pushdown — correct, only CHROM is the
+genomic contig). **Default if unspecified: B.**
+
+## 5. Engineering
+
+- **Combined global state** `PfileMatrixGlobalState`: the current variant-block's N `SampleShardWriter`
+  (`.pgen` staging + slice `[lo,hi)`) + 1 `.pvar` staging + the N shared `.psam` + the roller's
+  block-boundary state (current `<vcol>` value, M accumulated block records with their `pos_min/max`)
+  + `created_dirs` + the catalog path.
+- **Roll + fan-out** in the sink: on a `<vcol>` transition, finalize the current block's N `.pgen` +
+  1 `.pvar`; open the next. Within a block, every row → all N `.pgen` (slice) + the 1 `.pvar` once.
+- **Cleanup — stage everything until finalize (a decision).** The two parents disagree: the variant
+  roller *promotes each block on its transition* (completed blocks survive a later failure); P13-007
+  *keeps all in staging* and asserts `glob('mid*')=0` after a mid-stream failure. **Keep P13-007's
+  guarantee:** hold ALL M·N `.pgen` + M `.pvar` + N `.psam` in staging, promote only at finalize.
+  Writers still CLOSE per variant-block (memory stays at N; a closed block's `.pgen.staging` sits on
+  disk), so the nothing-orphaned test reuses directly. Reuse `40fbb30`'s stale-catalog-on-overwrite
+  handling. Extend `CleanupPartial` to remove all M·N stagings + the M·N/M/N dirs (SINGLE, empty-only).
+- **Key-name collision (a guard).** `shard_samples` labels have no column name, so the writer invents
+  the sample-axis key name (e.g. `GROUP`). Key names must be unique across BOTH axes; reject at bind
+  if it collides with the `shard_by` column name or the variant keys (`CHROM`/`CHUNK`), with a clear
+  message. (Pick a reserved default and allow no override in v1.)
+- **Resource guard:** reuse `CheckSampleShardResources(N, variant_ct_limit)` — the concurrent writer
+  count is N. Note M·N total fds at promote (brief) vs 2N concurrent; the guard covers the binding case.
+
+## 6. Tests (new file `test/sql/write_pfile_matrix.test`)
+
+- **Grid round-trip via ATTACH** (P13-003 surface, exists today): `ATTACH '<out>.pfile.json' (TYPE
+  pfile_catalog)`, then the genotype relations equal the source in BOTH orientations
+  (`genotypes`/`genotypes_by_sample`), and the per-cell counts tile the source.
+- **Catalog shape** diffed against the `read_pfile_catalog_matrix_compound` fixture: `pfile_catalog:2`,
+  two axes, the compound variant keys with `over:"CHROM"` + per-block POS bounds, the sample enum,
+  the three templates, M·N cells, no `holes`.
+- **Pushdown present (fork B):** a `region :=` / `WHERE CHROM=… AND POS BETWEEN …` over the ATTACHed
+  matrix skips cells (assert via the count or the measured read), proving the POS key resolves.
+- **Error paths:** sample-orient rejected; bare LIST rejected; a sample-key-name collision rejected;
+  the resource guard (reuse P13-007's 250-group case) rejects before any file.
+- **Mid-stream failure** (reuse P13-007's pattern): an upstream/sink error after some blocks →
+  `glob('out*')=0` (nothing orphaned across the whole grid).
+
+## 7. Non-goals
+
+- **`value_bin` sample-attribute keys** — the `.psam` is IID-only; attribute-binned sample axes wait
+  on `sample_fields` metadata (same blocker as P13-007).
+- **Sub-CHROM POS chunking** — v1 emits one variant-block per `<vcol>` value (one CHUNK per CHROM).
+  Finer POS chunking (multiple CHUNKs within a CHROM) is a follow-on; the compound key already carries
+  the per-block POS bounds, so the catalog shape does not change when it lands.
+- **Sparse grids / `holes`** — the shard_by × shard_samples grid is dense by construction.
+- **Sample-orient input / transpose** — out of scope, as in P13-007.
+
+## 8. Phasing
+
+1. Verify the catalog shape vs the `matrix_compound` fixture (§2).
+2. Build test-first: bind (lift the reject + key-name guard + reuse `ParseSampleShards`), then the
+   combined roll∘fan-out write path (§5), then the v2 catalog emission (§2, fork B).
+3. Fresh whole-branch review, PR.
+
+## 9. Risks
+
+- **The roll∘fan-out state is the real complexity** — block transitions must finalize N writers and
+  open N, with the `.psam` written once. Every transition + the mid-stream failure gets a test.
+- **Catalog drift from the reader** — mitigated by diffing against the `matrix_compound` fixture, not
+  only the prose format doc.
+- **Fork-B bounds correctness** — the per-block POS `{min,max}` must be inclusive and exact (the
+  reader prunes on them); reuse the roller's `pos_min/pos_max` and test a POS-window prune.
