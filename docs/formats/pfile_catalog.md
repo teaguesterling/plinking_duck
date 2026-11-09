@@ -713,6 +713,13 @@ verifies every present cell first. Holes are never verified. See
 
 ### What version 2 does not do yet
 
+- **No sample-oriented read of a multi-block grid.** For a matrix whose cells span more than
+  one sample block, `c.genotypes_by_sample` raises an error. `read_pfile` combines one axis per
+  call, so a sample-oriented read of every cell would file other blocks' genotypes under one
+  block's IIDs. `c.genotypes` (one row per variant and sample block) and the other relations are
+  correct. A matrix with one sample block reads both views normally. The fix is a 2-D read (P13-006
+  §10.2).
+
 - **No cell-skip cascade.** `ATTACH` opens every surviving cell; a `WHERE` on
   `c.genotypes` skips row groups inside each cell, but does not yet drop a whole cell by
   predicate. `read_pfile_catalog` itself returns cell metadata, not genotypes.
