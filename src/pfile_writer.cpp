@@ -1398,6 +1398,13 @@ struct PfileWriteBindData : public FunctionData {
 	vector<idx_t> shard_lo;
 	vector<idx_t> shard_hi;
 
+	//! `shard_by` + `shard_samples` together (P13-010) — the variants x samples GRID: a pfile_catalog:2
+	//! matrix. Uses shard_by's key fields AND the sample-shard fields above; `sample_shard_mode` stays
+	//! false so the single-axis dispatch never claims it. `matrix_over_chrom`: the shard_by column IS
+	//! CHROM (case-insensitive), so its enum key carries "over":"CHROM" (the reader's contig key).
+	bool matrix_mode = false;
+	bool matrix_over_chrom = false;
+
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PfileWriteBindData>();
 		r->pvar_bind = unique_ptr_cast<FunctionData, PvarWriteBindData>(pvar_bind->Copy());
@@ -1413,6 +1420,8 @@ struct PfileWriteBindData : public FunctionData {
 		r->shard_labels = shard_labels;
 		r->shard_lo = shard_lo;
 		r->shard_hi = shard_hi;
+		r->matrix_mode = matrix_mode;
+		r->matrix_over_chrom = matrix_over_chrom;
 		return std::move(r);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -1422,7 +1431,7 @@ struct PfileWriteBindData : public FunctionData {
 		       psam_override == o.psam_override && shard_by == o.shard_by &&
 		       shard_key_input_idx == o.shard_key_input_idx && shard_key_header == o.shard_key_header &&
 		       sample_shard_mode == o.sample_shard_mode && shard_labels == o.shard_labels && shard_lo == o.shard_lo &&
-		       shard_hi == o.shard_hi;
+		       shard_hi == o.shard_hi && matrix_mode == o.matrix_mode && matrix_over_chrom == o.matrix_over_chrom;
 	}
 };
 
@@ -2338,6 +2347,26 @@ void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g
 	}
 }
 
+// ===========================================================================
+// FORMAT pfile + shard_by + shard_samples — the variants x samples GRID (P13-010): a
+// pfile_catalog:2 matrix. (Write path: Task 2.)
+// ===========================================================================
+
+const char *const kMatrixSampleKey = "GROUP"; //! the sample-axis enum key (labels have no column name)
+const char *const kMatrixChunkKey = "CHUNK";  //! the variant-axis ordinal_interval-over-POS key
+
+struct PfileMatrixGlobalState : public GlobalFunctionData {};
+
+unique_ptr<GlobalFunctionData> PfileMatrixInitGlobal(FileSystem &, const PfileWriteBindData &, const string &) {
+	throw NotImplementedException("write pfile: the shard_by x shard_samples matrix write path is not built yet");
+}
+
+void PfileMatrixSink(ExecutionContext &, const PfileWriteBindData &, GlobalFunctionData &, DataChunk &) {
+}
+
+void PfileMatrixFinalize(FileSystem &, PfileMatrixGlobalState &) {
+}
+
 unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindInput &input,
                                        const vector<CompatName> &names_in, const vector<LogicalType> &sql_types) {
 	const vector<string> names = CompatNameStrings(names_in);
@@ -2363,11 +2392,8 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		}
 	}
 
-	// shard_by (variant axis) and shard_samples (sample axis) at once is the V2 grid — not built.
-	if (has_shard_samples && !bind->shard_by.empty()) {
-		throw BinderException("write pfile: shard_by and shard_samples cannot be combined — sharding both axes at "
-		                      "once (the variants x samples grid) is a planned follow-on. Use one of them.");
-	}
+	// shard_by (variant axis) and shard_samples (sample axis) at once is the V2 grid (P13-010).
+	bind->matrix_mode = has_shard_samples && !bind->shard_by.empty();
 	if (has_shard_samples &&
 	    (!bind->pvar_override.empty() || !bind->pgen_override.empty() || !bind->psam_override.empty())) {
 		throw BinderException("write pfile: shard_samples cannot be combined with pvar/pgen/psam path overrides — "
@@ -2431,7 +2457,12 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	// --- shard_samples: validate the partition against the resolved IID order ---
 	if (has_shard_samples) {
 		ParseSampleShards(shard_samples_spec, bind->iids, *bind);
+		// The concurrent writer count is N in both modes: the matrix rolls variant-blocks, so it holds
+		// one block's N .pgen writers at a time (M x N files total, but never open at once).
 		CheckSampleShardResources(bind->shard_labels.size(), bind->pgen_bind->variant_ct_limit);
+		if (bind->matrix_mode) {
+			bind->sample_shard_mode = false; // the matrix owns dispatch, not the single-axis sample path
+		}
 		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
 			throw BinderException("write pfile: shard_samples target '%s' has no filename component for the shard "
 			                      "tree / dataset name — give the COPY target a name, e.g. TO 'out'",
@@ -2468,6 +2499,17 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		}
 		bind->shard_key_input_idx = sidx;
 		bind->shard_key_header = names[sidx];
+		if (bind->matrix_mode) {
+			// Matrix key names must be unique per axis AND across axes (the reader rejects a repeat):
+			// the variant axis is {<shard_by>, CHUNK}, the sample axis is {GROUP}.
+			if (StringUtil::CIEquals(names[sidx], kMatrixSampleKey) || StringUtil::CIEquals(names[sidx], kMatrixChunkKey)) {
+				throw BinderException("write pfile: shard_by '%s' with shard_samples — '%s' and '%s' are reserved "
+				                      "matrix key names (the sample-axis key and the variant-axis POS key). Rename "
+				                      "the column, e.g. SELECT ..., \"%s\" AS %s_key, and shard_by that.",
+				                      names[sidx], kMatrixSampleKey, kMatrixChunkKey, names[sidx], names[sidx]);
+			}
+			bind->matrix_over_chrom = StringUtil::CIEquals(names[sidx], "CHROM");
+		}
 		// A degenerate target with no name component would yield an empty dataset name (the loader
 		// rejects that) and no shard tree. Guard it at bind, before any file is touched.
 		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
@@ -2485,6 +2527,9 @@ unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, Funct
                                                    const string &file_path) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (bind.matrix_mode) {
+		return PfileMatrixInitGlobal(fs, bind, file_path);
+	}
 	if (bind.sample_shard_mode) {
 		return PfileSampleShardedInitGlobal(fs, bind, file_path);
 	}
@@ -2532,6 +2577,10 @@ unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, FunctionDat
 void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
                    DataChunk &input) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
+	if (bind.matrix_mode) {
+		PfileMatrixSink(context, bind, gstate, input);
+		return;
+	}
 	if (bind.sample_shard_mode) {
 		PfileSampleShardedSink(context, bind, gstate, input);
 		return;
@@ -2559,6 +2608,10 @@ void PfileCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, 
 void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (bind.matrix_mode) {
+		PfileMatrixFinalize(fs, gstate.Cast<PfileMatrixGlobalState>());
+		return;
+	}
 	if (bind.sample_shard_mode) {
 		PfileSampleShardedFinalize(fs, gstate.Cast<PfileSampleShardedGlobalState>());
 		return;
