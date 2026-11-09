@@ -240,33 +240,34 @@ request of the homelab session. Every fact below is from `main` @ 576034b unless
    narrowing `sample_indices` after bind already skips whole sample shards' `.pgen` I/O. Each
    shard's `.psam` is still parsed at bind.
 
-### 10.2 A prerequisite: `read_pfile` cannot read a 2-D grid, and ATTACH does it silently wrong
+### 10.2 A prerequisite: `read_pfile` cannot read a 2-D grid, and one ATTACH view was wrong
 
 `read_pfile` combines ONE axis per call: a variant-sharded list (implicit / identical) or a
 sample-sharded list (concatenate / disjoint). A matrix catalog with more than one sample block needs
-both at once. ATTACH bakes `c.genotypes` as `read_pfile([every cell])` in the default implicit
-mode, so it stacks cells from different sample blocks as if they had the same samples.
+both at once. ATTACH bakes both genotype views as `read_pfile([every cell])` in the default
+implicit mode.
 
 **Measured on `main` (2026-11-09)**, with the 2×2 fixture of `test/sql/attach_pfile_catalog.test`.
 CHROM {1, 2} × GROUP {A, B}, built from `pfile_example`. The truth is 4 variants × 4 samples:
 
-| relation | truth | `main` returns |
+| relation | `main` returns | verdict |
 |---|---|---|
-| `c.genotypes` | 4 rows, 4 genotypes each | **8 rows**, each variant twice, 2 genotypes each |
-| `c.genotypes_by_sample` | 4 rows | **2 rows** (groups A and B mixed under A's IIDs) |
-| `c.samples` | 4 | 4 |
+| `c.genotypes` | 8 rows: one per variant × sample block, each with that block's 2 samples | **correct as documented** (the per-cell fan-out in `docs/formats/pfile_catalog.md`), but no column names the block |
+| `c.genotypes_by_sample` | 2 rows (S1, S2), each with 8 calls; S1's row includes S3's calls from block B | **silently wrong** |
+| `c.samples` | 4 | correct |
 
-There is no error. The test cannot see it, because it compares `c.genotypes` with the same
-`read_pfile([4 cells])` call. With unequal block sizes, `read_pfile` errors on the sample-count
-check instead. The P13-010 matrix writer will produce exactly these grids, so the exposure grows.
+A first draft of this section called `c.genotypes` wrong too. That was my error: it matches the
+documented fan-out. The interim fix (`fix/attach-matrix-genotypes`) therefore guards only
+`c.genotypes_by_sample`: on a matrix with more than one sample block, it errors. The P13-010 matrix
+writer will produce exactly these grids, so the exposure grows.
 
 So a `catalog :=` input over a matrix needs a **2-D read** first. The natural shape on today's bind:
 each variant source carries the shared sample split (`sample_shards`) and reads its cells through a
 `ConcatPgenReader`. A matrix declares one sample-block axis for every variant block, so one split
 serves every source. A matrix may have HOLES (absent cells; `BuildCells(…, include_holes)`), and
 the 2-D read must decide what a hole means for its rows (an error, or missing calls) — an open
-design point. Until then, ATTACH of a matrix with more than one sample block should be
-rejected. Silent wrong rows are worse than an error.
+design point. With the 2-D read, `c.genotypes` can also return one row per variant across all
+sample blocks, in place of the fan-out.
 
 ### 10.3 Corrections to the original text
 
@@ -297,7 +298,8 @@ the `range` block (CHROM, POS min/max). Two ways to use it:
 
 **Recommendation: (i), staged so its first stage IS (ii).**
 
-1. The 2-D read (§10.2), and an ATTACH reject for a matrix with more than one sample block until it lands.
+1. The 2-D read (§10.2). It lifts the interim `c.genotypes_by_sample` guard and can replace the
+   `c.genotypes` fan-out with one row per variant.
 2. `catalog :=` on `read_pfile`: cells from the catalog, explicit params prune at bind, and only
    surviving cells' `.pvar` files load. This is (ii) on its own, and it is useful immediately
    (`read_pfile(catalog := …, region := …)`).
