@@ -2363,17 +2363,17 @@ struct MatrixSampleBlock {
 	string label;
 	idx_t lo = 0;
 	idx_t hi = 0;
-	string dir;                     //! "<dir>/out/GROUP=<label>"
+	string dir;                      //! "<dir>/out/GROUP=<label>"
 	string psam_final, psam_staging; //! dir + "/samples.psam" (+ ".staging")
 };
 
 // One CLOSED variant-block's catalog facts (Task 3 emits them as the variant axis's blocks[]).
 struct MatrixVariantBlock {
-	string key;              //! the shard_by value
-	uint64_t start = 0;      //! global half-open variant ordinals [start, stop)
+	string key;         //! the shard_by value
+	uint64_t start = 0; //! global half-open variant ordinals [start, stop)
 	uint64_t stop = 0;
-	bool has_pos = false;    //! POS extent seen (always true for >= 1 row: POS is a required role)
-	int64_t pos_min = 0;     //! TRUE min/max POS over the block (inclusive) — the CHUNK bounds
+	bool has_pos = false; //! POS extent seen (always true for >= 1 row: POS is a required role)
+	int64_t pos_min = 0;  //! TRUE min/max POS over the block (inclusive) — the CHUNK bounds
 	int64_t pos_max = 0;
 };
 
@@ -2638,7 +2638,62 @@ void PfileMatrixSink(ExecutionContext &context, const PfileWriteBindData &bind, 
 	}
 }
 
-void PfileMatrixFinalize(FileSystem &fs, PfileMatrixGlobalState &g) {
+// The pfile_catalog:2 matrix catalog, field-for-field the shape ParseMatrixCatalog / BuildCells parse
+// (test/sql/read_pfile_catalog_matrix_compound.test builds the reference fixture), in the `blocks` form:
+//   variants axis — [<vcol> enum (+ "over":"CHROM" iff <vcol> is CHROM), CHUNK ordinal_interval over POS]
+//                   one block per <vcol> value, CHUNK "0", bounds.CHUNK = the block's inclusive TRUE
+//                   {min,max} POS (fork B: the reader prunes cells on CHROM AND POS).
+//   samples axis  — [GROUP enum], one block per shard_samples label.
+//   template      — pfile uses one key of each axis, pvar only the variant key, psam only the sample key;
+//                   paths are relative to the catalog's dir (the PARENT of out/).
+// Dense: every (variant-block, sample-block) cell is written, so there is no `holes` array.
+void PfileWriteMatrixCatalog(PfileMatrixGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
+	const string vk = JsonEscape(g.vcol_label);
+	const string sk = kMatrixSampleKey;
+	const string ck = kMatrixChunkKey;
+	string j = "{\n";
+	j += "  \"pfile_catalog\": 2,\n";
+	j += "  \"dataset\": \"" + JsonEscape(g.base_name) + "\",\n";
+	j += "  \"axes\": [\n";
+	j += "    {\n      \"name\": \"variants\",\n";
+	j += "      \"keys\": [ { \"name\": \"" + vk + "\", \"type\": \"enum\"" +
+	     (bind.matrix_over_chrom ? string(", \"over\": \"CHROM\"") : string()) + " }, { \"name\": \"" + ck +
+	     "\", \"type\": \"ordinal_interval\", \"over\": \"POS\" } ],\n";
+	j += "      \"blocks\": [\n";
+	for (idx_t i = 0; i < g.vblocks.size(); i++) {
+		auto &b = g.vblocks[i];
+		j += "        { \"keys\": { \"" + vk + "\": \"" + JsonEscape(b.key) + "\", \"" + ck +
+		     "\": \"0\" }, \"start\": " + std::to_string(b.start) + ", \"stop\": " + std::to_string(b.stop) +
+		     ", \"bounds\": { \"" + ck + "\": { \"min\": " + std::to_string(b.pos_min) +
+		     ", \"max\": " + std::to_string(b.pos_max) + " } } }";
+		j += (i + 1 < g.vblocks.size()) ? ",\n" : "\n";
+	}
+	j += "      ]\n    },\n";
+	j += "    {\n      \"name\": \"samples\",\n";
+	j += "      \"keys\": [ { \"name\": \"" + sk + "\", \"type\": \"enum\" } ],\n";
+	j += "      \"blocks\": [\n";
+	for (idx_t i = 0; i < g.sblocks.size(); i++) {
+		auto &b = g.sblocks[i];
+		j += "        { \"keys\": { \"" + sk + "\": \"" + JsonEscape(b.label) +
+		     "\" }, \"start\": " + std::to_string(b.lo) + ", \"stop\": " + std::to_string(b.hi) + " }";
+		j += (i + 1 < g.sblocks.size()) ? ",\n" : "\n";
+	}
+	j += "      ]\n    }\n  ],\n";
+	const string root = JsonEscape(g.base_name) + "/";
+	const string vdir = root + vk + "={" + vk + "}";
+	const string sdir = sk + "={" + sk + "}";
+	j += "  \"template\": {\n";
+	j += "    \"pfile\": \"" + vdir + "/" + sdir + "/data\",\n";
+	j += "    \"pvar\": \"" + vdir + "/variants.pvar\",\n";
+	j += "    \"psam\": \"" + root + sdir + "/samples.psam\"\n";
+	j += "  }\n}\n";
+	auto h = fs.OpenFile(g.catalog_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	h->Write(const_cast<char *>(j.data()), j.size());
+	h->Sync();
+	h.reset();
+}
+
+void PfileMatrixFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileMatrixGlobalState &g) {
 	try {
 		if (!g.opened) {
 			throw IOException("write pfile: shard_by x shard_samples produced no variants — the input query "
@@ -2647,7 +2702,7 @@ void PfileMatrixFinalize(FileSystem &fs, PfileMatrixGlobalState &g) {
 		if (g.has_active) {
 			PfileMatrixBlockClose(g);
 		}
-		// Promote: every .pvar, every .psam, then every .pgen, then (Task 3) the catalog LAST. Not atomic
+		// Promote: every .pvar, every .psam, then every .pgen, then the catalog LAST. Not atomic
 		// as a group — a prior run's catalog is removed first, so a failure between renames leaves the
 		// cohort absent (no catalog), never stale.
 		RemoveStaleCatalog(fs, g.catalog_path);
@@ -2660,6 +2715,7 @@ void PfileMatrixFinalize(FileSystem &fs, PfileMatrixGlobalState &g) {
 		for (auto &m : g.pgen_moves) {
 			fs.MoveFile(m.first, m.second);
 		}
+		PfileWriteMatrixCatalog(g, bind, fs); // the completion marker
 		g.finished = true;
 	} catch (...) {
 		g.CleanupPartial(fs);
@@ -2802,11 +2858,20 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		if (bind->matrix_mode) {
 			// Matrix key names must be unique per axis AND across axes (the reader rejects a repeat):
 			// the variant axis is {<shard_by>, CHUNK}, the sample axis is {GROUP}.
-			if (StringUtil::CIEquals(names[sidx], kMatrixSampleKey) || StringUtil::CIEquals(names[sidx], kMatrixChunkKey)) {
+			if (StringUtil::CIEquals(names[sidx], kMatrixSampleKey) ||
+			    StringUtil::CIEquals(names[sidx], kMatrixChunkKey)) {
 				throw BinderException("write pfile: shard_by '%s' with shard_samples — '%s' and '%s' are reserved "
 				                      "matrix key names (the sample-axis key and the variant-axis POS key). Rename "
 				                      "the column, e.g. SELECT ..., \"%s\" AS %s_key, and shard_by that.",
 				                      names[sidx], kMatrixSampleKey, kMatrixChunkKey, names[sidx], names[sidx]);
+			}
+			// The column name is also a literal in the catalog templates ("<col>={<col>}"), where a brace
+			// would open/close a placeholder and make the catalog unparseable.
+			if (names[sidx].find_first_of("{}") != string::npos) {
+				throw BinderException("write pfile: shard_by column '%s' with shard_samples — the name contains a "
+				                      "brace ('{' or '}'), which the matrix catalog template cannot carry. Rename "
+				                      "the column.",
+				                      names[sidx]);
 			}
 			bind->matrix_over_chrom = StringUtil::CIEquals(names[sidx], "CHROM");
 		}
@@ -2909,7 +2974,7 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (bind.matrix_mode) {
-		PfileMatrixFinalize(fs, gstate.Cast<PfileMatrixGlobalState>());
+		PfileMatrixFinalize(fs, bind, gstate.Cast<PfileMatrixGlobalState>());
 		return;
 	}
 	if (bind.sample_shard_mode) {
