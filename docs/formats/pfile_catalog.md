@@ -682,6 +682,12 @@ variants. The rows do not yet carry a column that names the source cell or
 sample-block; that reassembly (and the derived count columns) is P13-004. For a
 per-variant count, use `c.variants`.
 
+For a matrix, `c.genotypes` reads each cell with its **template-resolved** `.pvar` and `.psam`,
+so a cell needs no companion files of its own. The `genotypes` column follows `read_pfile`'s
+own rule. It is a fixed `ARRAY` when every sample block holds the same number of samples, and a
+`LIST` when the blocks differ in size, because the per-block arrays could not then share one
+fixed width.
+
 ### Inspecting a matrix without reading it
 
 Two functions look at the catalog file alone and open no data file:
@@ -712,6 +718,15 @@ verifies every present cell first. Holes are never verified. See
 [Verification](../functions/read_pfile_catalog.md#matrix-catalogs-version-2).
 
 ### What version 2 does not do yet
+
+- **No sample-oriented read of a multi-block grid.** For a matrix whose cells span more than
+  one sample block, `c.genotypes_by_sample` raises an error. `read_pfile` combines one axis per
+  call, so a sample-oriented read of every cell would file other blocks' genotypes under one
+  block's IIDs. `c.genotypes` (one row per variant and sample block) and the other relations are
+  correct. A matrix with one sample block reads both views normally when its cells have their own
+  companion files. On a templated matrix (one `.pvar` per variant block, no per-cell copies),
+  `c.genotypes_by_sample` fails to find a `.pvar`, because a multi-file `read_pfile` cannot take a
+  `.pvar` per shard. The fix for both is a 2-D read (P13-006 §10.2).
 
 - **No cell-skip cascade.** `ATTACH` opens every surviving cell; a `WHERE` on
   `c.genotypes` skips row groups inside each cell, but does not yet drop a whole cell by
