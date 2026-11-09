@@ -310,3 +310,121 @@ SELECT (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM mc.genotypes
 ----
 0	2
 
+# ---------------------------------------------------------------------------
+# TEMPLATED matrices: each cell is a bare .pgen (FORMAT pgen writes no companions), and the
+# catalog's templates name ONE .pvar per variant block and ONE .psam per sample block — the v2
+# format's own layout (a per-cell .pvar is impossible when the pvar template uses only variant
+# keys). c.genotypes must read each cell with its templated companions. Before this fix it failed
+# with "cannot find .pvar" on any such matrix.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT c AS CHROM, g AS "GROUP", 0 AS x FROM (VALUES ('1'),('2')) a(c), (VALUES ('A'),('B')) b(g))
+TO '{TEST_DIR}/tdata' (FORMAT csv, PARTITION_BY (CHROM, "GROUP"));
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/tdata/CHROM=1/GROUP=A/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/tdata/CHROM=1/GROUP=B/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/tdata/CHROM=2/GROUP=A/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 4) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/tdata/CHROM=2/GROUP=B/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"tmpl","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"tdata/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/matrix_tmpl.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement ok
+ATTACH '{TEST_DIR}/matrix_tmpl.pfile.json' AS tm (TYPE pfile_catalog);
+
+# Equal sample blocks (2 + 2): a fixed ARRAY, as read_pfile's own 'auto' gives one cell.
+query T
+SELECT DISTINCT typeof(genotypes) FROM tm.genotypes;
+----
+TINYINT[2]
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM tm.genotypes
+        EXCEPT ALL (SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 1, 2) FROM read_pfile('test/data/pfile_example')
+                    UNION ALL SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 3, 4) FROM read_pfile('test/data/pfile_example')))),
+       (SELECT count(*) FROM tm.genotypes);
+----
+0	8
+
+# A WHERE still reaches each cell's read.
+query I
+SELECT count(*) FROM tm.genotypes WHERE CHROM = '2';
+----
+2
+
+# UNEVEN sample blocks (A = S1,S2; B = S3 only): the widths differ, so the column falls back to a
+# LIST (read_pfile's own ARRAY-or-LIST rule, lifted to the grid). Each row's list holds its block's
+# samples.
+statement ok
+COPY (SELECT c AS CHROM, g AS "GROUP", 0 AS x FROM (VALUES ('1'),('2')) a(c), (VALUES ('A'),('B')) b(g))
+TO '{TEST_DIR}/udata' (FORMAT csv, PARTITION_BY (CHROM, "GROUP"));
+
+statement ok
+COPY (SELECT g AS "GROUP", 0 AS x FROM (VALUES ('A'),('B')) b(g)) TO '{TEST_DIR}/urefs' (FORMAT csv, PARTITION_BY ("GROUP"));
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/urefs/GROUP=A/blk' (FORMAT pfile, samples ['S1', 'S2']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/urefs/GROUP=B/blk' (FORMAT pfile, samples ['S3']);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/udata/CHROM=1/GROUP=A/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/udata/CHROM=1/GROUP=B/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/udata/CHROM=2/GROUP=A/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 3, 3) AS genotypes
+      FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
+TO '{TEST_DIR}/udata/CHROM=2/GROUP=B/cell.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"uneven","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":3}]}]}],"template":{"pfile":"udata/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"urefs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/matrix_uneven.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement ok
+ATTACH '{TEST_DIR}/matrix_uneven.pfile.json' AS um (TYPE pfile_catalog);
+
+query T
+SELECT DISTINCT typeof(genotypes) FROM um.genotypes;
+----
+TINYINT[]
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, genotypes FROM um.genotypes
+        EXCEPT ALL (SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 1, 2) FROM read_pfile('test/data/pfile_example')
+                    UNION ALL SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 3, 3) FROM read_pfile('test/data/pfile_example')))),
+       (SELECT count(*) FROM um.genotypes);
+----
+0	8
+
