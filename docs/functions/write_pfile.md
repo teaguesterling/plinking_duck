@@ -36,6 +36,11 @@ paths. See [Limitations](#limitations-and-deferrals) for everything that is
 deliberately out of scope — read it before relying on the writer; the deferrals
 are real, not polish.
 
+Later releases add **sharding** on top of that base: [`shard_by`](#sharded-output-shard_by)
+along the variant axis, [`shard_samples`](#sample-sharded-output-shard_samples) along
+the sample axis, and [both at once](#matrix-output-shard_by--shard_samples) as a matrix.
+Each emits a [`.pfile.json` catalog](../formats/pfile_catalog.md).
+
 ## `FORMAT pfile` — the bundle
 
 ```sql
@@ -240,8 +245,9 @@ shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar
   `samples [...]`. A bare `TINYINT[N]` list is rejected.
 - **Variant-orient input only.** No transpose: a sample-orient stream fails on the
   missing `CHROM` role.
-- **Not combinable** with `shard_by` (sharding both axes is a planned follow-on) or
-  with `pvar`/`pgen`/`psam` path overrides (the layout generates every path).
+- **Combinable with `shard_by`** to shard both axes at once — see
+  [Matrix output](#matrix-output-shard_by--shard_samples). **Not combinable** with
+  `pvar`/`pgen`/`psam` path overrides (the layout generates every path).
 - **Memory and file handles.** Unlike `shard_by`, which keeps one writer open at a
   time, every variant row goes to every shard, so all N `.pgen` writers are open
   at once. Each one reserves about 1.5 bytes per variant of `variant_count` (about
@@ -261,6 +267,91 @@ shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar
 The emitted `.pfile.json` records `shared.pvar`, and per shard its `prefix`, its
 `psam`, and a global half-open `[start, stop)` **sample**-ordinal `partition` that
 tiles `[0, total)`.
+
+### Matrix output (`shard_by` × `shard_samples`)
+
+Give **both** `shard_by` and `shard_samples` in one `COPY` to shard the two axes at
+once. The result is a **matrix**: an M × N grid of `.pgen` cells — M variant-blocks by
+N sample-blocks — described by a
+[version-2 `pfile_catalog`](../formats/pfile_catalog.md#version-2-the-matrix-form).
+
+```sql
+COPY (SELECT * FROM read_pfile('cohort', genotypes := 'struct') ORDER BY CHROM, POS)
+TO 'out' (FORMAT pfile, shard_by 'CHROM',
+          shard_samples {batch1: ['s1', 's2'], batch2: ['s3', 's4', 's5']});
+```
+
+The layout is one `.pvar` per variant-block, one `.psam` per sample-block, and one
+`.pgen` per cell:
+
+```
+out/CHROM=<v>/variants.pvar             # M, one per variant-block
+out/GROUP=<label>/samples.psam          # N, one per sample-block
+out/CHROM=<v>/GROUP=<label>/data.pgen   # M x N cells
+out.pfile.json                          # the v2 catalog — written LAST
+```
+
+The grid is the `shard_by` **variant roll** with the `shard_samples` **sample
+fan-out** inside each variant-block. The roller holds one variant-block open at a
+time; inside it, N `.pgen` writers each take their sample slice. So **N** writers are
+open at once, not M × N — the sample count, not the grid size, sets the footprint.
+The N `.psam` are the same for every variant-block, so each is written once.
+
+**The emitted catalog** (`pfile_catalog: 2`) keys the variant axis with **two**
+compound keys and the sample axis with one:
+
+- `CHROM` (an `enum`). It carries `"over": "CHROM"` **only** when the `shard_by`
+  column is `CHROM` (case-insensitive), which lets `region` prune cells by contig. A
+  non-`CHROM` shard key omits `over`, and `region` is then refused.
+- `CHUNK` (an `ordinal_interval` over `POS`), with the per-block `POS` `{min, max}`
+  bounds the writer fills as it streams. This lets `region` prune cells by position,
+  not only by contig.
+- `GROUP` (an `enum`) on the sample axis — one label per sample-block.
+
+The grid is **dense**: every variant-block pairs with every sample-block, so the
+catalog has no `holes`. Read it back the usual ways:
+
+- [`read_pfile_catalog`](read_pfile_catalog.md) — one row per cell, with prune and
+  verify. `region := '2:…'` prunes on both the contig and the `POS` bounds.
+- `ATTACH 'out.pfile.json' (TYPE pfile_catalog)` — the structural relations
+  (`c.variants`, `c.samples`, `c.cells`, `c.variant_blocks`, `c.sample_blocks`) and
+  the variant-oriented `c.genotypes`. Each cell is read through its template-resolved
+  `.pvar` and `.psam`, so a cell needs no companion of its own.
+- One cell, directly, with the block's shared companions:
+  `read_pfile('out/CHROM=1/GROUP=batch1/data', pvar := 'out/CHROM=1/variants.pvar', psam := 'out/GROUP=batch1/samples.psam')`.
+
+**Reserved key names.** The writer names the variant `POS` key `CHUNK` and the sample
+key `GROUP`. A `shard_by` column of either name (case-insensitive) would put one key
+name on both axes, so it is rejected at bind. The shard key and the target basename
+each become a catalog template literal, so a name with a `{` or `}` brace is rejected
+too.
+
+**Guards and rejects** — all at bind, before any file is written:
+
+- **The resource guard counts N**, the concurrent writer count — the same guard as
+  [`shard_samples`](#sample-sharded-output-shard_samples). Too many groups for the
+  host's memory or open-file limit fails the `COPY`, naming the mitigations (a smaller
+  `variant_count`, or fewer groups).
+- The same identity, orientation, contiguity, and label rules as `shard_samples`
+  apply (the sample-axis code is shared): a bare `TINYINT[N]` list with no identity, a
+  sample-oriented stream, a non-contiguous group, or a bad label is rejected.
+- `pvar`/`pgen`/`psam` path overrides cannot be combined (the layout generates every
+  path). Zero input rows write nothing.
+
+**Failure leaves nothing.** Every file stages until the whole grid is complete, and
+the catalog is promoted last. Any failure — upstream, in the sink, or a shard key that
+reappears after another — removes every staging file and every directory the `COPY`
+created. An overwrite replaces the whole grid and leaves the catalog valid; a mid-run
+failure leaves no catalog, never a stale one.
+
+!!! warning "The sample-oriented read of a matrix is not supported yet"
+
+    `c.genotypes_by_sample` (the sample-oriented ATTACH relation) does **not** work on
+    a writer-produced matrix. A multi-sample-block grid is guarded, and a
+    multi-variant-block grid cannot supply a per-block `.pvar` to a sample-oriented
+    read. Both need the two-dimensional read (P13-006). The variant-oriented
+    `c.genotypes`, the structural relations, and `read_pfile_catalog` are correct. See
+    [What version 2 does not do yet](../formats/pfile_catalog.md#what-version-2-does-not-do-yet).
 
 ## Standalone formats
 
@@ -385,15 +476,16 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
   reconstructed, so a round-trip is **value-equal, not byte-equal**.
 - **Position-sorted, chromosome-contiguous input is required** (the monotonicity
   check), and the whole fileset is **local-only**.
-- **One shard axis at a time.** `shard_by` (variant-shards over a shared `.psam`)
-  and `shard_samples` (sample-shards over a shared `.pvar`) cannot be combined; a
-  variants × samples grid is a follow-on.
+- **A matrix has no sample-oriented read yet.** `shard_by` and `shard_samples`
+  combine into a [matrix](#matrix-output-shard_by--shard_samples), but its
+  `c.genotypes_by_sample` ATTACH relation is not supported — the variant-oriented
+  `c.genotypes` and the other relations are. It needs the 2-D read (P13-006).
 - **Parquet companions, `.pgi` split index, and PLINK-VCF export are deferred**
   (Phases D–E).
 
 ## See Also
 
-- [`pfile_catalog` catalog format](../formats/pfile_catalog.md) — the catalog the sharded writer emits (schema, boundary law, trust model)
+- [`pfile_catalog` catalog format](../formats/pfile_catalog.md) — the catalog the sharded writer emits (schema, boundary law, trust model), including the [version-2 matrix](../formats/pfile_catalog.md#version-2-the-matrix-form)
 - [read_pfile_catalog](read_pfile_catalog.md) — read the emitted `.pfile.json` back in SQL
 - [read_pfile](read_pfile.md) — read a fileset back (the round-trip partner)
 - [read_pvar](read_pvar.md) · [read_pgen](read_pgen.md) · [read_psam](read_psam.md)
