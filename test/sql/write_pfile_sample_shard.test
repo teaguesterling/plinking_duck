@@ -165,12 +165,6 @@ SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM re
 # NEGATIVE — bind-time rejects (no file is written)
 # ===========================================================================
 
-statement error
-COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
-TO '__TEST_DIR__/bad' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
-----
-shard_by and shard_samples cannot be combined
-
 # A group that is not a contiguous run of the input sample order.
 statement error
 COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)

@@ -1398,6 +1398,13 @@ struct PfileWriteBindData : public FunctionData {
 	vector<idx_t> shard_lo;
 	vector<idx_t> shard_hi;
 
+	//! `shard_by` + `shard_samples` together (P13-010) — the variants x samples GRID: a pfile_catalog:2
+	//! matrix. Uses shard_by's key fields AND the sample-shard fields above; `sample_shard_mode` stays
+	//! false so the single-axis dispatch never claims it. `matrix_over_chrom`: the shard_by column IS
+	//! CHROM (case-insensitive), so its enum key carries "over":"CHROM" (the reader's contig key).
+	bool matrix_mode = false;
+	bool matrix_over_chrom = false;
+
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PfileWriteBindData>();
 		r->pvar_bind = unique_ptr_cast<FunctionData, PvarWriteBindData>(pvar_bind->Copy());
@@ -1413,6 +1420,8 @@ struct PfileWriteBindData : public FunctionData {
 		r->shard_labels = shard_labels;
 		r->shard_lo = shard_lo;
 		r->shard_hi = shard_hi;
+		r->matrix_mode = matrix_mode;
+		r->matrix_over_chrom = matrix_over_chrom;
 		return std::move(r);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -1422,7 +1431,7 @@ struct PfileWriteBindData : public FunctionData {
 		       psam_override == o.psam_override && shard_by == o.shard_by &&
 		       shard_key_input_idx == o.shard_key_input_idx && shard_key_header == o.shard_key_header &&
 		       sample_shard_mode == o.sample_shard_mode && shard_labels == o.shard_labels && shard_lo == o.shard_lo &&
-		       shard_hi == o.shard_hi;
+		       shard_hi == o.shard_hi && matrix_mode == o.matrix_mode && matrix_over_chrom == o.matrix_over_chrom;
 	}
 };
 
@@ -2197,26 +2206,28 @@ unique_ptr<GlobalFunctionData> PfileSampleShardedInitGlobal(FileSystem &fs, cons
 // Create the shard tree + staging files on the first row: the shared .pvar staging + header, and
 // every shard's .psam staging (identity is out-of-band, fully known at bind). Each .pgen writer is
 // primed with its slice size; pgenlib init is deferred to its first append.
+// Create `dir` and every missing ANCESTOR of it, recording each one THIS COPY created (parent
+// first) in `created_dirs`, so cleanup can remove them again deepest-first — only if empty.
+void CreateDirRecorded(FileSystem &fs, const string &dir, vector<string> &created_dirs) {
+	vector<string> missing; // deepest first
+	string d = dir;
+	while (!d.empty() && !fs.DirectoryExists(d)) {
+		missing.push_back(d);
+		auto slash = d.find_last_of("/\\");
+		if (slash == string::npos || slash == 0) {
+			break;
+		}
+		d = d.substr(0, slash);
+	}
+	for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+		fs.CreateDirectory(*it);
+		created_dirs.push_back(*it);
+	}
+}
+
 void PfileSampleShardedOpen(PfileSampleShardedGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
 	g.opened = true; // from here on, cleanup owns whatever exists
-	// Record each directory we create (parent first), so cleanup can remove it again — only if empty.
-	// That includes every missing ANCESTOR of the shard tree, not only out/ itself.
-	{
-		vector<string> missing; // deepest first
-		string d = g.base;
-		while (!d.empty() && !fs.DirectoryExists(d)) {
-			missing.push_back(d);
-			auto slash = d.find_last_of("/\\");
-			if (slash == string::npos || slash == 0) {
-				break;
-			}
-			d = d.substr(0, slash);
-		}
-		for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
-			fs.CreateDirectory(*it);
-			g.created_dirs.push_back(*it);
-		}
-	}
+	CreateDirRecorded(fs, g.base, g.created_dirs);
 	for (auto &sh : g.shards) {
 		if (!fs.DirectoryExists(sh.dir)) {
 			fs.CreateDirectory(sh.dir);
@@ -2338,6 +2349,380 @@ void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g
 	}
 }
 
+// ===========================================================================
+// FORMAT pfile + shard_by + shard_samples — the variants x samples GRID (P13-010): a
+// pfile_catalog:2 matrix. (Write path: Task 2.)
+// ===========================================================================
+
+const char *const kMatrixSampleKey = "GROUP"; //! the sample-axis enum key (labels have no column name)
+const char *const kMatrixChunkKey = "CHUNK";  //! the variant-axis ordinal_interval-over-POS key
+
+// One sample-block of the grid: constant across variant-blocks (the split never changes), so its
+// .psam is written ONCE, on the first row.
+struct MatrixSampleBlock {
+	string label;
+	idx_t lo = 0;
+	idx_t hi = 0;
+	string dir;                      //! "<dir>/out/GROUP=<label>"
+	string psam_final, psam_staging; //! dir + "/samples.psam" (+ ".staging")
+};
+
+// One CLOSED variant-block's catalog facts (Task 3 emits them as the variant axis's blocks[]).
+struct MatrixVariantBlock {
+	string key;         //! the shard_by value
+	uint64_t start = 0; //! global half-open variant ordinals [start, stop)
+	uint64_t stop = 0;
+	bool has_pos = false; //! POS extent seen (always true for >= 1 row: POS is a required role)
+	int64_t pos_min = 0;  //! TRUE min/max POS over the block (inclusive) — the CHUNK bounds
+	int64_t pos_max = 0;
+};
+
+// The grid = the shard_by variant roll with the shard_samples fan-out inside each variant-block.
+// At any moment: ONE variant-block open = 1 .pvar + N .pgen writers (memory ~ N, as P13-007). On a
+// key transition the block's N .pgen + 1 .pvar are FINISHED but stay in STAGING (P13-007's guarantee,
+// spec §5): a failure anywhere leaves nothing. Everything promotes at finalize, catalog LAST.
+struct PfileMatrixGlobalState : public GlobalFunctionData {
+	string base;         //! "<dir>/out" (the grid tree)
+	string base_name;    //! "out" — dataset name + prefix of every relative catalog path
+	string vcol_label;   //! the shard_by column name (variant-axis enum key + hive dir label)
+	string catalog_path; //! "<dir>/out.pfile.json"
+	vector<MatrixSampleBlock> sblocks;
+	vector<string> created_dirs; //! dirs THIS COPY created, parent before child
+	FileSystem *fs = nullptr;
+	bool opened = false;   //! first row seen (files exist from here on)
+	bool finished = false; //! everything promoted — the destructor must not clean
+	bool cleaned = false;
+
+	// the open variant-block
+	bool has_active = false;
+	string active_key;
+	unique_ptr<PvarWriteGlobalState> cur_pvar;
+	string cur_pvar_staging, cur_pvar_final;
+	vector<unique_ptr<PgenWriteGlobalState>> cur_pgens; //! one per sample-block, index-aligned with sblocks
+	vector<string> cur_pgen_finals;
+
+	// closed (finished, still-staged) files: (staging, final), promoted at finalize
+	vector<std::pair<string, string>> pvar_moves;
+	vector<std::pair<string, string>> pgen_moves;
+
+	// cross-block
+	std::set<string> seen_keys;
+	uint64_t running_start = 0;
+	vector<MatrixVariantBlock> vblocks;
+
+	// Remove every staging file this COPY created — the open block's (writers closed first), every
+	// closed block's .pvar/.pgen staging (+ pgenlib's .tmp), every .psam staging — then the dirs it
+	// created, deepest first and NON-recursively (SINGLE): a dir holding anything else (a file promoted
+	// before a late finalize failure, or anything not ours) stays. Idempotent; never throws.
+	void CleanupPartial(FileSystem &sysfs) {
+		if (cleaned) {
+			return;
+		}
+		cleaned = true;
+		if (!opened) {
+			return; // nothing created yet; a file at a staging PATH is not ours
+		}
+		auto remove_quiet = [&](const string &p) {
+			try {
+				if (!p.empty() && sysfs.FileExists(p)) {
+					sysfs.RemoveFile(p);
+				}
+			} catch (...) {
+			}
+		};
+		if (cur_pvar && cur_pvar->handle) {
+			cur_pvar->handle.reset();
+		}
+		if (cur_pvar) {
+			remove_quiet(cur_pvar_staging);
+		}
+		for (auto &pg : cur_pgens) {
+			if (pg) {
+				pg->CleanupPartial(sysfs); // closes STPgenWriter + removes .pgen.staging(+.tmp)
+			}
+		}
+		for (auto &m : pvar_moves) {
+			remove_quiet(m.first);
+		}
+		for (auto &m : pgen_moves) {
+			remove_quiet(m.first);
+			remove_quiet(m.first + ".tmp");
+		}
+		for (auto &sb : sblocks) {
+			remove_quiet(sb.psam_staging);
+		}
+		for (auto it = created_dirs.rbegin(); it != created_dirs.rend(); ++it) {
+			try {
+				RemoveDirectoryOptions single;
+				single.mode = RemoveDirectoryMode::SINGLE;
+				sysfs.RemoveDirectoryExtended(*it, single);
+			} catch (...) {
+			}
+		}
+	}
+
+	~PfileMatrixGlobalState() override {
+		if (!finished && fs) {
+			CleanupPartial(*fs);
+		}
+	}
+};
+
+unique_ptr<GlobalFunctionData> PfileMatrixInitGlobal(FileSystem &fs, const PfileWriteBindData &bind,
+                                                     const string &file_path) {
+	auto g = make_uniq<PfileMatrixGlobalState>();
+	g->base = PfilePrefix(file_path);
+	g->base_name = PfileBaseName(g->base);
+	g->vcol_label = bind.shard_key_header;
+	g->catalog_path = g->base + ".pfile.json";
+	g->fs = &fs;
+	for (idx_t i = 0; i < bind.shard_labels.size(); i++) {
+		MatrixSampleBlock sb;
+		sb.label = bind.shard_labels[i];
+		sb.lo = bind.shard_lo[i];
+		sb.hi = bind.shard_hi[i];
+		sb.dir = fs.JoinPath(g->base, string(kMatrixSampleKey) + "=" + sb.label);
+		sb.psam_final = fs.JoinPath(sb.dir, "samples.psam");
+		sb.psam_staging = sb.psam_final + ".staging";
+		g->sblocks.push_back(std::move(sb));
+	}
+	// Nothing is created here: files open on the first row (PfileMatrixOpen).
+	return std::move(g);
+}
+
+// First row: the grid root (+ missing ancestors) and the N sample-block dirs + .psam staging (identity
+// is out-of-band, fully known at bind) — written ONCE for the whole grid.
+void PfileMatrixOpen(PfileMatrixGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
+	g.opened = true; // from here on, cleanup owns whatever exists
+	CreateDirRecorded(fs, g.base, g.created_dirs);
+	for (auto &sb : g.sblocks) {
+		CreateDirRecorded(fs, sb.dir, g.created_dirs);
+		vector<string> slice(bind.iids.begin() + static_cast<std::ptrdiff_t>(sb.lo),
+		                     bind.iids.begin() + static_cast<std::ptrdiff_t>(sb.hi));
+		WritePsamFromIids(fs, sb.psam_staging, slice);
+	}
+}
+
+// Open variant-block `key`: the shard_by contiguity + path-safety rules (as shard_by), its dir, the
+// .pvar staging + header (a fresh Pvar state, so monotonicity + the POS extent reset per block), and
+// N .pgen writers primed with their slice sizes (pgenlib init deferred to the first append).
+void PfileMatrixBlockOpen(PfileMatrixGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs,
+                          const string &key) {
+	ValidateShardKeyValue(g.vcol_label, key);
+	if (g.seen_keys.count(key) != 0) {
+		throw InvalidInputException(
+		    "write pfile: shard_by key '%s=%s' reappears after another value — input is not grouped by the "
+		    "shard key. Add ORDER BY %s, POS to the query so each shard key is contiguous.",
+		    g.vcol_label, key, g.vcol_label);
+	}
+	string vdir = fs.JoinPath(g.base, g.vcol_label + "=" + key);
+	CreateDirRecorded(fs, vdir, g.created_dirs);
+	g.cur_pvar_final = fs.JoinPath(vdir, "variants.pvar");
+	g.cur_pvar_staging = g.cur_pvar_final + ".staging";
+	g.cur_pvar = make_uniq<PvarWriteGlobalState>();
+	PvarOpenAndWriteHeader(*g.cur_pvar, fs, *bind.pvar_bind, g.cur_pvar_staging);
+
+	g.cur_pgens.clear();
+	g.cur_pgen_finals.clear();
+	for (auto &sb : g.sblocks) {
+		string cdir = fs.JoinPath(vdir, string(kMatrixSampleKey) + "=" + sb.label);
+		CreateDirRecorded(fs, cdir, g.created_dirs);
+		string pgen_final = fs.JoinPath(cdir, "data.pgen");
+		auto pg = make_uniq<PgenWriteGlobalState>();
+		pg->path = pgen_final + ".staging";
+		pg->sample_ct_known = true;
+		pg->sample_ct = static_cast<uint32_t>(sb.hi - sb.lo);
+		pg->variant_ct_limit = bind.pgen_bind->variant_ct_limit; // per-block bound, as shard_by
+		g.cur_pgens.push_back(std::move(pg));
+		g.cur_pgen_finals.push_back(pgen_final);
+	}
+	g.active_key = key;
+	g.has_active = true;
+	g.seen_keys.insert(key);
+}
+
+// Finish the open block's N .pgen + 1 .pvar, record its catalog facts, and KEEP its files in staging
+// (queued for promotion at finalize). Frees the N writers, so memory stays at one block.
+void PfileMatrixBlockClose(PfileMatrixGlobalState &g) {
+	uint64_t variant_ct = g.cur_pgens.empty() ? 0 : g.cur_pgens[0]->appended;
+	for (idx_t i = 0; i < g.cur_pgens.size(); i++) {
+		PgenFinish(*g.cur_pgens[i]); // a block opens only on a row, so appended >= 1
+		g.pgen_moves.emplace_back(g.cur_pgens[i]->path, g.cur_pgen_finals[i]);
+		g.cur_pgens[i].reset(); // finished: its staging file is now owned by pgen_moves
+	}
+	if (g.cur_pvar->handle) {
+		g.cur_pvar->handle->Sync();
+		g.cur_pvar->handle.reset();
+	}
+	g.pvar_moves.emplace_back(g.cur_pvar_staging, g.cur_pvar_final);
+
+	MatrixVariantBlock vb;
+	vb.key = g.active_key;
+	vb.start = g.running_start;
+	vb.stop = g.running_start + variant_ct;
+	vb.has_pos = g.cur_pvar->has_pos_extent;
+	vb.pos_min = g.cur_pvar->first_pos; // running TRUE min (see PvarWriteGlobalState)
+	vb.pos_max = g.cur_pvar->pos_max;
+	g.running_start = vb.stop;
+	g.vblocks.push_back(std::move(vb));
+
+	g.cur_pvar.reset();
+	g.cur_pgens.clear();
+	g.cur_pgen_finals.clear();
+	g.has_active = false;
+}
+
+void PfileMatrixSink(ExecutionContext &context, const PfileWriteBindData &bind, GlobalFunctionData &gstate,
+                     DataChunk &input) {
+	auto &g = gstate.Cast<PfileMatrixGlobalState>();
+	auto &fs = FileSystem::GetFileSystem(context.client);
+	try {
+		if (input.size() == 0) {
+			return;
+		}
+		if (!g.opened) {
+			PfileMatrixOpen(g, bind, fs);
+		}
+		input.Flatten();
+		const idx_t n = input.size();
+		const uint32_t total = static_cast<uint32_t>(bind.iids.size());
+		idx_t row = 0;
+		while (row < n) {
+			auto kv = input.GetValue(bind.shard_key_input_idx, row);
+			if (kv.IsNull()) {
+				throw InvalidInputException(
+				    "write pfile: the shard_by key column '%s' is NULL for a row — a shard key cannot be NULL",
+				    g.vcol_label);
+			}
+			string key = kv.ToString();
+			// Maximal contiguous run [row, run_end) with the same key: one block write covers it.
+			idx_t run_end = row + 1;
+			while (run_end < n) {
+				auto kv2 = input.GetValue(bind.shard_key_input_idx, run_end);
+				if (kv2.IsNull() || kv2.ToString() != key) {
+					break;
+				}
+				run_end++;
+			}
+			if (!g.has_active || g.active_key != key) {
+				if (g.has_active) {
+					PfileMatrixBlockClose(g);
+				}
+				PfileMatrixBlockOpen(g, bind, fs, key);
+			}
+			// The block's .pvar first: its (CHROM, POS) monotonicity check fires before any .pgen append.
+			PvarWriteChunk(*bind.pvar_bind, *g.cur_pvar, input, row, run_end);
+			for (idx_t r = row; r < run_end; r++) {
+				Value geno_val = PgenRowGenotypes(*bind.pgen_bind, input, r);
+				const vector<Value> &calls = GenotypeCalls(geno_val);
+				if (calls.size() != total) {
+					throw InvalidInputException(
+					    "write pgen: variant %llu has %llu genotypes but the sample count is %u — every variant must "
+					    "list the same number of samples",
+					    static_cast<unsigned long long>(g.running_start + g.cur_pgens[0]->appended),
+					    static_cast<unsigned long long>(calls.size()), total);
+				}
+				for (idx_t i = 0; i < g.cur_pgens.size(); i++) {
+					auto &pg = *g.cur_pgens[i];
+					if (!pg.writer_inited) {
+						PgenEnsureWriterInited(pg, pg.sample_ct);
+					}
+					PgenAppendCallRange(pg, calls, g.sblocks[i].lo, g.sblocks[i].hi);
+				}
+			}
+			row = run_end;
+		}
+	} catch (...) {
+		g.CleanupPartial(fs);
+		throw;
+	}
+}
+
+// The pfile_catalog:2 matrix catalog, field-for-field the shape ParseMatrixCatalog / BuildCells parse
+// (test/sql/read_pfile_catalog_matrix_compound.test builds the reference fixture), in the `blocks` form:
+//   variants axis — [<vcol> enum (+ "over":"CHROM" iff <vcol> is CHROM), CHUNK ordinal_interval over POS]
+//                   one block per <vcol> value, CHUNK "0", bounds.CHUNK = the block's inclusive TRUE
+//                   {min,max} POS (fork B: the reader prunes cells on CHROM AND POS).
+//   samples axis  — [GROUP enum], one block per shard_samples label.
+//   template      — pfile uses one key of each axis, pvar only the variant key, psam only the sample key;
+//                   paths are relative to the catalog's dir (the PARENT of out/).
+// Dense: every (variant-block, sample-block) cell is written, so there is no `holes` array.
+void PfileWriteMatrixCatalog(PfileMatrixGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
+	const string vk = JsonEscape(g.vcol_label);
+	const string sk = kMatrixSampleKey;
+	const string ck = kMatrixChunkKey;
+	string j = "{\n";
+	j += "  \"pfile_catalog\": 2,\n";
+	j += "  \"dataset\": \"" + JsonEscape(g.base_name) + "\",\n";
+	j += "  \"axes\": [\n";
+	j += "    {\n      \"name\": \"variants\",\n";
+	j += "      \"keys\": [ { \"name\": \"" + vk + "\", \"type\": \"enum\"" +
+	     (bind.matrix_over_chrom ? string(", \"over\": \"CHROM\"") : string()) + " }, { \"name\": \"" + ck +
+	     "\", \"type\": \"ordinal_interval\", \"over\": \"POS\" } ],\n";
+	j += "      \"blocks\": [\n";
+	for (idx_t i = 0; i < g.vblocks.size(); i++) {
+		auto &b = g.vblocks[i];
+		j += "        { \"keys\": { \"" + vk + "\": \"" + JsonEscape(b.key) + "\", \"" + ck +
+		     "\": \"0\" }, \"start\": " + std::to_string(b.start) + ", \"stop\": " + std::to_string(b.stop) +
+		     ", \"bounds\": { \"" + ck + "\": { \"min\": " + std::to_string(b.pos_min) +
+		     ", \"max\": " + std::to_string(b.pos_max) + " } } }";
+		j += (i + 1 < g.vblocks.size()) ? ",\n" : "\n";
+	}
+	j += "      ]\n    },\n";
+	j += "    {\n      \"name\": \"samples\",\n";
+	j += "      \"keys\": [ { \"name\": \"" + sk + "\", \"type\": \"enum\" } ],\n";
+	j += "      \"blocks\": [\n";
+	for (idx_t i = 0; i < g.sblocks.size(); i++) {
+		auto &b = g.sblocks[i];
+		j += "        { \"keys\": { \"" + sk + "\": \"" + JsonEscape(b.label) +
+		     "\" }, \"start\": " + std::to_string(b.lo) + ", \"stop\": " + std::to_string(b.hi) + " }";
+		j += (i + 1 < g.sblocks.size()) ? ",\n" : "\n";
+	}
+	j += "      ]\n    }\n  ],\n";
+	const string root = JsonEscape(g.base_name) + "/";
+	const string vdir = root + vk + "={" + vk + "}";
+	const string sdir = sk + "={" + sk + "}";
+	j += "  \"template\": {\n";
+	j += "    \"pfile\": \"" + vdir + "/" + sdir + "/data\",\n";
+	j += "    \"pvar\": \"" + vdir + "/variants.pvar\",\n";
+	j += "    \"psam\": \"" + root + sdir + "/samples.psam\"\n";
+	j += "  }\n}\n";
+	auto h = fs.OpenFile(g.catalog_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	h->Write(const_cast<char *>(j.data()), j.size());
+	h->Sync();
+	h.reset();
+}
+
+void PfileMatrixFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileMatrixGlobalState &g) {
+	try {
+		if (!g.opened) {
+			throw IOException("write pfile: shard_by x shard_samples produced no variants — the input query "
+			                  "returned no rows");
+		}
+		if (g.has_active) {
+			PfileMatrixBlockClose(g);
+		}
+		// Promote: every .pvar, every .psam, then every .pgen, then the catalog LAST. Not atomic
+		// as a group — a prior run's catalog is removed first, so a failure between renames leaves the
+		// cohort absent (no catalog), never stale.
+		RemoveStaleCatalog(fs, g.catalog_path);
+		for (auto &m : g.pvar_moves) {
+			fs.MoveFile(m.first, m.second);
+		}
+		for (auto &sb : g.sblocks) {
+			fs.MoveFile(sb.psam_staging, sb.psam_final);
+		}
+		for (auto &m : g.pgen_moves) {
+			fs.MoveFile(m.first, m.second);
+		}
+		PfileWriteMatrixCatalog(g, bind, fs); // the completion marker
+		g.finished = true;
+	} catch (...) {
+		g.CleanupPartial(fs);
+		throw;
+	}
+}
+
 unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindInput &input,
                                        const vector<CompatName> &names_in, const vector<LogicalType> &sql_types) {
 	const vector<string> names = CompatNameStrings(names_in);
@@ -2363,11 +2748,8 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		}
 	}
 
-	// shard_by (variant axis) and shard_samples (sample axis) at once is the V2 grid — not built.
-	if (has_shard_samples && !bind->shard_by.empty()) {
-		throw BinderException("write pfile: shard_by and shard_samples cannot be combined — sharding both axes at "
-		                      "once (the variants x samples grid) is a planned follow-on. Use one of them.");
-	}
+	// shard_by (variant axis) and shard_samples (sample axis) at once is the V2 grid (P13-010).
+	bind->matrix_mode = has_shard_samples && !bind->shard_by.empty();
 	if (has_shard_samples &&
 	    (!bind->pvar_override.empty() || !bind->pgen_override.empty() || !bind->psam_override.empty())) {
 		throw BinderException("write pfile: shard_samples cannot be combined with pvar/pgen/psam path overrides — "
@@ -2431,7 +2813,20 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	// --- shard_samples: validate the partition against the resolved IID order ---
 	if (has_shard_samples) {
 		ParseSampleShards(shard_samples_spec, bind->iids, *bind);
+		// The concurrent writer count is N in both modes: the matrix rolls variant-blocks, so it holds
+		// one block's N .pgen writers at a time (M x N files total, but never open at once).
 		CheckSampleShardResources(bind->shard_labels.size(), bind->pgen_bind->variant_ct_limit);
+		if (bind->matrix_mode) {
+			bind->sample_shard_mode = false; // the matrix owns dispatch, not the single-axis sample path
+			// The target basename is the grid root, a literal in every catalog template: a brace there
+			// would open/close a placeholder and make the catalog unparseable.
+			if (PfileBaseName(PfilePrefix(input.info.file_path)).find_first_of("{}") != string::npos) {
+				throw BinderException(
+				    "write pfile: shard_by + shard_samples target '%s' — the name contains a brace "
+				    "('{' or '}'), which the matrix catalog template cannot carry. Rename the target.",
+				    input.info.file_path);
+			}
+		}
 		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
 			throw BinderException("write pfile: shard_samples target '%s' has no filename component for the shard "
 			                      "tree / dataset name — give the COPY target a name, e.g. TO 'out'",
@@ -2468,6 +2863,26 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		}
 		bind->shard_key_input_idx = sidx;
 		bind->shard_key_header = names[sidx];
+		if (bind->matrix_mode) {
+			// Matrix key names must be unique per axis AND across axes (the reader rejects a repeat):
+			// the variant axis is {<shard_by>, CHUNK}, the sample axis is {GROUP}.
+			if (StringUtil::CIEquals(names[sidx], kMatrixSampleKey) ||
+			    StringUtil::CIEquals(names[sidx], kMatrixChunkKey)) {
+				throw BinderException("write pfile: shard_by '%s' with shard_samples — '%s' and '%s' are reserved "
+				                      "matrix key names (the sample-axis key and the variant-axis POS key). Rename "
+				                      "the column, e.g. SELECT ..., \"%s\" AS %s_key, and shard_by that.",
+				                      names[sidx], kMatrixSampleKey, kMatrixChunkKey, names[sidx], names[sidx]);
+			}
+			// The column name is also a literal in the catalog templates ("<col>={<col>}"), where a brace
+			// would open/close a placeholder and make the catalog unparseable.
+			if (names[sidx].find_first_of("{}") != string::npos) {
+				throw BinderException("write pfile: shard_by column '%s' with shard_samples — the name contains a "
+				                      "brace ('{' or '}'), which the matrix catalog template cannot carry. Rename "
+				                      "the column.",
+				                      names[sidx]);
+			}
+			bind->matrix_over_chrom = StringUtil::CIEquals(names[sidx], "CHROM");
+		}
 		// A degenerate target with no name component would yield an empty dataset name (the loader
 		// rejects that) and no shard tree. Guard it at bind, before any file is touched.
 		if (PfileBaseName(PfilePrefix(input.info.file_path)).empty()) {
@@ -2485,6 +2900,9 @@ unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, Funct
                                                    const string &file_path) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (bind.matrix_mode) {
+		return PfileMatrixInitGlobal(fs, bind, file_path);
+	}
 	if (bind.sample_shard_mode) {
 		return PfileSampleShardedInitGlobal(fs, bind, file_path);
 	}
@@ -2532,6 +2950,10 @@ unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, FunctionDat
 void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
                    DataChunk &input) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
+	if (bind.matrix_mode) {
+		PfileMatrixSink(context, bind, gstate, input);
+		return;
+	}
 	if (bind.sample_shard_mode) {
 		PfileSampleShardedSink(context, bind, gstate, input);
 		return;
@@ -2559,6 +2981,10 @@ void PfileCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, 
 void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (bind.matrix_mode) {
+		PfileMatrixFinalize(fs, bind, gstate.Cast<PfileMatrixGlobalState>());
+		return;
+	}
 	if (bind.sample_shard_mode) {
 		PfileSampleShardedFinalize(fs, gstate.Cast<PfileSampleShardedGlobalState>());
 		return;

@@ -1,0 +1,503 @@
+# name: test/sql/write_pfile_matrix.test
+# description: COPY ... (FORMAT pfile, shard_by '<vcol>', shard_samples {...}) — shard BOTH axes into a pfile_catalog:2 matrix: M variant-blocks x N sample-blocks (P13-010). Oracle: the source fileset.
+# group: [sql]
+
+require plinking_duck
+
+# Layout written into TO '<dir>/<name>' (hive labels; the catalog templates are the contract):
+#   <dir>/<name>/<vcol>=<v>/variants.pvar               — M, one per variant-block
+#   <dir>/<name>/GROUP=<label>/samples.psam             — N, one per sample-block (written once)
+#   <dir>/<name>/<vcol>=<v>/GROUP=<label>/data.pgen     — M x N cells
+#   <dir>/<name>.pfile.json                             — the v2 catalog, written LAST
+# large_example: 3000 variants x 8 samples (SAMP1..SAMP8), CHROM 1/2/3 x 1000 each.
+# pgen_example: 4 variants x 4 samples (SAMPLE1..4), CHROM 1 (3 variants) + CHROM 2 (1 variant).
+
+# ===========================================================================
+# NEGATIVE — bind-time rejects (no file is written)
+# ===========================================================================
+
+# The sample-axis key is the reserved name GROUP: a shard_by column of that name would put one key
+# name on both axes (the reader rejects it). Case-insensitive.
+statement error
+COPY (SELECT *, CHROM AS "group" FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'group', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+reserved
+
+# CHUNK is the variant axis's POS key: a shard_by column named CHUNK would declare it twice.
+statement error
+COPY (SELECT *, CHROM AS "CHUNK" FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHUNK', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+reserved
+
+# A bare TINYINT[N] LIST carries no sample identity (the existing identity error).
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+needs sample identity
+
+# Sample-orient input (rows are samples, no variant columns): the existing missing-role error.
+statement error
+COPY (SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample'))
+TO '{TEST_DIR}/bad' (FORMAT pfile, samples ['SAMP1'], shard_by 'IID', shard_samples {a: ['SAMP1']});
+----
+CHROM
+
+# The sample-shard rules still apply (ParseSampleShards is reused): a non-contiguous group.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP3'], b: ['SAMP2', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+contiguous
+
+# Path overrides cannot be combined (the layout generates every path).
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM', pvar '{TEST_DIR}/x.pvar', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+cannot be combined with pvar/pgen/psam path overrides
+
+# Resource guard on N (the concurrent writer count): 250 one-sample groups at variant_count 2e9
+# reserve ~750 GB, so the COPY fails at BIND, naming the mitigations.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pca_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM', variant_count 2000000000, shard_samples {g0: ['per0'], g1: ['per1'], g2: ['per2'], g3: ['per3'], g4: ['per4'], g5: ['per5'], g6: ['per6'], g7: ['per7'], g8: ['per8'], g9: ['per9'], g10: ['per10'], g11: ['per11'], g12: ['per12'], g13: ['per13'], g14: ['per14'], g15: ['per15'], g16: ['per16'], g17: ['per17'], g18: ['per18'], g19: ['per19'], g20: ['per20'], g21: ['per21'], g22: ['per22'], g23: ['per23'], g24: ['per24'], g25: ['per25'], g26: ['per26'], g27: ['per27'], g28: ['per28'], g29: ['per29'], g30: ['per30'], g31: ['per31'], g32: ['per32'], g33: ['per33'], g34: ['per34'], g35: ['per35'], g36: ['per36'], g37: ['per37'], g38: ['per38'], g39: ['per39'], g40: ['per40'], g41: ['per41'], g42: ['per42'], g43: ['per43'], g44: ['per44'], g45: ['per45'], g46: ['per46'], g47: ['per47'], g48: ['per48'], g49: ['per49'], g50: ['per50'], g51: ['per51'], g52: ['per52'], g53: ['per53'], g54: ['per54'], g55: ['per55'], g56: ['per56'], g57: ['per57'], g58: ['per58'], g59: ['per59'], g60: ['per60'], g61: ['per61'], g62: ['per62'], g63: ['per63'], g64: ['per64'], g65: ['per65'], g66: ['per66'], g67: ['per67'], g68: ['per68'], g69: ['per69'], g70: ['per70'], g71: ['per71'], g72: ['per72'], g73: ['per73'], g74: ['per74'], g75: ['per75'], g76: ['per76'], g77: ['per77'], g78: ['per78'], g79: ['per79'], g80: ['per80'], g81: ['per81'], g82: ['per82'], g83: ['per83'], g84: ['per84'], g85: ['per85'], g86: ['per86'], g87: ['per87'], g88: ['per88'], g89: ['per89'], g90: ['per90'], g91: ['per91'], g92: ['per92'], g93: ['per93'], g94: ['per94'], g95: ['per95'], g96: ['per96'], g97: ['per97'], g98: ['per98'], g99: ['per99'], g100: ['per100'], g101: ['per101'], g102: ['per102'], g103: ['per103'], g104: ['per104'], g105: ['per105'], g106: ['per106'], g107: ['per107'], g108: ['per108'], g109: ['per109'], g110: ['per110'], g111: ['per111'], g112: ['per112'], g113: ['per113'], g114: ['per114'], g115: ['per115'], g116: ['per116'], g117: ['per117'], g118: ['per118'], g119: ['per119'], g120: ['per120'], g121: ['per121'], g122: ['per122'], g123: ['per123'], g124: ['per124'], g125: ['per125'], g126: ['per126'], g127: ['per127'], g128: ['per128'], g129: ['per129'], g130: ['per130'], g131: ['per131'], g132: ['per132'], g133: ['per133'], g134: ['per134'], g135: ['per135'], g136: ['per136'], g137: ['per137'], g138: ['per138'], g139: ['per139'], g140: ['per140'], g141: ['per141'], g142: ['per142'], g143: ['per143'], g144: ['per144'], g145: ['per145'], g146: ['per146'], g147: ['per147'], g148: ['per148'], g149: ['per149'], g150: ['per150'], g151: ['per151'], g152: ['per152'], g153: ['per153'], g154: ['per154'], g155: ['per155'], g156: ['per156'], g157: ['per157'], g158: ['per158'], g159: ['per159'], g160: ['per160'], g161: ['per161'], g162: ['per162'], g163: ['per163'], g164: ['per164'], g165: ['per165'], g166: ['per166'], g167: ['per167'], g168: ['per168'], g169: ['per169'], g170: ['per170'], g171: ['per171'], g172: ['per172'], g173: ['per173'], g174: ['per174'], g175: ['per175'], g176: ['per176'], g177: ['per177'], g178: ['per178'], g179: ['per179'], g180: ['per180'], g181: ['per181'], g182: ['per182'], g183: ['per183'], g184: ['per184'], g185: ['per185'], g186: ['per186'], g187: ['per187'], g188: ['per188'], g189: ['per189'], g190: ['per190'], g191: ['per191'], g192: ['per192'], g193: ['per193'], g194: ['per194'], g195: ['per195'], g196: ['per196'], g197: ['per197'], g198: ['per198'], g199: ['per199'], g200: ['per200'], g201: ['per201'], g202: ['per202'], g203: ['per203'], g204: ['per204'], g205: ['per205'], g206: ['per206'], g207: ['per207'], g208: ['per208'], g209: ['per209'], g210: ['per210'], g211: ['per211'], g212: ['per212'], g213: ['per213'], g214: ['per214'], g215: ['per215'], g216: ['per216'], g217: ['per217'], g218: ['per218'], g219: ['per219'], g220: ['per220'], g221: ['per221'], g222: ['per222'], g223: ['per223'], g224: ['per224'], g225: ['per225'], g226: ['per226'], g227: ['per227'], g228: ['per228'], g229: ['per229'], g230: ['per230'], g231: ['per231'], g232: ['per232'], g233: ['per233'], g234: ['per234'], g235: ['per235'], g236: ['per236'], g237: ['per237'], g238: ['per238'], g239: ['per239'], g240: ['per240'], g241: ['per241'], g242: ['per242'], g243: ['per243'], g244: ['per244'], g245: ['per245'], g246: ['per246'], g247: ['per247'], g248: ['per248'], g249: ['per249']});
+----
+fewer groups
+
+# The shard_by column name becomes a template literal + key name: '{' / '}' would make the catalog
+# template unparseable, so it is rejected at bind.
+statement error
+COPY (SELECT *, CHROM AS "c{x}" FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'c{x}', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+brace
+
+# The COPY target's basename is also a template literal (the grid root): a brace there would write a
+# catalog the reader cannot parse, so it is rejected at bind too.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad}x' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+brace
+
+# None of the bind rejects wrote anything.
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/bad*');
+----
+0
+
+# ===========================================================================
+# POSITIVE — a 3 x 2 grid (3 CHROM blocks x 2 sample-blocks), STRUCT input
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/g' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# The layout: M=3 .pvar, N=2 .psam, M x N = 6 .pgen; no staging left behind.
+query IIII
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/g/CHROM=*/variants.pvar')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/g/GROUP=*/samples.psam')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/g/CHROM=*/GROUP=*/data.pgen')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/g/**/*.staging*'));
+----
+3	2	6	0
+
+# Each sample-block .psam is its IID slice, in order (written once, shared by every variant-block).
+query T
+SELECT string_agg(IID, ',') FROM read_psam('{TEST_DIR}/g/GROUP=a/samples.psam');
+----
+SAMP1,SAMP2,SAMP3
+
+query T
+SELECT string_agg(IID, ',') FROM read_psam('{TEST_DIR}/g/GROUP=b/samples.psam');
+----
+SAMP4,SAMP5,SAMP6,SAMP7,SAMP8
+
+# Each variant-block .pvar holds exactly its CHROM's 1000 variants.
+query TI
+SELECT string_agg(DISTINCT CHROM, ','), count(*) FROM read_pvar('{TEST_DIR}/g/CHROM=2/variants.pvar');
+----
+2	1000
+
+# Every cell equals the source restricted to (its CHROM) x (its sample slice): genotypes AND row count.
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/g/CHROM=1/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=1/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [0, 1, 2]) WHERE CHROM = '1')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/g/CHROM=1/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=1/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam'));
+----
+0	1000
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/g/CHROM=1/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=1/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [3, 4, 5, 6, 7]) WHERE CHROM = '1')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/g/CHROM=1/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=1/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam'));
+----
+0	1000
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/g/CHROM=2/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=2/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [0, 1, 2]) WHERE CHROM = '2')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/g/CHROM=2/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=2/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam'));
+----
+0	1000
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/g/CHROM=2/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=2/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [3, 4, 5, 6, 7]) WHERE CHROM = '2')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/g/CHROM=2/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=2/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam'));
+----
+0	1000
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/g/CHROM=3/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=3/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [0, 1, 2]) WHERE CHROM = '3')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/g/CHROM=3/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=3/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam'));
+----
+0	1000
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/g/CHROM=3/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=3/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example', samples := [3, 4, 5, 6, 7]) WHERE CHROM = '3')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/g/CHROM=3/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=3/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam'));
+----
+0	1000
+
+# ===========================================================================
+# CATALOG — pfile_catalog:2, compound variant keys (CHROM enum over:"CHROM" + CHUNK ordinal_interval
+# over POS with per-block bounds), one sample enum, three templates, dense (no holes). Shape diffed
+# against the read_pfile_catalog_matrix_compound fixture.
+# ===========================================================================
+
+query IIII
+SELECT count(*), count(DISTINCT pvar), count(DISTINCT psam), count(*) FILTER (WHERE verified)
+FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json');
+----
+6	3	2	6
+
+# verify_all checks EVERY cell before any prune: counts match, no CHROM/POS under-claim.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', verify_all := true);
+----
+6
+
+# compound keys surface as one map per cell, variant-major order.
+query TTT
+SELECT keys['CHROM'], keys['CHUNK'], keys['GROUP']
+FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json') ORDER BY source_ordinal;
+----
+1	0	a
+1	0	b
+2	0	a
+2	0	b
+3	0	a
+3	0	b
+
+# The raw JSON: field shapes the reader parses (as the compound fixture), and no holes.
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('{TEST_DIR}/g.pfile.json'))
+WHERE contains(c, '"pfile_catalog": 2')
+  AND contains(c, '"dataset": "g"')
+  AND contains(c, '{ "name": "CHROM", "type": "enum", "over": "CHROM" }')
+  AND contains(c, '{ "name": "CHUNK", "type": "ordinal_interval", "over": "POS" }')
+  AND contains(c, '{ "keys": { "CHROM": "2", "CHUNK": "0" }, "start": 1000, "stop": 2000, "bounds": { "CHUNK": { "min": 100, "max": 100000 } } }')
+  AND contains(c, '{ "name": "GROUP", "type": "enum" }')
+  AND contains(c, '{ "keys": { "GROUP": "b" }, "start": 3, "stop": 8 }')
+  AND contains(c, '"pfile": "g/CHROM={CHROM}/GROUP={GROUP}/data"')
+  AND contains(c, '"pvar": "g/CHROM={CHROM}/variants.pvar"')
+  AND contains(c, '"psam": "g/GROUP={GROUP}/samples.psam"')
+  AND NOT contains(c, '"holes"');
+----
+1
+
+# ---------------------------------------------------------------------------
+# PUSHDOWN (fork B) — region prunes cells on CHROM AND on the CHUNK POS bounds. Every CHROM of
+# large_example spans POS [100, 100000].
+# ---------------------------------------------------------------------------
+
+# CHROM: contig '2' keeps only the CHROM=2 variant-block x N=2 sample-blocks.
+query TI
+SELECT string_agg(DISTINCT keys['CHROM'], ','), count(*)
+FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '2:5000-6000');
+----
+2	2
+
+# POS: a window just past the block's max drops it. An enum-only (fork A) catalog would keep 2 here.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '2:100001-100100');
+----
+0
+
+# ... and a window just before its min.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '2:1-99');
+----
+0
+
+# Inclusive bounds: a window at the block's exact min, or exact max, keeps it.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '2:100-100');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '2:100000-100000');
+----
+2
+
+# The sample enum prunes too, and multiplies with region: 1 variant-block x 1 sample-block.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '3:100-200', keys := {'GROUP': ['b']});
+----
+1
+
+# ---------------------------------------------------------------------------
+# GRID ROUND TRIP — every (variant, IID, call) of the M x N cells equals the source, both directions.
+# Each cell is read through the templated companions (its block's .pvar + its sample-block's .psam).
+# NOTE: ATTACH's v2 genotype relations (m.genotypes / m.genotypes_by_sample) are NOT asserted here.
+# They read read_pfile([every cell prefix]) with no pvar/psam overrides, so they (1) need a .pvar
+# co-located with each cell's .pgen — this layout shares one .pvar per variant-block, so they error for
+# EVERY matrix written here, N=1 included — and (2) concatenate along the variant axis, which cannot
+# assemble more than one sample-block. A pre-existing reader gap (see the P13-010 PR); the writer's
+# output is verified by verify_all + this oracle instead.
+# ---------------------------------------------------------------------------
+
+query III
+WITH grid AS (
+    SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/g/CHROM=1/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=1/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/g/CHROM=1/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=1/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/g/CHROM=2/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=2/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/g/CHROM=2/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=2/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/g/CHROM=3/GROUP=a/data', pvar := '{TEST_DIR}/g/CHROM=3/variants.pvar', psam := '{TEST_DIR}/g/GROUP=a/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/g/CHROM=3/GROUP=b/data', pvar := '{TEST_DIR}/g/CHROM=3/variants.pvar', psam := '{TEST_DIR}/g/GROUP=b/samples.psam', orient := 'genotype'))
+SELECT (SELECT count(*) FROM (FROM grid EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype'))),
+       (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') EXCEPT ALL FROM grid)),
+       (SELECT count(*) FROM grid);
+----
+0	0	24000
+
+# ATTACH: the structural relations resolve through the catalog's template paths.
+statement ok
+ATTACH '{TEST_DIR}/g.pfile.json' AS m (TYPE pfile_catalog);
+
+query IIIII
+SELECT (SELECT count(*) FROM m.cells), (SELECT sum(variant_stop - variant_start) FROM m.cells),
+       (SELECT count(*) FROM m.variant_blocks), (SELECT count(*) FROM m.sample_blocks),
+       (SELECT count(*) FROM m.variants);
+----
+6	6000	3	2	3000
+
+query T
+SELECT string_agg(IID, ',' ORDER BY IID) FROM m.samples;
+----
+SAMP1,SAMP2,SAMP3,SAMP4,SAMP5,SAMP6,SAMP7,SAMP8
+
+statement ok
+DETACH m;
+
+# ---------------------------------------------------------------------------
+# A non-CHROM shard_by: the variant enum key carries NO "over" (only CHROM is the contig), so the
+# catalog still parses and verifies, region is refused (no contig key), and the data round-trips.
+# ---------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT *, CASE WHEN CHROM = '3' THEN 'late' ELSE 'early' END AS cohort
+      FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/nc' (FORMAT pfile, shard_by 'cohort', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query II
+SELECT count(*), string_agg(DISTINCT keys['cohort'], ',' ORDER BY keys['cohort'])
+FROM read_pfile_catalog('{TEST_DIR}/nc.pfile.json', verify_all := true);
+----
+4	early,late
+
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('{TEST_DIR}/nc.pfile.json'))
+WHERE contains(c, '{ "name": "cohort", "type": "enum" }') AND NOT contains(c, '"over": "CHROM"');
+----
+1
+
+statement error
+SELECT * FROM read_pfile_catalog('{TEST_DIR}/nc.pfile.json', region := '1:1-2');
+----
+invalid predicate
+
+query III
+WITH ncgrid AS (
+    SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/nc/cohort=early/GROUP=a/data', pvar := '{TEST_DIR}/nc/cohort=early/variants.pvar', psam := '{TEST_DIR}/nc/GROUP=a/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/nc/cohort=early/GROUP=b/data', pvar := '{TEST_DIR}/nc/cohort=early/variants.pvar', psam := '{TEST_DIR}/nc/GROUP=b/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/nc/cohort=late/GROUP=a/data', pvar := '{TEST_DIR}/nc/cohort=late/variants.pvar', psam := '{TEST_DIR}/nc/GROUP=a/samples.psam', orient := 'genotype')
+    UNION ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/nc/cohort=late/GROUP=b/data', pvar := '{TEST_DIR}/nc/cohort=late/variants.pvar', psam := '{TEST_DIR}/nc/GROUP=b/samples.psam', orient := 'genotype'))
+SELECT (SELECT count(*) FROM (FROM ncgrid EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype'))),
+       (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') EXCEPT ALL FROM ncgrid)),
+       (SELECT count(*) FROM ncgrid);
+----
+0	0	24000
+
+# ---------------------------------------------------------------------------
+# Overwrite: a second COPY onto the same target replaces the grid; the catalog stays valid.
+# ---------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM <> '3' ORDER BY CHROM, POS)
+TO '{TEST_DIR}/g' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', verify_all := true);
+----
+4
+
+# ===========================================================================
+# EDGES — M=1 (one CHROM) and N=1 (one group); a LIST input identified by `samples`
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') WHERE CHROM = '1' ORDER BY CHROM, POS)
+TO '{TEST_DIR}/m1' (FORMAT pfile, shard_by 'CHROM', shard_samples {x: ['SAMPLE1'], y: ['SAMPLE2', 'SAMPLE3', 'SAMPLE4']});
+
+query III
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/m1/CHROM=*/variants.pvar')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/m1/GROUP=*/samples.psam')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/m1/CHROM=*/GROUP=*/data.pgen'));
+----
+1	2	2
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/m1/CHROM=1/GROUP=y/data', pvar := '{TEST_DIR}/m1/CHROM=1/variants.pvar', psam := '{TEST_DIR}/m1/GROUP=y/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pgen_example', samples := [1, 2, 3]) WHERE CHROM = '1')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/m1/CHROM=1/GROUP=y/data', pvar := '{TEST_DIR}/m1/CHROM=1/variants.pvar', psam := '{TEST_DIR}/m1/GROUP=y/samples.psam'));
+----
+0	3
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pgen_example') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/n1' (FORMAT pfile, samples ['SAMPLE1', 'SAMPLE2', 'SAMPLE3', 'SAMPLE4'], shard_by 'CHROM', shard_samples {every: ['SAMPLE1', 'SAMPLE2', 'SAMPLE3', 'SAMPLE4']});
+
+query III
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/n1/CHROM=*/variants.pvar')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/n1/GROUP=*/samples.psam')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/n1/CHROM=*/GROUP=*/data.pgen'));
+----
+2	1	2
+
+query II
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('{TEST_DIR}/n1/CHROM=2/GROUP=every/data', pvar := '{TEST_DIR}/n1/CHROM=2/variants.pvar', psam := '{TEST_DIR}/n1/GROUP=every/samples.psam')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/pgen_example') WHERE CHROM = '2')),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/n1/CHROM=2/GROUP=every/data', pvar := '{TEST_DIR}/n1/CHROM=2/variants.pvar', psam := '{TEST_DIR}/n1/GROUP=every/samples.psam'));
+----
+0	1
+
+# Both edges are VALID matrices: every cell verifies.
+query II
+SELECT (SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/m1.pfile.json', verify_all := true)),
+       (SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', verify_all := true));
+----
+2	2
+
+# PER-BLOCK POS bounds (large_example's CHROMs all share one extent, so this grid is the discriminating
+# one): CHROM 1 spans [10000, 30000], CHROM 2 is the single POS 15000.
+query I
+SELECT count(*) FROM (SELECT decode(content) c FROM read_blob('{TEST_DIR}/n1.pfile.json'))
+WHERE contains(c, '{ "keys": { "CHROM": "1", "CHUNK": "0" }, "start": 0, "stop": 3, "bounds": { "CHUNK": { "min": 10000, "max": 30000 } } }')
+  AND contains(c, '{ "keys": { "CHROM": "2", "CHUNK": "0" }, "start": 3, "stop": 4, "bounds": { "CHUNK": { "min": 15000, "max": 15000 } } }');
+----
+1
+
+# A window inside CHROM 1's extent but below CHROM 2's single POS: CHROM 2 drops, CHROM 1 keeps.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '2:10000-14999');
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '1:10000-14999');
+----
+1
+
+# CHROM 1's exact max keeps it; one past drops it.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '1:30000-30000');
+----
+1
+
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/n1.pfile.json', region := '1:30001-40000');
+----
+0
+
+# ===========================================================================
+# NEGATIVE — failures after files open: nothing is orphaned across the whole grid
+# ===========================================================================
+
+# An UPSTREAM error at var2500 (CHROM 3), after blocks CHROM=1 and CHROM=2 have CLOSED (their 2+2
+# .pgen sit in staging): no catalog, no finals, no staging, no dirs left behind. The error() is in a
+# projection OVER the sorted subquery, so it fires while rows stream into the sink.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500' THEN error('boom at var2500') ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '{TEST_DIR}/mid' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+boom at var2500
+
+query II
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/mid*')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/mid/**'));
+----
+0	0
+
+# A sink-side error (an out-of-range call) after two block transitions: same guarantee.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500' THEN struct_pack(SAMP1 := 7::TINYINT, SAMP2 := 0::TINYINT, SAMP3 := 0::TINYINT, SAMP4 := 0::TINYINT, SAMP5 := 0::TINYINT, SAMP6 := 0::TINYINT, SAMP7 := 0::TINYINT, SAMP8 := 0::TINYINT) ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '{TEST_DIR}/sinkerr' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+out of range
+
+query II
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/sinkerr*')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/sinkerr/**'));
+----
+0	0
+
+# A shard key that reappears after another value (input not grouped by the key) is rejected in the
+# sink, and the blocks already closed are removed.
+statement error
+COPY (SELECT *, (POS % 200)::VARCHAR AS par FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/reap' (FORMAT pfile, shard_by 'par', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+reappears
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/reap*');
+----
+0
+
+# Zero rows: nothing to write; nothing created.
+statement error
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE false)
+TO '{TEST_DIR}/zero' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+no rows
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/zero*');
+----
+0
+
+# Missing parent directories are created for the target; a mid-stream failure removes them again.
+# Proof without a directory listing: '{TEST_DIR}/np' can then be written as a FILE.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500' THEN error('boom in np') ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '{TEST_DIR}/np/deep/out' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+boom in np
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/np' (FORMAT csv);

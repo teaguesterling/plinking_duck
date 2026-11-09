@@ -1,0 +1,125 @@
+# P13-010 V2 Matrix Writer — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (inline) or
+> subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
+
+**Goal:** `COPY (…) TO 'out' (FORMAT pfile, shard_by '<vcol>', shard_samples {label:[iids],…})` writes a
+`pfile_catalog: 2` matrix — M `.pvar` × N `.psam` × M·N `.pgen` + the catalog.
+
+**Architecture:** The grid is the shipped variant roll (`PfileSharded*`) with P13-007's sample fan-out
+(`PfileSampleSharded*`, N writers) as its inner loop. At most N `.pgen` writers + 1 `.pvar` open at a
+time; the N `.psam` are written once; everything stages until finalize; the v2 catalog is written last.
+
+**Spec:** `docs/planning/P13-010-matrix-writer` (this branch). Read it — inversion, composition, the
+v2 catalog contract, the §4 decision (B, compound keys), the engineering.
+
+## Global Constraints
+
+- **v2.0.0-only.** Builds via Slurm: `srun -n 1 -c 12 --mem=32G -p batch -t 300 make`. DuckDB
+  `memory_limit` below `--mem` in probes. The plink-ng submodule shows dirty after any build — that
+  is the intentional `patches/plink-ng/*.patch` at CMake configure, not a local edit.
+- **Variant-axis keys = B (compound), DECIDED.** `CHROM` enum (`over:"CHROM"` when `<vcol>` is CHROM)
+  + a `CHUNK` `ordinal_interval`-over-`POS` key, per-block `bounds:{min,max}` from the roller.
+- **Catalog = `pfile_catalog: 2`**, matching the reader (`pfile_catalog_matrix.cpp`,
+  `ParseMatrixCatalog`/`BuildCells`) — verify field-for-field against the fixture
+  `read_pfile_catalog_matrix_compound` builds. Two axes; templates (`pfile` ≥1 key each axis, `pvar`
+  variants-only, `psam` samples-only); **dense, no `holes`**.
+- **Reuse, do not re-implement:** `ParseSampleShards` (sample split), `PgenRowGenotypes`/`GenotypeCalls`
+  /`PgenAppendCallRange` (slice), `CheckSampleShardResources` (guard, on N), `WritePsamFromIids`,
+  `PvarWriteChunk`, the variant roller's block-boundary + `pos_min/max` logic, `40fbb30`'s
+  stale-catalog handling.
+- **New test file** `test/sql/write_pfile_matrix.test`. Do NOT edit the P13-007 / sharded test files.
+- **No regression:** plain bundle, variant `shard_by`, and `shard_samples` paths stay green. Full
+  suite (`./build/release/test/unittest '[sql]'`) green.
+- Commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` + the `Claude-Session:` line.
+
+## Review Focus
+
+- **Block transition.** On a `<vcol>` change: finalize the current block's N `.pgen` + 1 `.pvar`, open
+  the next block's N+1, and DO NOT rewrite the N `.psam` (written once). Test a ≥2-variant-block ×
+  ≥2-sample-block grid and assert every cell's genotypes equal the source slice. (Task 2.)
+- **Nothing orphaned across M·N.** Stage-everything-until-finalize: a mid-stream failure after some
+  blocks closed leaves ZERO files (reuse P13-007's `glob('out*')=0` pattern over the whole tree). (Task 2.)
+- **POS bounds inclusive + exact.** The reader prunes cells on them; an off-by-one over/under-prunes.
+  Test a `WHERE CHROM=… AND POS BETWEEN …` that must drop whole cells and keep others. (Task 3.)
+- **Key-name collision.** The invented sample key name must not equal the `shard_by` column or
+  `CHROM`/`CHUNK`; reject at bind. (Task 1.)
+- **Resource guard on N (not M·N).** The concurrent writer count is N; reuse the P13-007 guard and a
+  high-N reject test. (Task 1/2.)
+- **Single-block edges.** M=1 (one chrom) and N=1 (one group) each still emit a valid 1×N / M×1 matrix.
+
+---
+
+### Task 1: bind — lift the reject, invent + guard the sample key, gate
+
+**Files:** Modify `src/pfile_writer.cpp` (`PfileCopyBind`, the `shard_by`+`shard_samples` reject at
+~2368, add a matrix-mode branch + key-name guard). Test: `test/sql/write_pfile_matrix.test` (new).
+
+**Interfaces:**
+- Consumes: `ParseSampleShards` (sample split), the `shard_by` column resolution, `ResolveIdentity`.
+- Produces: on `PfileWriteBindData`, a `bool matrix_mode` + the reused sample-shard fields + the
+  variant key name (the `shard_by` column), the sample key name (reserved default, e.g. `GROUP`), and
+  a flag whether `over:"CHROM"` applies (`<vcol>` == `CHROM`, case-insensitive).
+
+- [ ] **Step 1: failing bind-error tests.** `shard_by` + `shard_samples` now ACCEPTED (was rejected);
+  plus `statement error` for: sample key name collides with the `shard_by` column; sample-orient input;
+  bare LIST; the resource guard (reuse P13-007's 250-group case). Each a stable message substring.
+- [ ] **Step 2: run, verify FAIL** (matrix mode unimplemented / old reject still fires).
+  Run: `srun -n 1 -c 12 --mem=32G -p ci -t 20 ./build/release/test/unittest 'test/sql/write_pfile_matrix.test'`
+- [ ] **Step 3: implement.** Replace the reject with a matrix-mode branch: set `matrix_mode`, reuse
+  `ParseSampleShards` + `shard_by` resolution, invent the sample key name, reject a collision, run
+  `CheckSampleShardResources` on N.
+- [ ] **Step 4: run, verify PASS.**
+- [ ] **Step 5: commit** (`feat(P13-010): matrix bind — lift the reject, key-name guard`).
+
+### Task 2: the write path — roll ∘ fan-out, stage until finalize
+
+**Files:** Modify `src/pfile_writer.cpp` (`PfileMatrixGlobalState`, `PfileCopyInitGlobal`/`Sink`/
+`Finalize` matrix branches). Test: `test/sql/write_pfile_matrix.test`.
+
+**Interfaces:**
+- Consumes: Task 1's bind; the variant roller's block-boundary logic; P13-007's `SampleShardWriter`
+  + `PgenAppendCallRange`; `PvarWriteChunk`; `WritePsamFromIids`.
+- Produces: the M·N `.pgen` + M `.pvar` + N `.psam` under the layout
+  `out/<vkey>/variants.pvar`, `out/<skey>/samples.psam`, `out/<vkey>/<skey>/data.pgen`.
+
+- [ ] **Step 1: failing grid round-trip test.** `COPY (… ORDER BY CHROM, POS) TO '{TEST_DIR}/g'
+  (FORMAT pfile, shard_by 'CHROM', shard_samples {a:[…], b:[…]})` over a ≥2-chrom source; then
+  `ATTACH '{TEST_DIR}/g.pfile.json' AS m (TYPE pfile_catalog)` and assert `m.genotypes` /
+  `m.genotypes_by_sample` equal the source, per-cell counts tile. (P13-003 ATTACH exists.)
+- [ ] **Step 2: run, verify FAIL** (no matrix write path; files absent).
+- [ ] **Step 3: implement.** `PfileMatrixGlobalState`: current block's N `SampleShardWriter` + 1
+  `.pvar` + N shared `.psam` (written once at first row) + roller block records (`pos_min/max`) +
+  `created_dirs`. Sink: on a `<vcol>` transition finalize N `.pgen` + 1 `.pvar`, open next; within a
+  block, each row → `.pvar` once + N `.pgen` slices. Stage all; `CleanupPartial` removes all M·N
+  stagings + dirs (SINGLE). Reuse `40fbb30` stale-catalog handling.
+- [ ] **Step 4: run, verify PASS.**
+- [ ] **Step 5: mid-stream failure test** — an upstream/sink error after block 1 closed →
+  `statement error` then `glob('{TEST_DIR}/g*')=0` and `glob('{TEST_DIR}/g/**')=0`.
+- [ ] **Step 6: commit** (`feat(P13-010): matrix write path — roll ∘ fan-out, stage to finalize`).
+
+### Task 3: v2 catalog emission (fork B)
+
+**Files:** Modify `src/pfile_writer.cpp` (catalog write in the matrix `Finalize`, last). Test:
+`test/sql/write_pfile_matrix.test`.
+
+**Interfaces:** Consumes Task 2's promoted grid + block records (CHROM values, label values,
+`pos_min/max`). Produces `out.pfile.json` (`pfile_catalog:2`).
+
+- [ ] **Step 1: verify the contract** — `git show origin/main` for the fixture that
+  `read_pfile_catalog_matrix_compound` builds; confirm the axes/keys/templates/bounds field shapes.
+- [ ] **Step 2: failing catalog + pushdown tests.** `read_pfile_catalog_*` / raw JSON over the Task-2
+  output: `pfile_catalog:2`, variants axis = compound [CHROM enum `over:"CHROM"`, CHUNK
+  ordinal_interval over POS with per-block `{min,max}`], samples axis = one enum, 3 templates, M·N
+  cells, no `holes`. PLUS a pushdown test: `SELECT … FROM m.genotypes WHERE CHROM='<c>' AND POS
+  BETWEEN lo AND hi` returns the right rows (and, if measurable, skips other cells).
+- [ ] **Step 3: run, verify FAIL** (no catalog emitted).
+- [ ] **Step 4: implement** the v2 catalog write (last, after all promotes), fork B shape, matching
+  the fixture byte-for-byte on structure.
+- [ ] **Step 5: run, verify PASS; then the FULL suite** `srun … -p batch -t 120 …/unittest '[sql]'`
+  — assert no regression (plain / `shard_by` / `shard_samples` still green).
+- [ ] **Step 6: commit** (`feat(P13-010): emit pfile_catalog:2 matrix with compound variant keys`).
+
+## Phasing after the build
+1. Fresh whole-branch review (most capable model), fix Critical/Important, PR.
+2. (No deferred tests — the ATTACH + matrix reader are already on main.)
