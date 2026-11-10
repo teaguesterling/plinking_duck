@@ -858,7 +858,9 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
                                    const string &override_pgen, const string &override_pvar,
                                    const string &override_psam, bool need_psam, bool need_pvar,
                                    const RegionFilter &region, uint32_t &raw_sample_ct_out,
-                                   PgenLocalizeGuard &localize_guard) {
+                                   PgenLocalizeGuard &localize_guard, bool load_pvar = true) {
+	// need_pvar discovers the .pvar path; load_pvar also parses it now (false: a lazy_variants
+	// catalog read, whose EnsureLazyVariants parses it at InitGlobal).
 	PfileSource src;
 	// Resolve explicit overrides against file_search_path too (keep the literal
 	// if not found, so downstream open produces the natural error message).
@@ -982,8 +984,8 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 		throw IOException("read_pfile: failed to initialize '%s' (phase 2): %s", src.pgen_path, errstr_buf);
 	}
 
-	if (!need_pvar) {
-		return src; // a later sample shard: header counts only (see need_pvar)
+	if (!need_pvar || !load_pvar) {
+		return src; // a later sample shard (header counts only), or a deferred .pvar parse
 	}
 	LoadSourceVariants(context, src, region);
 	return src;
@@ -1846,12 +1848,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			elem_pvar = override_pvar;
 			elem_psam = override_psam;
 		}
-		const bool load_pvar_now = need_pvar && !bind_data->lazy_variants;
-		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
-		                                  load_pvar_now, bind_data->region, src_sample_ct, bind_data->localize_guard);
-		if (need_pvar && !load_pvar_now) {
-			src.pvar_path = elem_pvar; // the catalog's resolved path; EnsureLazyVariants loads it
-		}
+		// A lazy_variants read still DISCOVERS the .pvar path here (a v1 entry may omit "pvar"), and
+		// only defers the parse.
+		PfileSource src =
+		    LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam, need_pvar,
+		                    bind_data->region, src_sample_ct, bind_data->localize_guard, !bind_data->lazy_variants);
 
 		if (from_catalog) {
 			// The cell's .pgen must hold exactly the extents its blocks declare.

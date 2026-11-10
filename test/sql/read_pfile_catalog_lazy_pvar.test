@@ -59,6 +59,17 @@ SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/ss.pfile.json', variants 
 ----
 2
 
+# A v1 entry may omit "pvar": the deferred load must still find '<prefix>.pvar' (bind discovers
+# the path; only the parse is deferred).
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := 'test/data/pfile_catalog_single.pfile.json')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(catalog := 'test/data/pfile_catalog_single.pfile.json', orient := 'genotype'));
+----
+0	24000
+
 # ---------------------------------------------------------------------------
 # Results equal the full read
 # ---------------------------------------------------------------------------
