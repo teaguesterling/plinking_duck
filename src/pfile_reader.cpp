@@ -41,6 +41,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <unordered_set>
 
 namespace duckdb {
@@ -1232,6 +1233,13 @@ struct CatalogGrid {
 	//! catalog declares only its concat axis (its partitions); its shared axis has no declared extent.
 	bool has_variant_extent = true;
 	bool has_sample_extent = true;
+	//! Per variant block (index = variant_block): the genomic range the catalog declares, held as a
+	//! ShardEntry so ShardEntry::RangeOverlaps decides a prune. has_range == false keeps the block.
+	vector<ShardEntry> variant_ranges;
+	//! The grid as the catalog declares it, before pruning. Guards on the cohort's shape use these,
+	//! so pruning never changes which queries are valid.
+	idx_t declared_variant_block_ct = 0;
+	idx_t declared_sample_block_ct = 0;
 };
 
 //! A v1 catalog as a grid: concat_dim "variants" is N variant blocks x 1 sample block, "samples"
@@ -1262,6 +1270,11 @@ static void LoadV1CatalogGrid(FileSystem &fs, const string &content, CatalogGrid
 	if (grid.cells.empty()) {
 		throw InvalidInputException("read_pfile: catalog '%s' lists no files", grid.path);
 	}
+	if (by_samples || cat.is_single) {
+		grid.variant_ranges.resize(1); // one variant block, no declared range: never pruned
+	} else {
+		grid.variant_ranges = files; // each shard's own `range` (CHROM list, POS extent)
+	}
 }
 
 static CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const string &path) {
@@ -1280,6 +1293,8 @@ static CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const
 	}
 	if (!IsMatrixCatalog(content)) {
 		LoadV1CatalogGrid(fs, content, grid);
+		grid.declared_variant_block_ct = grid.variant_ranges.size();
+		grid.declared_sample_block_ct = grid.sample_block_ct;
 		return grid;
 	}
 	auto matrix = ParseMatrixCatalog(fs, grid.path, content);
@@ -1315,7 +1330,130 @@ static CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const
 			throw InvalidInputException("read_pfile: catalog '%s' does not describe a full grid", path);
 		}
 	}
+	// Each variant block's declared range: its CHROM enum value, and the inclusive POS bounds of an
+	// ordinal_interval key over POS. A block that declares neither has no range and is never pruned.
+	const AxisKey *contig_key = matrix.variants.ContigKey();
+	const AxisKey *pos_key = nullptr;
+	for (auto &k : matrix.variants.keys) {
+		if (k.type == AxisKeyType::ORDINAL_INTERVAL && k.over == "POS") {
+			pos_key = &k;
+			break;
+		}
+	}
+	for (auto &block : matrix.variants.blocks) {
+		ShardEntry r;
+		if (contig_key) {
+			r.chrom.push_back(block.ValueOf(contig_key->name));
+			r.has_range = true;
+		}
+		const BlockBound *b = pos_key ? block.FindBound(pos_key->name) : nullptr;
+		if (b) {
+			r.has_pos = true;
+			r.pos_min = b->lo;
+			r.pos_max = b->hi;
+			r.has_range = true;
+		}
+		grid.variant_ranges.push_back(std::move(r));
+	}
+	grid.declared_variant_block_ct = variant_block_ct;
+	grid.declared_sample_block_ct = grid.sample_block_ct;
 	return grid;
+}
+
+//! P13-006 §10.4 stage 2: prune the grid at bind from the EXPLICIT params, so a pruned cell's
+//! .pgen/.pvar/.psam is never opened. Both axes keep any block the catalog cannot rule out, so the
+//! rows are the same as a full read.
+//!   * region := keeps a variant block unless its declared range proves no overlap (CHROM matched
+//!     verbatim, as the reader's own region filter matches). If no block survives, the first is kept:
+//!     the region filter then yields what the full read yields (0 variants; every sample row).
+//!   * samples := as INTEGER indices into the whole cohort keeps the sample blocks that hold one, and
+//!     rewrites the indices into the surviving blocks. IIDs are not pruned: block membership needs
+//!     each block's .psam. Indices that would error (out of range, duplicate, NULL) prune nothing, so
+//!     the error names the cohort-wide index. combine_samples := 'disjoint' prunes nothing either:
+//!     its unique-IID check must see every block.
+static void PruneCatalogGrid(const TableFunctionBindInput &input, Selection &sel, CatalogGrid &grid) {
+	const idx_t V = grid.declared_variant_block_ct;
+	const idx_t K = grid.declared_sample_block_ct;
+	vector<bool> keep_vb(V, true);
+	vector<bool> keep_sb(K, true);
+
+	if (sel.has_region && !sel.region.IsNull() && grid.variant_ranges.size() == V) {
+		auto region = ParseRegion(sel.region.GetValue<string>());
+		bool any = false;
+		for (idx_t vb = 0; vb < V; vb++) {
+			keep_vb[vb] = grid.variant_ranges[vb].RangeOverlaps(region.chrom, region.start, region.end);
+			any = any || keep_vb[vb];
+		}
+		if (!any) {
+			keep_vb[0] = true;
+		}
+	}
+
+	vector<int64_t> points;
+	bool prune_samples = grid.has_sample_extent && K > 1 && sel.has_samples && !sel.samples.IsNull() &&
+	                     sel.samples.type().id() == LogicalTypeId::LIST &&
+	                     ListType::GetChildType(sel.samples.type()).IsIntegral();
+	auto cs_it = input.named_parameters.find("combine_samples");
+	if (cs_it != input.named_parameters.end() && !cs_it->second.IsNull() &&
+	    StringUtil::Lower(cs_it->second.ToString()) == "disjoint") {
+		prune_samples = false;
+	}
+	// Sample block sb spans [starts[sb], stops[sb]) in the whole cohort (cells are row-major).
+	vector<int64_t> starts(K), stops(K);
+	if (prune_samples) {
+		for (idx_t sb = 0; sb < K; sb++) {
+			starts[sb] = grid.cells[sb].sample_start;
+			stops[sb] = grid.cells[sb].sample_stop;
+		}
+		const int64_t total = stops[K - 1];
+		std::set<int64_t> seen;
+		for (auto &v : ListValue::GetChildren(sel.samples)) {
+			if (v.IsNull()) {
+				prune_samples = false;
+				break;
+			}
+			auto idx = v.GetValue<int64_t>();
+			if (idx < 0 || idx >= total || !seen.insert(idx).second) {
+				prune_samples = false;
+				break;
+			}
+			points.push_back(idx);
+		}
+		prune_samples = prune_samples && !points.empty();
+	}
+	if (prune_samples) {
+		for (idx_t sb = 0; sb < K; sb++) {
+			bool hit = false;
+			for (auto p : points) {
+				hit = hit || (starts[sb] <= p && p < stops[sb]);
+			}
+			keep_sb[sb] = hit;
+		}
+		// An index moves down by the width of every pruned block before it.
+		auto child_type = ListType::GetChildType(sel.samples.type());
+		vector<Value> remapped;
+		for (auto p : points) {
+			int64_t shift = 0;
+			for (idx_t sb = 0; sb < K && stops[sb] <= p; sb++) {
+				shift += keep_sb[sb] ? 0 : stops[sb] - starts[sb];
+			}
+			remapped.push_back(Value::BIGINT(p - shift).DefaultCastAs(child_type));
+		}
+		sel.samples = Value::LIST(child_type, std::move(remapped));
+	}
+
+	vector<MatrixCell> kept;
+	idx_t kept_k = 0;
+	for (idx_t sb = 0; sb < K; sb++) {
+		kept_k += keep_sb[sb] ? 1 : 0;
+	}
+	for (idx_t i = 0; i < grid.cells.size(); i++) {
+		if (keep_vb[i / K] && keep_sb[i % K]) {
+			kept.push_back(std::move(grid.cells[i]));
+		}
+	}
+	grid.cells = std::move(kept);
+	grid.sample_block_ct = kept_k;
 }
 
 static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionBindInput &input,
@@ -1395,6 +1533,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				}
 			}
 			grid = LoadCatalogGrid(context, fs, catalog_path);
+			PruneCatalogGrid(input, sel, grid);
 		}
 	}
 	const bool from_catalog = !grid.cells.empty();
@@ -1478,16 +1617,18 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// A catalog grid is sample-sharded when it has more than one sample block; its sample
 	// blocks are disjoint by construction, so it reads through 'concatenate' by default and
 	// rejects a mode that asserts the blocks hold the SAME samples.
-	if (from_catalog && grid.sample_block_ct > 1) {
+	if (from_catalog && grid.declared_sample_block_ct > 1) {
 		if (input.named_parameters.find("combine_samples") == input.named_parameters.end()) {
-			bind_data->combine_samples = CombineSamplesMode::CONCATENATE;
+			if (grid.sample_block_ct > 1) {
+				bind_data->combine_samples = CombineSamplesMode::CONCATENATE;
+			}
 		} else if (bind_data->combine_samples != CombineSamplesMode::CONCATENATE &&
 		           bind_data->combine_samples != CombineSamplesMode::DISJOINT) {
 			throw InvalidInputException(
 			    "read_pfile: combine_samples := '%s' contradicts catalog '%s': its %llu sample blocks hold different "
 			    "samples. Use 'concatenate' (the default here) or 'disjoint'.",
 			    CombineSamplesModeName(bind_data->combine_samples), grid.path,
-			    static_cast<unsigned long long>(grid.sample_block_ct));
+			    static_cast<unsigned long long>(grid.declared_sample_block_ct));
 		}
 	}
 	const bool concat = from_catalog ? grid.sample_block_ct > 1
@@ -1501,7 +1642,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// (a sample-sharded list has one variant axis), so reject them here as the variant-sharded
 	// guard does: each block would resolve them on its own (variant_range := [0, 1] returned
 	// variant 0 of EVERY block).
-	if (concat && prefixes.size() > sample_block_ct) {
+	// A catalog pruned to ONE variant block still has its declared blocks: the guard keeps applying.
+	if ((concat && prefixes.size() > sample_block_ct) ||
+	    (from_catalog && grid.declared_variant_block_ct > 1 && prefixes.size() == sample_block_ct)) {
 		auto vr_it = input.named_parameters.find("variant_range");
 		if (sel.has_variants || sel.has_variant_range ||
 		    input.named_parameters.find("variants") != input.named_parameters.end() ||
@@ -1509,7 +1652,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			throw InvalidInputException("read_pfile: variants := [...] and variant_range across %llu variant blocks "
 			                            "are not yet supported (multi-file: each block has its own variant ordinals); "
 			                            "use region := for selection across blocks",
-			                            static_cast<unsigned long long>(prefixes.size() / sample_block_ct));
+			                            static_cast<unsigned long long>(from_catalog
+			                                                                ? grid.declared_variant_block_ct
+			                                                                : prefixes.size() / sample_block_ct));
 		}
 	}
 

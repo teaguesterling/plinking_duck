@@ -232,7 +232,23 @@ SELECT * FROM read_pfile('/data/cohort', catalog := false);            -- the fi
 
 The grid must be complete. A catalog with a hole (an absent cell) is an error, because a 2-D read of a holed grid is not defined yet. Each cell's `.pgen` must hold exactly the counts that the catalog declares: both axes for a matrix, the concat axis (its partitions) for a version 1 catalog. As with `'concatenate'`, only the counts are checked: variant identity across a variant block's cells is positional.
 
-With more than one variant block, `variants := [...]` and `variant_range` are errors, because each block has its own variant ordinals. Use `region :=` to select variants across blocks. With one variant block, both work.
+With more than one variant block, `variants := [...]` and `variant_range` are errors, because each block has its own variant ordinals. Use `region :=` to select variants across blocks. With one variant block, both work. The block count here is the count the catalog declares, before pruning.
+
+**Pruning.** `region :=` and `samples :=` drop whole cells at bind, so `read_pfile` never opens a dropped cell's `.pgen`, `.pvar` or `.psam`. The rows are the same as a full read.
+
+```sql
+-- Opens only the CHROM=2 variant block's cells.
+SELECT * FROM read_pfile('/data/cohort', region := '2:1000000-2000000');
+-- Opens only the sample block that holds cohort sample 5.
+SELECT * FROM read_pfile('/data/cohort', samples := [5], orient := 'sample');
+```
+
+- `region :=` drops a variant block when its declared range proves that no variant can match: a matrix block's `CHROM` key value and its POS bounds, or a version 1 file's `range`. The contig name must match exactly, as in the region filter itself. A block that declares no range is kept.
+- `samples :=` with integer indices drops each sample block that holds none of them. The indices count samples across the whole cohort, before and after pruning.
+- `samples :=` with IIDs drops nothing, because block membership needs each block's `.psam`.
+- Nothing is dropped when an index is out of range or repeated, so the error names the cohort-wide index. Nothing is dropped from the sample axis with `combine_samples := 'disjoint'`, because its unique-IID check must see every block.
+- The checks that run when a cell is read (counts against the catalog, sample counts) do not run for a dropped cell.
+- A `WHERE` clause does not prune cells yet. Pass `region :=` or `samples :=`.
 
 A catalog names every input, so `pgen :=`, `pvar :=` and `psam :=` are errors with it (with a discovered catalog too: the error says to pass `catalog := false`). A `catalog := '<path>'` with a positional prefix is also an error. With more than one sample block, `combine_samples` defaults to `'concatenate'`. `'disjoint'` also checks that the IIDs are unique across the sample blocks. `'implicit'` and `'identical'` are errors, because the sample blocks hold different samples. `ATTACH … (TYPE pfile_catalog)` uses this read for `c.genotypes_by_sample`.
 

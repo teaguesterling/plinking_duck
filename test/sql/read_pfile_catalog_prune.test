@@ -1,0 +1,195 @@
+# name: test/sql/read_pfile_catalog_prune.test
+# description: read_pfile(catalog :=) prunes cells at bind from region := and samples :=, and never opens a pruned cell
+# group: [sql]
+
+require plinking_duck
+
+# P13-006 §10.4 stage 2. Equality alone cannot show that a cell was pruned (a full read gives the
+# same rows), so the proof is a CORRUPTED cell: a read that opens it errors, and a read that
+# prunes it succeeds. The oracle for every result is large_example itself (3000 variants x 8
+# samples, CHROM 1/2/3 x 1000).
+statement ok
+SET threads = 4;
+
+# Clean fixtures: a 3 x 2 matrix (CHROM blocks x {lo: SAMP1-4, hi: SAMP5-8}) and a v1 shard_by.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM');
+
+# Corrupted copies. bad_v: variant block CHROM=2's .pvar is garbage. bad_s: sample block hi's
+# .psam is garbage. bad_vs: v1 shard CHROM=3's .pvar is garbage.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad_v' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad_v/CHROM=2/variants.pvar' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad_s' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad_s/GROUP=hi/samples.psam' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad_vs' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad_vs/CHROM=3/data.pvar' (FORMAT csv, header false);
+
+# The corruption is real: a read that opens the bad cell errors.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad_v.pfile.json');
+----
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad_s.pfile.json');
+----
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad_vs.pfile.json');
+----
+
+# ---------------------------------------------------------------------------
+# region := prunes variant blocks whose declared CHROM/POS cannot overlap it
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/bad_v.pfile.json', region := '1')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', region := '1'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad_v.pfile.json', region := '1'));
+----
+0	1000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/bad_vs.pfile.json', region := '2:100-50000')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', region := '2:100-50000'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad_vs.pfile.json', region := '2:100-50000'))
+     = (SELECT count(*) FROM read_pfile('test/data/large_example', region := '2:100-50000'));
+----
+0	true
+
+# Discovery reaches the same pruning (the prefix names the catalog).
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/bad_v', region := '3');
+----
+1000
+
+# A region that overlaps the bad block still opens it.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad_v.pfile.json', region := '2');
+----
+
+# A region no block can hold reads like the unpruned cohort: 0 variant rows, 8 sample rows.
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '9');
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '9', orient := 'sample');
+----
+8
+
+# A matrix keyed by a column other than CHROM declares no contig per block, so region := keeps
+# every block (each REF block holds variants of every CHROM).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY REF, CHROM, POS)
+TO '{TEST_DIR}/byref' (FORMAT pfile, shard_by 'REF', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/byref.pfile.json', region := '1')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', region := '1'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/byref.pfile.json', region := '1'));
+----
+0	1000
+
+# ---------------------------------------------------------------------------
+# samples := (integer indices into the whole cohort) prunes sample blocks
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/bad_s.pfile.json', samples := [0, 1], orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', samples := [0, 1], orient := 'sample'))),
+       (SELECT list(IID ORDER BY IID) FROM read_pfile(catalog := '{TEST_DIR}/bad_s.pfile.json', samples := [0, 1], orient := 'sample'));
+----
+0	[SAMP1, SAMP2]
+
+# Index 5 is SAMP6 in the whole cohort; with block lo pruned it is index 1 of block hi.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', samples := [5], orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', samples := [5], orient := 'sample'))),
+       (SELECT list(IID) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', samples := [5], orient := 'sample'));
+----
+0	[SAMP6]
+
+query I
+SELECT count(*) FROM (
+  SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', samples := [1, 6], orient := 'genotype')
+  EXCEPT ALL
+  SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', samples := [1, 6], orient := 'genotype'));
+----
+0
+
+# Variant orient: the genotypes array holds the selected samples in cohort order.
+query I
+SELECT count(*) FROM (
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', samples := [6, 4])
+  EXCEPT ALL
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', samples := [6, 4]));
+----
+0
+
+# Both axes: region and samples leave one cell (CHROM=2 x hi).
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '2', samples := [7])
+          EXCEPT ALL
+          SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', region := '2', samples := [7]))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '2', samples := [7]));
+----
+0	1000
+
+# IIDs are not pruned (block membership needs each .psam), but the result is unchanged.
+query I
+SELECT count(*) FROM (
+  SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', samples := ['SAMP2', 'SAMP7'], orient := 'sample')
+  EXCEPT ALL
+  SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', samples := ['SAMP2', 'SAMP7'], orient := 'sample'));
+----
+0
+
+# An out-of-range index keeps every block, so the error names the cohort-wide index.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', samples := [8]);
+----
+8
+
+# ---------------------------------------------------------------------------
+# Guards use the DECLARED grid, not the pruned one
+# ---------------------------------------------------------------------------
+# One variant block survives region := '1', but variants := still means a cohort-wide ordinal.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '1', variants := [0]);
+----
+variant blocks
+
+# One sample block survives samples := [0], but the blocks still hold different samples.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', samples := [0], combine_samples := 'identical');
+----
+contradicts
