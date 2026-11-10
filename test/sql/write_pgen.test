@@ -237,7 +237,7 @@ TO '__TEST_DIR__/ow.pgen' (FORMAT pgen);
 
 statement ok
 COPY (SELECT * FROM read_pfile('test/data/pfile_example') WHERE ID = 'rs1')
-TO '__TEST_DIR__/ow.pgen' (FORMAT pgen);
+TO '__TEST_DIR__/ow.pgen' (FORMAT pgen, force true);
 
 query I
 SELECT (SELECT hex(content) FROM read_blob('__TEST_DIR__/ow.pgen'))

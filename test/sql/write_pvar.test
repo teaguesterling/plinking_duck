@@ -265,7 +265,7 @@ appears twice
 # would pass even without truncation).
 statement ok
 COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') WHERE ID = 'rs1')
-TO '__TEST_DIR__/rt_pfile.pvar' (FORMAT pvar);
+TO '__TEST_DIR__/rt_pfile.pvar' (FORMAT pvar, force true);
 
 query I
 SELECT count(*) FROM read_pvar('__TEST_DIR__/rt_pfile.pvar');

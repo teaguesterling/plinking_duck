@@ -8,6 +8,7 @@
 #include "pgen_vfs_opener.hpp"
 #include "pgen_concat_reader.hpp"
 #include "pfile_catalog_matrix.hpp"
+#include "pfile_catalog.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
@@ -1227,7 +1228,41 @@ struct CatalogGrid {
 	string path;
 	vector<MatrixCell> cells;
 	idx_t sample_block_ct = 0;
+	//! Whether the catalog declares each cell's extent on that axis. A v2 matrix declares both. A v1
+	//! catalog declares only its concat axis (its partitions); its shared axis has no declared extent.
+	bool has_variant_extent = true;
+	bool has_sample_extent = true;
 };
+
+//! A v1 catalog as a grid: concat_dim "variants" is N variant blocks x 1 sample block, "samples"
+//! is 1 x K, and a single-fileset catalog is 1 x 1. The parser has already folded the shared
+//! companion (.psam or .pvar) into every entry and resolved every path.
+static void LoadV1CatalogGrid(FileSystem &fs, const string &content, CatalogGrid &grid) {
+	auto cat = ParseV1Catalog(fs, grid.path, content);
+	auto files = cat.files;
+	std::stable_sort(files.begin(), files.end(),
+	                 [](const ShardEntry &a, const ShardEntry &b) { return a.partition_start < b.partition_start; });
+	const bool by_samples = cat.concat_dim == "samples";
+	grid.has_variant_extent = !cat.is_single && !by_samples;
+	grid.has_sample_extent = !cat.is_single && by_samples;
+	grid.sample_block_ct = by_samples ? files.size() : 1;
+	for (idx_t i = 0; i < files.size(); i++) {
+		MatrixCell cell;
+		cell.prefix = files[i].prefix;
+		cell.pvar = files[i].pvar;
+		cell.psam = files[i].psam;
+		cell.variant_block = by_samples ? 0 : static_cast<int64_t>(i);
+		cell.sample_block = by_samples ? static_cast<int64_t>(i) : 0;
+		auto &start = by_samples ? cell.sample_start : cell.variant_start;
+		auto &stop = by_samples ? cell.sample_stop : cell.variant_stop;
+		start = files[i].partition_start;
+		stop = files[i].partition_stop;
+		grid.cells.push_back(std::move(cell));
+	}
+	if (grid.cells.empty()) {
+		throw InvalidInputException("read_pfile: catalog '%s' lists no files", grid.path);
+	}
+}
 
 static CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const string &path) {
 	CatalogGrid grid;
@@ -1244,9 +1279,8 @@ static CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const
 		}
 	}
 	if (!IsMatrixCatalog(content)) {
-		throw InvalidInputException("read_pfile: catalog := reads a v2 matrix catalog (\"pfile_catalog\": 2); '%s' "
-		                            "is not one. Read a v1 catalog's files as a list, or ATTACH it.",
-		                            path);
+		LoadV1CatalogGrid(fs, content, grid);
+		return grid;
 	}
 	auto matrix = ParseMatrixCatalog(fs, grid.path, content);
 	grid.cells = BuildCells(matrix, fs, /*include_holes=*/true);
@@ -1305,24 +1339,62 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// (LIST(VARCHAR), row-concatenated in order). Empty inputs → only named params.
 	auto &fs = FileSystem::GetFileSystem(context);
 
-	// catalog := '<x>.pfile.json' (a v2 matrix): the catalog's cells ARE the inputs, read as one
-	// 2-D cohort — variant blocks row-concatenated, sample blocks concatenated (see CatalogGrid).
+	// A catalog's cells ARE the inputs, read as one 2-D cohort — variant blocks row-concatenated,
+	// sample blocks concatenated (see CatalogGrid). The catalog comes from:
+	//   catalog := '<x>.pfile.json'  — that catalog (no positional path);
+	//   a positional '<x>.pfile.json' — that catalog;
+	//   a positional VARCHAR prefix '<p>' — DISCOVERED when '<p>.pfile.json' exists. The catalog wins
+	//     over a '<p>.pgen' beside it (the ATTACH order). Local paths only: a pathmacro:/URL argument
+	//     with a suffix appended would be a different macro call or object.
+	// catalog := false turns discovery off; catalog := true requires a catalog at the prefix.
 	CatalogGrid grid;
 	{
+		enum class CatalogMode { AUTO, OFF, REQUIRE, PATH };
+		CatalogMode mode = CatalogMode::AUTO;
+		string catalog_path;
 		auto cat_it = input.named_parameters.find("catalog");
 		if (cat_it != input.named_parameters.end() && !cat_it->second.IsNull()) {
-			if (!input.inputs.empty()) {
-				throw InvalidInputException("read_pfile: catalog := cannot be combined with a positional path (the "
-				                            "catalog names the inputs)");
-			}
-			for (const char *key : {"pgen", "pvar", "psam"}) {
-				if (input.named_parameters.find(key) != input.named_parameters.end()) {
-					throw InvalidInputException("read_pfile: catalog := cannot be combined with %s := (the catalog "
-					                            "names every cell's companions)",
-					                            key);
+			if (cat_it->second.type().id() == LogicalTypeId::BOOLEAN) {
+				mode = cat_it->second.GetValue<bool>() ? CatalogMode::REQUIRE : CatalogMode::OFF;
+			} else {
+				mode = CatalogMode::PATH;
+				catalog_path = cat_it->second.ToString();
+				if (!input.inputs.empty()) {
+					throw InvalidInputException("read_pfile: catalog := '<path>' cannot be combined with a positional "
+					                            "path (the catalog names the inputs)");
 				}
 			}
-			grid = LoadCatalogGrid(context, fs, cat_it->second.GetValue<string>());
+		}
+		string prefix_arg; // the positional VARCHAR prefix, if any (a list never discovers)
+		if (!input.inputs.empty() && !input.inputs[0].IsNull() &&
+		    input.inputs[0].type().id() == LogicalTypeId::VARCHAR) {
+			prefix_arg = input.inputs[0].GetValue<string>();
+		}
+		if (mode == CatalogMode::AUTO || mode == CatalogMode::REQUIRE) {
+			if (StringUtil::EndsWith(prefix_arg, ".pfile.json")) {
+				catalog_path = prefix_arg;
+			} else if (!prefix_arg.empty() && prefix_arg.find("://") == string::npos &&
+			           !StringUtil::StartsWith(prefix_arg, "pathmacro:") &&
+			           prefix_arg.find_first_of("*?[") == string::npos) {
+				catalog_path = ResolveExistingPath(context, fs, prefix_arg + ".pfile.json");
+			}
+			if (mode == CatalogMode::REQUIRE && catalog_path.empty()) {
+				throw InvalidInputException("read_pfile: catalog := true, but there is no catalog at '%s.pfile.json' "
+				                            "(discovery looks only at local paths; name a remote catalog with "
+				                            "catalog := '<path>')",
+				                            prefix_arg.empty() ? string("(no positional prefix)") : prefix_arg);
+			}
+		}
+		if (!catalog_path.empty()) {
+			for (const char *key : {"pgen", "pvar", "psam"}) {
+				if (input.named_parameters.find(key) != input.named_parameters.end()) {
+					throw InvalidInputException(
+					    "read_pfile: a catalog (%s) cannot be combined with %s := (the catalog names every cell's "
+					    "companions). To read the prefix as a fileset instead, pass catalog := false.",
+					    catalog_path, key);
+				}
+			}
+			grid = LoadCatalogGrid(context, fs, catalog_path);
 		}
 	}
 	const bool from_catalog = !grid.cells.empty();
@@ -1587,8 +1659,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		if (from_catalog) {
 			// The cell's .pgen must hold exactly the extents its blocks declare.
 			const auto &cell = grid.cells[si];
-			if (static_cast<int64_t>(src.raw_variant_ct) != cell.variant_stop - cell.variant_start ||
-			    static_cast<int64_t>(src_sample_ct) != cell.sample_stop - cell.sample_start) {
+			if ((grid.has_variant_extent &&
+			     static_cast<int64_t>(src.raw_variant_ct) != cell.variant_stop - cell.variant_start) ||
+			    (grid.has_sample_extent &&
+			     static_cast<int64_t>(src_sample_ct) != cell.sample_stop - cell.sample_start)) {
 				throw InvalidInputException(
 				    "read_pfile: catalog '%s': cell '%s' holds %u variants x %u samples, but its blocks declare %lld "
 				    "variants x %lld samples",
@@ -5247,7 +5321,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		DeclareNamedParameters(fn, {{"pgen", LogicalType::VARCHAR},
 		                            {"pvar", LogicalType::VARCHAR},
 		                            {"psam", LogicalType::VARCHAR},
-		                            {"catalog", LogicalType::VARCHAR},
+		                            {"catalog", LogicalType::ANY},
 		                            {"orient", LogicalType::VARCHAR},
 		                            {"dosages", LogicalType::BOOLEAN},
 		                            {"phased", LogicalType::BOOLEAN},

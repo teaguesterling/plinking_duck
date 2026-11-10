@@ -18,7 +18,7 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
 | `prefix` | `VARCHAR` or `LIST(VARCHAR)` | *(required, unless `catalog`)* | Common file prefix (e.g., `'data/cohort'`), or a list of prefixes to read as one table (see [Multi-File Input](#multi-file-input)) |
-| `catalog` | `VARCHAR` | — | A version 2 matrix catalog (`.pfile.json`), read as one cohort across its variant and sample blocks. Replaces `prefix`. See [Matrix catalog input](#matrix-catalog-input-catalog) |
+| `catalog` | `VARCHAR` or `BOOLEAN` | discover | A catalog (`.pfile.json`, version 1 or 2), read as one cohort across its blocks. A path replaces `prefix`. `false` turns off discovery of `prefix.pfile.json`; `true` requires it. See [Catalog input](#catalog-input-catalog) |
 | `pgen` | `VARCHAR` | `prefix.pgen` | Explicit `.pgen` path |
 | `pvar` | `VARCHAR` | `prefix.pvar` | Explicit `.pvar` or `.bim` path |
 | `psam` | `VARCHAR` | `prefix.psam` | Explicit `.psam` or `.fam` path |
@@ -211,25 +211,30 @@ Each shard's `.psam` must have the same columns in `orient := 'genotype'` and `o
 
 `.psam.parquet` companions work in this mode. In `orient := 'genotype'` and `orient := 'sample'`, the psam columns are read lazily from every shard's parquet file, in shard order. These orients need one kind of `.psam` for every shard: all text or all parquet. A mix is an error. Variant orient reads only counts or IIDs, so it accepts a mix.
 
-#### Matrix catalog input (`catalog :=`)
+#### Catalog input (`catalog :=`)
 
-A [version 2 matrix catalog](../formats/pfile_catalog.md) splits a cohort along **both** axes: variant blocks × sample blocks. `catalog :=` reads the whole grid as one cohort:
+A [catalog](../formats/pfile_catalog.md) (`.pfile.json`) describes a cohort split into blocks. A version 2 matrix splits it along **both** axes: variant blocks × sample blocks. A version 1 catalog splits it along one axis: the `shard_by` writer gives variant blocks, and the `shard_samples` writer gives sample blocks. `read_pfile` reads every kind as one cohort:
 
 ```sql
+SELECT * FROM read_pfile('/data/cohort');                              -- discovers /data/cohort.pfile.json
+SELECT * FROM read_pfile('/data/cohort.pfile.json');                   -- a literal catalog path
 SELECT * FROM read_pfile(catalog := '/data/cohort.pfile.json', orient := 'sample');
+SELECT * FROM read_pfile('/data/cohort', catalog := false);            -- the fileset /data/cohort.p{gen,var,sam}
 ```
+
+**Discovery.** When the first argument is one prefix `p` and `p.pfile.json` exists, `read_pfile('p')` reads the catalog. This is true even when `p.pgen` also exists: the catalog wins, as in `ATTACH`. Pass `catalog := false` to read the fileset instead. Pass `catalog := true` to require a catalog, so that a missing one is an error. Discovery runs only for a local path. It does not run for a URL, `pathmacro:`, a glob, or a list of prefixes. For those, name the catalog with `catalog :=` or a literal `.pfile.json` path.
 
 - The variants are the variant blocks in order. The samples are the sample blocks in order.
 - Within each variant block, the sample blocks are concatenated, as with `combine_samples := 'concatenate'`. The variant blocks are then concatenated, as with a variant-sharded list.
 - So variant orient gives one row per variant with **every** sample, and sample orient gives one row per sample with **every** variant.
-- Each cell is read with its template-resolved `.pvar` (its variant block's) and `.psam` (its sample block's). A cell needs no companion files of its own.
+- Each cell is read with the `.pvar` and `.psam` that the catalog names: in a matrix, its variant block's `.pvar` and its sample block's `.psam` (template-resolved); in a version 1 catalog, the shared companion and each file's own. A cell needs no companion files of its own.
 - All three orients, all genotype modes, and the sample, region and count filters work. Counts and frequencies use the whole cohort.
 
-The grid must be complete. A catalog with a hole (an absent cell) is an error, because a 2-D read of a holed grid is not defined yet. Each cell's `.pgen` must hold exactly the variant and sample counts that its blocks declare. As with `'concatenate'`, only the counts are checked: variant identity across a variant block's cells is positional.
+The grid must be complete. A catalog with a hole (an absent cell) is an error, because a 2-D read of a holed grid is not defined yet. Each cell's `.pgen` must hold exactly the counts that the catalog declares: both axes for a matrix, the concat axis (its partitions) for a version 1 catalog. As with `'concatenate'`, only the counts are checked: variant identity across a variant block's cells is positional.
 
 With more than one variant block, `variants := [...]` and `variant_range` are errors, because each block has its own variant ordinals. Use `region :=` to select variants across blocks. With one variant block, both work.
 
-`catalog :=` names every input, so a positional prefix, `pgen :=`, `pvar :=` and `psam :=` are errors with it. With more than one sample block, `combine_samples` defaults to `'concatenate'`. `'disjoint'` also checks that the IIDs are unique across the sample blocks. `'implicit'` and `'identical'` are errors, because the sample blocks hold different samples. `ATTACH … (TYPE pfile_catalog)` uses this read for `c.genotypes_by_sample`.
+A catalog names every input, so `pgen :=`, `pvar :=` and `psam :=` are errors with it (with a discovered catalog too: the error says to pass `catalog := false`). A `catalog := '<path>'` with a positional prefix is also an error. With more than one sample block, `combine_samples` defaults to `'concatenate'`. `'disjoint'` also checks that the IIDs are unique across the sample blocks. `'implicit'` and `'identical'` are errors, because the sample blocks hold different samples. `ATTACH … (TYPE pfile_catalog)` uses this read for `c.genotypes_by_sample`.
 
 The list of prefixes can come from anywhere: a literal list, a **glob** (`read_pfile('data/chr*.pgen')`), or a **catalog macro** returning a `VARCHAR[]` of shard prefixes — e.g. the scalarfs `pathmacro:` protocol, which `read_pfile` resolves to local shard paths and reads directly: `read_pfile('pathmacro:cohort?gene=BRCA1')`.
 

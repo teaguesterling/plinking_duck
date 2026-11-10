@@ -378,7 +378,7 @@ COPY (SELECT 'not ours' AS x) TO '__TEST_DIR__/st/a/data.psam.staging' (FORMAT c
 
 statement error
 COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') WHERE false)
-TO '__TEST_DIR__/st' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+TO '__TEST_DIR__/st' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']}, force true);
 ----
 no rows
 
@@ -412,7 +412,7 @@ COPY (SELECT 1 AS x) TO '__TEST_DIR__/pr/c/data.pgen' (FORMAT csv, PER_THREAD_OU
 # The re-run promotes pr.pvar, the .psam files and a/data.pgen, then the c/data.pgen rename fails.
 statement error
 COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') ORDER BY CHROM, POS)
-TO '__TEST_DIR__/pr' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], c: ['SAMPLE3', 'SAMPLE4']});
+TO '__TEST_DIR__/pr' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], c: ['SAMPLE3', 'SAMPLE4']}, force true);
 ----
 rename
 
@@ -428,7 +428,7 @@ TO '__TEST_DIR__/pr2' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b
 
 statement error
 COPY (SELECT * FROM read_pfile('test/data/pgen_example', genotypes := 'struct') WHERE false)
-TO '__TEST_DIR__/pr2' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+TO '__TEST_DIR__/pr2' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']}, force true);
 ----
 no rows
 

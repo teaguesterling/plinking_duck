@@ -420,7 +420,7 @@ SELECT count(*) FROM read_pfile_catalog('__TEST_DIR__/ov.pfile.json');
 # Unsorted re-run: CHROM=1 is promoted (replacing the old shard), then '1' reappears -> error.
 statement error
 COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY POS)
-TO '__TEST_DIR__/ov' (FORMAT pfile, shard_by 'CHROM');
+TO '__TEST_DIR__/ov' (FORMAT pfile, shard_by 'CHROM', force true);
 ----
 reappears
 

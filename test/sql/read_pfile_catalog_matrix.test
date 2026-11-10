@@ -197,7 +197,7 @@ verification failed (count mismatch)
 statement ok
 COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(genotypes::TINYINT[], 1, 2) AS genotypes
       FROM read_pfile('test/data/pfile_example') WHERE CHROM = '2')
-TO '{TEST_DIR}/data/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S1', 'S2']);
+TO '{TEST_DIR}/data/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S1', 'S2'], force true);
 
 statement error
 SELECT * FROM read_pfile_catalog('{TEST_DIR}/matrix_dense.pfile.json');

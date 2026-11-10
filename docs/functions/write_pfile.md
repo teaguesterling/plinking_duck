@@ -67,6 +67,7 @@ target is stripped to the prefix, so `TO 'out'` and `TO 'out.pfile'` both write
 | `pvar` / `pgen` / `psam` | `VARCHAR` | `prefix.{pvar,pgen,psam}` | Per-file path overrides (symmetric with the reader's path overrides). |
 | `shard_by` | `VARCHAR` | *(none)* | Shard along the **variant** axis by a key column. See [Sharded output](#sharded-output-shard_by). |
 | `shard_samples` | `STRUCT` | *(none)* | Shard along the **sample** axis into named IID groups. See [Sample-sharded output](#sample-sharded-output-shard_samples). |
+| `force` | `BOOLEAN` | `false` | Replace existing output. Without it, a `COPY` onto an existing target is an error. See [Existing output](#existing-output-force). |
 
 Every input column not consumed by a `variant_fields` role (and not the genotypes
 column) is carried through into the `.pvar` as an extra column under its own name,
@@ -107,9 +108,26 @@ Because `.pgen` is written through a raw `FILE*` that bypasses DuckDB's VFS, the
 `pgen` override (which would otherwise write `.pvar`/`.psam` to the remote store).
 To land a fileset on a remote store, write it locally and copy it up separately.
 
+### Existing output (`force`)
+
+A `COPY` never replaces existing output unless it sets `force` (`force` alone, or `force true`). Without `force`, it is an error at bind, before any file is written, when the target already exists. This applies to every writer:
+
+| Writer | Existing paths that need `force` |
+|---|---|
+| `FORMAT pvar` / `pgen` / `psam` | the target file (or its path override) |
+| `FORMAT pfile` | any of `prefix.pvar`, `prefix.pgen`, `prefix.psam` (or their overrides), or a catalog `prefix.pfile.json` |
+| `FORMAT pfile` with `shard_by` and/or `shard_samples` | `prefix.pfile.json`, `prefix.pgen`, `prefix.pvar`, `prefix.psam`, or the shard tree `prefix/` |
+
+```sql
+COPY (SELECT …) TO 'out' (FORMAT pfile);              -- error if 'out.pgen' (etc.) exists
+COPY (SELECT …) TO 'out' (FORMAT pfile, force true);  -- replaces it
+```
+
+With `force`, a plain `FORMAT pfile` write also **removes a catalog** `prefix.pfile.json`, just before it promotes its files. [`read_pfile('prefix')`](read_pfile.md#catalog-input-catalog) reads that catalog in preference to a fileset, so a catalog left from an earlier sharded run would otherwise be read, with the new `.psam`, over the old shards.
+
 ### Atomic overwrite
 
-The three files are written to `.staging` siblings in the same directory and
+With `force`, the three files are written to `.staging` siblings in the same directory and
 renamed onto their final paths only when all three are complete. So a failure at
 any point **before** the final promote leaves a pre-existing fileset
 **byte-identical** — a failed overwrite never clobbers the prior data, and no
@@ -174,7 +192,7 @@ partition column).
   and the shared `.psam` are durable. A mid-run failure leaves no `.pfile.json`
   and no `.staging` residue; shards that already closed before the failure remain
   on disk, but without the catalog the set reads as incomplete-by-construction.
-- **Overwriting an existing target.** A prior run's `.pfile.json` is removed just
+- **Overwriting an existing target (with `force`).** A prior run's `.pfile.json` is removed just
   before the first shard is promoted, because from then on it would describe a mix
   of new and old shards. A re-run that fails after that point leaves no catalog
   (the cohort reads as absent), never a stale one. A re-run that fails earlier
@@ -260,7 +278,7 @@ shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar
   upstream query error mid-stream, removes every staging file and every directory
   the COPY created (only if empty). On success the writer promotes the `.pvar`,
   then every `.psam`, then every `.pgen`, then writes the catalog last. When it
-  overwrites an existing target, it removes the prior catalog just before the
+  overwrites an existing target (with `force`), it removes the prior catalog just before the
   first promotion. A failure during promotion then leaves no catalog, never a
   stale one, and a failure before promotion leaves the prior cohort intact.
 
@@ -341,11 +359,11 @@ too.
 **Failure leaves nothing.** Every file stages until the whole grid is complete, and
 the catalog is promoted last. Any failure — upstream, in the sink, or a shard key that
 reappears after another — removes every staging file and every directory the `COPY`
-created. An overwrite replaces the whole grid and leaves the catalog valid; a mid-run
+created. An overwrite (with `force`) replaces the whole grid and leaves the catalog valid; a mid-run
 failure leaves no catalog, never a stale one.
 
 To read the whole matrix as one cohort, use
-[`read_pfile(catalog := …)`](read_pfile.md#matrix-catalog-input-catalog), or `ATTACH` it and
+[`read_pfile(catalog := …)`](read_pfile.md#catalog-input-catalog), or `ATTACH` it and
 query `c.genotypes_by_sample` (one row per sample, with every variant).
 
 ## Standalone formats
