@@ -31,6 +31,12 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include <pgenlib_read.h>
 #include <pgenlib_ffi_support.h>
@@ -526,6 +532,9 @@ struct PfileBindData : public TableFunctionData {
 	bool lazy_variants = false;
 	mutable std::mutex lazy_variants_lock;
 	mutable bool lazy_variants_loaded = false;
+	//! lazy_variants only: each source's declared genomic range (parallel to `sources`), for the
+	//! stage-4 pushdown_complex_filter hook, which drops sources a WHERE on CHROM/POS cannot reach.
+	vector<ShardEntry> source_ranges;
 
 	// How multiple sources' sample sets combine (multi-file only).
 	CombineSamplesMode combine_samples = CombineSamplesMode::IMPLICIT;
@@ -1932,6 +1941,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// read_pfile still owns the region ∩ set (BuildEffectiveVariantList) and the
 		// variant_range post-filter below, since their type + timing differ from the handler.
 		if (bind_data->lazy_variants) {
+			bind_data->source_ranges.push_back(grid.variant_ranges[grid.cells[si].variant_block]);
 			bind_data->sources.push_back(std::move(src)); // region / variant_range apply at InitGlobal
 			continue;
 		}
@@ -5509,6 +5519,222 @@ static void PfilePartitionsScan(ClientContext &context, TableFunctionInput &data
 }
 
 // ---------------------------------------------------------------------------
+// WHERE-driven cell pruning (P13-006 §10.4 stage 4)
+// ---------------------------------------------------------------------------
+
+//! The function column of a direct, depth-0 reference to this scan's column, else INVALID_INDEX.
+static idx_t CellPruneColumnOf(const LogicalGet &get, const Expression &e) {
+	if (e.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return DConstants::INVALID_INDEX;
+	}
+	auto &col = e.Cast<BoundColumnRefExpression>();
+	auto &binding = col.Binding();
+	if (col.Depth() != 0 || binding.table_index != get.table_index) {
+		return DConstants::INVALID_INDEX;
+	}
+	auto &ids = get.GetColumnIds();
+	const idx_t i = binding.column_index.GetIndex();
+	if (i >= ids.size() || ids[i].IsVirtualColumn() || ids[i].IsPushdownExtract() || ids[i].HasType()) {
+		return DConstants::INVALID_INDEX;
+	}
+	return ids[i].GetPrimaryIndex();
+}
+
+//! The value of a foldable, non-NULL expression (a constant, or a constant cast).
+static bool CellPruneConstant(ClientContext &context, const Expression &e, Value &out) {
+	if (!e.IsFoldable() || !ExpressionExecutor::TryEvaluateScalar(context, e, out)) {
+		return false;
+	}
+	return !out.IsNull();
+}
+
+//! What the WHERE says about CHROM and POS, as a conjunction. Only predicates that are
+//! recognized narrow it; any other predicate is ignored, which keeps more blocks, never fewer.
+struct CellPruneConstraints {
+	bool has_chrom = false;
+	std::set<string> chroms; //! the CHROM values a row may have (intersected across predicates)
+	bool has_pos = false;
+	int64_t pos_lo = std::numeric_limits<int64_t>::lowest(); //! inclusive
+	int64_t pos_hi = std::numeric_limits<int64_t>::max();    //! inclusive
+
+	void AllowChroms(const std::set<string> &values) {
+		if (!has_chrom) {
+			chroms = values;
+			has_chrom = true;
+			return;
+		}
+		std::set<string> both;
+		for (auto &v : values) {
+			if (chroms.count(v)) {
+				both.insert(v);
+			}
+		}
+		chroms = std::move(both);
+	}
+	//! POS <type> v, for one comparison type with the column on the left.
+	void NarrowPos(ExpressionType type, int64_t v) {
+		has_pos = true;
+		switch (type) {
+		case ExpressionType::COMPARE_EQUAL:
+			pos_lo = MaxValue(pos_lo, v);
+			pos_hi = MinValue(pos_hi, v);
+			break;
+		case ExpressionType::COMPARE_GREATERTHAN:
+			pos_lo = v == std::numeric_limits<int64_t>::max() ? v : MaxValue(pos_lo, v + 1);
+			if (v == std::numeric_limits<int64_t>::max()) {
+				pos_hi = std::numeric_limits<int64_t>::lowest(); // nothing is greater
+			}
+			break;
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			pos_lo = MaxValue(pos_lo, v);
+			break;
+		case ExpressionType::COMPARE_LESSTHAN:
+			pos_hi = v == std::numeric_limits<int64_t>::lowest() ? v : MinValue(pos_hi, v - 1);
+			if (v == std::numeric_limits<int64_t>::lowest()) {
+				pos_lo = std::numeric_limits<int64_t>::max(); // nothing is less
+			}
+			break;
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+			pos_hi = MinValue(pos_hi, v);
+			break;
+		default:
+			break;
+		}
+	}
+	bool Unsatisfiable() const {
+		return (has_chrom && chroms.empty()) || (has_pos && pos_lo > pos_hi);
+	}
+	//! Can a row in a block with declared range `r` satisfy the constraints?
+	bool MayOverlap(const ShardEntry &r) const {
+		if (Unsatisfiable()) {
+			return false;
+		}
+		if (!r.has_range) {
+			return true;
+		}
+		if (has_chrom && !r.chrom.empty()) {
+			bool any = false;
+			for (auto &c : r.chrom) {
+				any = any || chroms.count(c) > 0;
+			}
+			if (!any) {
+				return false;
+			}
+		}
+		if (has_pos && r.has_pos && (pos_hi < r.pos_min || pos_lo > r.pos_max)) {
+			return false;
+		}
+		return true;
+	}
+};
+
+static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet &get, const Expression &e,
+                                        CellPruneConstraints &c) {
+	const auto type = e.GetExpressionType();
+	if (type == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : e.Cast<BoundConjunctionExpression>().GetChildren()) {
+			CollectCellPruneConstraints(context, get, *child, c);
+		}
+		return;
+	}
+	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
+		if (kids.size() < 2 || CellPruneColumnOf(get, *kids[0]) != PfileBindData::CHROM_COL) {
+			return;
+		}
+		std::set<string> values;
+		for (idx_t i = 1; i < kids.size(); i++) {
+			Value v;
+			if (!CellPruneConstant(context, *kids[i], v) || v.type().id() != LogicalTypeId::VARCHAR) {
+				return; // one unknown member: the set could be anything
+			}
+			values.insert(v.GetValue<string>());
+		}
+		c.AllowChroms(values);
+		return;
+	}
+	if (e.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return;
+	}
+	auto &fn = e.Cast<BoundFunctionExpression>();
+	if (type == ExpressionType::COMPARE_BETWEEN) {
+		if (!BoundBetweenExpression::HasValidBindData(fn) ||
+		    CellPruneColumnOf(get, BoundBetweenExpression::Input(fn)) != PfileBindData::POS_COL) {
+			return;
+		}
+		Value lo, hi;
+		if (CellPruneConstant(context, BoundBetweenExpression::LowerBound(fn), lo) &&
+		    lo.DefaultTryCastAs(LogicalType::BIGINT)) {
+			c.NarrowPos(BoundBetweenExpression::LowerComparisonType(fn), lo.GetValue<int64_t>());
+		}
+		if (CellPruneConstant(context, BoundBetweenExpression::UpperBound(fn), hi) &&
+		    hi.DefaultTryCastAs(LogicalType::BIGINT)) {
+			c.NarrowPos(BoundBetweenExpression::UpperComparisonType(fn), hi.GetValue<int64_t>());
+		}
+		return;
+	}
+	if (!BoundComparisonExpression::IsComparison(e)) {
+		return;
+	}
+	auto &left = BoundComparisonExpression::Left(fn);
+	auto &right = BoundComparisonExpression::Right(fn);
+	idx_t col = CellPruneColumnOf(get, left);
+	const Expression *other = &right;
+	ExpressionType cmp = type;
+	if (col == DConstants::INVALID_INDEX) {
+		col = CellPruneColumnOf(get, right);
+		other = &left;
+		cmp = FlipComparisonExpression(type);
+	}
+	Value v;
+	if (col == DConstants::INVALID_INDEX || !CellPruneConstant(context, *other, v)) {
+		return;
+	}
+	if (col == PfileBindData::CHROM_COL && cmp == ExpressionType::COMPARE_EQUAL &&
+	    v.type().id() == LogicalTypeId::VARCHAR) {
+		c.AllowChroms({v.GetValue<string>()});
+	} else if (col == PfileBindData::POS_COL && v.DefaultTryCastAs(LogicalType::BIGINT)) {
+		c.NarrowPos(cmp, v.GetValue<int64_t>());
+	}
+}
+
+//! pushdown_complex_filter: drop each catalog variant block (source) that the WHERE's CHROM/POS
+//! predicates provably cannot reach, BEFORE InitGlobal loads any .pvar (lazy_variants) or opens
+//! any .pgen. Every filter stays in `filters`, so DuckDB still pushes and applies all of them and
+//! the rows equal a full read. If no block survives, the first is kept (the filters then yield no
+//! rows). Only a lazy_variants read is pruned: there the .pvar is not loaded and variant_offsets
+//! is not final until EnsureLazyVariants.
+static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                       vector<unique_ptr<Expression>> &filters) {
+	auto &bind_data = bind_data_p->Cast<PfileBindData>();
+	if (!bind_data.lazy_variants || bind_data.lazy_variants_loaded || bind_data.sources.size() <= 1 ||
+	    bind_data.source_ranges.size() != bind_data.sources.size()) {
+		return;
+	}
+	CellPruneConstraints c;
+	for (auto &f : filters) {
+		CollectCellPruneConstraints(context, get, *f, c);
+	}
+	if (!c.has_chrom && !c.has_pos) {
+		return;
+	}
+	vector<PfileSource> kept;
+	vector<ShardEntry> kept_ranges;
+	for (idx_t i = 0; i < bind_data.sources.size(); i++) {
+		if (c.MayOverlap(bind_data.source_ranges[i])) {
+			kept.push_back(std::move(bind_data.sources[i]));
+			kept_ranges.push_back(bind_data.source_ranges[i]);
+		}
+	}
+	if (kept.empty()) {
+		kept.push_back(std::move(bind_data.sources[0]));
+		kept_ranges.push_back(bind_data.source_ranges[0]);
+	}
+	bind_data.sources = std::move(kept);
+	bind_data.source_ranges = std::move(kept_ranges);
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -5522,6 +5748,8 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		// (input.filters). The scan prunes the variant set where it safely can and ALWAYS
 		// re-applies the full set per chunk (ApplyResidualFilters) for correctness.
 		fn.filter_pushdown = true;
+		// Stage 4: a WHERE on CHROM/POS drops catalog variant blocks before any is opened.
+		fn.pushdown_complex_filter = PfilePushdownComplexFilter;
 		// Composable selection: a STRUCT whose samples/region/variants/variant_range
 		// fields seed the axes; the individual params override per-field
 		// (most-specific-wins). samples/variants are ANY — type dispatch is in bind.
