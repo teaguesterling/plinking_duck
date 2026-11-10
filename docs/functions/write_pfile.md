@@ -38,7 +38,7 @@ are real, not polish.
 
 Later releases add **sharding** on top of that base: [`shard_by`](#sharded-output-shard_by)
 along the variant axis, [`shard_samples`](#sample-sharded-output-shard_samples) along
-the sample axis, and [both at once](#matrix-output-shard_by--shard_samples) as a matrix.
+the sample axis, and [both at once](#matrix-output-shard_by-and-shard_samples) as a matrix.
 Each emits a [`.pfile.json` catalog](../formats/pfile_catalog.md).
 
 ## `FORMAT pfile` — the bundle
@@ -246,7 +246,7 @@ shard names the shared `.pvar`: `read_pfile('out/batch1/data', pvar := 'out.pvar
 - **Variant-orient input only.** No transpose: a sample-orient stream fails on the
   missing `CHROM` role.
 - **Combinable with `shard_by`** to shard both axes at once — see
-  [Matrix output](#matrix-output-shard_by--shard_samples). **Not combinable** with
+  [Matrix output](#matrix-output-shard_by-and-shard_samples). **Not combinable** with
   `pvar`/`pgen`/`psam` path overrides (the layout generates every path).
 - **Memory and file handles.** Unlike `shard_by`, which keeps one writer open at a
   time, every variant row goes to every shard, so all N `.pgen` writers are open
@@ -268,7 +268,7 @@ The emitted `.pfile.json` records `shared.pvar`, and per shard its `prefix`, its
 `psam`, and a global half-open `[start, stop)` **sample**-ordinal `partition` that
 tiles `[0, total)`.
 
-### Matrix output (`shard_by` × `shard_samples`)
+### Matrix output (`shard_by` and `shard_samples`)
 
 Give **both** `shard_by` and `shard_samples` in one `COPY` to shard the two axes at
 once. The result is a **matrix**: an M × N grid of `.pgen` cells — M variant-blocks by
@@ -477,7 +477,7 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
 - **Position-sorted, chromosome-contiguous input is required** (the monotonicity
   check), and the whole fileset is **local-only**.
 - **A matrix has no sample-oriented read yet.** `shard_by` and `shard_samples`
-  combine into a [matrix](#matrix-output-shard_by--shard_samples), but its
+  combine into a [matrix](#matrix-output-shard_by-and-shard_samples), but its
   `c.genotypes_by_sample` ATTACH relation is not supported — the variant-oriented
   `c.genotypes` and the other relations are. It needs the 2-D read (P13-006).
 - **Parquet companions, `.pgi` split index, and PLINK-VCF export are deferred**
