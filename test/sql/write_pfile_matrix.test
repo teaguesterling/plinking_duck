@@ -343,7 +343,7 @@ SELECT (SELECT count(*) FROM (FROM ncgrid EXCEPT ALL SELECT CHROM, POS, ID, REF,
 
 statement ok
 COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM <> '3' ORDER BY CHROM, POS)
-TO '{TEST_DIR}/g' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+TO '{TEST_DIR}/g' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, force true);
 
 query I
 SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', verify_all := true);

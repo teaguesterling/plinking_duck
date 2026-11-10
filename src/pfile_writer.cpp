@@ -175,6 +175,41 @@ string CellToField(const Value &v, const string &col_name) {
 	return s;
 }
 
+// No writer replaces existing output unless the COPY sets `force` (Teague, 2026-11-10). The check
+// runs at BIND, so a refused COPY touches no file. `force` alone, or `force true`, enables it.
+// Motivating defect: read_pfile('<p>') prefers '<p>.pfile.json', and a plain COPY TO '<p>' used to
+// overwrite a sharded run's shared '<p>.psam' while leaving its catalog — so the old shards were
+// read under the new sample IDs, silently.
+bool ParseForceOption(CopyFunctionBindInput &input) {
+	for (auto &opt : input.info.options) {
+		if (StringUtil::Lower(CompatNameStr(opt.first)) != "force") {
+			continue;
+		}
+		if (opt.second.empty()) {
+			return true; // bare `force`
+		}
+		if (opt.second[0].IsNull()) {
+			return false;
+		}
+		return opt.second[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+	}
+	return false;
+}
+
+void RefuseExistingOutput(ClientContext &context, bool force, const vector<string> &paths, const char *writer) {
+	if (force) {
+		return;
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	for (auto &path : paths) {
+		if (!path.empty() && (fs.FileExists(path) || fs.DirectoryExists(path))) {
+			throw BinderException("%s: '%s' already exists. COPY does not replace existing output unless the COPY "
+			                      "sets force: add `force true` to the COPY options.",
+			                      writer, path);
+		}
+	}
+}
+
 // Core `.pvar` bind: resolve variant roles + carried-through extras against the
 // input schema. `exclude` names input column indices that must NOT be carried
 // through as extra `.pvar` columns (the bundle passes the genotypes column here
@@ -285,12 +320,15 @@ unique_ptr<PvarWriteBindData> BuildPvarBind(CopyFunctionBindInput &input, const 
 	return std::move(bind);
 }
 
-unique_ptr<FunctionData> PvarCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<CompatName> &names_in,
-                                      const vector<LogicalType> &sql_types) {
+unique_ptr<FunctionData> PvarCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+                                      const vector<CompatName> &names_in, const vector<LogicalType> &sql_types) {
 	// DuckDB v2.0 retyped copy_to_bind_t's names to vector<Identifier>; convert
 	// once here so the vector<string>-based helpers below stay unchanged.
 	const vector<string> names = CompatNameStrings(names_in);
-	return BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
+	auto bind = BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
+	RefuseExistingOutput(context, ParseForceOption(input),
+	                     {bind->path_override.empty() ? input.info.file_path : bind->path_override}, "write pvar");
+	return std::move(bind);
 }
 
 // Open the `.pvar` handle at `path` (overwrite) and write its header line. Shared
@@ -784,10 +822,13 @@ unique_ptr<PgenWriteBindData> BuildPgenBind(CopyFunctionBindInput &input, const 
 	return std::move(bind);
 }
 
-unique_ptr<FunctionData> PgenCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<CompatName> &names_in,
-                                      const vector<LogicalType> &sql_types) {
+unique_ptr<FunctionData> PgenCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+                                      const vector<CompatName> &names_in, const vector<LogicalType> &sql_types) {
 	const vector<string> names = CompatNameStrings(names_in);
-	return BuildPgenBind(input, names, sql_types);
+	auto bind = BuildPgenBind(input, names, sql_types);
+	RefuseExistingOutput(context, ParseForceOption(input),
+	                     {bind->path_override.empty() ? input.info.file_path : bind->path_override}, "write pgen");
+	return std::move(bind);
 }
 
 unique_ptr<GlobalFunctionData> PgenCopyInitGlobal(ClientContext &, FunctionData &bind_data, const string &file_path) {
@@ -1239,8 +1280,8 @@ struct PsamWriteGlobalState : public GlobalFunctionData {
 
 struct PsamWriteLocalState : public LocalFunctionData {};
 
-unique_ptr<FunctionData> PsamCopyBind(ClientContext &, CopyFunctionBindInput &input, const vector<CompatName> &names_in,
-                                      const vector<LogicalType> &sql_types) {
+unique_ptr<FunctionData> PsamCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+                                      const vector<CompatName> &names_in, const vector<LogicalType> &sql_types) {
 	const vector<string> names = CompatNameStrings(names_in);
 	auto bind = make_uniq<PsamWriteBindData>();
 
@@ -1284,6 +1325,8 @@ unique_ptr<FunctionData> PsamCopyBind(ClientContext &, CopyFunctionBindInput &in
 		}
 		bind->iid_input_idx = idx;
 	}
+	RefuseExistingOutput(context, ParseForceOption(input),
+	                     {bind->path_override.empty() ? input.info.file_path : bind->path_override}, "write psam");
 	return std::move(bind);
 }
 
@@ -1382,6 +1425,9 @@ struct PfileWriteBindData : public FunctionData {
 	string pvar_override; //! `pvar` path option (empty -> prefix + ".pvar")
 	string pgen_override; //! `pgen` path option (empty -> prefix + ".pgen")
 	string psam_override; //! `psam` path option (empty -> prefix + ".psam")
+	//! Plain bundle with `force`: '<prefix>.pfile.json', removed just before promotion (a catalog
+	//! there would describe some OTHER output at this prefix, and read_pfile prefers it). Empty otherwise.
+	string stale_catalog_path;
 
 	//! `shard_by '<col>'` — empty means the plain (single-fileset) bundle. When set, the one
 	//! ordered COPY fans out one pfile per contiguous key value under a hive layout, a single
@@ -2892,7 +2938,21 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		}
 	}
 
-	(void)context;
+	// Existing output at this prefix is never replaced without `force`. Plain: the three effective
+	// files and a catalog at the prefix (which read_pfile would prefer over the new fileset).
+	// Sharded (any mode): the catalog, the root companions, a fileset at the prefix, and the shard tree.
+	const bool force = ParseForceOption(input);
+	const bool sharded = bind->matrix_mode || bind->sample_shard_mode || !bind->shard_by.empty();
+	if (sharded) {
+		RefuseExistingOutput(context, force,
+		                     {prefix + ".pfile.json", prefix + ".pgen", prefix + ".pvar", prefix + ".psam", prefix},
+		                     "write pfile");
+	} else {
+		RefuseExistingOutput(context, force, {eff_pgen, eff_pvar, eff_psam, prefix + ".pfile.json"}, "write pfile");
+		if (force) {
+			bind->stale_catalog_path = prefix + ".pfile.json";
+		}
+	}
 	return std::move(bind);
 }
 
@@ -3004,7 +3064,12 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 		}
 		// All three staging files are complete — promote them to the final paths
 		// (rename, overwriting any prior fileset intra-filesystem). ONLY here does an
-		// existing fileset change; an earlier failure never reached this point.
+		// existing fileset change; an earlier failure never reached this point. Under
+		// `force`, a catalog at this prefix goes first: it describes other output, and
+		// read_pfile('<prefix>') would read it instead of this fileset.
+		if (!bind.stale_catalog_path.empty()) {
+			RemoveStaleCatalog(fs, bind.stale_catalog_path);
+		}
 		g.PromoteStaging(fs);
 	} catch (...) {
 		g.CleanupPartial(fs);

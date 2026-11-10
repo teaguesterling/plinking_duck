@@ -1,0 +1,136 @@
+# name: test/sql/write_pfile_force.test
+# description: COPY never replaces existing output unless `force` is set; with force, a plain pfile write removes a stale catalog
+# group: [sql]
+
+require plinking_duck
+
+# Teague's rule (2026-11-10): no writer overwrites an existing target unless `force` is on. The
+# motivating defect: read_pfile('<p>') prefers '<p>.pfile.json', and a plain COPY TO '<p>' used to
+# leave a sharded run's catalog in place while overwriting its shared '<p>.psam' — so the old
+# shards were read under the new sample IDs, silently.
+
+# --- every standalone writer: a second write to the same target errors, force replaces it ---
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/pfile_example.pvar')) TO '{TEST_DIR}/a.pvar' (FORMAT pvar);
+
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/pfile_example.pvar')) TO '{TEST_DIR}/a.pvar' (FORMAT pvar);
+----
+force
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('test/data/pfile_example.pvar')) TO '{TEST_DIR}/a.pvar' (FORMAT pvar, force true);
+
+statement ok
+COPY (SELECT IID FROM read_psam('test/data/pfile_example.psam')) TO '{TEST_DIR}/a.psam' (FORMAT psam);
+
+statement error
+COPY (SELECT IID FROM read_psam('test/data/pfile_example.psam')) TO '{TEST_DIR}/a.psam' (FORMAT psam);
+----
+force
+
+statement ok
+COPY (SELECT IID FROM read_psam('test/data/pfile_example.psam')) TO '{TEST_DIR}/a.psam' (FORMAT psam, force);
+
+statement ok
+COPY (SELECT genotypes FROM read_pfile('test/data/pfile_example')) TO '{TEST_DIR}/a.pgen' (FORMAT pgen);
+
+statement error
+COPY (SELECT genotypes FROM read_pfile('test/data/pfile_example')) TO '{TEST_DIR}/a.pgen' (FORMAT pgen);
+----
+force
+
+statement ok
+COPY (SELECT genotypes FROM read_pfile('test/data/pfile_example')) TO '{TEST_DIR}/a.pgen' (FORMAT pgen, force true);
+
+# force false is the default spelled out.
+statement error
+COPY (SELECT genotypes FROM read_pfile('test/data/pfile_example')) TO '{TEST_DIR}/a.pgen' (FORMAT pgen, force false);
+----
+force
+
+# --- the plain pfile bundle: any one of its three files existing is enough to refuse ---
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct')) TO '{TEST_DIR}/p' (FORMAT pfile);
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct')) TO '{TEST_DIR}/p' (FORMAT pfile);
+----
+force
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct')) TO '{TEST_DIR}/p' (FORMAT pfile, force true);
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/p');
+----
+4
+
+# --- every sharded writer: an existing catalog (or shard tree) refuses; force overwrites ---
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM');
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM');
+----
+force
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM', force true);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+----
+force
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+
+statement error
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMPLE1', 'SAMPLE2'], b: ['SAMPLE3', 'SAMPLE4']});
+----
+force
+
+# --- THE DEFECT: a plain fileset written over a sharded run's prefix ---
+# Without force it refuses (vs.psam and vs.pfile.json exist), so nothing is mislabelled.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes FROM read_pfile('test/data/pfile_example'))
+TO '{TEST_DIR}/vs' (FORMAT pfile, samples ['N1', 'N2', 'N3', 'N4']);
+----
+force
+
+# The refused write changed nothing: the catalog still reads the original cohort.
+query T
+SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/vs', orient := 'sample');
+----
+[SAMPLE1, SAMPLE2, SAMPLE3, SAMPLE4]
+
+# With force, the stale catalog is removed, so read_pfile('vs') reads the NEW fileset under its
+# own IIDs — not the old shards relabelled N1..N4.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes FROM read_pfile('test/data/pfile_example'))
+TO '{TEST_DIR}/vs' (FORMAT pfile, samples ['N1', 'N2', 'N3', 'N4'], force true);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/vs.pfile.json');
+----
+0
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, genotypes::TINYINT[] FROM read_pfile('{TEST_DIR}/vs')
+          EXCEPT ALL
+          SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/pfile_example'))),
+       (SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/vs', orient := 'sample'));
+----
+0	[N1, N2, N3, N4]

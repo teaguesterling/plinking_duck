@@ -156,30 +156,41 @@ SELECT count(*) FROM read_pfile('test/data/large_example');
 
 # ---------------------------------------------------------------------------
 # BOTH '<p>.pfile.json' and '<p>.pgen' exist: the catalog wins; catalog := false reads the fileset.
-# The fileset is written with distinct IIDs (FS1..FS8), so the two reads are told apart by IID.
+# A plain write over a catalog prefix now REMOVES the catalog (force; see write_pfile_force.test),
+# so this state is built the other way: a plain fileset first (IIDs FS1..FS8), then a matrix
+# written over the same prefix with force (the sharded writers leave a '<p>.pgen' in place).
 # ---------------------------------------------------------------------------
 statement ok
 COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1')
-TO '{TEST_DIR}/mx' (FORMAT pfile, samples ['FS1', 'FS2', 'FS3', 'FS4', 'FS5', 'FS6', 'FS7', 'FS8']);
+TO '{TEST_DIR}/both' (FORMAT pfile, samples ['FS1', 'FS2', 'FS3', 'FS4', 'FS5', 'FS6', 'FS7', 'FS8']);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/both' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, force true);
+
+query I
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/both.pgen')) + (SELECT count(*) FROM glob('{TEST_DIR}/both.pfile.json'));
+----
+2
 
 query T
-SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/mx', orient := 'sample');
+SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/both', orient := 'sample');
 ----
 [SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
 
 query T
-SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/mx', orient := 'sample', catalog := false);
+SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/both', orient := 'sample', catalog := false);
 ----
 [FS1, FS2, FS3, FS4, FS5, FS6, FS7, FS8]
 
 # With the catalog in force, a companion override is ambiguous: the error names catalog := false.
 statement error
-SELECT count(*) FROM read_pfile('{TEST_DIR}/mx', psam := '{TEST_DIR}/mx.psam');
+SELECT count(*) FROM read_pfile('{TEST_DIR}/both', psam := '{TEST_DIR}/both.psam');
 ----
 catalog := false
 
 statement ok
-SELECT count(*) FROM read_pfile('{TEST_DIR}/mx', psam := '{TEST_DIR}/mx.psam', catalog := false);
+SELECT count(*) FROM read_pfile('{TEST_DIR}/both', psam := '{TEST_DIR}/both.psam', catalog := false);
 
 # A list input never discovers: each element is a fileset, as before.
 statement error

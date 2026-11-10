@@ -353,7 +353,7 @@ statement error
 COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes,
              CASE WHEN POS = 20000 THEN CAST('nope' AS INTEGER) ELSE 0 END AS x
       FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
-TO '__TEST_DIR__/G' (FORMAT pfile);
+TO '__TEST_DIR__/G' (FORMAT pfile, force true);
 ----
 nope
 

@@ -1379,7 +1379,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				catalog_path = ResolveExistingPath(context, fs, prefix_arg + ".pfile.json");
 			}
 			if (mode == CatalogMode::REQUIRE && catalog_path.empty()) {
-				throw InvalidInputException("read_pfile: catalog := true, but there is no catalog at '%s.pfile.json'",
+				throw InvalidInputException("read_pfile: catalog := true, but there is no catalog at '%s.pfile.json' "
+				                            "(discovery looks only at local paths; name a remote catalog with "
+				                            "catalog := '<path>')",
 				                            prefix_arg.empty() ? string("(no positional prefix)") : prefix_arg);
 			}
 		}
