@@ -248,7 +248,7 @@ SELECT * FROM read_pfile('/data/cohort', samples := [5], orient := 'sample');
 - `samples :=` with IIDs drops nothing, because block membership needs each block's `.psam`.
 - Nothing is dropped when an index is out of range or repeated, so the error names the cohort-wide index. Nothing is dropped from the sample axis with `combine_samples := 'disjoint'`, because its unique-IID check must see every block.
 - The checks that run when a cell is read (counts against the catalog, sample counts) do not run for a dropped cell.
-- A `WHERE` clause does not prune cells yet. Pass `region :=` or `samples :=`.
+- A `WHERE` on `CHROM` and `POS` also drops variant blocks, in variant and genotype orient (not with `variants := [...]`). It applies to `CHROM = 'x'`, `CHROM IN (...)`, and `POS` with `=`, `<`, `<=`, `>`, `>=` or `BETWEEN`, joined with `AND`. Other predicates, and `OR`, drop nothing. The filter itself still runs, so the rows are the same. A `WHERE` on a view over `read_pfile` (such as an `ATTACH` view) drops blocks the same way.
 
 **When each file is read.** In variant and genotype orient, bind reads each cell's `.pgen` header and each sample block's `.psam`, but not the `.pvar` files. The `.pvar` files load when the scan starts. So `DESCRIBE` or `PREPARE` of a catalog read parses no `.pvar`, and an error in a `.pvar` shows when the query runs. Sample orient reads every `.pvar` at bind, because its schema needs the variant count. `variants := [...]` also reads the `.pvar` at bind, to resolve the IDs.
 

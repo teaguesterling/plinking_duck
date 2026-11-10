@@ -235,6 +235,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	bool sample_concat = false;      // a v1 concat_dim='samples' catalog
 	bool is_matrix = false;          // a v2 matrix catalog
 	string matrix_path_sql;          // its absolute path, as a SQL literal (is_matrix only)
+	string catalog_path_sql;         // the catalog's absolute path, as a SQL literal (any catalog)
 	bool matrix_has_holes = false;   // a declared hole (an absent cell) exists (is_matrix only)
 	vector<MatrixCell> matrix_cells; // its present cells, template-resolved (is_matrix only)
 
@@ -260,6 +261,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	} else {
 		string content = ReadWholeFile(fs, catalog_path);
 		string path_sql = SQLString::ToString(AbsPath(fs, catalog_path));
+		catalog_path_sql = path_sql;
 		cells_sql = "SELECT * FROM read_pfile_catalog(" + path_sql + ")";
 		if (IsMatrixCatalog(content)) {
 			is_matrix = true;
@@ -303,8 +305,15 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// beside shared.pvar), so pvar_paths holds exactly that path.
 	string shared_pvar = (sample_concat && pvar_paths.size() == 1) ? pvar_paths[0] : "";
 	vector<std::pair<Identifier, string>> views;
-	if (is_matrix) {
+	// c.genotypes is the catalog read itself, read_pfile(catalog := ...): one row per variant with
+	// every sample, and a WHERE on CHROM/POS drops variant blocks before they are read (P13-006
+	// stage 4). Teague approved the change on 2026-11-09; before it, a matrix fanned out one row per
+	// variant x sample block. A matrix with holes keeps that fan-out: read_pfile(catalog := ...)
+	// rejects holes, and their 2-D meaning is not defined. A bare fileset has no catalog to name.
+	if (is_matrix && matrix_has_holes) {
 		views.emplace_back(Identifier("genotypes"), MatrixGenotypesSql(matrix_cells));
+	} else if (!catalog_path_sql.empty()) {
+		views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(catalog := " + catalog_path_sql + ")");
 	} else {
 		views.emplace_back(Identifier("genotypes"),
 		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false));

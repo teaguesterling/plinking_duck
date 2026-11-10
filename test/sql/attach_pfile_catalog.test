@@ -71,13 +71,10 @@ TO '{TEST_DIR}/matrix_dense.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESC
 statement ok
 ATTACH '{TEST_DIR}/matrix_dense.pfile.json' AS c (TYPE pfile_catalog);
 
-# c.genotypes equals read_pfile over the same four surviving cell prefixes
-# (self-checking: no hardcoded count, proves the baked view reads the real cells).
+# c.genotypes is the 2-D read of the catalog: read_pfile(catalog := ...), one row per variant.
 query T
 SELECT (SELECT count(*) FROM c.genotypes) =
-       (SELECT count(*) FROM read_pfile([
-          '{TEST_DIR}/data/CHROM=1/GROUP=A/cell', '{TEST_DIR}/data/CHROM=1/GROUP=B/cell',
-          '{TEST_DIR}/data/CHROM=2/GROUP=A/cell', '{TEST_DIR}/data/CHROM=2/GROUP=B/cell']));
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/matrix_dense.pfile.json'));
 ----
 true
 
@@ -87,16 +84,15 @@ SELECT count(*) > 0 FROM c.genotypes;
 ----
 true
 
-# c.genotypes FANS OUT per cell (docs/formats/pfile_catalog.md): one row per variant x sample
-# block, each row carrying that block's samples only. Truth oracle: the source, sliced to group A
-# (S1, S2) and to group B (S3, S4) — not a re-read of the same cells.
+# c.genotypes has ONE row per variant, with every sample block's calls in order (A = S1, S2;
+# B = S3, S4). Teague approved this change on 2026-11-09: before, the view fanned out one row per
+# variant x sample block. Truth oracle: the source, not a re-read of the same cells.
 query II
 SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM c.genotypes
-        EXCEPT ALL (SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 1, 2) FROM read_pfile('test/data/pfile_example')
-                    UNION ALL SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 3, 4) FROM read_pfile('test/data/pfile_example')))),
+        EXCEPT ALL SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/pfile_example'))),
        (SELECT count(*) FROM c.genotypes);
 ----
-0	8
+0	4
 
 # ---------------------------------------------------------------------------
 # Task 2: grid relations — c.cells, c.variant_blocks, c.sample_blocks
@@ -175,10 +171,7 @@ true
 # WHERE on c.genotypes rides read_pfile's pushdown and returns the correct subset.
 query T
 SELECT (SELECT count(*) FROM c.genotypes WHERE CHROM = '1') =
-       (SELECT count(*) FROM read_pfile([
-          '{TEST_DIR}/data/CHROM=1/GROUP=A/cell', '{TEST_DIR}/data/CHROM=1/GROUP=B/cell',
-          '{TEST_DIR}/data/CHROM=2/GROUP=A/cell', '{TEST_DIR}/data/CHROM=2/GROUP=B/cell'])
-        WHERE CHROM = '1');
+       (SELECT count(*) FROM read_pfile('test/data/pfile_example') WHERE CHROM = '1');
 ----
 true
 
@@ -374,25 +367,24 @@ TO '{TEST_DIR}/matrix_tmpl.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCA
 statement ok
 ATTACH '{TEST_DIR}/matrix_tmpl.pfile.json' AS tm (TYPE pfile_catalog);
 
-# Equal sample blocks (2 + 2): a fixed ARRAY, as read_pfile's own 'auto' gives one cell.
+# One row per variant across both sample blocks (2 + 2): a fixed ARRAY of all 4 samples.
 query T
 SELECT DISTINCT typeof(genotypes) FROM tm.genotypes;
 ----
-TINYINT[2]
+TINYINT[4]
 
 query II
 SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM tm.genotypes
-        EXCEPT ALL (SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 1, 2) FROM read_pfile('test/data/pfile_example')
-                    UNION ALL SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 3, 4) FROM read_pfile('test/data/pfile_example')))),
+        EXCEPT ALL SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/pfile_example'))),
        (SELECT count(*) FROM tm.genotypes);
 ----
-0	8
+0	4
 
-# A WHERE still reaches each cell's read.
+# A WHERE reaches the read.
 query I
 SELECT count(*) FROM tm.genotypes WHERE CHROM = '2';
 ----
-2
+1
 
 # The templated grid's sample-oriented view: the 2-D read through the templated companions.
 query II
@@ -418,9 +410,8 @@ SELECT (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM tc.genotypes
 ----
 0	2
 
-# UNEVEN sample blocks (A = S1,S2; B = S3 only): the widths differ, so the column falls back to a
-# LIST (read_pfile's own ARRAY-or-LIST rule, lifted to the grid). Each row's list holds its block's
-# samples.
+# UNEVEN sample blocks (A = S1,S2; B = S3 only): one row per variant holds all 3 samples, so the
+# widths no longer matter: a fixed ARRAY of 3.
 statement ok
 COPY (SELECT c AS CHROM, g AS "GROUP", 0 AS x FROM (VALUES ('1'),('2')) a(c), (VALUES ('A'),('B')) b(g))
 TO '{TEST_DIR}/udata' (FORMAT csv, PARTITION_BY (CHROM, "GROUP"));
@@ -468,15 +459,14 @@ ATTACH '{TEST_DIR}/matrix_uneven.pfile.json' AS um (TYPE pfile_catalog);
 query T
 SELECT DISTINCT typeof(genotypes) FROM um.genotypes;
 ----
-TINYINT[]
+TINYINT[3]
 
 query II
-SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, genotypes FROM um.genotypes
-        EXCEPT ALL (SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 1, 2) FROM read_pfile('test/data/pfile_example')
-                    UNION ALL SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 3, 3) FROM read_pfile('test/data/pfile_example')))),
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM um.genotypes
+        EXCEPT ALL SELECT CHROM, POS, ID, list_slice(genotypes::TINYINT[], 1, 3) FROM read_pfile('test/data/pfile_example'))),
        (SELECT count(*) FROM um.genotypes);
 ----
-0	8
+0	4
 
 # The uneven grid's sample-oriented view: 3 samples, each with all 4 variants.
 query II
@@ -485,3 +475,45 @@ SELECT (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM um.genotypes
        (SELECT count(*) FROM um.genotypes_by_sample);
 ----
 0	3
+
+# ---------------------------------------------------------------------------
+# P13-006 stage 4: a WHERE on the ATTACH view drops variant blocks before they are read.
+# CHROM=2's .pvar is garbage, so any read that opens that block errors.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/wbad' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/wbad/CHROM=2/variants.pvar' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/wbadv1' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/wbadv1/CHROM=2/data.pvar' (FORMAT csv, header false);
+
+statement ok
+ATTACH '{TEST_DIR}/wbad.pfile.json' AS wb (TYPE pfile_catalog);
+
+statement ok
+ATTACH '{TEST_DIR}/wbadv1.pfile.json' AS wb1 (TYPE pfile_catalog);
+
+statement error
+SELECT count(*) FROM wb.genotypes;
+----
+variants.pvar
+
+query II
+SELECT (SELECT count(*) FROM (SELECT ID, genotypes::TINYINT[] FROM wb.genotypes WHERE CHROM = '3'
+        EXCEPT ALL SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example') WHERE CHROM = '3')),
+       (SELECT count(*) FROM wb.genotypes WHERE CHROM = '3');
+----
+0	1000
+
+# A v1 catalog's view prunes the same way.
+query I
+SELECT count(*) FROM wb1.genotypes WHERE CHROM IN ('1', '3');
+----
+2000
