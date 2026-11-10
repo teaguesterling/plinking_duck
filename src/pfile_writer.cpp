@@ -1,7 +1,7 @@
 #include "pfile_writer.hpp"
 #include "plink_common.hpp"  // AlignedBuffer + pgenlib read/misc headers
 #include "pfile_catalog.hpp" // shared ShardEntry (the pfile_catalog catalog model, also used by the reader)
-#include "duckdb_compat.hpp" // CompatName / CompatNameStr(ings) — Identifier boundaries on DuckDB v2.0
+#include "duckdb_compat.hpp" // CompatName / CompatNameStr(ings), CompatRegisteredState
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -1554,7 +1554,9 @@ void RegisterStagingCleanup(ClientContext &context, STATE &g) {
 			owner->CleanupPartial(fs);
 		}
 	};
-	context.registered_state->GetOrCreate<StagingCleanupRegistry>(StagingCleanupRegistry::KEY)->Add(g.cleanup_token);
+	CompatRegisteredState(context)
+	    .GetOrCreate<StagingCleanupRegistry>(StagingCleanupRegistry::KEY)
+	    ->Add(g.cleanup_token);
 }
 
 //! Call FIRST in a bundle state's destructor. After it returns, the query-end hook cannot reach
