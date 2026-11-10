@@ -17,7 +17,8 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `prefix` | `VARCHAR` or `LIST(VARCHAR)` | *(required)* | Common file prefix (e.g., `'data/cohort'`), or a list of prefixes to read as one table (see [Multi-File Input](#multi-file-input)) |
+| `prefix` | `VARCHAR` or `LIST(VARCHAR)` | *(required, unless `catalog`)* | Common file prefix (e.g., `'data/cohort'`), or a list of prefixes to read as one table (see [Multi-File Input](#multi-file-input)) |
+| `catalog` | `VARCHAR` | — | A version 2 matrix catalog (`.pfile.json`), read as one cohort across its variant and sample blocks. Replaces `prefix`. See [Matrix catalog input](#matrix-catalog-input-catalog) |
 | `pgen` | `VARCHAR` | `prefix.pgen` | Explicit `.pgen` path |
 | `pvar` | `VARCHAR` | `prefix.pvar` | Explicit `.pvar` or `.bim` path |
 | `psam` | `VARCHAR` | `prefix.psam` | Explicit `.psam` or `.fam` path |
@@ -209,6 +210,26 @@ Because there is one variant axis, `pvar :=`, `variants := [...]` and `variant_r
 Each shard's `.psam` must have the same columns in `orient := 'genotype'` and `orient := 'sample'`. `'concatenate'` does not check IID uniqueness across shards. A duplicate IID then fails only in the modes that name columns after IIDs (`genotypes := 'columns'` / `'struct'`) or that look up a sample by IID. Use `'disjoint'` to check it.
 
 `.psam.parquet` companions work in this mode. In `orient := 'genotype'` and `orient := 'sample'`, the psam columns are read lazily from every shard's parquet file, in shard order. These orients need one kind of `.psam` for every shard: all text or all parquet. A mix is an error. Variant orient reads only counts or IIDs, so it accepts a mix.
+
+#### Matrix catalog input (`catalog :=`)
+
+A [version 2 matrix catalog](../formats/pfile_catalog.md) splits a cohort along **both** axes: variant blocks × sample blocks. `catalog :=` reads the whole grid as one cohort:
+
+```sql
+SELECT * FROM read_pfile(catalog := '/data/cohort.pfile.json', orient := 'sample');
+```
+
+- The variants are the variant blocks in order. The samples are the sample blocks in order.
+- Within each variant block, the sample blocks are concatenated, as with `combine_samples := 'concatenate'`. The variant blocks are then concatenated, as with a variant-sharded list.
+- So variant orient gives one row per variant with **every** sample, and sample orient gives one row per sample with **every** variant.
+- Each cell is read with its template-resolved `.pvar` (its variant block's) and `.psam` (its sample block's). A cell needs no companion files of its own.
+- All three orients, all genotype modes, and the sample, region and count filters work. Counts and frequencies use the whole cohort.
+
+The grid must be complete. A catalog with a hole (an absent cell) is an error, because a 2-D read of a holed grid is not defined yet. Each cell's `.pgen` must hold exactly the variant and sample counts that its blocks declare. As with `'concatenate'`, only the counts are checked: variant identity across a variant block's cells is positional.
+
+With more than one variant block, `variants := [...]` and `variant_range` are errors, because each block has its own variant ordinals. Use `region :=` to select variants across blocks. With one variant block, both work.
+
+`catalog :=` names every input, so a positional prefix, `pgen :=`, `pvar :=` and `psam :=` are errors with it. With more than one sample block, `combine_samples` defaults to `'concatenate'`. `'disjoint'` also checks that the IIDs are unique across the sample blocks. `'implicit'` and `'identical'` are errors, because the sample blocks hold different samples. `ATTACH … (TYPE pfile_catalog)` uses this read for `c.genotypes_by_sample`.
 
 The list of prefixes can come from anywhere: a literal list, a **glob** (`read_pfile('data/chr*.pgen')`), or a **catalog macro** returning a `VARCHAR[]` of shard prefixes — e.g. the scalarfs `pathmacro:` protocol, which `read_pfile` resolves to local shard paths and reads directly: `read_pfile('pathmacro:cohort?gene=BRCA1')`.
 

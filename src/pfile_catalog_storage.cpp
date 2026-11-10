@@ -234,6 +234,8 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	string cells_sql;
 	bool sample_concat = false;      // a v1 concat_dim='samples' catalog
 	bool is_matrix = false;          // a v2 matrix catalog
+	string matrix_path_sql;          // its absolute path, as a SQL literal (is_matrix only)
+	bool matrix_has_holes = false;   // a declared hole (an absent cell) exists (is_matrix only)
 	vector<MatrixCell> matrix_cells; // its present cells, template-resolved (is_matrix only)
 
 	auto take_cell = [&](const string &prefix, const string &pvar, const string &psam) {
@@ -261,6 +263,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 		cells_sql = "SELECT * FROM read_pfile_catalog(" + path_sql + ")";
 		if (IsMatrixCatalog(content)) {
 			is_matrix = true;
+			matrix_path_sql = path_sql;
 			auto matrix = ParseMatrixCatalog(fs, catalog_path, content);
 			for (auto &cell : BuildCells(matrix, fs, /*include_holes=*/false)) {
 				if (cell.present) {
@@ -268,6 +271,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 					matrix_cells.push_back(cell);
 				}
 			}
+			matrix_has_holes = matrix_cells.size() != matrix.variants.blocks.size() * matrix.samples.blocks.size();
 			variant_blocks_sql = BuildBlockViewSql(matrix.variants, path_sql, "variant_start", "variant_stop");
 			sample_blocks_sql = BuildBlockViewSql(matrix.samples, path_sql, "sample_start", "sample_stop");
 		} else {
@@ -305,25 +309,17 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 		views.emplace_back(Identifier("genotypes"),
 		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false));
 	}
-	// A matrix whose present cells span MORE THAN ONE sample block needs a 2-D read for the
-	// SAMPLE-oriented view. read_pfile combines one axis per call, so a sample-oriented read of
-	// every cell takes the samples from one block and concatenates every cell's genotypes under
-	// them — other blocks' calls filed under the wrong IIDs (measured). Until that read exists
-	// (P13-006 §10.2) this view errors. c.genotypes is unaffected: its documented per-cell fan-out
-	// (one row per variant x sample block) is correct. The view raises the error at
-	// BIND (a table-function argument is constant-folded when the view binds), so every query on it
-	// — count(*), a WHERE on a real column, a filter that matches no row, DESCRIBE — gets this
-	// message. Measured: a row-level `WHERE error(…)` form returned 0 rows (no error) when the filter
-	// matched no row, and a projected `error()` column is optimized away under count(*).
-	if (is_matrix && psam_paths.size() > 1) {
-		string msg = StringUtil::Format(
-		    "ATTACH pfile_catalog '%s': %s.genotypes_by_sample is not available yet for a matrix with %llu "
-		    "sample blocks. read_pfile cannot yet combine the variant and sample axes in one read, so each "
-		    "sample's genotypes would include other blocks' calls. %s.genotypes (one row per variant and sample "
-		    "block) and the other relations are correct.",
-		    raw_path, name, static_cast<unsigned long long>(psam_paths.size()), name);
+	// A matrix's SAMPLE-oriented view is the 2-D read: read_pfile(catalog := …) concatenates the
+	// sample blocks within each variant block and row-concatenates the variant blocks, with every
+	// cell's template-resolved companions. (A list read of the cells combines one axis only: it
+	// filed other sample blocks' calls under the first block's IIDs — measured before this view.)
+	// A matrix with holes errors at bind inside read_pfile, so every query on the view (count(*),
+	// a filter that matches no row, DESCRIBE) gets that message — EXCEPT with one sample block:
+	// there a hole removes a whole variant block, and the variant-sharded list read of the
+	// present cells is correct (it was the view before the 2-D read; kept so it does not regress).
+	if (is_matrix && !(matrix_has_holes && psam_paths.size() == 1)) {
 		views.emplace_back(Identifier("genotypes_by_sample"),
-		                   "SELECT * FROM range(error(" + SQLString::ToString(msg) + ")::BIGINT)");
+		                   "SELECT * FROM read_pfile(catalog := " + matrix_path_sql + ", orient := 'sample')");
 	} else {
 		views.emplace_back(Identifier("genotypes_by_sample"),
 		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, true));

@@ -7,6 +7,7 @@
 #include "plink_profile.hpp"
 #include "pgen_vfs_opener.hpp"
 #include "pgen_concat_reader.hpp"
+#include "pfile_catalog_matrix.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
 
@@ -393,6 +394,11 @@ struct PfileSource {
 	uint32_t ResolveVariantIdx(uint32_t effective_pos) const {
 		return has_effective_variant_list ? effective_variant_indices[effective_pos] : effective_pos;
 	}
+
+	//! Sample-sharded read (PfileBindData::IsConcat): this variant block's .pgen for each
+	//! sample shard, parallel to PfileBindData::sample_shards. A list read has ONE source; a
+	//! 2-D grid (catalog := over a matrix) has one source per variant block.
+	vector<string> shard_pgen_paths;
 };
 
 // How the sample sets of multiple sources are combined. UNION and INTERSECT are
@@ -477,15 +483,28 @@ struct PfileBindData : public TableFunctionData {
 	uint32_t raw_sample_ct = 0;
 
 	// Sample-sharded cohort (combine_samples := 'concatenate' over more than one
-	// fileset): one entry per shard, in list order, with its .pgen, its own sample
-	// count and its offset in the combined sample space. Empty for every other read.
-	// When non-empty, `sources` holds exactly ONE PfileSource — the shared variant
-	// axis (shard 0's .pvar, or the pvar := override) — so variant scheduling is the
-	// single-file path, and every per-variant read goes through a ConcatPgenReader.
+	// fileset, or catalog := over a matrix with more than one sample block): one entry
+	// per shard, in order, with its own sample count and its offset in the combined
+	// sample space. Empty for every other read. The split is SHARED by every source:
+	// each source is one variant block (a list read has exactly one, the shared variant
+	// axis; a 2-D grid has one per variant block) and holds its own .pgen per shard in
+	// PfileSource::shard_pgen_paths. Every per-variant read goes through a
+	// ConcatPgenReader opened on ShardsFor(source). (`pgen_path` here is variant block
+	// 0's, for messages.)
 	vector<PgenSampleShard> sample_shards;
 	vector<string> sample_shard_psam_paths; // parallel to sample_shards
 	bool IsConcat() const {
 		return !sample_shards.empty();
+	}
+	//! The sample split with source `src_idx`'s .pgen per shard (IsConcat only).
+	vector<PgenSampleShard> ShardsFor(idx_t src_idx) const {
+		auto shards = sample_shards;
+		const auto &paths = sources[src_idx].shard_pgen_paths;
+		D_ASSERT(paths.size() == shards.size());
+		for (idx_t k = 0; k < shards.size(); k++) {
+			shards[k].pgen_path = paths[k];
+		}
+		return shards;
 	}
 
 	// Mode
@@ -1200,6 +1219,71 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 // Bind function
 // ---------------------------------------------------------------------------
 
+//! catalog := '<x>.pfile.json': a v2 MATRIX catalog's cells as a full V x K grid, row-major
+//! (variant block, then sample block), so cell i sits at variant block i / K, sample block i % K.
+//! Each cell carries its TEMPLATE-resolved .pvar (its variant block's) and .psam (its sample
+//! block's), and its declared extents, which bind checks against the .pgen header.
+struct CatalogGrid {
+	string path;
+	vector<MatrixCell> cells;
+	idx_t sample_block_ct = 0;
+};
+
+static CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const string &path) {
+	CatalogGrid grid;
+	grid.path = ResolveExistingPath(context, fs, path);
+	if (grid.path.empty()) {
+		throw InvalidInputException("read_pfile: catalog file not found: '%s'", path);
+	}
+	string content;
+	{
+		auto handle = fs.OpenFile(grid.path, FileFlags::FILE_FLAGS_READ);
+		content.resize(handle->GetFileSize());
+		if (!content.empty()) {
+			handle->Read(reinterpret_cast<void *>(&content[0]), content.size());
+		}
+	}
+	if (!IsMatrixCatalog(content)) {
+		throw InvalidInputException("read_pfile: catalog := reads a v2 matrix catalog (\"pfile_catalog\": 2); '%s' "
+		                            "is not one. Read a v1 catalog's files as a list, or ATTACH it.",
+		                            path);
+	}
+	auto matrix = ParseMatrixCatalog(fs, grid.path, content);
+	grid.cells = BuildCells(matrix, fs, /*include_holes=*/true);
+	for (auto &cell : grid.cells) {
+		if (!cell.present) {
+			string where;
+			for (auto &kv : cell.keys) {
+				where += (where.empty() ? "" : ", ") + kv.first + "=" + kv.second;
+			}
+			throw InvalidInputException("read_pfile: catalog '%s' has a hole (an absent cell) at {%s}. A 2-D read of "
+			                            "a matrix with holes is not supported yet.",
+			                            path, where);
+		}
+	}
+	std::stable_sort(grid.cells.begin(), grid.cells.end(), [](const MatrixCell &a, const MatrixCell &b) {
+		return a.variant_block != b.variant_block ? a.variant_block < b.variant_block : a.sample_block < b.sample_block;
+	});
+	grid.sample_block_ct = matrix.samples.blocks.size();
+	const idx_t variant_block_ct = matrix.variants.blocks.size();
+	if (grid.cells.empty() || grid.sample_block_ct == 0 ||
+	    grid.cells.size() != variant_block_ct * grid.sample_block_ct) {
+		throw InvalidInputException("read_pfile: catalog '%s' does not describe a full grid (%llu cells for %llu "
+		                            "variant blocks x %llu sample blocks)",
+		                            path, static_cast<unsigned long long>(grid.cells.size()),
+		                            static_cast<unsigned long long>(variant_block_ct),
+		                            static_cast<unsigned long long>(grid.sample_block_ct));
+	}
+	for (idx_t i = 0; i < grid.cells.size(); i++) {
+		auto &cell = grid.cells[i];
+		if (static_cast<idx_t>(cell.variant_block) != i / grid.sample_block_ct ||
+		    static_cast<idx_t>(cell.sample_block) != i % grid.sample_block_ct) {
+			throw InvalidInputException("read_pfile: catalog '%s' does not describe a full grid", path);
+		}
+	}
+	return grid;
+}
+
 static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<CompatName> &names) {
 	BindPhaseTimer bind_timer("PfileBind(total)");
@@ -1221,8 +1305,34 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// (LIST(VARCHAR), row-concatenated in order). Empty inputs → only named params.
 	auto &fs = FileSystem::GetFileSystem(context);
 
+	// catalog := '<x>.pfile.json' (a v2 matrix): the catalog's cells ARE the inputs, read as one
+	// 2-D cohort — variant blocks row-concatenated, sample blocks concatenated (see CatalogGrid).
+	CatalogGrid grid;
+	{
+		auto cat_it = input.named_parameters.find("catalog");
+		if (cat_it != input.named_parameters.end() && !cat_it->second.IsNull()) {
+			if (!input.inputs.empty()) {
+				throw InvalidInputException("read_pfile: catalog := cannot be combined with a positional path (the "
+				                            "catalog names the inputs)");
+			}
+			for (const char *key : {"pgen", "pvar", "psam"}) {
+				if (input.named_parameters.find(key) != input.named_parameters.end()) {
+					throw InvalidInputException("read_pfile: catalog := cannot be combined with %s := (the catalog "
+					                            "names every cell's companions)",
+					                            key);
+				}
+			}
+			grid = LoadCatalogGrid(context, fs, cat_it->second.GetValue<string>());
+		}
+	}
+	const bool from_catalog = !grid.cells.empty();
+
 	vector<string> prefixes;
-	if (!input.inputs.empty()) {
+	if (from_catalog) {
+		for (auto &cell : grid.cells) {
+			prefixes.push_back(cell.prefix);
+		}
+	} else if (!input.inputs.empty()) {
 		prefixes = ResolvePathList(input.inputs[0], "read_pfile");
 		// Expand glob patterns and protocol URLs (e.g. pathmacro:) to concrete
 		// local prefixes/paths, so a single URL/glob can fan out to a sharded
@@ -1293,8 +1403,43 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// A sample-sharded cohort: same variants, different samples per fileset. There is
 	// ONE variant axis, so pvar := (the shared .pvar), variants := and variant_range
 	// resolve unambiguously; only the per-shard pgen/psam overrides are rejected.
-	const bool concat = multi_file && (bind_data->combine_samples == CombineSamplesMode::CONCATENATE ||
-	                                   bind_data->combine_samples == CombineSamplesMode::DISJOINT);
+	// A catalog grid is sample-sharded when it has more than one sample block; its sample
+	// blocks are disjoint by construction, so it reads through 'concatenate' by default and
+	// rejects a mode that asserts the blocks hold the SAME samples.
+	if (from_catalog && grid.sample_block_ct > 1) {
+		if (input.named_parameters.find("combine_samples") == input.named_parameters.end()) {
+			bind_data->combine_samples = CombineSamplesMode::CONCATENATE;
+		} else if (bind_data->combine_samples != CombineSamplesMode::CONCATENATE &&
+		           bind_data->combine_samples != CombineSamplesMode::DISJOINT) {
+			throw InvalidInputException(
+			    "read_pfile: combine_samples := '%s' contradicts catalog '%s': its %llu sample blocks hold different "
+			    "samples. Use 'concatenate' (the default here) or 'disjoint'.",
+			    CombineSamplesModeName(bind_data->combine_samples), grid.path,
+			    static_cast<unsigned long long>(grid.sample_block_ct));
+		}
+	}
+	const bool concat = from_catalog ? grid.sample_block_ct > 1
+	                                 : multi_file && (bind_data->combine_samples == CombineSamplesMode::CONCATENATE ||
+	                                                  bind_data->combine_samples == CombineSamplesMode::DISJOINT);
+	// Sample blocks per variant block: input element si sits at variant block si / K, sample
+	// block si % K. A list read is one row (concat) or one column (every other mode).
+	const idx_t sample_block_ct = from_catalog ? grid.sample_block_ct : (concat ? prefixes.size() : 1);
+	// variants / variant_range resolve against ONE source's variant index. A grid with several
+	// variant blocks AND several sample blocks takes the concat branch below, which allows them
+	// (a sample-sharded list has one variant axis), so reject them here as the variant-sharded
+	// guard does: each block would resolve them on its own (variant_range := [0, 1] returned
+	// variant 0 of EVERY block).
+	if (concat && prefixes.size() > sample_block_ct) {
+		auto vr_it = input.named_parameters.find("variant_range");
+		if (sel.has_variants || sel.has_variant_range ||
+		    input.named_parameters.find("variants") != input.named_parameters.end() ||
+		    (vr_it != input.named_parameters.end() && !vr_it->second.IsNull())) {
+			throw InvalidInputException("read_pfile: variants := [...] and variant_range across %llu variant blocks "
+			                            "are not yet supported (multi-file: each block has its own variant ordinals); "
+			                            "use region := for selection across blocks",
+			                            static_cast<unsigned long long>(prefixes.size() / sample_block_ct));
+		}
+	}
 
 	// --- Multi-file guards (throw before loading anything) ---
 	if (concat) {
@@ -1414,43 +1559,83 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_timer.Note("resolving %llu source(s)", (unsigned long long)prefixes.size());
 	for (idx_t si = 0; si < prefixes.size(); si++) {
 		uint32_t src_sample_ct = 0;
+		const idx_t vb = si / sample_block_ct; // this element's variant block
+		const idx_t sb = si % sample_block_ct; // this element's sample block
 		// combine_samples := 'identical' needs each shard's .psam discovered so we
 		// can compare IIDs below; otherwise only source 0's psam is needed. A psam
 		// override supplies one shared .psam for all shards, so there is nothing to
 		// discover or compare per shard.
 		// combine_samples := 'concatenate' needs every shard's .psam (its own samples)
-		// but only shard 0's .pvar (the shared variant axis).
-		bool need_psam = (si == 0) || concat ||
+		// but only shard 0's .pvar (the shared variant axis) — in a grid, variant block 0's
+		// .psam per sample block and each variant block's first .pvar.
+		bool need_psam = (si == 0) || (concat && vb == 0) ||
 		                 (bind_data->combine_samples == CombineSamplesMode::IDENTICAL && override_psam.empty());
-		bool need_pvar = !(concat && si > 0);
-		PfileSource src =
-		    LoadPfileSource(context, fs, prefixes[si], si == 0 ? override_pgen : string(),
-		                    si == 0 ? override_pvar : string(), si == 0 ? override_psam : string(), need_psam,
-		                    need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard);
+		bool need_pvar = !(concat && sb > 0);
+		string elem_pgen, elem_pvar, elem_psam;
+		if (from_catalog) {
+			// The cell's template-resolved companions (a cell has no sibling .pvar/.psam).
+			elem_pvar = need_pvar ? grid.cells[si].pvar : string();
+			elem_psam = need_psam ? grid.cells[si].psam : string();
+		} else if (si == 0) {
+			elem_pgen = override_pgen;
+			elem_pvar = override_pvar;
+			elem_psam = override_psam;
+		}
+		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
+		                                  need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard);
+
+		if (from_catalog) {
+			// The cell's .pgen must hold exactly the extents its blocks declare.
+			const auto &cell = grid.cells[si];
+			if (static_cast<int64_t>(src.raw_variant_ct) != cell.variant_stop - cell.variant_start ||
+			    static_cast<int64_t>(src_sample_ct) != cell.sample_stop - cell.sample_start) {
+				throw InvalidInputException(
+				    "read_pfile: catalog '%s': cell '%s' holds %u variants x %u samples, but its blocks declare %lld "
+				    "variants x %lld samples",
+				    grid.path, src.pgen_path, src.raw_variant_ct, src_sample_ct,
+				    static_cast<long long>(cell.variant_stop - cell.variant_start),
+				    static_cast<long long>(cell.sample_stop - cell.sample_start));
+			}
+		}
 
 		if (concat) {
 			// Sample shard: the samples add up; the variants must be the same set. Only
 			// the COUNT is checked (positional trust, like 'implicit'): shards 1..K's
-			// .pvar files are never read.
-			if (si > 0 && src.raw_variant_ct != bind_data->sources[0].raw_variant_ct) {
+			// .pvar files are never read. In a grid, every variant block repeats the one
+			// sample split, so a later block's shard must match its split entry's count.
+			if (sb == 0) {
+				src.shard_pgen_paths.push_back(src.pgen_path); // becomes this block's source below
+			} else {
+				auto &block = bind_data->sources.back();
+				if (src.raw_variant_ct != block.raw_variant_ct) {
+					throw InvalidInputException(
+					    "read_pfile: variant count mismatch across sample shards: '%s' has %u variants, but '%s' has "
+					    "%u. combine_samples := '%s' needs every shard to hold the same variants in the same order.",
+					    src.pgen_path, src.raw_variant_ct, block.pgen_path, block.raw_variant_ct,
+					    CombineSamplesModeName(bind_data->combine_samples));
+				}
+				block.shard_pgen_paths.push_back(src.pgen_path);
+			}
+			if (vb == 0) {
+				if (static_cast<uint64_t>(bind_data->raw_sample_ct) + src_sample_ct > UINT32_MAX) {
+					throw InvalidInputException("read_pfile: combine_samples := 'concatenate' exceeds %u samples",
+					                            UINT32_MAX);
+				}
+				PgenSampleShard shard;
+				shard.pgen_path = src.pgen_path;
+				shard.raw_sample_ct = src_sample_ct;
+				shard.sample_offset = bind_data->raw_sample_ct;
+				bind_data->raw_sample_ct += src_sample_ct;
+				bind_data->sample_shards.push_back(std::move(shard));
+				bind_data->sample_shard_psam_paths.push_back(src.psam_path);
+			} else if (src_sample_ct != bind_data->sample_shards[sb].raw_sample_ct) {
 				throw InvalidInputException(
-				    "read_pfile: variant count mismatch across sample shards: '%s' has %u variants, but '%s' has %u. "
-				    "combine_samples := '%s' needs every shard to hold the same variants in the same order.",
-				    src.pgen_path, src.raw_variant_ct, bind_data->sources[0].pgen_path,
-				    bind_data->sources[0].raw_variant_ct, CombineSamplesModeName(bind_data->combine_samples));
+				    "read_pfile: sample count mismatch across variant blocks: '%s' has %u samples, but sample block "
+				    "%llu has %u (from '%s')",
+				    src.pgen_path, src_sample_ct, static_cast<unsigned long long>(sb),
+				    bind_data->sample_shards[sb].raw_sample_ct, bind_data->sample_shards[sb].pgen_path);
 			}
-			if (static_cast<uint64_t>(bind_data->raw_sample_ct) + src_sample_ct > UINT32_MAX) {
-				throw InvalidInputException("read_pfile: combine_samples := 'concatenate' exceeds %u samples",
-				                            UINT32_MAX);
-			}
-			PgenSampleShard shard;
-			shard.pgen_path = src.pgen_path;
-			shard.raw_sample_ct = src_sample_ct;
-			shard.sample_offset = bind_data->raw_sample_ct;
-			bind_data->raw_sample_ct += src_sample_ct;
-			bind_data->sample_shards.push_back(std::move(shard));
-			bind_data->sample_shard_psam_paths.push_back(src.psam_path);
-			if (si > 0) {
+			if (sb > 0) {
 				continue; // a later shard contributes samples only, never a variant source
 			}
 		} else if (si == 0) {
@@ -1807,14 +1992,16 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		if (bind_data->count_filter.HasFilter() || bind_data->genotype_filter.active) {
 			// Count-filter readers open .pgen — route through the VFS while active.
 			PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
-			// Sample-sharded cohort: count every shard (summed) through one reader.
+			// Sample-sharded cohort: count every shard (summed) through one reader per
+			// source (variant block), opened on that block's shard .pgen files.
 			unique_ptr<ConcatPgenReader> cf_cat;
-			if (bind_data->IsConcat()) {
-				cf_cat = make_uniq<ConcatPgenReader>();
-				cf_cat->Open(context, bind_data->use_vfs, bind_data->sample_shards, bind_data->Primary().raw_variant_ct,
-				             bind_data->has_sample_subset, bind_data->sample_indices);
-			}
-			for (auto &src : bind_data->sources) {
+			for (idx_t cf_src_idx = 0; cf_src_idx < bind_data->sources.size(); cf_src_idx++) {
+				auto &src = bind_data->sources[cf_src_idx];
+				if (bind_data->IsConcat()) {
+					cf_cat = make_uniq<ConcatPgenReader>();
+					cf_cat->Open(context, bind_data->use_vfs, bind_data->ShardsFor(cf_src_idx), src.raw_variant_ct,
+					             bind_data->has_sample_subset, bind_data->sample_indices);
+				}
 				// Init temporary PgenReader for count filtering (not opened when cf_cat
 				// reads a sample-sharded cohort; Cleanup* on a preinit'd reader is a no-op).
 				plink2::PgenFileInfo cf_pgfi;
@@ -2153,17 +2340,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			// occupies matrix rows [variant_offsets[src_idx], variant_offsets[src_idx+1]).
 			// The per-source readers open .pgen — route through the VFS while active.
 			PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
-			// Sample-sharded cohort (combine_samples := 'concatenate'): one reader over
-			// every shard, presenting the combined sample space. Nothing is opened per
-			// source below (there is exactly one source: the shared variant axis).
+			// Sample-sharded cohort (combine_samples := 'concatenate', or a 2-D grid): one
+			// reader per source (variant block) over every shard of that block, presenting
+			// the combined sample space. The plain per-source reader below is then unused.
 			unique_ptr<ConcatPgenReader> pr_cat;
-			if (bind_data->IsConcat()) {
-				pr_cat = make_uniq<ConcatPgenReader>();
-				pr_cat->Open(context, bind_data->use_vfs, bind_data->sample_shards, bind_data->Primary().raw_variant_ct,
-				             bind_data->has_sample_subset, bind_data->sample_indices);
-			}
 			for (idx_t src_idx = 0; src_idx < bind_data->sources.size(); src_idx++) {
 				PfileSource &src = bind_data->sources[src_idx];
+				if (bind_data->IsConcat()) {
+					pr_cat = make_uniq<ConcatPgenReader>();
+					pr_cat->Open(context, bind_data->use_vfs, bind_data->ShardsFor(src_idx), src.raw_variant_ct,
+					             bind_data->has_sample_subset, bind_data->sample_indices);
+				}
 				uint32_t global_offset = bind_data->variant_offsets[src_idx];
 
 				// Temporary PgenReader for THIS source (unused, and never opened, when
@@ -3149,14 +3336,16 @@ static void OpenSourceReader(ClientContext &context, PfileLocalState &state, con
 		return;
 	}
 	if (bind_data.IsConcat()) {
-		// One source (the shared variant axis); the reader spans every sample shard.
+		// One source per variant block; the reader spans every sample shard of THIS block
+		// (a fresh ConcatPgenReader replaces the previous block's, which closes its files).
 		// pgfi/pgr are preinit'd only, so the destructor's Cleanup* calls are no-ops.
 		plink2::PreinitPgfi(&state.pgfi);
 		plink2::PreinitPgr(&state.pgr);
 		plink2::PgrClearSampleSubsetIndex(nullptr, &state.pssi);
 		state.concat = make_uniq<ConcatPgenReader>();
-		state.concat->Open(context, bind_data.use_vfs, bind_data.sample_shards, bind_data.Primary().raw_variant_ct,
-		                   bind_data.has_sample_subset, bind_data.sample_indices);
+		state.concat->Open(context, bind_data.use_vfs, bind_data.ShardsFor(source_idx),
+		                   bind_data.sources[source_idx].raw_variant_ct, bind_data.has_sample_subset,
+		                   bind_data.sample_indices);
 		state.current_source_idx = source_idx;
 		state.initialized = true;
 		return;
@@ -5058,6 +5247,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		DeclareNamedParameters(fn, {{"pgen", LogicalType::VARCHAR},
 		                            {"pvar", LogicalType::VARCHAR},
 		                            {"psam", LogicalType::VARCHAR},
+		                            {"catalog", LogicalType::VARCHAR},
 		                            {"orient", LogicalType::VARCHAR},
 		                            {"dosages", LogicalType::BOOLEAN},
 		                            {"phased", LogicalType::BOOLEAN},
@@ -5077,6 +5267,11 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	};
 
 	TableFunctionSet set("read_pfile");
+	// No positional argument: the inputs come from named parameters only — catalog := (a v2
+	// matrix, read as one 2-D cohort) or the pgen/pvar/psam paths.
+	TableFunction none("read_pfile", {}, PfileScan, PfileBind, PfileInitGlobal, PfileInitLocal);
+	add_named_params(none);
+	set.AddFunction(none);
 	TableFunction one("read_pfile", {LogicalType::VARCHAR}, PfileScan, PfileBind, PfileInitGlobal, PfileInitLocal);
 	add_named_params(one);
 	set.AddFunction(one);

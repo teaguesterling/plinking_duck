@@ -344,14 +344,9 @@ reappears after another — removes every staging file and every directory the `
 created. An overwrite replaces the whole grid and leaves the catalog valid; a mid-run
 failure leaves no catalog, never a stale one.
 
-!!! warning "The sample-oriented read of a matrix is not supported yet"
-
-    `c.genotypes_by_sample` (the sample-oriented ATTACH relation) does **not** work on
-    a writer-produced matrix. A multi-sample-block grid is guarded, and a
-    multi-variant-block grid cannot supply a per-block `.pvar` to a sample-oriented
-    read. Both need the two-dimensional read (P13-006). The variant-oriented
-    `c.genotypes`, the structural relations, and `read_pfile_catalog` are correct. See
-    [What version 2 does not do yet](../formats/pfile_catalog.md#what-version-2-does-not-do-yet).
+To read the whole matrix as one cohort, use
+[`read_pfile(catalog := …)`](read_pfile.md#matrix-catalog-input-catalog), or `ATTACH` it and
+query `c.genotypes_by_sample` (one row per sample, with every variant).
 
 ## Standalone formats
 
@@ -476,10 +471,6 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
   reconstructed, so a round-trip is **value-equal, not byte-equal**.
 - **Position-sorted, chromosome-contiguous input is required** (the monotonicity
   check), and the whole fileset is **local-only**.
-- **A matrix has no sample-oriented read yet.** `shard_by` and `shard_samples`
-  combine into a [matrix](#matrix-output-shard_by-and-shard_samples), but its
-  `c.genotypes_by_sample` ATTACH relation is not supported — the variant-oriented
-  `c.genotypes` and the other relations are. It needs the 2-D read (P13-006).
 - **Parquet companions, `.pgi` split index, and PLINK-VCF export are deferred**
   (Phases D–E).
 

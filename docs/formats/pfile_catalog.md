@@ -658,7 +658,7 @@ The attached database holds seven views. Each one is backed by a shipped reader:
 | `c.variants` | the distinct variant-block `.pvar` (`read_pvar`) |
 | `c.samples` | the distinct sample-block `.psam` (`read_psam`) |
 | `c.genotypes` | `read_pfile` over every surviving cell, variant-oriented |
-| `c.genotypes_by_sample` | the same cells, sample-oriented |
+| `c.genotypes_by_sample` | the same cells, sample-oriented. For a matrix: `read_pfile(catalog := …, orient := 'sample')`, one row per sample across every block |
 | `c.cells` | `read_pfile_catalog` — one row per surviving cell |
 | `c.variant_blocks`, `c.sample_blocks` | the per-axis block tiling |
 
@@ -720,14 +720,11 @@ verifies every present cell first. Holes are never verified. See
 
 ### What version 2 does not do yet
 
-- **No sample-oriented read of a multi-block grid.** For a matrix whose cells span more than
-  one sample block, `c.genotypes_by_sample` raises an error. `read_pfile` combines one axis per
-  call, so a sample-oriented read of every cell would file other blocks' genotypes under one
-  block's IIDs. `c.genotypes` (one row per variant and sample block) and the other relations are
-  correct. A matrix with one sample block reads both views normally when its cells have their own
-  companion files. On a templated matrix (one `.pvar` per variant block, no per-cell copies),
-  `c.genotypes_by_sample` fails to find a `.pvar`, because a multi-file `read_pfile` cannot take a
-  `.pvar` per shard. The fix for both is a 2-D read (P13-006 §10.2).
+- **No sample-oriented read of a matrix with holes.** `c.genotypes_by_sample` is the 2-D read
+  ([`read_pfile(catalog := …)`](../functions/read_pfile.md#matrix-catalog-input-catalog)). It
+  gives one row per sample, with every variant from every variant block. On a matrix with a hole
+  (an absent cell), it raises an error, because a 2-D read of a holed grid is not defined yet.
+  `c.genotypes` and the other relations read a holed matrix normally.
 
 - **No cell-skip cascade.** `ATTACH` opens every surviving cell; a `WHERE` on
   `c.genotypes` skips row groups inside each cell, but does not yet drop a whole cell by
