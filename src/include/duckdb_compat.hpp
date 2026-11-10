@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include <type_traits>
 #include <utility>
 
@@ -84,6 +86,14 @@
 #if __has_include("duckdb/common/identifier.hpp")
 #define DUCKDB_HAS_IDENTIFIER 1
 #include "duckdb/common/identifier.hpp"
+#endif
+
+// DuckDB main (after v2.0) added duckdb/main/context.hpp: the class Context, which a ClientContext
+// owns and which now holds the registered states. ClientContext::GetContext() returns Context&, and
+// Context must be complete before CompatRegisteredState (below) can call GetRegisteredState() on it.
+// The header is absent on v2.0, so the include is skipped there.
+#if __has_include("duckdb/main/context.hpp")
+#include "duckdb/main/context.hpp"
 #endif
 
 // --- scalar function bind signature --------------------------------------------
@@ -432,5 +442,31 @@ inline void CompatReferenceConstant(Vector &vec, const Value &value, idx_t count
 	vec.Reference(value);
 }
 #endif
+
+// --- ClientContext registered states moved into Context (DuckDB main) -----------
+// v2.0: ClientContext::registered_state, a public unique_ptr<RegisteredStateManager>.
+// main: the manager moved to the client's Context (duckdb/main/context.hpp), reached through
+//       context.GetContext().GetRegisteredState() (duckdb/duckdb c33d4b46f, 2026-11-05).
+// v2.0 has neither GetContext() nor context.hpp. Probed on the NEW accessor, as the rule at the
+// top says. Tag dispatch keeps the `.registered_state` branch a dependent name, so it is not
+// looked up on a DuckDB that removed it.
+template <class C, class = void>
+struct CompatHasContextRegisteredState : std::false_type {};
+template <class C>
+struct CompatHasContextRegisteredState<C, decltype(void(std::declval<C &>().GetContext().GetRegisteredState()))>
+    : std::true_type {};
+
+template <class C>
+inline RegisteredStateManager &CompatRegisteredStateImpl(C &context, std::true_type) {
+	return context.GetContext().GetRegisteredState();
+}
+template <class C>
+inline RegisteredStateManager &CompatRegisteredStateImpl(C &context, std::false_type) {
+	return *context.registered_state;
+}
+//! The client's registered-state manager (ClientContextState instances), on either line.
+inline RegisteredStateManager &CompatRegisteredState(ClientContext &context) {
+	return CompatRegisteredStateImpl(context, CompatHasContextRegisteredState<ClientContext>());
+}
 
 } // namespace duckdb
