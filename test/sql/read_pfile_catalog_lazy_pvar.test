@@ -1,0 +1,146 @@
+# name: test/sql/read_pfile_catalog_lazy_pvar.test
+# description: read_pfile(catalog :=) in variant and genotype orient loads each cell's .pvar at InitGlobal, not at bind
+# group: [sql]
+
+require plinking_duck
+
+# P13-006 §10.4 stage 3. Bind no longer parses a catalog cell's .pvar in variant or genotype
+# orient: their schema needs only the sample axis. The .pvar loads at the start of the scan, so a
+# later filter hook (stage 4) can drop cells before any .pvar is read. Proof: a cell with a garbage
+# .pvar binds (DESCRIBE succeeds) and still errors when the scan runs. The oracle for every result
+# is large_example (3000 variants x 8 samples, CHROM 1/2/3 x 1000).
+statement ok
+SET threads = 4;
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad/CHROM=2/variants.pvar' (FORMAT csv, header false);
+
+# A v1 catalog with one variant block (shard_samples), for variant_range.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# ---------------------------------------------------------------------------
+# Bind does not read the .pvar (variant and genotype orient); the scan still does
+# ---------------------------------------------------------------------------
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json');
+
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json', orient := 'genotype');
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json');
+----
+variants.pvar
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json', orient := 'genotype');
+----
+variants.pvar
+
+# Sample orient's schema needs the variant count, so its bind still reads every .pvar.
+statement error
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json', orient := 'sample');
+----
+variants.pvar
+
+# variants := resolves IDs at bind, so it still reads the .pvar there (single block: ss).
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/ss.pfile.json', variants := ['var1', 'var2']);
+----
+2
+
+# ---------------------------------------------------------------------------
+# Results equal the full read
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json'));
+----
+0	3000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', region := '3:100-40000')
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', region := '3:100-40000'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', region := '3:100-40000'))
+     = (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', region := '3:100-40000'));
+----
+0	true
+
+# region and samples together, in variant orient.
+query I
+SELECT count(*) FROM (
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '2:100-60000', samples := [5])
+  EXCEPT ALL
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', region := '2:100-60000', samples := [5]));
+----
+0
+
+# variant_range on a one-variant-block catalog: absolute ordinals [10, 20).
+query II
+SELECT count(*), min(__ordinal) FROM read_pfile(catalog := '{TEST_DIR}/ss.pfile.json', variant_range := [10, 20], with_ordinal := true);
+----
+10	10
+
+# Pushed WHERE filters run on the deferred variant data.
+query I
+SELECT count(*) FROM (
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE CHROM = '2' AND POS BETWEEN 1000 AND 50000
+  EXCEPT ALL
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example') WHERE CHROM = '2' AND POS BETWEEN 1000 AND 50000);
+----
+0
+
+query II
+SELECT count(*), list(ID ORDER BY ID) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE ID IN ('var1', 'var1500', 'var2999');
+----
+3	[var1, var1500, var2999]
+
+# __ordinal restarts in each variant block (like a variant-sharded list).
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', with_ordinal := true) WHERE __ordinal < 10;
+----
+30
+
+# ---------------------------------------------------------------------------
+# A prepared statement runs InitGlobal more than once on the same bind data
+# ---------------------------------------------------------------------------
+statement ok
+PREPARE q AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '2');
+
+query I
+EXECUTE q;
+----
+1000
+
+query I
+EXECUTE q;
+----
+1000
+
+statement ok
+PREPARE g AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype');
+
+query I
+EXECUTE g;
+----
+24000
+
+query I
+EXECUTE g;
+----
+24000

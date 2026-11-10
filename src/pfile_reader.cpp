@@ -519,6 +519,14 @@ struct PfileBindData : public TableFunctionData {
 	// (one per localized source). Per-query lifecycle: unlinked when bind data dies.
 	PgenLocalizeGuard localize_guard;
 
+	//! P13-006 §10.4 stage 3: a catalog read in variant or genotype orient leaves every source's
+	//! .pvar unread at bind (their schema needs only the sample axis). EnsureLazyVariants loads them,
+	//! applies region and variant_range, and rebuilds variant_offsets at the start of InitGlobal,
+	//! once per bind data (a prepared statement runs InitGlobal again on the same bind data).
+	bool lazy_variants = false;
+	mutable std::mutex lazy_variants_lock;
+	mutable bool lazy_variants_loaded = false;
+
 	// How multiple sources' sample sets combine (multi-file only).
 	CombineSamplesMode combine_samples = CombineSamplesMode::IMPLICIT;
 
@@ -826,6 +834,26 @@ struct PfileLocalState : public LocalTableFunctionState {
 //! 'concatenate') shares shard 0's variants, so only its .pgen header is read and
 //! `variants` stays empty. Outputs this file's sample count via
 //! `raw_sample_ct_out` for the caller's cross-source equality check.
+//! Load one source's .pvar (src.pvar_path) into src.variants, and check its count against the
+//! .pgen header. A parquet .pvar is region-pushed. Called at bind, or at InitGlobal for a
+//! deferred (lazy_variants) catalog read.
+static void LoadSourceVariants(ClientContext &context, PfileSource &src, const RegionFilter &region) {
+	if (region.active && IsParquetFile(src.pvar_path)) {
+		src.variants =
+		    LoadVariantMetadataFromParquetRegion(context, src.pvar_path, region.chrom, region.start, region.end,
+		                                         static_cast<idx_t>(src.raw_variant_ct), "read_pfile");
+	} else {
+		src.variants = LoadVariantMetadata(context, src.pvar_path, "read_pfile");
+	}
+
+	if (src.variants.variant_ct != src.raw_variant_ct) {
+		throw InvalidInputException("read_pfile: variant count mismatch: .pgen has %u variants, "
+		                            ".pvar/.bim '%s' has %llu variants",
+		                            src.raw_variant_ct, src.pvar_path,
+		                            static_cast<unsigned long long>(src.variants.variant_ct));
+	}
+}
+
 static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const string &prefix,
                                    const string &override_pgen, const string &override_pvar,
                                    const string &override_psam, bool need_psam, bool need_pvar,
@@ -957,24 +985,37 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	if (!need_pvar) {
 		return src; // a later sample shard: header counts only (see need_pvar)
 	}
-
-	// --- Load variant metadata (region pushdown for parquet) ---
-	if (region.active && IsParquetFile(src.pvar_path)) {
-		src.variants =
-		    LoadVariantMetadataFromParquetRegion(context, src.pvar_path, region.chrom, region.start, region.end,
-		                                         static_cast<idx_t>(src.raw_variant_ct), "read_pfile");
-	} else {
-		src.variants = LoadVariantMetadata(context, src.pvar_path, "read_pfile");
-	}
-
-	if (src.variants.variant_ct != src.raw_variant_ct) {
-		throw InvalidInputException("read_pfile: variant count mismatch: .pgen has %u variants, "
-		                            ".pvar/.bim '%s' has %llu variants",
-		                            src.raw_variant_ct, src.pvar_path,
-		                            static_cast<unsigned long long>(src.variants.variant_ct));
-	}
-
+	LoadSourceVariants(context, src, region);
 	return src;
+}
+
+//! variant_range := [lo, hi): keep only the variants whose ORIGINAL ordinal is in [lo, hi), as a
+//! post-filter on the (sorted) effective list. Both bounds are clamped to [0, raw_variant_ct];
+//! hi == n is the valid end of the half-open range, and lo >= n or lo >= hi gives an empty set.
+static void ApplyVariantRange(PfileSource &src, int64_t range_lo, int64_t range_hi) {
+	uint32_t lo = static_cast<uint32_t>(std::min<int64_t>(range_lo, static_cast<int64_t>(src.raw_variant_ct)));
+	uint32_t hi = static_cast<uint32_t>(std::min<int64_t>(range_hi, static_cast<int64_t>(src.raw_variant_ct)));
+	if (!src.has_effective_variant_list) {
+		// No prior filter: build [lo, hi) directly (no full-variant scan).
+		src.has_effective_variant_list = true;
+		src.effective_variant_indices.clear();
+		if (hi > lo) {
+			src.effective_variant_indices.reserve(hi - lo);
+			for (uint32_t v = lo; v < hi; v++) {
+				src.effective_variant_indices.push_back(v);
+			}
+		}
+	} else {
+		// Intersect with an existing region/variants list (sorted ascending).
+		vector<uint32_t> kept;
+		kept.reserve(src.effective_variant_indices.size());
+		for (auto v : src.effective_variant_indices) {
+			if (v >= lo && v < hi) {
+				kept.push_back(v);
+			}
+		}
+		src.effective_variant_indices = std::move(kept);
+	}
 }
 
 //! Build one source's effective variant list (intersection of region + variants
@@ -1772,6 +1813,13 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_data->variant_range_lo = sel.variant_range_lo;
 	bind_data->variant_range_hi = sel.variant_range_hi;
 
+	// A catalog read in variant or genotype orient defers each source's .pvar to InitGlobal: their
+	// schema needs only the sample axis. variants := resolves IDs against the .pvar at bind, and
+	// sample orient's schema needs the variant count, so both keep the bind-time load.
+	bind_data->lazy_variants =
+	    from_catalog && !bind_data->has_variant_filter &&
+	    (bind_data->orient_mode == OrientMode::VARIANT || bind_data->orient_mode == OrientMode::GENOTYPE);
+
 	// --- Build sources (one per prefix) ---
 	bind_timer.Note("resolving %llu source(s)", (unsigned long long)prefixes.size());
 	for (idx_t si = 0; si < prefixes.size(); si++) {
@@ -1798,8 +1846,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			elem_pvar = override_pvar;
 			elem_psam = override_psam;
 		}
+		const bool load_pvar_now = need_pvar && !bind_data->lazy_variants;
 		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
-		                                  need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard);
+		                                  load_pvar_now, bind_data->region, src_sample_ct, bind_data->localize_guard);
+		if (need_pvar && !load_pvar_now) {
+			src.pvar_path = elem_pvar; // the catalog's resolved path; EnsureLazyVariants loads it
+		}
 
 		if (from_catalog) {
 			// The cell's .pgen must hold exactly the extents its blocks declare.
@@ -1878,6 +1930,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// `variants`-ONLY Selection is handed over (sample_info=nullptr, no region/variant_range):
 		// read_pfile still owns the region ∩ set (BuildEffectiveVariantList) and the
 		// variant_range post-filter below, since their type + timing differ from the handler.
+		if (bind_data->lazy_variants) {
+			bind_data->sources.push_back(std::move(src)); // region / variant_range apply at InitGlobal
+			continue;
+		}
 		std::unordered_set<uint32_t> variant_set;
 		if (bind_data->has_variant_filter) {
 			Selection variants_sel;
@@ -1898,33 +1954,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// ResolveVariantIdx(pos) then yields ABSOLUTE ordinals (e.g. [5,8) -> 5,6,7),
 		// never restarted at 0, for free.
 		if (bind_data->has_variant_range) {
-			// Clamp both bounds to [0, raw_variant_ct]; hi == n is the valid end
-			// boundary of the half-open range. lo >= n or lo >= hi yields an empty set.
-			uint32_t lo = static_cast<uint32_t>(
-			    std::min<int64_t>(bind_data->variant_range_lo, static_cast<int64_t>(src.raw_variant_ct)));
-			uint32_t hi = static_cast<uint32_t>(
-			    std::min<int64_t>(bind_data->variant_range_hi, static_cast<int64_t>(src.raw_variant_ct)));
-			if (!src.has_effective_variant_list) {
-				// No prior filter: build [lo, hi) directly (no full-variant scan).
-				src.has_effective_variant_list = true;
-				src.effective_variant_indices.clear();
-				if (hi > lo) {
-					src.effective_variant_indices.reserve(hi - lo);
-					for (uint32_t v = lo; v < hi; v++) {
-						src.effective_variant_indices.push_back(v);
-					}
-				}
-			} else {
-				// Intersect with an existing region/variants list (sorted ascending).
-				vector<uint32_t> kept;
-				kept.reserve(src.effective_variant_indices.size());
-				for (auto v : src.effective_variant_indices) {
-					if (v >= lo && v < hi) {
-						kept.push_back(v);
-					}
-				}
-				src.effective_variant_indices = std::move(kept);
-			}
+			ApplyVariantRange(src, bind_data->variant_range_lo, bind_data->variant_range_hi);
 		}
 
 		bind_data->sources.push_back(std::move(src));
@@ -3326,8 +3356,40 @@ static void ApplyResidualFilters(ClientContext &context, optional_ptr<TableFilte
 static constexpr uint32_t MULTI_VARIANT_SUBBATCH = 1000;
 static constexpr uint32_t MULTI_GENOTYPE_SUBBATCH = 64;
 
+//! The deferred half of a lazy_variants bind: load every source's .pvar, apply region and
+//! variant_range, and rebuild variant_offsets. Runs once per bind data, under its lock; a failed
+//! load leaves it unloaded, so a re-execution reports the same error. The bind data is const in
+//! InitGlobal but was created mutable (make_uniq in PfileBind); these fields are written only here.
+static void EnsureLazyVariants(ClientContext &context, const PfileBindData &bind_data_c) {
+	if (!bind_data_c.lazy_variants) {
+		return;
+	}
+	std::lock_guard<std::mutex> guard(bind_data_c.lazy_variants_lock);
+	if (bind_data_c.lazy_variants_loaded) {
+		return;
+	}
+	auto &bind_data = const_cast<PfileBindData &>(bind_data_c);
+	for (auto &src : bind_data.sources) {
+		src.has_effective_variant_list = false;
+		src.effective_variant_indices.clear();
+		LoadSourceVariants(context, src, bind_data.region);
+		BuildEffectiveVariantList(src, bind_data.region, {}, false);
+		if (bind_data.has_variant_range) {
+			ApplyVariantRange(src, bind_data.variant_range_lo, bind_data.variant_range_hi);
+		}
+	}
+	bind_data.variant_offsets.assign(1, 0);
+	uint32_t cum = 0;
+	for (auto &s : bind_data.sources) {
+		cum += s.EffectiveVariantCt();
+		bind_data.variant_offsets.push_back(cum);
+	}
+	bind_data.lazy_variants_loaded = true;
+}
+
 static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PfileBindData>();
+	EnsureLazyVariants(context, bind_data);
 	auto state = make_uniq<PfileGlobalState>();
 
 	state->column_ids = input.column_ids;

@@ -250,6 +250,8 @@ SELECT * FROM read_pfile('/data/cohort', samples := [5], orient := 'sample');
 - The checks that run when a cell is read (counts against the catalog, sample counts) do not run for a dropped cell.
 - A `WHERE` clause does not prune cells yet. Pass `region :=` or `samples :=`.
 
+**When each file is read.** In variant and genotype orient, bind reads each cell's `.pgen` header and each sample block's `.psam`, but not the `.pvar` files. The `.pvar` files load when the scan starts. So `DESCRIBE` or `PREPARE` of a catalog read parses no `.pvar`, and an error in a `.pvar` shows when the query runs. Sample orient reads every `.pvar` at bind, because its schema needs the variant count. `variants := [...]` also reads the `.pvar` at bind, to resolve the IDs.
+
 A catalog names every input, so `pgen :=`, `pvar :=` and `psam :=` are errors with it (with a discovered catalog too: the error says to pass `catalog := false`). A `catalog := '<path>'` with a positional prefix is also an error. With more than one sample block, `combine_samples` defaults to `'concatenate'`. `'disjoint'` also checks that the IIDs are unique across the sample blocks. `'implicit'` and `'identical'` are errors, because the sample blocks hold different samples. `ATTACH … (TYPE pfile_catalog)` uses this read for `c.genotypes_by_sample`.
 
 The list of prefixes can come from anywhere: a literal list, a **glob** (`read_pfile('data/chr*.pgen')`), or a **catalog macro** returning a `VARCHAR[]` of shard prefixes — e.g. the scalarfs `pathmacro:` protocol, which `read_pfile` resolves to local shard paths and reads directly: `read_pfile('pathmacro:cohort?gene=BRCA1')`.
