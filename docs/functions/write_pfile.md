@@ -345,7 +345,7 @@ created. An overwrite replaces the whole grid and leaves the catalog valid; a mi
 failure leaves no catalog, never a stale one.
 
 To read the whole matrix as one cohort, use
-[`read_pfile(catalog := …)`](read_pfile.md#matrix-catalog-input-catalog), or `ATTACH` it and
+[`read_pfile(catalog := …)`](read_pfile.md#catalog-input-catalog), or `ATTACH` it and
 query `c.genotypes_by_sample` (one row per sample, with every variant).
 
 ## Standalone formats

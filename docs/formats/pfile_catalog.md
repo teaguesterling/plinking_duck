@@ -721,7 +721,7 @@ verifies every present cell first. Holes are never verified. See
 ### What version 2 does not do yet
 
 - **No sample-oriented read of a matrix with holes.** `c.genotypes_by_sample` is the 2-D read
-  ([`read_pfile(catalog := …)`](../functions/read_pfile.md#matrix-catalog-input-catalog)). It
+  ([`read_pfile(catalog := …)`](../functions/read_pfile.md#catalog-input-catalog)). It
   gives one row per sample, with every variant from every variant block. On a matrix with a hole
   (an absent cell), it raises an error, because a 2-D read of a holed grid is not defined yet.
   `c.genotypes` and the other relations read a holed matrix normally.

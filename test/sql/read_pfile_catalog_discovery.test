@@ -1,0 +1,188 @@
+# name: test/sql/read_pfile_catalog_discovery.test
+# description: read_pfile reads v1 catalogs through catalog :=, and discovers '<p>.pfile.json' from a bare prefix
+# group: [sql]
+
+require plinking_duck
+
+# Fixtures come from the writer (FORMAT pfile) over large_example: 3000 variants x 8 samples,
+# 3 chromosomes x 1000. The oracle for every read is large_example itself. Several threads, so the
+# grid reads cross source (variant-block) boundaries inside parallel scans.
+statement ok
+SET threads = 4;
+
+# v1, concat_dim "variants": 3 CHROM shards over one shared .psam.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM');
+
+# v1, concat_dim "samples": 3 sample shards over one shared .pvar.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# v2 matrix: 3 CHROM blocks x 2 sample blocks.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# ---------------------------------------------------------------------------
+# catalog := over a v1 catalog
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/vs.pfile.json')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/vs.pfile.json'));
+----
+0	3000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/vs.pfile.json', orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/vs.pfile.json', orient := 'sample'));
+----
+0	8
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/ss.pfile.json')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/ss.pfile.json'));
+----
+0	3000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/ss.pfile.json', orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/ss.pfile.json', orient := 'sample'));
+----
+0	8
+
+# The v2 matrix at this size: every orient, many batches, several threads across 3 x 2 cells.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json'));
+----
+0	3000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample'));
+----
+0	8
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype')
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype'));
+----
+0	24000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample', genotypes := 'stats')
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'stats'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample', genotypes := 'stats'));
+----
+0	8
+
+# ---------------------------------------------------------------------------
+# Discovery: read_pfile('<p>') reads '<p>.pfile.json' when it exists. The writer puts no .pgen
+# at the catalog prefix, so before discovery each of these failed with "cannot find .pgen".
+# ---------------------------------------------------------------------------
+query T
+SELECT (SELECT list(ID ORDER BY ID) FROM read_pfile('{TEST_DIR}/vs')) =
+       (SELECT list(ID ORDER BY ID) FROM read_pfile('test/data/large_example'));
+----
+true
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('{TEST_DIR}/ss', orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM read_pfile('{TEST_DIR}/ss', orient := 'sample'));
+----
+0	8
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/mx', orient := 'sample');
+----
+8
+
+# A literal '.pfile.json' path is a catalog too.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/mx.pfile.json');
+----
+3000
+
+# catalog := true requires a catalog at the prefix.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/mx', catalog := true);
+----
+3000
+
+statement error
+SELECT count(*) FROM read_pfile('test/data/large_example', catalog := true);
+----
+catalog
+
+# catalog := false turns discovery off: the bare prefix has no .pgen.
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/mx', catalog := false);
+----
+.pgen
+
+# A plain fileset with no catalog beside it is read exactly as before.
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example');
+----
+3000
+
+# ---------------------------------------------------------------------------
+# BOTH '<p>.pfile.json' and '<p>.pgen' exist: the catalog wins; catalog := false reads the fileset.
+# The fileset is written with distinct IIDs (FS1..FS8), so the two reads are told apart by IID.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1')
+TO '{TEST_DIR}/mx' (FORMAT pfile, samples ['FS1', 'FS2', 'FS3', 'FS4', 'FS5', 'FS6', 'FS7', 'FS8']);
+
+query T
+SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/mx', orient := 'sample');
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+query T
+SELECT list(IID ORDER BY IID) FROM read_pfile('{TEST_DIR}/mx', orient := 'sample', catalog := false);
+----
+[FS1, FS2, FS3, FS4, FS5, FS6, FS7, FS8]
+
+# With the catalog in force, a companion override is ambiguous: the error names catalog := false.
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/mx', psam := '{TEST_DIR}/mx.psam');
+----
+catalog := false
+
+statement ok
+SELECT count(*) FROM read_pfile('{TEST_DIR}/mx', psam := '{TEST_DIR}/mx.psam', catalog := false);
+
+# A list input never discovers: each element is a fileset, as before.
+statement error
+SELECT count(*) FROM read_pfile(['{TEST_DIR}/vs', '{TEST_DIR}/ss']);
+----
+.pgen
