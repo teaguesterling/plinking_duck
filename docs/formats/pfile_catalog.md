@@ -739,7 +739,7 @@ verifies every present cell first. Holes are never verified. See
   catalog.
 - **The writer emits the common grid, not every form.** `COPY … (FORMAT pfile,
   shard_by '<vcol>', shard_samples {…})` writes a version-2 matrix — see
-  [Matrix output](../functions/write_pfile.md#matrix-output-shard_by--shard_samples).
+  [Matrix output](../functions/write_pfile.md#matrix-output-shard_by-and-shard_samples).
   It emits two variant keys (`CHROM` plus a `CHUNK` `ordinal_interval` over `POS`) and
   one sample `enum`. A richer axis — a `value_bin`, extra sample keys, or `holes` — is
   still written by hand or by other tooling, in the shapes on this page.
@@ -754,6 +754,6 @@ verifies every present cell first. Holes are never verified. See
 - [`read_pfile_catalog`](../functions/read_pfile_catalog.md) — read, verify, and prune a catalog in SQL
 - [`read_pfile_catalog_metadata`](../functions/read_pfile_catalog_metadata.md) — the catalog's literal declared schema
 - [`read_pfile_catalog_layout`](../functions/read_pfile_catalog_layout.md) — the catalog's interpreted chunk map (holes included, no file I/O)
-- [Writing filesets (`COPY … TO`)](../functions/write_pfile.md) — emit a v1 catalog ([`shard_by`](../functions/write_pfile.md#sharded-output-shard_by) or [`shard_samples`](../functions/write_pfile.md#sample-sharded-output-shard_samples)) or a [v2 matrix](../functions/write_pfile.md#matrix-output-shard_by--shard_samples)
+- [Writing filesets (`COPY … TO`)](../functions/write_pfile.md) — emit a v1 catalog ([`shard_by`](../functions/write_pfile.md#sharded-output-shard_by) or [`shard_samples`](../functions/write_pfile.md#sample-sharded-output-shard_samples)) or a [v2 matrix](../functions/write_pfile.md#matrix-output-shard_by-and-shard_samples)
 - [`read_pfile`](../functions/read_pfile.md) — read a single fileset (how a surviving shard is scanned)
 - [File Formats](../file-formats.md) — the underlying `.pgen` / `.pvar` / `.psam` fileset
