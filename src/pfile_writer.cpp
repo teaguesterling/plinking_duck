@@ -9,12 +9,16 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 
 #include <pgenlib_write.h> // STPgenWriter write path (P9 Phase B, FORMAT pgen)
 
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #ifndef _WIN32
@@ -1481,14 +1485,95 @@ struct PfileWriteBindData : public FunctionData {
 	}
 };
 
+// ---------------------------------------------------------------------------
+// Query-end staging cleanup (the four FORMAT pfile bundle states).
+//
+// DuckDB v2.0 opens a COPY's file state in an async job, and that job owns the writer's global
+// state. A scheduler worker can release the job AFTER the failed statement has returned. An
+// upstream-query error (e.g. a cast failure) bypasses the sink and finalize, so the destructor
+// was its only cleanup, and it ran late: the next statement could still see
+// '<p>.pvar.staging' and '<p>.psam.staging' (the write_pfile.test:387 CI flake). A late removal
+// by path can also hit the staging files of a retry to the same prefix.
+//
+// So each bundle state registers a token at InitGlobal. QueryEnd runs on the query thread after
+// the executor has drained (TaskExecutor::DrainTasks waits for running tasks), and it runs an
+// unfinished state's CleanupPartial. The destructor clears the token first, so the cleanup runs
+// once, on whichever side comes first, and never after the statement has returned.
+// ---------------------------------------------------------------------------
+struct StagingCleanupToken {
+	std::mutex lock;
+	//! The owner's cleanup. Empty after it ran, or after the owner's destructor started.
+	std::function<void(FileSystem &)> run;
+};
+
+class StagingCleanupRegistry : public ClientContextState {
+public:
+	static constexpr const char *KEY = "plinking_duck_copy_staging_cleanup";
+
+	void Add(shared_ptr<StagingCleanupToken> token) {
+		std::lock_guard<std::mutex> guard(lock);
+		tokens.push_back(std::move(token));
+	}
+
+	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
+		vector<shared_ptr<StagingCleanupToken>> pending;
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			pending.swap(tokens);
+		}
+		if (pending.empty()) {
+			return;
+		}
+		auto &fs = FileSystem::GetFileSystem(context);
+		for (auto &token : pending) {
+			std::lock_guard<std::mutex> guard(token->lock);
+			if (token->run) {
+				try {
+					token->run(fs);
+				} catch (...) {
+					// Best-effort cleanup; never mask the query's own error.
+				}
+				token->run = nullptr;
+			}
+		}
+	}
+
+private:
+	std::mutex lock;
+	vector<shared_ptr<StagingCleanupToken>> tokens;
+};
+
+//! Register `g` for query-end cleanup. STATE needs `finished`, `cleanup_token` and an idempotent
+//! `CleanupPartial(FileSystem &)` that removes only staging.
+template <class STATE>
+void RegisterStagingCleanup(ClientContext &context, STATE &g) {
+	g.cleanup_token = make_shared_ptr<StagingCleanupToken>();
+	STATE *owner = &g;
+	g.cleanup_token->run = [owner](FileSystem &fs) {
+		if (!owner->finished) {
+			owner->CleanupPartial(fs);
+		}
+	};
+	context.registered_state->GetOrCreate<StagingCleanupRegistry>(StagingCleanupRegistry::KEY)->Add(g.cleanup_token);
+}
+
+//! Call FIRST in a bundle state's destructor. After it returns, the query-end hook cannot reach
+//! the state; if the hook already ran, the state's `cleaned` flag makes its own cleanup a no-op.
+void ReleaseStagingCleanup(const shared_ptr<StagingCleanupToken> &token) {
+	if (token) {
+		std::lock_guard<std::mutex> guard(token->lock);
+		token->run = nullptr;
+	}
+}
+
 struct PfileWriteGlobalState : public GlobalFunctionData {
 	// ATOMIC STAGING. All three writers target `.staging` paths in the SAME directory
 	// as the final files; InitGlobal therefore NEVER touches an existing fileset. Only
 	// a SUCCESSFUL finalize renames staging -> final (overwriting intra-filesystem via
 	// rename(2)). So an upstream-query error that bypasses the sink/finalize cleanup
 	// cannot clobber a prior fileset — it only leaves staging files, removed by the
-	// destructor. (`pvar_g.path` / `pgen_g.path` / `psam_path` all hold STAGING paths;
-	// pgenlib owns `<pgen.staging>.tmp` underneath, hence the distinct `.staging`
+	// query-end hook (RegisterStagingCleanup), or by the destructor if that runs first. (`pvar_g.path` / `pgen_g.path`
+	// / `psam_path` all hold STAGING paths; pgenlib owns `<pgen.staging>.tmp` underneath, hence the distinct `.staging`
 	// suffix — never `.tmp`, which is pgenlib's.)
 	PvarWriteGlobalState pvar_g; //! pvar_g.path = <pvar_final>.staging
 	PgenWriteGlobalState pgen_g; //! pgen_g.path = <pgen_final>.staging
@@ -1498,7 +1583,14 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 	string psam_final;
 	FileSystem *fs = nullptr; //! captured in InitGlobal so the destructor can clean staging
 	bool cleaned = false;
-	bool finished = false; //! staging fully promoted to final (don't clean in the destructor)
+	bool finished = false;                         //! staging fully promoted to final (don't clean in the destructor)
+	shared_ptr<StagingCleanupToken> cleanup_token; //! query-end cleanup (RegisterStagingCleanup)
+	//! The .pvar/.psam staging files are created at the first Sink (or at Finalize for zero rows),
+	//! not at InitGlobal. DuckDB v2.0 runs InitGlobal in an async open job that a failed query does
+	//! not wait for, so a file created there can appear after QueryEnd and escape its cleanup.
+	//! Sink and Finalize run in work the query drains before QueryEnd.
+	bool staging_opened = false;
+	string pvar_staging_path;
 
 	// Remove the STAGING siblings we created, in a safe order: close the pvar handle,
 	// then close pgenlib + remove .pgen.staging/.pgen.staging.tmp, then .psam.staging,
@@ -1549,6 +1641,7 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 	// never orphaned. Only staging — the final fileset is only ever written by a
 	// successful PromoteStaging, after which finished == true and this is a no-op.
 	~PfileWriteGlobalState() override {
+		ReleaseStagingCleanup(cleanup_token);
 		if (!finished && fs) {
 			CleanupPartial(*fs);
 		}
@@ -1661,6 +1754,7 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 	FileSystem *fs = nullptr;
 	bool finished = false; //! catalog emitted — destructor must not clean
 	bool cleaned = false;
+	shared_ptr<StagingCleanupToken> cleanup_token; //! query-end cleanup (RegisterStagingCleanup)
 
 	// the open shard
 	bool has_active = false;
@@ -1716,6 +1810,7 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 	}
 
 	~PfileShardedGlobalState() override {
+		ReleaseStagingCleanup(cleanup_token);
 		if (!finished && fs) {
 			CleanupPartial(*fs);
 		}
@@ -2169,6 +2264,7 @@ struct PfileSampleShardedGlobalState : public GlobalFunctionData {
 	bool opened = false;   //! files created (first row seen)
 	bool finished = false; //! catalog written — the destructor must not clean
 	bool cleaned = false;
+	shared_ptr<StagingCleanupToken> cleanup_token; //! query-end cleanup (RegisterStagingCleanup)
 
 	// Remove everything this COPY created that is not a completed cohort: the shared .pvar staging,
 	// every shard's .pgen staging (+ pgenlib's .tmp, via its own CleanupPartial) and .psam staging,
@@ -2216,6 +2312,7 @@ struct PfileSampleShardedGlobalState : public GlobalFunctionData {
 	}
 
 	~PfileSampleShardedGlobalState() override {
+		ReleaseStagingCleanup(cleanup_token);
 		if (!finished && fs) {
 			CleanupPartial(*fs);
 		}
@@ -2438,6 +2535,7 @@ struct PfileMatrixGlobalState : public GlobalFunctionData {
 	bool opened = false;   //! first row seen (files exist from here on)
 	bool finished = false; //! everything promoted — the destructor must not clean
 	bool cleaned = false;
+	shared_ptr<StagingCleanupToken> cleanup_token; //! query-end cleanup (RegisterStagingCleanup)
 
 	// the open variant-block
 	bool has_active = false;
@@ -2508,6 +2606,7 @@ struct PfileMatrixGlobalState : public GlobalFunctionData {
 	}
 
 	~PfileMatrixGlobalState() override {
+		ReleaseStagingCleanup(cleanup_token);
 		if (!finished && fs) {
 			CleanupPartial(*fs);
 		}
@@ -2961,13 +3060,19 @@ unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, Funct
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (bind.matrix_mode) {
-		return PfileMatrixInitGlobal(fs, bind, file_path);
+		auto result = PfileMatrixInitGlobal(fs, bind, file_path);
+		RegisterStagingCleanup(context, result->Cast<PfileMatrixGlobalState>());
+		return result;
 	}
 	if (bind.sample_shard_mode) {
-		return PfileSampleShardedInitGlobal(fs, bind, file_path);
+		auto result = PfileSampleShardedInitGlobal(fs, bind, file_path);
+		RegisterStagingCleanup(context, result->Cast<PfileSampleShardedGlobalState>());
+		return result;
 	}
 	if (!bind.shard_by.empty()) {
-		return PfileShardedInitGlobal(fs, bind, file_path);
+		auto result = PfileShardedInitGlobal(fs, bind, file_path);
+		RegisterStagingCleanup(context, result->Cast<PfileShardedGlobalState>());
+		return result;
 	}
 	auto g = make_uniq<PfileWriteGlobalState>();
 
@@ -2991,16 +3096,21 @@ unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, Funct
 	g->pgen_g.sample_ct = bind.pgen_bind->sample_ct;
 	g->pgen_g.variant_ct_limit = bind.pgen_bind->variant_ct_limit;
 
-	try {
-		// pvar: open staging + header. psam: written in full to staging now (out-of-band
-		// identity). Neither touches the existing final fileset.
-		PvarOpenAndWriteHeader(g->pvar_g, fs, *bind.pvar_bind, pvar_staging);
-		WritePsamFromIids(fs, psam_staging, bind.iids);
-	} catch (...) {
-		g->CleanupPartial(fs);
-		throw;
-	}
+	g->pvar_staging_path = pvar_staging;
+	RegisterStagingCleanup(context, *g);
 	return std::move(g);
+}
+
+// Create the plain bundle's .pvar staging (+ header) and its .psam staging (written in full:
+// out-of-band identity). Neither touches the existing final fileset. Called inside the Sink and
+// Finalize try-guards, so a failure here is cleaned like any other write failure.
+void PfileEnsureStagingOpened(FileSystem &fs, const PfileWriteBindData &bind, PfileWriteGlobalState &g) {
+	if (g.staging_opened) {
+		return;
+	}
+	g.staging_opened = true;
+	PvarOpenAndWriteHeader(g.pvar_g, fs, *bind.pvar_bind, g.pvar_staging_path);
+	WritePsamFromIids(fs, g.psam_path, bind.iids);
 }
 
 unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, FunctionData &) {
@@ -3025,6 +3135,7 @@ void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFun
 	auto &g = gstate.Cast<PfileWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
 	try {
+		PfileEnsureStagingOpened(fs, bind, g);
 		// pvar first: its (CHROM, POS) monotonicity check fires here, so unsorted
 		// input throws before any .pgen append — and the catch removes all siblings.
 		PvarWriteChunk(*bind.pvar_bind, g.pvar_g, input, 0, input.size());
@@ -3055,6 +3166,7 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 	}
 	auto &g = gstate.Cast<PfileWriteGlobalState>();
 	try {
+		PfileEnsureStagingOpened(fs, bind, g); // zero-row input: no Sink ran
 		// pgen finalize throws on zero variants (pgenlib cannot finish a 0-variant
 		// .pgen) → cleanup removes the staging .pvar/.psam too (finals untouched).
 		PgenFinish(g.pgen_g);
