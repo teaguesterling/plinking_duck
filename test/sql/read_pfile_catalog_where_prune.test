@@ -1,0 +1,114 @@
+# name: test/sql/read_pfile_catalog_where_prune.test
+# description: a WHERE on CHROM/POS drops catalog variant blocks before their .pvar or .pgen is read
+# group: [sql]
+
+require plinking_duck
+
+# P13-006 §10.4 stage 4. read_pfile's pushdown_complex_filter hook reads the WHERE on CHROM and
+# POS, and drops each variant block whose declared range proves no row can match. Every filter
+# stays in the plan, so the rows are those of a full read. Proof: CHROM=2's .pvar is garbage, so
+# a read that opens that block errors, and a WHERE that excludes it succeeds. The oracle is
+# large_example (3000 variants x 8 samples, CHROM 1/2/3 x 1000).
+statement ok
+SET threads = 4;
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad/CHROM=2/variants.pvar' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/badvs' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badvs/CHROM=2/data.pvar' (FORMAT csv, header false);
+
+# The corruption is real.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json');
+----
+variants.pvar
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '2';
+----
+variants.pvar
+
+# ---------------------------------------------------------------------------
+# CHROM equality / IN, with and without POS
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '1'
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example') WHERE CHROM = '1')),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '1');
+----
+0	1000
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM IN ('1', '3');
+----
+2000
+
+query I
+SELECT count(*) FROM (
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE '3' = CHROM AND POS BETWEEN 1000 AND 40000
+  EXCEPT ALL
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example') WHERE CHROM = '3' AND POS BETWEEN 1000 AND 40000);
+----
+0
+
+query II
+SELECT (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '1' AND POS > 50000 AND POS <= 60000)
+     = (SELECT count(*) FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND POS > 50000 AND POS <= 60000),
+       (SELECT count(*) FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND POS > 50000 AND POS <= 60000) > 0;
+----
+true	true
+
+# A v1 shard_by catalog prunes the same way.
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badvs.pfile.json') WHERE CHROM = '3';
+----
+1000
+
+# Genotype orient, and discovery from the bare prefix.
+query I
+SELECT count(*) FROM (
+  SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/bad', orient := 'genotype') WHERE CHROM = '1' AND IID = 'SAMP6'
+  EXCEPT ALL
+  SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND IID = 'SAMP6');
+----
+0
+
+# Contradictory constraints keep one block, and the filter returns no rows.
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '1' AND CHROM = '3';
+----
+0
+
+# A WHERE through a view reaches the hook.
+statement ok
+CREATE VIEW cohort AS SELECT * FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json');
+
+query I
+SELECT count(*) FROM cohort WHERE CHROM = '3';
+----
+1000
+
+# A prepared statement keeps its pruning on each run.
+statement ok
+PREPARE p AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '1';
+
+query I
+EXECUTE p;
+----
+1000
+
+query I
+EXECUTE p;
+----
+1000

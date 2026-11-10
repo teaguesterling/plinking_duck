@@ -657,7 +657,7 @@ The attached database holds seven views. Each one is backed by a shipped reader:
 |---|---|
 | `c.variants` | the distinct variant-block `.pvar` (`read_pvar`) |
 | `c.samples` | the distinct sample-block `.psam` (`read_psam`) |
-| `c.genotypes` | `read_pfile` over every surviving cell, variant-oriented |
+| `c.genotypes` | the catalog read, `read_pfile(catalog := …)`: one row per variant with every sample (a matrix with holes: one row per variant per sample block, see below) |
 | `c.genotypes_by_sample` | the same cells, sample-oriented. For a matrix: `read_pfile(catalog := …, orient := 'sample')`, one row per sample across every block |
 | `c.cells` | `read_pfile_catalog` — one row per surviving cell |
 | `c.variant_blocks`, `c.sample_blocks` | the per-axis block tiling |
@@ -669,25 +669,25 @@ fileset. A v1 cohort's non-concat (shared) axis has no declared extent, so that 
 carries `NULL` spans.
 
 The catalog is **read-only**: a write to `c.*` raises. Do not pass `READ_ONLY` to
-`ATTACH`; the catalog is always read-only, and the storage is in-memory. A `WHERE`
-on `c.genotypes` pushes into each cell's `read_pfile` scan, so it skips row groups by
-`CHROM` and `POS`. The attach opens **every** surviving cell. It does not yet skip a
-cell by predicate (see below). An all-holes catalog has no cell to read, so its
-`ATTACH` raises.
+`ATTACH`; the catalog is always read-only, and the storage is in-memory. An all-holes
+catalog has no cell to read, so its `ATTACH` raises.
 
-**`c.genotypes` fans out per cell.** Each cell holds one sample-block's genotypes for
-one variant-block. So a variant that spans several sample-blocks returns **one row
-per sample-block**, and the `genotypes` list on each row covers only that cell's
-samples. `count(*) FROM c.genotypes` is therefore variants × sample-blocks, not
-variants. The rows do not yet carry a column that names the source cell or
-sample-block; that reassembly (and the derived count columns) is P13-004. For a
-per-variant count, use `c.variants`.
+**`c.genotypes` is one row per variant.** It is
+[`read_pfile(catalog := …)`](../functions/read_pfile.md#catalog-input-catalog): within each
+variant block the sample blocks are concatenated, so each row's `genotypes` holds every sample
+of the cohort, in sample-block order. Each cell is read with its **template-resolved** `.pvar`
+and `.psam`, so a cell needs no companion files of its own.
 
-For a matrix, `c.genotypes` reads each cell with its **template-resolved** `.pvar` and `.psam`,
-so a cell needs no companion files of its own. The `genotypes` column follows `read_pfile`'s
-own rule. It is a fixed `ARRAY` when every sample block holds the same number of samples, and a
-`LIST` when the blocks differ in size, because the per-block arrays could not then share one
-fixed width.
+A `WHERE` on `CHROM` or `POS` drops whole variant blocks before they are read, when the
+catalog's declared ranges prove that no row can match. The filter still runs on the rest, so
+the rows are the same. For example, `SELECT * FROM c.genotypes WHERE CHROM = '2'` opens only
+the `CHROM=2` block's cells.
+
+In v0.16.0 and earlier, a matrix's `c.genotypes` returned one row per variant **per sample
+block**, each row with only that block's samples. A matrix **with holes** still does: a 2-D read
+of a holed grid is not defined yet. There, `count(*) FROM c.genotypes` is variants × sample
+blocks, the `genotypes` column is a fixed `ARRAY` only when every sample block has the same
+width (else a `LIST`), and a `WHERE` drops no cell.
 
 ### Inspecting a matrix without reading it
 
@@ -726,9 +726,10 @@ verifies every present cell first. Holes are never verified. See
   (an absent cell), it raises an error, because a 2-D read of a holed grid is not defined yet.
   `c.genotypes` and the other relations read a holed matrix normally.
 
-- **No cell-skip cascade.** `ATTACH` opens every surviving cell; a `WHERE` on
-  `c.genotypes` skips row groups inside each cell, but does not yet drop a whole cell by
-  predicate. `read_pfile_catalog` itself returns cell metadata, not genotypes.
+- **Cell skip covers the variant axis only.** A `WHERE` on `CHROM` / `POS` drops variant
+  blocks of `c.genotypes`. A `WHERE` on a sample (`IID`) drops no sample block, and
+  `c.genotypes_by_sample` (sample orient) reads every cell at bind. `read_pfile_catalog` itself
+  returns cell metadata, not genotypes.
 - **No projection fast-path.** `c.genotypes` exposes `read_pfile`'s native genotype
   columns. The derived counts (het, hom_alt, missing, n_alt) are not a fast-path column
   set yet.
