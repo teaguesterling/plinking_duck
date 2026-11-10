@@ -1,0 +1,32 @@
+# name: test/sql/write_pfile_error_cleanup.test
+# description: a COPY that fails upstream leaves no staging files by the time the statement returns
+# group: [sql]
+
+require plinking_duck
+
+# DuckDB v2.0 opens a COPY's file state in an async job. The writer's global state can then
+# be destroyed on a worker thread AFTER the failed statement has returned, so cleanup that
+# runs only in the destructor races the next statement. CI caught this as a ~2% flake of
+# write_pfile.test:387 ("fresh*" glob found 2 staging files: the .psam.staging and
+# .pvar.staging that InitGlobal creates). Each iteration fails a COPY mid-stream and checks the
+# directory at once. The race needs CPU contention: run alone this passes even before the fix
+# (0/1500 iterations); with 4 copies on 2 CPUs it failed in 3 of 4 runs before the fix.
+statement ok
+SET threads = 4;
+
+loop i 0 300
+
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes,
+             CASE WHEN POS = 20000 THEN CAST('nope' AS INTEGER) ELSE 0 END AS x
+      FROM read_pfile('test/data/pfile_example', genotypes := 'struct'))
+TO '__TEST_DIR__/plain_${i}' (FORMAT pfile);
+----
+nope
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/plain_${i}*');
+----
+0
+
+endloop
