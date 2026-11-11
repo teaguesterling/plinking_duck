@@ -22,6 +22,8 @@ writer path is now **P13-007** (penciled, separate).
 - [x] §7 step 5, measured on a 10 × 4 grid, 2026-11-10 — §10.5. A `WHERE` skips each pruned
       cell's `.pvar` and genotype reads. Bind still opened every cell's `.pgen` header; stage 5
       (#103) defers that open, so a `WHERE` now skips it too (§10.6).
+- [x] Sample-axis prune: in genotype orient, a `WHERE` on `IID` skips the sample blocks it cannot
+      reach (§10.7), 2026-11-10. Sample orient is not done: it reads its matrix at bind.
 
 ## The gap
 
@@ -394,3 +396,41 @@ strace run per case.
   remote catalog, and it is not measured.
 - Exceptions that keep the bind-time open: a version 1 catalog's first cell (it gives the sample
   count), and `plinking_pgen_io := 'localize'` (it copies every `.pgen` at bind).
+
+### 10.7 Measured (2026-11-10): a `WHERE` on `IID` prunes the sample axis
+
+In genotype orient a row is one variant × one sample, so a `WHERE` on `IID` removes whole sample
+blocks. `PfilePushdownComplexFilter` now also collects `IID = c` and `IID IN (c, …)` from the
+conjunction. `PruneSamplesByIid` narrows `sample_indices` to the samples with those IIDs,
+intersected with `samples :=`. A sample block with no selected sample is then never opened:
+`ConcatPgenReader::Open` skips it, and `CheckDeferredPgenHeaders` skips its header too. Every
+filter stays in place, so the rows equal a full read.
+
+Same fixture as §10.5 (10 × 4 grid, 30000 variants × 10000 samples), genotype orient, 4 threads,
+3 runs per case. The two builds are main at 9166930 and this change.
+
+| Case | `.pgen` distinct / opens, before | after | time, before | after |
+|---|---|---|---|---|
+| `WHERE IID = 'S02501'` | 40 / 200 | 10 / 50 | 11.50 s | 0.12 s |
+| `WHERE IID IN (2 blocks)` | 40 / 200 | 20 / 100 | 12.17 s | 0.10 s |
+| `WHERE IID = … AND CHROM = '3'` | 4 / 20 | 1 / 5 | 2.02 s | 0.09 s |
+| `WHERE IID = 'NOPE'` | 40 / 200 | 10 / 50 | 11.45 s | 0.11 s |
+| `samples := ['S02501']` | 40 / 80 | 10 / 50 | 0.09 s | 0.09 s |
+| `WHERE hash(IID) = hash(…)` (not recognized) | 40 / 200 | 40 / 200 | 12.24 s | 12.24 s |
+| sample orient, `WHERE IID = …` | 40 / 80 | 40 / 80 | 2.50 s | 2.55 s |
+
+- In each case, `count(*)` and `sum(genotype)` are the same before and after.
+- Inferred, not profiled: most of the time saved is not I/O. Before, the scan emitted 300M rows
+  (30000 × 10000), and the `WHERE` removed all but 30000. Now it emits one sample per variant.
+- `samples :=` already skipped the data reads; the header check opened the other blocks. Now
+  it does not.
+- **Not with `af_range` / `ac_range`.** They compute each variant's frequency over the sample
+  set, before the `WHERE`. A narrowed set would change which variants pass, so they keep it whole.
+- An IID that no sample has keeps one sample to scan; the `WHERE` then removes its rows.
+- A duplicate IID (`concatenate` does not require unique IIDs) keeps every sample that has it.
+- **Not done: sample orient.** It reads the whole matrix at bind, before the planner calls the
+  hook. This is the `c.genotypes_by_sample WHERE IID = …` case. To prune it, the matrix read must
+  move from bind to InitGlobal. That is a separate change.
+- Variant orient has no `IID` column. A sample filter there is `samples :=`.
+- Test: `test/sql/read_pfile_catalog_iid_prune.test`. Its fixture has a garbage `.pgen` in every
+  cell of one sample block.

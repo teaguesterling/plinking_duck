@@ -1,0 +1,208 @@
+# name: test/sql/read_pfile_catalog_iid_prune.test
+# description: read_pfile(catalog :=, orient := 'genotype') skips the sample blocks that a WHERE on IID cannot reach
+# group: [sql]
+
+require plinking_duck
+
+# P13-006: the sample-axis mirror of the CHROM/POS cell prune. In genotype orient a row is one
+# variant x one sample, so a WHERE on IID removes whole sample blocks. The reader narrows its
+# sample set to the IIDs the WHERE names, and a block with no selected sample is never opened:
+# not its data, and not its header. Every filter is still applied, so the rows equal a full read.
+# Proof: every cell of sample block 'hi' has a garbage .pgen. A WHERE that names only 'lo' IIDs
+# succeeds; a read that keeps any 'hi' sample errors. The oracle is large_example
+# (3000 variants x 8 samples, CHROM 1/2/3 x 1000).
+statement ok
+SET threads = 4;
+
+# Clean 3 x 2 matrix (CHROM blocks x {lo: SAMP1-4, hi: SAMP5-8}).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# badhi: the same matrix, with a garbage .pgen in every cell of sample block 'hi'.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/badhi' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badhi/CHROM=1/GROUP=hi/data.pgen' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badhi/CHROM=2/GROUP=hi/data.pgen' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badhi/CHROM=3/GROUP=hi/data.pgen' (FORMAT csv, header false);
+
+# ---------------------------------------------------------------------------
+# The corruption is real: a read that keeps a 'hi' sample errors
+# ---------------------------------------------------------------------------
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype');
+----
+data.pgen
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'SAMP6';
+----
+data.pgen
+
+# A predicate the reader does not recognize keeps every block.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE hash(IID) = hash('SAMP2');
+----
+data.pgen
+
+# An OR is not a conjunction: it can reach a 'hi' row through CHROM, so nothing is pruned.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'SAMP2' OR CHROM = '2';
+----
+data.pgen
+
+# ---------------------------------------------------------------------------
+# A WHERE on IID that names only 'lo' samples never opens a 'hi' cell
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'SAMP2'
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'SAMP2')),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'SAMP2');
+----
+0	3000
+
+# The constant on the left.
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE 'SAMP3' = IID;
+----
+3000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID IN ('SAMP1', 'SAMP4')
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID IN ('SAMP1', 'SAMP4'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID IN ('SAMP1', 'SAMP4'));
+----
+0	6000
+
+# With a CHROM predicate too: both axes prune.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'SAMP1' AND CHROM = '3'
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'SAMP1' AND CHROM = '3')),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'SAMP1' AND CHROM = '3');
+----
+0	1000
+
+# A per-row genotype filter is per sample, so it prunes the same way.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype', include_genotypes := ['het']) WHERE IID = 'SAMP2'
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het']) WHERE IID = 'SAMP2')),
+       (SELECT count(*) = (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het']) WHERE IID = 'SAMP2')
+        FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype', include_genotypes := ['het']) WHERE IID = 'SAMP2');
+----
+0	true
+
+# ---------------------------------------------------------------------------
+# With samples :=, the sample set is the intersection
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype', samples := ['SAMP1', 'SAMP6']) WHERE IID = 'SAMP1';
+----
+3000
+
+# An empty intersection still reads one selected sample, and the filter then removes its rows.
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', samples := ['SAMP6']) WHERE IID = 'SAMP1';
+----
+0
+
+# An IID that no block holds: no rows (the reader keeps one sample to scan).
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'NOPE';
+----
+0
+
+# ---------------------------------------------------------------------------
+# A variant filter over the sample set keeps every sample
+# ---------------------------------------------------------------------------
+# af_range / ac_range compute each variant's frequency over the selected samples. A WHERE on IID
+# filters rows after that, so it must not shrink the set the frequency is computed over.
+query I
+SELECT count(*) FROM (
+  SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', af_range := {min: 0.3, max: 0.5}) WHERE IID = 'SAMP1'
+  EXCEPT ALL
+  SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', af_range := {min: 0.3, max: 0.5}) WHERE IID = 'SAMP1');
+----
+0
+
+query I
+SELECT count(*) = (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', af_range := {min: 0.3, max: 0.5}) WHERE IID = 'SAMP1')
+FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', af_range := {min: 0.3, max: 0.5}) WHERE IID = 'SAMP1';
+----
+true
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype', ac_range := {min: 1, max: 16}) WHERE IID = 'SAMP1';
+----
+data.pgen
+
+# ---------------------------------------------------------------------------
+# A duplicate IID: every block that holds it is read
+# ---------------------------------------------------------------------------
+# A v1 sample concat that lists large_example twice: 16 samples, each IID twice.
+query I
+SELECT count(*) FROM (
+  SELECT ID, IID, genotype FROM read_pfile(catalog := 'test/data/pfile_catalog_dup_samples.pfile.json', orient := 'genotype') WHERE IID = 'SAMP3'
+  EXCEPT ALL
+  SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'SAMP3'
+  EXCEPT ALL
+  SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'SAMP3');
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile(catalog := 'test/data/pfile_catalog_dup_samples.pfile.json', orient := 'genotype') WHERE IID = 'SAMP3';
+----
+6000
+
+# ---------------------------------------------------------------------------
+# A prepared parameter is not a constant at planning, so it prunes nothing
+# ---------------------------------------------------------------------------
+statement ok
+PREPARE q AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype') WHERE IID = $1;
+
+query I
+EXECUTE q('SAMP1');
+----
+3000
+
+query I
+EXECUTE q('SAMP7');
+----
+3000
+
+# A prepared constant prunes on each run.
+statement ok
+PREPARE p AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype') WHERE IID = 'SAMP2';
+
+query I
+EXECUTE p;
+----
+3000
+
+query I
+EXECUTE p;
+----
+3000
+
+# ---------------------------------------------------------------------------
+# Out of scope: variant orient has no IID column, and sample orient reads its matrix at bind
+# ---------------------------------------------------------------------------
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP2';
+----
+data.pgen

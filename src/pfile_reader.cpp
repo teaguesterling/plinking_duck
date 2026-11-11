@@ -3414,6 +3414,14 @@ static void CheckDeferredPgenHeaders(ClientContext &context, const PfileBindData
 	    bind_data.IsConcat() ? bind_data.ShardsFor(src_idx) : vector<PgenSampleShard>();
 	const idx_t n = bind_data.IsConcat() ? shards.size() : 1;
 	for (idx_t k = 0; k < n; k++) {
+		if (bind_data.IsConcat() && bind_data.has_sample_subset) {
+			// A shard that holds no selected sample is never read, so it is not opened here either.
+			auto it = std::lower_bound(bind_data.sample_indices.begin(), bind_data.sample_indices.end(),
+			                           shards[k].sample_offset);
+			if (it == bind_data.sample_indices.end() || *it >= shards[k].sample_offset + shards[k].raw_sample_ct) {
+				continue;
+			}
+		}
 		const string &path = bind_data.IsConcat() ? shards[k].pgen_path : src.pgen_path;
 		const uint32_t declared_samples = bind_data.IsConcat() ? shards[k].raw_sample_ct : bind_data.raw_sample_ct;
 		uint32_t variant_ct = 0;
@@ -5627,20 +5635,30 @@ struct CellPruneConstraints {
 	bool has_pos = false;
 	int64_t pos_lo = std::numeric_limits<int64_t>::lowest(); //! inclusive
 	int64_t pos_hi = std::numeric_limits<int64_t>::max();    //! inclusive
+	//! The IID column in genotype orient (INVALID_INDEX otherwise), and the IID values a row may have.
+	idx_t iid_col = DConstants::INVALID_INDEX;
+	bool has_iid = false;
+	std::set<string> iids;
 
-	void AllowChroms(const std::set<string> &values) {
-		if (!has_chrom) {
-			chroms = values;
-			has_chrom = true;
+	static void Intersect(bool &has, std::set<string> &current, const std::set<string> &values) {
+		if (!has) {
+			current = values;
+			has = true;
 			return;
 		}
 		std::set<string> both;
 		for (auto &v : values) {
-			if (chroms.count(v)) {
+			if (current.count(v)) {
 				both.insert(v);
 			}
 		}
-		chroms = std::move(both);
+		current = std::move(both);
+	}
+	void AllowChroms(const std::set<string> &values) {
+		Intersect(has_chrom, chroms, values);
+	}
+	void AllowIids(const std::set<string> &values) {
+		Intersect(has_iid, iids, values);
 	}
 	//! POS <type> v, for one comparison type with the column on the left.
 	void NarrowPos(ExpressionType type, int64_t v) {
@@ -5710,7 +5728,8 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	}
 	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
 		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
-		if (kids.size() < 2 || CellPruneColumnOf(get, *kids[0]) != PfileBindData::CHROM_COL) {
+		const idx_t in_col = kids.size() < 2 ? DConstants::INVALID_INDEX : CellPruneColumnOf(get, *kids[0]);
+		if (in_col != PfileBindData::CHROM_COL && (in_col == DConstants::INVALID_INDEX || in_col != c.iid_col)) {
 			return;
 		}
 		std::set<string> values;
@@ -5721,7 +5740,11 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 			}
 			values.insert(v.GetValue<string>());
 		}
-		c.AllowChroms(values);
+		if (in_col == PfileBindData::CHROM_COL) {
+			c.AllowChroms(values);
+		} else {
+			c.AllowIids(values);
+		}
 		return;
 	}
 	if (e.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
@@ -5764,6 +5787,8 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (col == PfileBindData::CHROM_COL && cmp == ExpressionType::COMPARE_EQUAL &&
 	    v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowChroms({v.GetValue<string>()});
+	} else if (col == c.iid_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
+		c.AllowIids({v.GetValue<string>()});
 	} else if (col == PfileBindData::POS_COL && v.DefaultTryCastAs(LogicalType::BIGINT)) {
 		c.NarrowPos(cmp, v.GetValue<int64_t>());
 	}
@@ -5775,18 +5800,76 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 //! the rows equal a full read. If no block survives, the first is kept (the filters then yield no
 //! rows). Only a lazy_variants read is pruned: there the .pvar is not loaded and variant_offsets
 //! is not final until EnsureLazyVariants.
+//! The sample-axis mirror, for genotype orient over sample shards: narrow the sample set to the IIDs
+//! the WHERE names, intersected with samples :=. A shard with no selected sample is then never opened
+//! (ConcatPgenReader::Open skips it, and so does CheckDeferredPgenHeaders). The WHERE still filters every
+//! row, so the rows equal a full read. Not with af_range / ac_range: they compute each variant's
+//! frequency over the sample set, before the WHERE. An IID that no sample has keeps one sample to scan.
+static void PruneSamplesByIid(ClientContext &context, PfileBindData &bind_data, const CellPruneConstraints &c) {
+	if (!c.has_iid || bind_data.count_filter.HasFilter()) {
+		return;
+	}
+	EnsureSourceIids(context, bind_data.sample_metadata, bind_data.sample_info);
+	const auto &all = bind_data.sample_info.iids;
+	if (all.size() != bind_data.raw_sample_ct) {
+		return; // the IIDs are not all known here: keep every sample
+	}
+	vector<uint32_t> keep; // ascending, as sample_indices is
+	if (bind_data.has_sample_subset) {
+		for (auto s : bind_data.sample_indices) {
+			if (c.iids.count(all[s])) {
+				keep.push_back(s);
+			}
+		}
+	} else {
+		for (uint32_t s = 0; s < bind_data.raw_sample_ct; s++) {
+			if (c.iids.count(all[s])) {
+				keep.push_back(s); // every match: concatenate does not require unique IIDs
+			}
+		}
+	}
+	if (keep.size() == bind_data.OutputSampleCt()) {
+		return;
+	}
+	if (keep.empty()) {
+		keep.push_back(bind_data.has_sample_subset ? bind_data.sample_indices[0] : 0);
+	}
+	bind_data.sample_indices = std::move(keep);
+	bind_data.has_sample_subset = true;
+	bind_data.subset_sample_ct = static_cast<uint32_t>(bind_data.sample_indices.size());
+	if (bind_data.genotype_filter.active) {
+		bind_data.count_filter_subset =
+		    make_uniq<SampleSubset>(BuildSampleSubset(bind_data.raw_sample_ct, bind_data.sample_indices));
+	}
+}
+
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
-	if (!bind_data.lazy_variants || bind_data.lazy_variants_loaded || bind_data.sources.size() <= 1 ||
-	    bind_data.source_ranges.size() != bind_data.sources.size()) {
+	const bool prune_samples = bind_data.orient_mode == OrientMode::GENOTYPE && bind_data.IsConcat() &&
+	                           bind_data.sample_shards.size() > 1 && !bind_data.lazy_variants_loaded;
+	const bool prune_variants = bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
+	                            bind_data.sources.size() > 1 &&
+	                            bind_data.source_ranges.size() == bind_data.sources.size();
+	if (!prune_samples && !prune_variants) {
 		return;
 	}
 	CellPruneConstraints c;
+	if (prune_samples) {
+		const auto &psam_cols = bind_data.sample_metadata.header.column_names;
+		for (idx_t j = 0; j < bind_data.geno_sample_col_to_psam_col.size(); j++) {
+			if (psam_cols[bind_data.geno_sample_col_to_psam_col[j]] == "IID") {
+				c.iid_col = bind_data.geno_sample_col_start + j;
+			}
+		}
+	}
 	for (auto &f : filters) {
 		CollectCellPruneConstraints(context, get, *f, c);
 	}
-	if (!c.has_chrom && !c.has_pos) {
+	if (prune_samples) {
+		PruneSamplesByIid(context, bind_data, c);
+	}
+	if (!prune_variants || (!c.has_chrom && !c.has_pos)) {
 		return;
 	}
 	vector<PfileSource> kept;
