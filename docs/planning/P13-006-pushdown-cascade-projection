@@ -20,7 +20,8 @@ writer path is now **P13-007** (penciled, separate).
       §4 spike (the hook runs AFTER bind), adds a prerequisite (§10.2, a 2-D read), and puts a new
       owner fork: §10.4. The owner chose **(i) lazy bind** on 2026-11-09.
 - [x] §7 step 5, measured on a 10 × 4 grid, 2026-11-10 — §10.5. A `WHERE` skips each pruned
-      cell's `.pvar` and genotype reads. Bind still opens every cell's `.pgen` header.
+      cell's `.pvar` and genotype reads. Bind still opened every cell's `.pgen` header; stage 5
+      (#103) defers that open, so a `WHERE` now skips it too (§10.6).
 
 ## The gap
 
@@ -354,8 +355,8 @@ hook cannot translate it. Do not use `CHROM || '' = '3'` as a baseline. The opti
 - A `WHERE` on CHROM prunes as well as `region :=` does: 31 ms against 28 ms, at 1 `.pvar` each.
   Against the no-pruning baseline, it is 5.5 times less work (172 → 31 ms), and 4.9 times less
   through the ATTACH view (202 → 41 ms). This is the doc's headline, measured.
-- **A `WHERE` does not skip the `.pgen` open.** Bind opens all 40 `.pgen` files, even for
-  `DESCRIBE`. `LoadPfileSource` (`pfile_reader.cpp:970`, `PgfiInitPhase1`/`Phase2`) reads only two
+- **A `WHERE` does not skip the `.pgen` open** (fixed by stage 5, §10.6). Bind opens all 40
+  `.pgen` files, even for `DESCRIBE`. `LoadPfileSource` (`pfile_reader.cpp:970`, `PgfiInitPhase1`/`Phase2`) reads only two
   counts from each header, `raw_variant_ct` and `raw_sample_ct`. The hook runs after bind, so it
   cannot take those opens back. `region :=` prunes before the bind loop, so it opens 4.
 - On local disk the 40 header opens cost about 4 ms. On a remote store each open is at least one
@@ -366,3 +367,30 @@ hook cannot translate it. Do not use `CHROM || '' = '3'` as a baseline. The opti
 **Not measured.** A remote catalog; more than one machine; cold cache; sample orient; a larger
 grid. The absolute times are small, because the fixture is 12 MB. The ratios and the open counts
 are the result, not the milliseconds.
+
+### 10.6 Measured (2026-11-10): stage 5 defers the `.pgen` header open
+
+Stage 5 (#103) takes each cell's counts from the catalog at bind. InitGlobal opens the header of
+each cell the scan keeps, and checks it against those counts. The fixture and method are the same
+as §10.5. The two builds are main at 95d84b5 and stage 5. Both columns of the table come from one
+strace run per case.
+
+| Case | `.pgen` distinct / opens, before | after |
+|---|---|---|
+| bind only (`DESCRIBE`) | 40 / 40 | 0 / 0 |
+| no `WHERE` | 40 / 164 | 40 / 164 |
+| `WHERE CHROM = '3'` | 40 / 56 | 4 / 20 |
+| `WHERE CHROM IN ('3', '7')` | 40 / 64 | 8 / 36 |
+| `region := '3'` | 4 / 20 | 4 / 20 |
+| ATTACH `c.genotypes WHERE CHROM = '3'` | 40 / 56 | 4 / 20 |
+
+- A `WHERE` now opens the same `.pgen` files as the equivalent `region :=`.
+- In each case, `count(*)` and `max(genotypes[1])` are the same as on main.
+- Local time is unchanged. In an interleaved A/B (11 rounds, the order alternating each round),
+  every median delta is within ±11 ms, and the ranges overlap.
+- **Still at bind: the existence checks.** Path discovery stats each cell's files. A pruned query
+  does 54 stats on cell files (40 `.pgen`, 10 `.pvar`, 4 `.psam`). `region := '3'` does 9. Both
+  also stat the catalog once. On httpfs each stat is a HEAD request. This is the next gap for a
+  remote catalog, and it is not measured.
+- Exceptions that keep the bind-time open: a version 1 catalog's first cell (it gives the sample
+  count), and `plinking_pgen_io := 'localize'` (it copies every `.pgen` at bind).
