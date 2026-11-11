@@ -117,8 +117,9 @@ bool PgenIoUseVfs(ClientContext &context, const string &pgen_path) {
 	if (policy == "native" || policy == "localize") {
 		return false;
 	}
-	// auto: route remote/VFS paths through Path V; plain-local uses native fopen.
-	return FileSystem::IsRemoteFile(pgen_path);
+	// auto: route remote/VFS paths through Path V; plain-local uses native fopen. Any other
+	// scheme:// path (file://, a protocol file system) also goes through the VFS: fopen cannot open it.
+	return FileSystem::IsRemoteFile(pgen_path) || pgen_path.find("://") != string::npos;
 }
 
 // --- PgenLocalizeGuard: RAII cleanup of downloaded temp .pgen copies ------------

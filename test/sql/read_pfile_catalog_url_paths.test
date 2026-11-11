@@ -1,0 +1,58 @@
+# name: test/sql/read_pfile_catalog_url_paths.test
+# description: a catalog read through a URL (scheme://) resolves its relative paths under that URL
+# group: [sql]
+
+require plinking_duck
+
+# A catalog's relative paths resolve against the catalog's directory. For a URL catalog
+# (http://host/x.pfile.json, s3://bucket/x.pfile.json) that directory is a URL too. The resolver
+# treated the URL as a relative local path: it prepended the working directory and collapsed the
+# '//' after the scheme ('<cwd>/http:/host/...'). So no remote catalog with relative paths could
+# be read. file:// takes the same code path and needs no network, so this test uses it.
+# plinking_pgen_io 'auto' (the default) opens a scheme:// .pgen through DuckDB's file system.
+
+# Resolved paths keep the scheme and the absolute catalog directory.
+query II
+SELECT bool_and(starts_with(prefix, 'file://{WORKING_DIR}/test/data/')), count(*)
+FROM read_pfile_catalog('file://{WORKING_DIR}/test/data/pfile_catalog_le_samples.pfile.json');
+----
+true	3
+
+query I
+SELECT bool_and(starts_with(psam, 'file://{WORKING_DIR}/test/data/le_cat_'))
+FROM read_pfile_catalog('file://{WORKING_DIR}/test/data/pfile_catalog_le_samples.pfile.json');
+----
+true
+
+# The read through the URL catalog equals the read through the local one.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := 'file://{WORKING_DIR}/test/data/pfile_catalog_le_samples.pfile.json', orient := 'genotype')
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile(catalog := 'test/data/pfile_catalog_le_samples.pfile.json', orient := 'genotype'))),
+       (SELECT count(*) FROM read_pfile(catalog := 'file://{WORKING_DIR}/test/data/pfile_catalog_le_samples.pfile.json', orient := 'genotype'));
+----
+0	24000
+
+# A version 2 matrix catalog (its template paths take another resolver).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := 'file://{WORKING_DIR}/{TEST_DIR}/mx.pfile.json', orient := 'genotype') WHERE CHROM = '2'
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '2')),
+       (SELECT count(*) FROM read_pfile(catalog := 'file://{WORKING_DIR}/{TEST_DIR}/mx.pfile.json', orient := 'genotype') WHERE CHROM = '2');
+----
+0	8000
+
+# Through ATTACH.
+statement ok
+ATTACH 'file://{WORKING_DIR}/{TEST_DIR}/mx.pfile.json' AS c (TYPE pfile_catalog);
+
+query I
+SELECT count(*) FROM c.genotypes WHERE CHROM = '3';
+----
+1000

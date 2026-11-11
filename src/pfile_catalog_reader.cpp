@@ -78,11 +78,34 @@ bool JsonGetInt64(yyjson_val *v, int64_t &out) {
 
 // ---- path resolution (§7.2) ----------------------------------------------
 
+//! Length of a URL's `scheme://authority` root (`http://host:8080`, `s3://bucket`, `file://`), or 0
+//! when `path` is not a URL. The path after the root is absolute.
+static size_t UrlRootLength(const string &path) {
+	auto sep = path.find("://");
+	if (sep == string::npos || sep == 0 || !StringUtil::CharacterIsAlpha(path[0])) {
+		return 0;
+	}
+	for (size_t k = 1; k < sep; k++) {
+		const char ch = path[k];
+		if (!StringUtil::CharacterIsAlphaNumeric(ch) && ch != '+' && ch != '-' && ch != '.') {
+			return 0;
+		}
+	}
+	auto slash = path.find('/', sep + 3);
+	return slash == string::npos ? path.size() : slash;
+}
+
 //! Collapse `.`/`..`/duplicate separators in a POSIX-style path (os.path.normpath semantics, enough
-//! for catalog paths). Preserves a leading `/` (absolute) and a trailing-less form.
+//! for catalog paths). Preserves a leading `/` (absolute) and a trailing-less form. A URL keeps its
+//! `scheme://authority` root, and the path after it is normalized as an absolute path.
 string NormPath(const string &path) {
 	if (path.empty()) {
 		return ".";
+	}
+	const size_t root = UrlRootLength(path);
+	if (root > 0) {
+		const string rest = path.substr(root);
+		return path.substr(0, root) + (rest.empty() ? string() : NormPath(rest));
 	}
 	bool absolute = path[0] == '/';
 	vector<string> out;
@@ -122,7 +145,7 @@ string NormPath(const string &path) {
 
 //! Absolute-ize `path` against the process CWD (os.path.abspath), then normalize.
 string AbsPath(FileSystem &fs, const string &path) {
-	if (fs.IsPathAbsolute(path)) {
+	if (UrlRootLength(path) > 0 || fs.IsPathAbsolute(path)) {
 		return NormPath(path);
 	}
 	return NormPath(FileSystem::GetWorkingDirectory() + "/" + path);
@@ -145,8 +168,11 @@ string DirName(const string &path) {
 //! and NORMALIZED (CWD-independent, `..` collapsed), so a consumer can use it as a chunk source path
 //! regardless of its own working directory (I5 / catalog.py `_resolve`).
 string ResolvePath(FileSystem &fs, const string &base_dir, const string &path, bool path_is_relative) {
-	if (!path_is_relative || fs.IsPathAbsolute(path)) {
+	if (!path_is_relative || UrlRootLength(path) > 0 || fs.IsPathAbsolute(path)) {
 		return NormPath(path);
+	}
+	if (UrlRootLength(base_dir) > 0) {
+		return NormPath(base_dir + "/" + path); // a URL directory: always '/'
 	}
 	return NormPath(fs.JoinPath(base_dir, path));
 }
