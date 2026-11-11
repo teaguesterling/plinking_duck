@@ -255,7 +255,70 @@ EXECUTE p;
 3000
 
 # ---------------------------------------------------------------------------
-# Out of scope: variant orient has no IID column, and sample orient reads its matrix at bind
+# Sample orient, genotypes := 'counts' / 'stats': these stream at scan time, so the same prune applies
+# ---------------------------------------------------------------------------
+# A row is one sample. The genotypes column is projected, so the scan reads every kept cell.
+statement error
+SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP6';
+----
+data.pgen
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP2'
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP2')),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP2');
+----
+0	1
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'stats') WHERE IID IN ('SAMP1', 'SAMP4')
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'stats') WHERE IID IN ('SAMP1', 'SAMP4'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'stats') WHERE IID IN ('SAMP1', 'SAMP4'));
+----
+0	2
+
+# A prepared statement keeps the narrowed sample set on each execution.
+statement ok
+PREPARE pc AS SELECT count(*), bool_and(genotypes.hom_alt >= 0) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP1';
+
+query II
+EXECUTE pc;
+----
+1	true
+
+query II
+EXECUTE pc;
+----
+1	true
+
+# A kept cell's .pgen header is checked at InitGlobal even when no genotype column is projected.
+statement error
+SELECT IID FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP6';
+----
+data.pgen
+
+query I
+SELECT IID FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts') WHERE IID = 'SAMP3';
+----
+SAMP3
+
+# The catalog's declared counts still bind: DESCRIBE opens no .pgen.
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts');
+
+# Not pruned: a genotype filter keeps a variant only if some sample of the whole cohort passes it.
+# Bind counts every variant over every cell before the WHERE is known, so it opens the 'hi' cells.
+statement error
+SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'counts', include_genotypes := ['hom_alt']) WHERE IID = 'SAMP3';
+----
+data.pgen
+
+# ---------------------------------------------------------------------------
+# Out of scope: variant orient has no IID column, and sample orient's per-element modes read their matrix at bind
 # ---------------------------------------------------------------------------
 statement error
 SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP2';

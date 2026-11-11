@@ -23,7 +23,8 @@ writer path is now **P13-007** (penciled, separate).
       cell's `.pvar` and genotype reads. Bind still opened every cell's `.pgen` header; stage 5
       (#103) defers that open, so a `WHERE` now skips it too (§10.6).
 - [x] Sample-axis prune: in genotype orient, a `WHERE` on `IID` skips the sample blocks it cannot
-      reach (§10.7), 2026-11-10. Sample orient is not done: it reads its matrix at bind.
+      reach (§10.7), 2026-11-10. Sample orient `genotypes := 'counts'` / `'stats'` too (§10.9),
+      2026-11-11. Sample orient's per-element modes are not done: they read the matrix at bind.
 - [x] Bind takes a catalog cell's paths as written, with no existence check (§10.8), 2026-11-11.
       A remote catalog with relative paths could not be read at all before #106.
 
@@ -473,3 +474,37 @@ d54cbbe3df) loads this build with `allow_extensions_metadata_mismatch`.
 - Not measured: a real object store (S3 latency per request), a larger grid, `cache_httpfs`.
 - Test: `test/sql/read_pfile_catalog_bind_stats.test`. A catalog names a fileset that does not
   exist. A query that prunes it succeeds; one that keeps it errors and names the file.
+
+### 10.9 Measured (2026-11-11): the IID prune in sample orient, counts and stats
+
+Sample orient `genotypes := 'counts'` / `'stats'` reads no genotype at bind: it streams per-sample
+counts at scan time. So the §10.7 prune applies to it, with two changes.
+
+- **Bind defers the cell's `.pgen` header** (`smp_headers_at_init`), as stage 5 does for variant and
+  genotype orient. Before, sample orient read every header at bind, so a pruned block was still
+  opened. The `.pvar` still loads at bind, because the schema needs the variant count. It is
+  checked against the count the catalog declares. `EnsureLazyVariants` checks the headers at
+  InitGlobal, after the hook, and skips a shard with no selected sample.
+- **The hook's CHROM/POS columns are now fields of `CellPruneConstraints`.** They were the constants
+  0 and 1. In sample orient, column 0 is the first `.psam` column (`IID`), so `IID = 'x'` was read
+  as `CHROM = 'x'`. Sample orient sets both to `INVALID_INDEX`.
+
+Bind decides this before it parses the filters, so it looks at the parameters: any `af_range`,
+`ac_range`, `include_genotypes` or `genotype_range` keeps the bind-time header read. Those filters
+count every variant over every sample at bind (the variant set does not depend on the `WHERE`), so
+they open every cell anyway.
+
+Same fixture as §10.5, 4 threads, 3 runs per case. The builds are 4ee61f1 (same reader as main at
+ecab5ed) and this change. In each case the result is the same before and after.
+
+| Case | `.pgen` distinct / opens, before | after | time, before | after |
+|---|---|---|---|---|
+| counts, `WHERE IID = 'S02501'` | 40 / 164 | 10 / 41 | 0.39 s | 0.10 s |
+| stats, `WHERE IID IN (2 blocks)` | 40 / 160 | 20 / 78 | 0.29 s | 0.10 s |
+| counts, `samples := ['S02501']` | 40 / 70 | 10 / 41 | 0.11 s | 0.11 s |
+| array (default), `WHERE IID = …` | 40 / 80 | 40 / 80 | 1.65 s | 1.56 s |
+
+- A kept cell's header is checked even when no genotype column is projected.
+- `DESCRIBE` of a counts/stats catalog read now opens no `.pgen`. A bad cell shows when the query runs.
+- **Not done: the per-element modes** (array, list, struct, columns). They read the matrix at bind,
+  before the planner calls the hook. This is the `c.genotypes_by_sample WHERE IID = …` case.

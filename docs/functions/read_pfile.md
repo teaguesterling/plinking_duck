@@ -285,7 +285,10 @@ In `orient := 'genotype'` over sample shards (a catalog with more than one sampl
 `WHERE IID IN (…)` narrows the sample set, as `samples := [...]` does. A shard that holds none of
 those IIDs is not read. A catalog read does not open its `.pgen` at all; a plain list still opens
 each header at bind. This does not apply with `af_range` or `ac_range`, which compute over the
-whole sample set, or in sample orient, which reads its genotypes at bind.
+whole sample set. In `orient := 'sample'`, it applies only to a catalog read with
+`genotypes := 'counts'` or `'stats'`, and no `af_range`, `ac_range`, `include_genotypes` or
+`genotype_range`. The other sample-orient modes read every genotype at bind, so they read every
+shard.
 
 ### Value Filters
 

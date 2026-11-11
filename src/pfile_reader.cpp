@@ -543,6 +543,9 @@ struct PfileBindData : public TableFunctionData {
 	//! EnsureLazyVariants opens the header of each source that survives pruning and checks it against
 	//! them. Off under plinking_pgen_io := 'localize', which copies every .pgen at bind.
 	bool lazy_pgen = false;
+	//! Sample orient counts/stats with no filter: bind reads no genotype, so the deferred .pgen
+	//! headers wait for InitGlobal (EnsureLazyVariants), after the WHERE on IID prune.
+	bool smp_headers_at_init = false;
 	string lazy_pgen_catalog_path;        //! for the count-check message
 	bool lazy_pgen_sample_extent = false; //! the catalog declares each cell's sample count (a v2 matrix)
 
@@ -1860,7 +1863,26 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	// Stage 5: a cell's .pgen header waits for InitGlobal too, when the catalog declares the cell's
 	// variant count and its sample count is known without the header: declared (a v2 matrix), or
 	// shared with cell 0 (a v1 variant concat, whose cell 0 still opens here).
-	bind_data->lazy_pgen = bind_data->lazy_variants && grid.has_variant_extent && !PgenIoLocalizes(context);
+	// Sample orient counts/stats with no filter read no genotype at bind, so they defer the header too
+	// (smp_headers_at_init), but still parse each .pvar at bind: the schema needs the variant count.
+	// Every other sample-orient read opens .pgen files at bind (the count filter, the matrix
+	// pre-read), so it reads each header at bind as before. The parameters are not parsed yet; a
+	// filter parameter that is present at all keeps the bind-time header read.
+	if (from_catalog && bind_data->orient_mode == OrientMode::SAMPLE) {
+		auto has_param = [&](const char *name) {
+			auto it = input.named_parameters.find(name);
+			return it != input.named_parameters.end() && !it->second.IsNull();
+		};
+		auto gm_it = input.named_parameters.find("genotypes");
+		const string gm = gm_it == input.named_parameters.end() || gm_it->second.IsNull()
+		                      ? string("auto")
+		                      : StringUtil::Lower(gm_it->second.ToString());
+		bind_data->smp_headers_at_init = (gm == "counts" || gm == "stats") && !has_param("af_range") &&
+		                                 !has_param("ac_range") && !has_param("include_genotypes") &&
+		                                 !has_param("genotype_range");
+	}
+	bind_data->lazy_pgen = (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent &&
+	                       !PgenIoLocalizes(context);
 	bind_data->lazy_pgen_catalog_path = grid.path;
 	bind_data->lazy_pgen_sample_extent = grid.has_sample_extent;
 
@@ -1898,13 +1920,18 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		const bool defer_header = bind_data->lazy_pgen && (grid.has_sample_extent || (!concat && si > 0));
 		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
 		                                  need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard,
-		                                  !bind_data->lazy_variants, !defer_header, !from_catalog);
+		                                  !bind_data->lazy_variants && !defer_header, !defer_header, !from_catalog);
 		if (defer_header) {
 			const auto &cell = grid.cells[si];
 			src.pgen_header_deferred = true;
 			src.raw_variant_ct = static_cast<uint32_t>(cell.variant_stop - cell.variant_start);
 			src_sample_ct = grid.has_sample_extent ? static_cast<uint32_t>(cell.sample_stop - cell.sample_start)
 			                                       : bind_data->raw_sample_ct;
+			if (!bind_data->lazy_variants && need_pvar) {
+				// Sample orient: the schema needs the variant count, so the .pvar loads now, and is
+				// checked against the count the catalog declares.
+				LoadSourceVariants(context, src, bind_data->region);
+			}
 		}
 
 		if (from_catalog) {
@@ -2289,6 +2316,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// iterate sources; the matrix is addressed by GLOBAL effective-variant
 		// position = variant_offsets[src] + local_ev.
 		plink2::PglErr err = plink2::kPglRetSuccess;
+		D_ASSERT(!bind_data->smp_headers_at_init ||
+		         (!bind_data->count_filter.HasFilter() && !bind_data->genotype_filter.active));
 		// Apply the count filter PER SOURCE before building schema, so the ARRAY
 		// dimension reflects the filtered total. genotype_range_all_pass accumulates
 		// globally across sources in file order, staying aligned with the matrix.
@@ -3452,8 +3481,10 @@ static void CheckDeferredPgenHeaders(ClientContext &context, const PfileBindData
 //! variant_range, and rebuild variant_offsets. Runs once per bind data, under its lock; a failed
 //! load leaves it unloaded, so a re-execution reports the same error. The bind data is const in
 //! InitGlobal but was created mutable (make_uniq in PfileBind); these fields are written only here.
+//! A sample-orient counts/stats read (smp_headers_at_init) parsed its .pvar at bind: here it only
+//! checks the deferred .pgen headers of the sample shards that the scan reads.
 static void EnsureLazyVariants(ClientContext &context, const PfileBindData &bind_data_c) {
-	if (!bind_data_c.lazy_variants) {
+	if (!bind_data_c.lazy_variants && !bind_data_c.smp_headers_at_init) {
 		return;
 	}
 	std::lock_guard<std::mutex> guard(bind_data_c.lazy_variants_lock);
@@ -3461,6 +3492,15 @@ static void EnsureLazyVariants(ClientContext &context, const PfileBindData &bind
 		return;
 	}
 	auto &bind_data = const_cast<PfileBindData &>(bind_data_c);
+	if (!bind_data.lazy_variants) {
+		for (idx_t src_idx = 0; src_idx < bind_data.sources.size(); src_idx++) {
+			if (bind_data.sources[src_idx].pgen_header_deferred) {
+				CheckDeferredPgenHeaders(context, bind_data, src_idx);
+			}
+		}
+		bind_data.lazy_variants_loaded = true;
+		return;
+	}
 	for (idx_t src_idx = 0; src_idx < bind_data.sources.size(); src_idx++) {
 		auto &src = bind_data.sources[src_idx];
 		if (src.pgen_header_deferred) {
@@ -5641,7 +5681,11 @@ struct CellPruneConstraints {
 	bool has_pos = false;
 	int64_t pos_lo = std::numeric_limits<int64_t>::lowest(); //! inclusive
 	int64_t pos_hi = std::numeric_limits<int64_t>::max();    //! inclusive
-	//! The IID column in genotype orient (INVALID_INDEX otherwise), and the IID values a row may have.
+	//! The CHROM and POS columns: the first two in variant and genotype orient. Sample orient has
+	//! neither (its first columns are the .psam's), so it sets both to INVALID_INDEX.
+	idx_t chrom_col = PfileBindData::CHROM_COL;
+	idx_t pos_col = PfileBindData::POS_COL;
+	//! The IID column in genotype or sample orient (INVALID_INDEX otherwise), and the IID values a row may have.
 	idx_t iid_col = DConstants::INVALID_INDEX;
 	bool has_iid = false;
 	std::set<string> iids;
@@ -5735,7 +5779,7 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
 		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
 		const idx_t in_col = kids.size() < 2 ? DConstants::INVALID_INDEX : CellPruneColumnOf(get, *kids[0]);
-		if (in_col != PfileBindData::CHROM_COL && (in_col == DConstants::INVALID_INDEX || in_col != c.iid_col)) {
+		if (in_col == DConstants::INVALID_INDEX || (in_col != c.chrom_col && in_col != c.iid_col)) {
 			return;
 		}
 		std::set<string> values;
@@ -5746,7 +5790,7 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 			}
 			values.insert(v.GetValue<string>());
 		}
-		if (in_col == PfileBindData::CHROM_COL) {
+		if (in_col == c.chrom_col) {
 			c.AllowChroms(values);
 		} else {
 			c.AllowIids(values);
@@ -5758,8 +5802,8 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	}
 	auto &fn = e.Cast<BoundFunctionExpression>();
 	if (type == ExpressionType::COMPARE_BETWEEN) {
-		if (!BoundBetweenExpression::HasValidBindData(fn) ||
-		    CellPruneColumnOf(get, BoundBetweenExpression::Input(fn)) != PfileBindData::POS_COL) {
+		if (!BoundBetweenExpression::HasValidBindData(fn) || c.pos_col == DConstants::INVALID_INDEX ||
+		    CellPruneColumnOf(get, BoundBetweenExpression::Input(fn)) != c.pos_col) {
 			return;
 		}
 		Value lo, hi;
@@ -5790,12 +5834,11 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (col == DConstants::INVALID_INDEX || !CellPruneConstant(context, *other, v)) {
 		return;
 	}
-	if (col == PfileBindData::CHROM_COL && cmp == ExpressionType::COMPARE_EQUAL &&
-	    v.type().id() == LogicalTypeId::VARCHAR) {
+	if (col == c.chrom_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowChroms({v.GetValue<string>()});
 	} else if (col == c.iid_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowIids({v.GetValue<string>()});
-	} else if (col == PfileBindData::POS_COL && v.DefaultTryCastAs(LogicalType::BIGINT)) {
+	} else if (col == c.pos_col && v.DefaultTryCastAs(LogicalType::BIGINT)) {
 		c.NarrowPos(cmp, v.GetValue<int64_t>());
 	}
 }
@@ -5852,8 +5895,11 @@ static void PruneSamplesByIid(ClientContext &context, PfileBindData &bind_data, 
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
-	const bool prune_samples = bind_data.orient_mode == OrientMode::GENOTYPE && bind_data.IsConcat() &&
-	                           bind_data.sample_shards.size() > 1 && !bind_data.lazy_variants_loaded;
+	// Sample orient: only counts/stats with no filter, whose bind reads no genotype (smp_headers_at_init).
+	// Its per-element modes pre-read the matrix at bind, before this hook.
+	const bool prune_samples = (bind_data.orient_mode == OrientMode::GENOTYPE || bind_data.smp_headers_at_init) &&
+	                           bind_data.IsConcat() && bind_data.sample_shards.size() > 1 &&
+	                           !bind_data.lazy_variants_loaded;
 	const bool prune_variants = bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
 	                            bind_data.sources.size() > 1 &&
 	                            bind_data.source_ranges.size() == bind_data.sources.size();
@@ -5863,9 +5909,19 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	CellPruneConstraints c;
 	if (prune_samples) {
 		const auto &psam_cols = bind_data.sample_metadata.header.column_names;
-		for (idx_t j = 0; j < bind_data.geno_sample_col_to_psam_col.size(); j++) {
-			if (psam_cols[bind_data.geno_sample_col_to_psam_col[j]] == "IID") {
-				c.iid_col = bind_data.geno_sample_col_start + j;
+		if (bind_data.orient_mode == OrientMode::SAMPLE) {
+			c.chrom_col = DConstants::INVALID_INDEX;
+			c.pos_col = DConstants::INVALID_INDEX;
+			for (idx_t j = 0; j < bind_data.sample_orient_col_to_psam_col.size(); j++) {
+				if (psam_cols[bind_data.sample_orient_col_to_psam_col[j]] == "IID") {
+					c.iid_col = j;
+				}
+			}
+		} else {
+			for (idx_t j = 0; j < bind_data.geno_sample_col_to_psam_col.size(); j++) {
+				if (psam_cols[bind_data.geno_sample_col_to_psam_col[j]] == "IID") {
+					c.iid_col = bind_data.geno_sample_col_start + j;
+				}
 			}
 		}
 	}
