@@ -86,6 +86,9 @@ directory** by default — so a catalog moves together with its files: copy the
 `.pfile.json` and the filesets as a set and the references still resolve. An
 **absolute path is honored as-is.** On a companion **object**,
 `"path_is_relative": false` opts that one path out of relative resolution.
+A catalog read from a URL (`https://host/cohort.pfile.json`, `s3://bucket/cohort.pfile.json`)
+resolves its relative paths under that URL: `grid/CHROM=1/data` becomes
+`https://host/grid/CHROM=1/data`.
 
 !!! note "Written relative, returned absolute"
 
