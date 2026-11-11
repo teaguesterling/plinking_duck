@@ -170,6 +170,61 @@ SELECT count(*) FROM read_pfile(catalog := 'test/data/pfile_catalog_dup_samples.
 6000
 
 # ---------------------------------------------------------------------------
+# A plain list of sample shards (no catalog): the rows equal a full read
+# ---------------------------------------------------------------------------
+# The same narrowing applies, so the scan reads only the shards that hold a selected sample. A
+# plain list still opens every shard's .pgen header at bind (no catalog declares the counts), so
+# a garbage .pgen cannot show the prune here. These cases check the rows.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(['test/data/le_cat_a', 'test/data/le_cat_b', 'test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7')
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7'))),
+       (SELECT count(*) FROM read_pfile(['test/data/le_cat_a', 'test/data/le_cat_b', 'test/data/le_cat_c'], combine_samples := 'concatenate', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7'));
+----
+0	6000
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(['test/data/le_cat_a', 'test/data/le_cat_b', 'test/data/le_cat_c'], combine_samples := 'disjoint', orient := 'genotype') WHERE IID = 'SAMP1'
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'SAMP1')),
+       (SELECT count(*) FROM read_pfile(['test/data/le_cat_a', 'test/data/le_cat_b', 'test/data/le_cat_c'], combine_samples := 'disjoint', orient := 'genotype') WHERE IID = 'SAMP1');
+----
+0	3000
+
+# ---------------------------------------------------------------------------
+# A catalog whose .psam is parquet: the IIDs load from the parquet, and the prune still applies
+# ---------------------------------------------------------------------------
+# The parquet IIDs carry a 'Q' prefix, so a row that matches proves the parquet was read.
+require parquet
+
+statement ok
+COPY (SELECT 'Q' || IID AS IID FROM read_psam('{TEST_DIR}/badhi/GROUP=lo/samples.psam')) TO '{TEST_DIR}/badhi/GROUP=lo/samples.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT 'Q' || IID AS IID FROM read_psam('{TEST_DIR}/badhi/GROUP=hi/samples.psam')) TO '{TEST_DIR}/badhi/GROUP=hi/samples.psam.parquet' (FORMAT parquet);
+
+# The same catalog, with the template naming the parquet .psam.
+statement ok
+COPY (SELECT replace(content, 'samples.psam"', 'samples.psam.parquet"') FROM read_text('{TEST_DIR}/badhi.pfile.json'))
+TO '{TEST_DIR}/badhi_pq.pfile.json' (FORMAT csv, header false, quote '');
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi_pq.pfile.json', orient := 'genotype') WHERE IID = 'QSAMP6';
+----
+data.pgen
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/badhi_pq.pfile.json', orient := 'genotype') WHERE IID = 'QSAMP2'
+          EXCEPT ALL
+          SELECT ID, 'Q' || IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'SAMP2')),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi_pq.pfile.json', orient := 'genotype') WHERE IID = 'QSAMP2');
+----
+0	3000
+
+# ---------------------------------------------------------------------------
 # A prepared parameter is not a constant at planning, so it prunes nothing
 # ---------------------------------------------------------------------------
 statement ok

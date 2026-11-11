@@ -432,5 +432,13 @@ Same fixture as §10.5 (10 × 4 grid, 30000 variants × 10000 samples), genotype
   hook. This is the `c.genotypes_by_sample WHERE IID = …` case. To prune it, the matrix read must
   move from bind to InitGlobal. That is a separate change.
 - Variant orient has no `IID` column. A sample filter there is `samples :=`.
+- A plain `combine_samples := 'concatenate'` / `'disjoint'` list prunes the same way, because the
+  gate is `IsConcat()`, not "from a catalog". There the scan skips the data reads, but bind still
+  opens every shard's `.pgen` header: stage 5 defers it only for a catalog.
+- A parquet `.psam` works when the catalog template names the `.psam.parquet`. A template that
+  names `samples.psam` reads the text file, even with a parquet companion beside it.
+- Side effect on `samples :=`: before, a count mismatch in an unselected sample block made the
+  read fail. Now that block is not opened, so the error shows only for a query that selects one of
+  its samples. This is the stage 5 rule ("a cell the query does not read is not checked").
 - Test: `test/sql/read_pfile_catalog_iid_prune.test`. Its fixture has a garbage `.pgen` in every
   cell of one sample block.

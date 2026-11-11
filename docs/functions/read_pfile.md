@@ -280,6 +280,13 @@ only the matching slice. Pushed predicates compose (intersect) with the `region`
 applied as a normal residual filter on the output, so results are always correct
 regardless of what the optimizer pushes.
 
+In `orient := 'genotype'` over sample shards (a catalog with more than one sample block, or a
+`combine_samples := 'concatenate'` / `'disjoint'` list), a `WHERE IID = '…'` or
+`WHERE IID IN (…)` narrows the sample set, as `samples := [...]` does. A shard that holds none of
+those IIDs is not read. A catalog read does not open its `.pgen` at all; a plain list still opens
+each header at bind. This does not apply with `af_range` or `ac_range`, which compute over the
+whole sample set, or in sample orient, which reads its genotypes at bind.
+
 ### Value Filters
 
 `af_range` and `ac_range` filter variants by allele frequency or count using fast genotype counting (no decompression). `include_genotypes` (and its numeric alias `genotype_range`) filters by hardcall category — in `variant` orient it sets non-matching values to NULL; in `genotype` and `sample` orient it drops non-matching rows, so a carrier query in `sample` orient materializes only the matching subjects. See [Common Parameters](../common-parameters.md).
