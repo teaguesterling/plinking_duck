@@ -386,7 +386,10 @@ struct PfileSource {
 	VariantMetadataIndex variants;
 
 	// pgenlib header: this file's variant count. raw_sample_ct is shared (PfileBindData).
+	// For a lazy_pgen cell (pgen_header_deferred), the count the catalog declares, until
+	// EnsureLazyVariants opens the header and checks it.
 	uint32_t raw_variant_ct = 0;
+	bool pgen_header_deferred = false;
 
 	// Effective variant list for this source (intersection of region + variant filter).
 	// When has_effective_variant_list is false, scan all raw_variant_ct sequentially.
@@ -535,6 +538,13 @@ struct PfileBindData : public TableFunctionData {
 	//! lazy_variants only: each source's declared genomic range (parallel to `sources`), for the
 	//! stage-4 pushdown_complex_filter hook, which drops sources a WHERE on CHROM/POS cannot reach.
 	vector<ShardEntry> source_ranges;
+	//! P13-006 §10.5 / stage 5: a lazy_variants read whose catalog declares the cells' counts also
+	//! leaves their .pgen headers unopened at bind. Bind takes each cell's counts from the catalog;
+	//! EnsureLazyVariants opens the header of each source that survives pruning and checks it against
+	//! them. Off under plinking_pgen_io := 'localize', which copies every .pgen at bind.
+	bool lazy_pgen = false;
+	string lazy_pgen_catalog_path;        //! for the count-check message
+	bool lazy_pgen_sample_extent = false; //! the catalog declares each cell's sample count (a v2 matrix)
 
 	// How multiple sources' sample sets combine (multi-file only).
 	CombineSamplesMode combine_samples = CombineSamplesMode::IMPLICIT;
@@ -863,13 +873,52 @@ static void LoadSourceVariants(ClientContext &context, PfileSource &src, const R
 	}
 }
 
+//! Open one .pgen header and return its counts. Routes the open through the VFS for a remote/VFS
+//! path (Path V). Called at bind, or at InitGlobal for a cell whose header open is deferred.
+static void ReadPgenHeaderCounts(ClientContext &context, const string &pgen_path, uint32_t &variant_ct_out,
+                                 uint32_t &sample_ct_out) {
+	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, pgen_path));
+	plink2::PgenFileInfo pgfi;
+	plink2::PreinitPgfi(&pgfi);
+	char errstr_buf[plink2::kPglErrstrBufBlen];
+	plink2::PgenHeaderCtrl header_ctrl;
+	uintptr_t pgfi_alloc_cacheline_ct = 0;
+
+	plink2::PglErr err = plink2::PgfiInitPhase1(pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX, &header_ctrl, &pgfi,
+	                                            &pgfi_alloc_cacheline_ct, errstr_buf);
+	if (err != plink2::kPglRetSuccess) {
+		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
+		plink2::CleanupPgfi(&pgfi, &cleanup_err);
+		throw IOException("read_pfile: failed to open '%s': %s", pgen_path, errstr_buf);
+	}
+
+	variant_ct_out = pgfi.raw_variant_ct;
+	sample_ct_out = pgfi.raw_sample_ct;
+
+	AlignedBuffer pgfi_alloc;
+	if (pgfi_alloc_cacheline_ct > 0) {
+		pgfi_alloc.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
+	}
+
+	uint32_t max_vrec_width = 0;
+	uintptr_t pgr_alloc_cacheline_ct = 0;
+	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct, &max_vrec_width, &pgfi,
+	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
+	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
+	plink2::CleanupPgfi(&pgfi, &cleanup_err);
+	if (err != plink2::kPglRetSuccess) {
+		throw IOException("read_pfile: failed to initialize '%s' (phase 2): %s", pgen_path, errstr_buf);
+	}
+}
+
 static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const string &prefix,
                                    const string &override_pgen, const string &override_pvar,
                                    const string &override_psam, bool need_psam, bool need_pvar,
                                    const RegionFilter &region, uint32_t &raw_sample_ct_out,
-                                   PgenLocalizeGuard &localize_guard, bool load_pvar = true) {
+                                   PgenLocalizeGuard &localize_guard, bool load_pvar = true, bool read_header = true) {
 	// need_pvar discovers the .pvar path; load_pvar also parses it now (false: a lazy_variants
-	// catalog read, whose EnsureLazyVariants parses it at InitGlobal).
+	// catalog read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
+	// .pgen header open too (a lazy_pgen catalog cell; see PfileBindData::lazy_pgen).
 	PfileSource src;
 	// Resolve explicit overrides against file_search_path too (keep the literal
 	// if not found, so downstream open produces the natural error message).
@@ -954,44 +1003,19 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 		}
 	}
 
+	if (!read_header) {
+		// A catalog cell whose counts the catalog declares: the caller sets them, and
+		// EnsureLazyVariants opens the header at InitGlobal if the scan keeps the cell.
+		D_ASSERT(!load_pvar);
+		return src;
+	}
+
 	// --- Read the .pgen header (counts) ---
 	// Under 'localize', materialize a local temp copy of this source's .pgen now
 	// (rewrites src.pgen_path in place) so the header and every later scan open read
 	// the native temp. No-op for other policies.
 	LocalizePgenIfRequested(context, src.pgen_path, localize_guard);
-	// Route the header open through the VFS for a remote/VFS path (Path V).
-	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, src.pgen_path));
-	plink2::PgenFileInfo pgfi;
-	plink2::PreinitPgfi(&pgfi);
-	char errstr_buf[plink2::kPglErrstrBufBlen];
-	plink2::PgenHeaderCtrl header_ctrl;
-	uintptr_t pgfi_alloc_cacheline_ct = 0;
-
-	plink2::PglErr err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX, &header_ctrl,
-	                                            &pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&pgfi, &cleanup_err);
-		throw IOException("read_pfile: failed to open '%s': %s", src.pgen_path, errstr_buf);
-	}
-
-	src.raw_variant_ct = pgfi.raw_variant_ct;
-	raw_sample_ct_out = pgfi.raw_sample_ct;
-
-	AlignedBuffer pgfi_alloc;
-	if (pgfi_alloc_cacheline_ct > 0) {
-		pgfi_alloc.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-	}
-
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct, &max_vrec_width, &pgfi,
-	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
-	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-	plink2::CleanupPgfi(&pgfi, &cleanup_err);
-	if (err != plink2::kPglRetSuccess) {
-		throw IOException("read_pfile: failed to initialize '%s' (phase 2): %s", src.pgen_path, errstr_buf);
-	}
+	ReadPgenHeaderCounts(context, src.pgen_path, src.raw_variant_ct, raw_sample_ct_out);
 
 	if (!need_pvar || !load_pvar) {
 		return src; // a later sample shard (header counts only), or a deferred .pvar parse
@@ -1830,6 +1854,12 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_data->lazy_variants =
 	    from_catalog && !bind_data->has_variant_filter &&
 	    (bind_data->orient_mode == OrientMode::VARIANT || bind_data->orient_mode == OrientMode::GENOTYPE);
+	// Stage 5: a cell's .pgen header waits for InitGlobal too, when the catalog declares the cell's
+	// variant count and its sample count is known without the header: declared (a v2 matrix), or
+	// shared with cell 0 (a v1 variant concat, whose cell 0 still opens here).
+	bind_data->lazy_pgen = bind_data->lazy_variants && grid.has_variant_extent && !PgenIoLocalizes(context);
+	bind_data->lazy_pgen_catalog_path = grid.path;
+	bind_data->lazy_pgen_sample_extent = grid.has_sample_extent;
 
 	// --- Build sources (one per prefix) ---
 	bind_timer.Note("resolving %llu source(s)", (unsigned long long)prefixes.size());
@@ -1859,9 +1889,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 		// A lazy_variants read still DISCOVERS the .pvar path here (a v1 entry may omit "pvar"), and
 		// only defers the parse.
-		PfileSource src =
-		    LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam, need_pvar,
-		                    bind_data->region, src_sample_ct, bind_data->localize_guard, !bind_data->lazy_variants);
+		const bool defer_header = bind_data->lazy_pgen && (grid.has_sample_extent || (!concat && si > 0));
+		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
+		                                  need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard,
+		                                  !bind_data->lazy_variants, !defer_header);
+		if (defer_header) {
+			const auto &cell = grid.cells[si];
+			src.pgen_header_deferred = true;
+			src.raw_variant_ct = static_cast<uint32_t>(cell.variant_stop - cell.variant_start);
+			src_sample_ct = grid.has_sample_extent ? static_cast<uint32_t>(cell.sample_stop - cell.sample_start)
+			                                       : bind_data->raw_sample_ct;
+		}
 
 		if (from_catalog) {
 			// The cell's .pgen must hold exactly the extents its blocks declare.
@@ -3367,6 +3405,35 @@ static void ApplyResidualFilters(ClientContext &context, optional_ptr<TableFilte
 static constexpr uint32_t MULTI_VARIANT_SUBBATCH = 1000;
 static constexpr uint32_t MULTI_GENOTYPE_SUBBATCH = 64;
 
+//! Stage 5: open the .pgen header of each cell of source `src_idx` (one per sample shard in a
+//! matrix) and check it holds the counts bind took from the catalog. The same checks bind runs on
+//! a cell it opens, with the same messages. Re-runs on each InitGlobal until the load succeeds.
+static void CheckDeferredPgenHeaders(ClientContext &context, const PfileBindData &bind_data, idx_t src_idx) {
+	const auto &src = bind_data.sources[src_idx];
+	const vector<PgenSampleShard> shards =
+	    bind_data.IsConcat() ? bind_data.ShardsFor(src_idx) : vector<PgenSampleShard>();
+	const idx_t n = bind_data.IsConcat() ? shards.size() : 1;
+	for (idx_t k = 0; k < n; k++) {
+		const string &path = bind_data.IsConcat() ? shards[k].pgen_path : src.pgen_path;
+		const uint32_t declared_samples = bind_data.IsConcat() ? shards[k].raw_sample_ct : bind_data.raw_sample_ct;
+		uint32_t variant_ct = 0;
+		uint32_t sample_ct = 0;
+		ReadPgenHeaderCounts(context, path, variant_ct, sample_ct);
+		if (variant_ct != src.raw_variant_ct || (bind_data.lazy_pgen_sample_extent && sample_ct != declared_samples)) {
+			throw InvalidInputException(
+			    "read_pfile: catalog '%s': cell '%s' holds %u variants x %u samples, but its blocks declare %u "
+			    "variants x %u samples",
+			    bind_data.lazy_pgen_catalog_path, path, variant_ct, sample_ct, src.raw_variant_ct, declared_samples);
+		}
+		if (sample_ct != declared_samples) {
+			throw InvalidInputException(
+			    "read_pfile: sample count mismatch across files: '%s' has %u samples, but expected %u "
+			    "(the first cell of catalog '%s'). All listed pfiles must share the same samples.",
+			    path, sample_ct, declared_samples, bind_data.lazy_pgen_catalog_path);
+		}
+	}
+}
+
 //! The deferred half of a lazy_variants bind: load every source's .pvar, apply region and
 //! variant_range, and rebuild variant_offsets. Runs once per bind data, under its lock; a failed
 //! load leaves it unloaded, so a re-execution reports the same error. The bind data is const in
@@ -3380,7 +3447,11 @@ static void EnsureLazyVariants(ClientContext &context, const PfileBindData &bind
 		return;
 	}
 	auto &bind_data = const_cast<PfileBindData &>(bind_data_c);
-	for (auto &src : bind_data.sources) {
+	for (idx_t src_idx = 0; src_idx < bind_data.sources.size(); src_idx++) {
+		auto &src = bind_data.sources[src_idx];
+		if (src.pgen_header_deferred) {
+			CheckDeferredPgenHeaders(context, bind_data, src_idx);
+		}
 		src.has_effective_variant_list = false;
 		src.effective_variant_indices.clear();
 		LoadSourceVariants(context, src, bind_data.region);

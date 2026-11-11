@@ -17,6 +17,10 @@ namespace duckdb {
 //! LocalizePgenIfRequested). Pure: no I/O, safe to call more than once.
 bool PgenIoUseVfs(ClientContext &context, const string &pgen_path);
 
+//! Whether `plinking_pgen_io == 'localize'`: every .pgen is copied to a local temp at bind
+//! (LocalizePgenIfRequested), so a reader must not defer that bind-time open.
+bool PgenIoLocalizes(ClientContext &context);
+
 //! RAII owner of localized (downloaded-to-local-temp) .pgen copies. Lives as a
 //! bind_data member so the temps survive the whole query and are unlinked when the
 //! bind data is destroyed (per-query temp lifecycle). Move-only: two owners must

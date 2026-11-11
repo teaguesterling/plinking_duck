@@ -1,0 +1,202 @@
+# name: test/sql/read_pfile_catalog_lazy_pgen.test
+# description: read_pfile(catalog :=) takes each cell's counts from the catalog at bind, and opens a cell's .pgen only if the scan keeps it
+# group: [sql]
+
+require plinking_duck
+
+# P13-006 §10.5 / stage 5. Bind opened every cell's .pgen header to read two counts that the
+# catalog already declares, so a WHERE could not skip the open. Now a lazy read (variant or
+# genotype orient, no variants :=) takes the counts from the catalog, and InitGlobal opens the
+# .pgen of each cell that survives pruning, and checks it against those counts. Proof: a cell
+# with a garbage .pgen binds (DESCRIBE succeeds), a WHERE that prunes it succeeds, and a read that
+# keeps it errors. The oracle is large_example (3000 variants x 8 samples, CHROM 1/2/3 x 1000).
+statement ok
+SET threads = 4;
+
+# Clean 3 x 2 matrix (CHROM blocks x {lo: SAMP1-4, hi: SAMP5-8}).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# bad: cell (CHROM=2, hi) has a garbage .pgen. bad0: cell (CHROM=1, lo), the first cell, does.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad/CHROM=2/GROUP=hi/data.pgen' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad0' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad0/CHROM=1/GROUP=lo/data.pgen' (FORMAT csv, header false);
+
+# v1 shard_by: shard CHROM=2 (not the first shard) has a garbage .pgen.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/badvs' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badvs/CHROM=2/data.pgen' (FORMAT csv, header false);
+
+# ---------------------------------------------------------------------------
+# Bind does not open a cell's .pgen; the scan opens only the cells it keeps
+# ---------------------------------------------------------------------------
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json');
+
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/bad0.pfile.json', orient := 'genotype');
+
+# The corruption is real: a read that keeps the cell errors, and names its .pgen.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json');
+----
+data.pgen
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '2';
+----
+data.pgen
+
+# A WHERE that prunes the cell never opens it.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM IN ('1', '3')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example') WHERE CHROM IN ('1', '3'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM IN ('1', '3'));
+----
+0	2000
+
+# The first cell is deferred too.
+query I
+SELECT count(*) FROM (
+  SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/bad0.pfile.json', orient := 'genotype') WHERE CHROM = '3'
+  EXCEPT ALL
+  SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '3');
+----
+0
+
+# Through the ATTACH view.
+statement ok
+ATTACH '{TEST_DIR}/bad.pfile.json' AS c (TYPE pfile_catalog);
+
+query I
+SELECT count(*) FROM c.genotypes WHERE CHROM = '1';
+----
+1000
+
+# v1 shard_by: a later shard is deferred.
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/badvs.pfile.json');
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badvs.pfile.json') WHERE CHROM = '3';
+----
+1000
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badvs.pfile.json');
+----
+data.pgen
+
+# A prepared statement opens the cells again on each run.
+statement ok
+PREPARE p AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '3';
+
+query I
+EXECUTE p;
+----
+1000
+
+query I
+EXECUTE p;
+----
+1000
+
+# ---------------------------------------------------------------------------
+# The counts the catalog declares are still checked, now when the cell opens
+# ---------------------------------------------------------------------------
+# mmv: cell (CHROM=2, hi) holds 10 variants, but its block declares 1000.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mmv' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', samples := [4, 5, 6, 7], genotypes := 'struct') WHERE CHROM = '2' ORDER BY POS LIMIT 10)
+TO '{TEST_DIR}/mmv/CHROM=2/GROUP=hi/data' (FORMAT pfile, force true);
+
+# mms: cell (CHROM=2, hi) holds 3 samples, but its block declares 4.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mms' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', samples := [4, 5, 6], genotypes := 'struct') WHERE CHROM = '2' ORDER BY POS)
+TO '{TEST_DIR}/mms/CHROM=2/GROUP=hi/data' (FORMAT pfile, force true);
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mmv.pfile.json');
+----
+but its blocks declare 1000 variants x 4 samples
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mms.pfile.json', orient := 'genotype');
+----
+but its blocks declare 1000 variants x 4 samples
+
+# A pruned cell is not checked (it is not read).
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mmv.pfile.json') WHERE CHROM = '1';
+----
+1000
+
+# Sample orient reads every cell at bind, so it checks every cell there.
+statement error
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/mmv.pfile.json', orient := 'sample');
+----
+but its blocks declare 1000 variants x 4 samples
+
+# ---------------------------------------------------------------------------
+# Results equal the full read
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json'));
+----
+0	3000
+
+query I
+SELECT count(*) FROM (
+  SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', samples := [1, 6])
+  EXCEPT ALL
+  SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', samples := [1, 6]));
+----
+0
+
+# plinking_pgen_io := 'localize' copies each .pgen at bind, so it keeps the bind-time open.
+statement ok
+SET plinking_pgen_io = 'localize';
+
+query I
+SELECT count(*) FROM (
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE CHROM = '2'
+  EXCEPT ALL
+  SELECT ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example') WHERE CHROM = '2');
+----
+0
+
+# The pruned cell is still copied and opened at bind (the error names its local temp copy).
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '1';
+----
+is not a .pgen file
+
+statement ok
+RESET plinking_pgen_io;

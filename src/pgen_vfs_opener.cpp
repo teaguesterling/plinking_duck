@@ -104,6 +104,10 @@ static string PgenIoPolicy(ClientContext &context) {
 	return policy;
 }
 
+bool PgenIoLocalizes(ClientContext &context) {
+	return PgenIoPolicy(context) == "localize";
+}
+
 bool PgenIoUseVfs(ClientContext &context, const string &pgen_path) {
 	string policy = PgenIoPolicy(context);
 	if (policy == "vfs") {
