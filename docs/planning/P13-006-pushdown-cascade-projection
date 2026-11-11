@@ -24,7 +24,8 @@ writer path is now **P13-007** (penciled, separate).
       (#103) defers that open, so a `WHERE` now skips it too (§10.6).
 - [x] Sample-axis prune: in genotype orient, a `WHERE` on `IID` skips the sample blocks it cannot
       reach (§10.7), 2026-11-10. Sample orient `genotypes := 'counts'` / `'stats'` too (§10.9),
-      2026-11-11. Sample orient's per-element modes are not done: they read the matrix at bind.
+      2026-11-11. Sample orient's per-element modes too (§10.10), 2026-11-11: their matrix fill
+      waits for InitGlobal.
 - [x] Bind takes a catalog cell's paths as written, with no existence check (§10.8), 2026-11-11.
       A remote catalog with relative paths could not be read at all before #106.
 
@@ -508,3 +509,40 @@ ecab5ed) and this change. In each case the result is the same before and after.
 - `DESCRIBE` of a counts/stats catalog read now opens no `.pgen`. A bad cell shows when the query runs.
 - **Not done: the per-element modes** (array, list, struct, columns). They read the matrix at bind,
   before the planner calls the hook. This is the `c.genotypes_by_sample WHERE IID = …` case.
+  §10.10 does it.
+
+### 10.10 Measured (2026-11-11): the IID prune in sample orient, per-element modes
+
+The per-element modes (array, list, struct, columns, also with `phased` or `dosages`) read every
+genotype into a matrix. Bind did that fill, before the planner calls the hook, so a `WHERE` on `IID`
+could not reduce it. The fill is now `FillSampleMatrix`. For a catalog read with no filter parameter
+(`smp_headers_at_init`, now for every genotypes mode), `EnsureLazyVariants` calls it at InitGlobal,
+after the header checks. The matrix then holds only the samples that the hook kept. With a filter
+parameter, bind still fills the matrix, as before: the count filter decides the variants over every
+sample at bind, so every cell is open anyway.
+
+Three behaviours move from bind to InitGlobal, for a catalog read with no filter parameter only:
+
+- `DESCRIBE` opens no `.pgen`. A bad or mismatched cell shows when the query runs. A missing cell
+  `.pvar` still errors at bind, and it is now the file the error names (the `.pgen` was first before).
+- **`plinking_max_matrix_elements` applies to the pruned matrix.** A `WHERE IID` that keeps one
+  sample of a cohort too large for the limit now runs. The check still runs before the fill
+  allocates. A `DESCRIBE` of a read over the limit no longer errors. A plain (non-catalog) read
+  keeps the check at bind.
+- A prepared statement fills the matrix once (the `lazy_variants_loaded` flag), from the narrowed
+  sample set.
+
+Same fixture as §10.5, 4 threads. The builds are 7e941b1 (#108, same reader as main at b0ceded) and
+this change. In each case the result is the same before and after. Peak RSS is `/usr/bin/time -f %M`,
+one run.
+
+| Case | `.pgen` distinct / opens, before | after | time, before | after | peak RSS, before | after |
+|---|---|---|---|---|---|---|
+| array, `WHERE IID = 'S02501'` | 40 / 80 | 10 / 20 | 2.58–2.73 s | 0.11–0.13 s | 587 MB | 54 MB |
+| list, `WHERE IID IN (2 blocks)` | 40 / 80 | 20 / 40 | 2.60–2.66 s | 0.13–0.14 s | | |
+| array, `samples := ['S02501']` | 40 / 50 | 10 / 20 | 0.121 s mean | 0.118 s mean | 52 MB | 53 MB |
+
+The `samples :=` row is 10 runs each; the first 3-run sample showed 0.095 s against 0.12 s, which
+10 runs did not reproduce. The array `WHERE` case took 1.65 s on the same reader in §10.9, against
+2.58 s here. I (Claude) did not find the cause; I infer host load, because the reader is unchanged.
+The after/before ratio comes from one session, back to back.

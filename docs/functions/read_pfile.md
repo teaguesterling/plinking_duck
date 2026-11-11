@@ -105,7 +105,7 @@ In sample orient mode, each row represents one sample. The genotypes array conta
 
 **Aggregate output** (`genotypes := 'counts'` or `'stats'`) replaces the array with a per-sample summary STRUCT — how many `hom_ref` / `het` / `hom_alt` / `missing` genotypes that sample has across the variant range (`stats` adds `n`, `af`, `maf`, `missing_rate`, `carrier_count`, `het_rate`). These modes **stream** (they do not materialize the variants × samples matrix), so they are not bounded by `plinking_max_matrix_elements` and are the fast path for per-individual **carrier counting** over large variant ranges. See [Performance](../guides/optimizations.md#per-sample-counts-carrier-finding).
 
-The array/list/struct/columns modes pre-read the genotype matrix at bind time (bounded by `plinking_max_matrix_elements`, default 16 G elements).
+The array/list/struct/columns modes pre-read the genotype matrix (bounded by `plinking_max_matrix_elements`, default 16 G elements). They do it at bind, except for a catalog read with no `af_range`, `ac_range`, `include_genotypes` or `genotype_range`: that read fills the matrix when the query starts, after a `WHERE IID` narrows the samples, and checks the limit against the narrowed matrix.
 
 ## Description
 
@@ -285,10 +285,11 @@ In `orient := 'genotype'` over sample shards (a catalog with more than one sampl
 `WHERE IID IN (…)` narrows the sample set, as `samples := [...]` does. A shard that holds none of
 those IIDs is not read. A catalog read does not open its `.pgen` at all; a plain list still opens
 each header at bind. This does not apply with `af_range` or `ac_range`, which compute over the
-whole sample set. In `orient := 'sample'`, it applies only to a catalog read with
-`genotypes := 'counts'` or `'stats'`, and no `af_range`, `ac_range`, `include_genotypes` or
-`genotype_range`. The other sample-orient modes read every genotype at bind, so they read every
-shard.
+whole sample set. In `orient := 'sample'`, it applies only to a catalog read with no `af_range`,
+`ac_range`, `include_genotypes` or `genotype_range`. For such a read, the array, list, struct and
+columns modes read the genotype matrix when the query starts, after the prune, so the matrix holds
+only the selected samples. With one of those filters, sample orient reads every genotype at bind,
+so it reads every shard.
 
 ### Value Filters
 
@@ -300,7 +301,7 @@ Genotype decoding is skipped when genotype columns (`genotypes` or `genotype`) a
 
 ### Parallel Scan
 
-Default mode uses multi-threaded parallel scanning. Genotype orient mode is single-threaded because it expands each variant into multiple rows (one per sample). Sample orient mode is single-threaded (all genotypes are pre-read at bind time).
+Default mode uses multi-threaded parallel scanning. Genotype orient mode is single-threaded because it expands each variant into multiple rows (one per sample). Sample orient mode is single-threaded (all genotypes are pre-read before the scan).
 
 ## Examples
 

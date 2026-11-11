@@ -83,11 +83,12 @@ SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gonepvar.pfile.json');
 ----
 gone.pvar
 
-# Sample orient reads every cell at bind, so the error shows at bind.
+# Sample orient parses every cell's .pvar at bind (the schema needs the variant count), so the
+# error shows at bind. Its .pgen headers wait for InitGlobal, so the .pvar is the file it names.
 statement error
 DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json', orient := 'sample');
 ----
-gone.pgen
+gone.pvar
 
 # A version 1 catalog's first cell still opens at bind (it gives the sample count).
 statement ok

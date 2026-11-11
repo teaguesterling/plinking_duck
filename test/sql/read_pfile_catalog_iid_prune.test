@@ -318,9 +318,119 @@ SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', 
 data.pgen
 
 # ---------------------------------------------------------------------------
-# Out of scope: variant orient has no IID column, and sample orient's per-element modes read their matrix at bind
+# Sample orient, per-element modes: the matrix fill waits for InitGlobal, so the same prune applies
 # ---------------------------------------------------------------------------
+# Before this, bind read the whole matrix (every cell), so this errored on a 'hi' data.pgen.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP2'
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample') WHERE IID = 'SAMP2')),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP2');
+----
+0	1
+
 statement error
-SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP2';
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP6';
 ----
 data.pgen
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'list') WHERE IID IN ('SAMP1', 'SAMP4')
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'list') WHERE IID IN ('SAMP1', 'SAMP4'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'list') WHERE IID IN ('SAMP1', 'SAMP4'));
+----
+0	2
+
+# Phased: each matrix row holds two alleles per sample, so the pruned (narrower) matrix must index right.
+query I
+SELECT count(*) FROM (
+  SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', phased := true) WHERE IID IN ('SAMP2', 'SAMP3')
+  EXCEPT ALL
+  SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample', phased := true) WHERE IID IN ('SAMP2', 'SAMP3'));
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'struct') WHERE IID = 'SAMP3'
+  EXCEPT ALL
+  SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'struct') WHERE IID = 'SAMP3');
+----
+0
+
+# Columns mode: compare one variant column by name.
+query I
+SELECT count(*) FROM (
+  SELECT IID, "var2" FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', genotypes := 'columns') WHERE IID = 'SAMP4'
+  EXCEPT ALL
+  SELECT IID, "var2" FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns') WHERE IID = 'SAMP4');
+----
+0
+
+# The ATTACH view of a matrix is this read.
+statement ok
+ATTACH '{TEST_DIR}/badhi.pfile.json' AS bh (TYPE pfile_catalog);
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM bh.genotypes_by_sample WHERE IID = 'SAMP2'
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample') WHERE IID = 'SAMP2')),
+       (SELECT count(*) FROM bh.genotypes_by_sample WHERE IID = 'SAMP2');
+----
+0	1
+
+statement error
+SELECT IID FROM bh.genotypes_by_sample WHERE IID = 'SAMP7';
+----
+data.pgen
+
+statement ok
+DETACH bh;
+
+# A prepared statement fills the matrix once, from the narrowed sample set.
+statement ok
+PREPARE pa AS SELECT count(*), bool_and(len(genotypes) = 3000) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP1';
+
+query II
+EXECUTE pa;
+----
+1	true
+
+query II
+EXECUTE pa;
+----
+1	true
+
+# DESCRIBE opens no .pgen.
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample');
+
+# plinking_max_matrix_elements applies to the pruned matrix: one sample x 3000 variants fits under
+# 10000, four samples do not. The check runs at InitGlobal, before the fill allocates.
+statement ok
+SET plinking_max_matrix_elements = 10000;
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample') WHERE IID = 'SAMP2';
+----
+1
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample') WHERE IID IN ('SAMP1', 'SAMP2', 'SAMP3', 'SAMP4');
+----
+would require 12000 genotype values
+
+statement ok
+RESET plinking_max_matrix_elements;
+
+# Not pruned: a genotype filter decides the variants at bind over every cell, as for counts.
+statement error
+SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', include_genotypes := ['het']) WHERE IID = 'SAMP2';
+----
+data.pgen
+
+# Out of scope: variant orient has no IID column, so a WHERE there cannot name a sample block.
