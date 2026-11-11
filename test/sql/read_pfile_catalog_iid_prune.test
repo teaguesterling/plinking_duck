@@ -361,6 +361,32 @@ SELECT count(*) FROM (
 ----
 0
 
+# Dosages: a separate matrix (dosage_matrix) and scan path.
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', dosages := true) WHERE IID IN ('SAMP1', 'SAMP4')
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample', dosages := true) WHERE IID IN ('SAMP1', 'SAMP4'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'sample', dosages := true) WHERE IID IN ('SAMP1', 'SAMP4'));
+----
+0	2
+
+# localize copies every .pgen at bind (no deferred header); the deferred fill reads the copies.
+statement ok
+SET plinking_pgen_io = 'localize';
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample') WHERE IID = 'SAMP6'
+          EXCEPT ALL
+          SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample') WHERE IID = 'SAMP6')),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample') WHERE IID = 'SAMP6');
+----
+0	1
+
+statement ok
+RESET plinking_pgen_io;
+
 # Columns mode: compare one variant column by name.
 query I
 SELECT count(*) FROM (
