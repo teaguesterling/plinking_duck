@@ -154,9 +154,19 @@ SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mmv.pfile.json') WHERE CH
 ----
 1000
 
-# Sample orient reads every cell at bind, so it checks every cell there.
-statement error
+# Sample orient with no filter checks each cell's header at InitGlobal, not at bind: DESCRIBE opens
+# no .pgen, and the scan checks every cell that it reads.
+statement ok
 DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/mmv.pfile.json', orient := 'sample');
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mmv.pfile.json', orient := 'sample');
+----
+but its blocks declare 1000 variants x 4 samples
+
+# A filter parameter reads genotypes at bind, so there it checks every cell at bind.
+statement error
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/mmv.pfile.json', orient := 'sample', include_genotypes := ['het']);
 ----
 but its blocks declare 1000 variants x 4 samples
 
