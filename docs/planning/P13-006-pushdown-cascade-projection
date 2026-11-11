@@ -11,15 +11,16 @@ writer path is now **P13-007** (penciled, separate).
 
 ## Status
 
-- [ ] Owner decision A1: cascade mechanism — **recommend B, a `catalog :=` input on the existing
-      readers** (covers every orientation + genotype shape); A2 (uniform backing) folds into it (§3)
-- [ ] Spike: a reader with a `catalog :=` input prunes its sources from pushed filters via
-      `pushdown_complex_filter` (so cell-skip reflects the `WHERE`, not just explicit params) (§4)
+- [x] Owner decision A1: cascade mechanism — B, a `catalog :=` input on `read_pfile` (§3). Decided
+      2026-11-09.
+- [x] Pruning from pushed filters via `pushdown_complex_filter` (§4): §10.4 stages 1–4, PRs #92,
+      #96, #97 (landed through #99), #98 (landed through #100).
 - [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing`/`hardy` count kernels (§5)
-- [ ] Implementation plan + build + review
 - [x] Refresh against current `read_pfile` (post #84/#85/#86), 2026-11-09 — §10. It changes the
       §4 spike (the hook runs AFTER bind), adds a prerequisite (§10.2, a 2-D read), and puts a new
-      owner fork: §10.4, **(i) lazy bind** vs **(ii) catalog-at-bind**.
+      owner fork: §10.4. The owner chose **(i) lazy bind** on 2026-11-09.
+- [x] §7 step 5, measured on a 10 × 4 grid, 2026-11-10 — §10.5. A `WHERE` skips each pruned
+      cell's `.pvar` and genotype reads. Bind still opens every cell's `.pgen` header.
 
 ## The gap
 
@@ -312,3 +313,56 @@ Only stage 4 delivers the doc's headline (a `WHERE` on `c.genotypes` skips cells
 each correct and shippable alone. If the owner wants the smallest path, stop after stage 2: that is
 (ii).
 
+
+### 10.5 Measured (2026-11-10): what a `WHERE` skips on a 10 × 4 grid
+
+**Fixture.** `wes_chr10` (30000 variants × 10000 samples), written as a matrix: 10 variant blocks
+(a synthetic CHROM `1`..`10`, one per POS decile, 3000 variants each) × 4 sample blocks of 2500.
+That is 40 cells, 12 MB. The catalog read equals the source: 30000 rows, and `EXCEPT ALL` against
+`read_pfile('test/data/wes_chr10')` gives 0 rows.
+
+```sql
+COPY (SELECT * REPLACE ((1 + (row_number() OVER (ORDER BY POS) - 1) * 10 // 30000)::VARCHAR AS CHROM)
+      FROM read_pfile('test/data/wes_chr10', genotypes := 'struct') ORDER BY POS)
+TO 'grid' (FORMAT pfile, shard_by 'CHROM', shard_samples {g0: [...2500 IIDs], g1: [...], g2: [...], g3: [...]});
+```
+
+**Method.** Each case is a fresh `duckdb` CLI process with `SET threads = 4`, run by Slurm
+(`-c 8`, partition `ci`) on longbottom. The build is bea7e6a, whose source tree equals main at
+95d84b5. Each case has 9 timed runs, and the table gives the median. One more run under
+`strace -f -e trace=openat` counts the files the process opened. The query is `SELECT count(*), max(genotypes[1]) FROM … <WHERE>`, so every surviving row
+is decoded. The local disk is warm (page cache). Time is the median minus the 82 ms of a
+`SELECT 1` process (start, plus `LOAD`).
+
+The no-pruning baseline is `WHERE hash(CHROM) = hash('3')`. It selects the same 3000 rows, but the
+hook cannot translate it. Do not use `CHROM || '' = '3'` as a baseline. The optimizer folds it to
+`CHROM = '3'` before the hook runs (`EXPLAIN` shows `Filters: CHROM = '3'`), so it prunes.
+
+| Case | Rows | Time, ms (net) | `.pgen` distinct / opens | `.pvar` opened |
+|---|---|---|---|---|
+| bind only (`DESCRIBE`) | — | 4 | 40 / 40 | 0 |
+| no `WHERE` | 30000 | 122 | 40 / 164 | 10 |
+| `WHERE hash(CHROM) = hash('3')` (no pruning) | 3000 | 172 | 40 / 160 | 10 |
+| `WHERE CHROM = '3'` | 3000 | 31 | 40 / 56 | 1 |
+| `WHERE CHROM IN ('3', '7')` | 6000 | 53 | 40 / 64 | 2 |
+| `region := '3'` (stage 2, at bind) | 3000 | 28 | 4 / 20 | 1 |
+| ATTACH `c.genotypes WHERE hash(CHROM) = hash('3')` | 3000 | 202 | 40 / 152 | 10 |
+| ATTACH `c.genotypes WHERE CHROM = '3'` | 3000 | 41 | 40 / 56 | 1 |
+
+**What this shows.**
+
+- A `WHERE` on CHROM prunes as well as `region :=` does: 31 ms against 28 ms, at 1 `.pvar` each.
+  Against the no-pruning baseline, it is 5.5 times less work (172 → 31 ms), and 4.9 times less
+  through the ATTACH view (202 → 41 ms). This is the doc's headline, measured.
+- **A `WHERE` does not skip the `.pgen` open.** Bind opens all 40 `.pgen` files, even for
+  `DESCRIBE`. `LoadPfileSource` (`pfile_reader.cpp:970`, `PgfiInitPhase1`/`Phase2`) reads only two
+  counts from each header, `raw_variant_ct` and `raw_sample_ct`. The hook runs after bind, so it
+  cannot take those opens back. `region :=` prunes before the bind loop, so it opens 4.
+- On local disk the 40 header opens cost about 4 ms. On a remote store each open is at least one
+  ranged GET, so I expect it to matter there. This is inferred: I did not measure a remote catalog.
+- The other `.pgen` opens are scan opens, one per reader per cell. 16 extra opens for one variant
+  block × 4 sample blocks at 4 threads matches "K `.pgen` files per variant block per thread".
+
+**Not measured.** A remote catalog; more than one machine; cold cache; sample orient; a larger
+grid. The absolute times are small, because the fixture is 12 MB. The ratios and the open counts
+are the result, not the milliseconds.
