@@ -200,3 +200,33 @@ is not a .pgen file
 
 statement ok
 RESET plinking_pgen_io;
+
+# ---------------------------------------------------------------------------
+# The deferred header open goes through DuckDB's VFS when the policy says so
+# ---------------------------------------------------------------------------
+# plinking_pgen_io := 'vfs' routes every .pgen open through the VFS (the path a remote catalog
+# takes), including the header open that now runs at InitGlobal.
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '3';
+----
+1000
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '2';
+----
+data.pgen
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json'));
+----
+0	3000
+
+statement ok
+RESET plinking_pgen_io;
