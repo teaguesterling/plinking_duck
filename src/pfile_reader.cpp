@@ -915,10 +915,13 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
                                    const string &override_pgen, const string &override_pvar,
                                    const string &override_psam, bool need_psam, bool need_pvar,
                                    const RegionFilter &region, uint32_t &raw_sample_ct_out,
-                                   PgenLocalizeGuard &localize_guard, bool load_pvar = true, bool read_header = true) {
+                                   PgenLocalizeGuard &localize_guard, bool load_pvar = true, bool read_header = true,
+                                   bool resolve_overrides = true) {
 	// need_pvar discovers the .pvar path; load_pvar also parses it now (false: a lazy_variants
 	// catalog read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
 	// .pgen header open too (a lazy_pgen catalog cell; see PfileBindData::lazy_pgen).
+	// resolve_overrides = false takes the given paths as written, with no existence check (a catalog
+	// cell: the catalog names absolute paths, and each check is a HEAD request on a remote store).
 	PfileSource src;
 	// Resolve explicit overrides against file_search_path too (keep the literal
 	// if not found, so downstream open produces the natural error message).
@@ -926,7 +929,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	src.pvar_path = override_pvar;
 	src.psam_path = override_psam;
 	for (auto *p : {&src.pgen_path, &src.pvar_path, &src.psam_path}) {
-		if (!p->empty()) {
+		if (resolve_overrides && !p->empty()) {
 			auto resolved = ResolveExistingPath(context, fs, *p);
 			if (!resolved.empty()) {
 				*p = resolved;
@@ -1879,7 +1882,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		bool need_pvar = !(concat && sb > 0);
 		string elem_pgen, elem_pvar, elem_psam;
 		if (from_catalog) {
-			// The cell's template-resolved companions (a cell has no sibling .pvar/.psam).
+			// The cell's resolved paths, taken as written: a kept cell's missing file errors when it
+			// opens; a pruned cell is never checked. A v1 entry that omits "pvar" still discovers it.
+			const string &cell_prefix = prefixes[si];
+			elem_pgen = StringUtil::EndsWith(cell_prefix, ".pgen") ? cell_prefix : cell_prefix + ".pgen";
 			elem_pvar = need_pvar ? grid.cells[si].pvar : string();
 			elem_psam = need_psam ? grid.cells[si].psam : string();
 		} else if (si == 0) {
@@ -1892,7 +1898,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		const bool defer_header = bind_data->lazy_pgen && (grid.has_sample_extent || (!concat && si > 0));
 		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
 		                                  need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard,
-		                                  !bind_data->lazy_variants, !defer_header);
+		                                  !bind_data->lazy_variants, !defer_header, !from_catalog);
 		if (defer_header) {
 			const auto &cell = grid.cells[si];
 			src.pgen_header_deferred = true;

@@ -24,6 +24,8 @@ writer path is now **P13-007** (penciled, separate).
       (#103) defers that open, so a `WHERE` now skips it too (§10.6).
 - [x] Sample-axis prune: in genotype orient, a `WHERE` on `IID` skips the sample blocks it cannot
       reach (§10.7), 2026-11-10. Sample orient is not done: it reads its matrix at bind.
+- [x] Bind takes a catalog cell's paths as written, with no existence check (§10.8), 2026-11-11.
+      A remote catalog with relative paths could not be read at all before #106.
 
 ## The gap
 
@@ -390,10 +392,9 @@ strace run per case.
 - In each case, `count(*)` and `max(genotypes[1])` are the same as on main.
 - Local time is unchanged. In an interleaved A/B (11 rounds, the order alternating each round),
   every median delta is within ±11 ms, and the ranges overlap.
-- **Still at bind: the existence checks.** Path discovery stats each cell's files. A pruned query
-  does 54 stats on cell files (40 `.pgen`, 10 `.pvar`, 4 `.psam`). `region := '3'` does 9. Both
-  also stat the catalog once. On httpfs each stat is a HEAD request. This is the next gap for a
-  remote catalog, and it is not measured.
+- **Still at bind: the existence checks** (fixed, §10.8). Path discovery stats each cell's files.
+  A pruned query does 54 stats on cell files (40 `.pgen`, 10 `.pvar`, 4 `.psam`). `region := '3'`
+  does 9. Both also stat the catalog once. On httpfs each stat is a HEAD request.
 - Exceptions that keep the bind-time open: a version 1 catalog's first cell (it gives the sample
   count), and `plinking_pgen_io := 'localize'` (it copies every `.pgen` at bind).
 
@@ -442,3 +443,33 @@ Same fixture as §10.5 (10 × 4 grid, 30000 variants × 10000 samples), genotype
   its samples. This is the stage 5 rule ("a cell the query does not read is not checked").
 - Test: `test/sql/read_pfile_catalog_iid_prune.test`. Its fixture has a garbage `.pgen` in every
   cell of one sample block.
+
+### 10.8 Measured (2026-11-11): bind no longer checks that a cell's files exist
+
+Bind ran path discovery on each catalog cell: `ResolveExistingPath` on the `.pgen`, `.pvar` and
+`.psam`. Each is a stat locally and a HEAD request on httpfs. A catalog names absolute paths, so
+bind now takes them as written (`LoadPfileSource(..., resolve_overrides = false)`). A kept cell's
+missing file errors when the scan opens it, and names the file. A pruned cell is never checked.
+
+**A prerequisite bug (#106).** No remote catalog with relative paths could be read. The path
+resolver treated `http://host/x.pfile.json` as a relative local path: `<cwd>/http:/host/...`.
+
+**Method.** A local HTTP server that serves Range requests and logs each request
+(`benchmarks/http_range_server.py`), the 10 × 4 grid of §10.5, 4 threads, the HTTP metadata cache off. The dev
+build cannot load the released httpfs. So the release v2.0.0 CLI (the same DuckDB commit,
+d54cbbe3df) loads this build with `allow_extensions_metadata_mismatch`.
+
+| Case | HEAD, #106 only | after | `.pgen` files fetched | result |
+|---|---|---|---|---|
+| `DESCRIBE` | 55 | 5 | 0 | same |
+| `WHERE CHROM = '3'` | 55 | 10 | 4 | same |
+| `region := '3'` | 10 | 10 | 4 | same |
+| genotype orient `WHERE IID = … AND CHROM = '3'` | 55 | 7 | 1 | same |
+
+- A pruned `WHERE` now sends the same requests as the equivalent `region :=`.
+- The HEADs left are the catalog, the four `.psam` files bind reads, and httpfs opening each file
+  the scan reads.
+- Locally, a pruned query stats no cell file at bind (was 54).
+- Not measured: a real object store (S3 latency per request), a larger grid, `cache_httpfs`.
+- Test: `test/sql/read_pfile_catalog_bind_stats.test`. A catalog names a fileset that does not
+  exist. A query that prunes it succeeds; one that keeps it errors and names the file.

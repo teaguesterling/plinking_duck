@@ -1,0 +1,100 @@
+# name: test/sql/read_pfile_catalog_bind_stats.test
+# description: read_pfile(catalog :=) does not check at bind that a cell's files exist; a missing file errors only for a cell the scan reads
+# group: [sql]
+
+require plinking_duck
+
+# P13-006 §10.6 left one bind-time cost per cell: path discovery checked that each cell's .pgen
+# and .pvar exist. On a remote catalog each check is a HEAD request: a pruned WHERE on the 10 x 4
+# bench grid sent 55 HEADs, region := sent 10. A catalog names its paths, so bind now takes them
+# as written. A kept cell's missing file errors when the scan opens it, and names the file. A
+# pruned cell is never checked, as stage 5 does for its .pgen header.
+statement ok
+SET threads = 4;
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM');
+
+# gone: shard CHROM=2 names a fileset that does not exist (.pgen and .pvar).
+statement ok
+COPY (SELECT replace(content, 'vs/CHROM=2/data', 'vs/CHROM=2/gone') FROM read_text('{TEST_DIR}/vs.pfile.json'))
+TO '{TEST_DIR}/gone.pfile.json' (FORMAT csv, header false, quote '');
+
+# gonepvar: shard CHROM=2 names a .pvar that does not exist (its .pgen exists).
+statement ok
+COPY (SELECT replace(content, 'vs/CHROM=2/data.pvar', 'vs/CHROM=2/gone.pvar') FROM read_text('{TEST_DIR}/vs.pfile.json'))
+TO '{TEST_DIR}/gonepvar.pfile.json' (FORMAT csv, header false, quote '');
+
+# ---------------------------------------------------------------------------
+# Bind does not check the cell's files
+# ---------------------------------------------------------------------------
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json');
+
+statement ok
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json', orient := 'genotype');
+
+# ---------------------------------------------------------------------------
+# A pruned cell's missing files do not error
+# ---------------------------------------------------------------------------
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json') WHERE CHROM IN ('1', '3')
+          EXCEPT ALL
+          SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example') WHERE CHROM IN ('1', '3'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json') WHERE CHROM IN ('1', '3'));
+----
+0	2000
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json', region := '3');
+----
+1000
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gonepvar.pfile.json') WHERE CHROM = '1';
+----
+1000
+
+statement ok
+ATTACH '{TEST_DIR}/gone.pfile.json' AS g (TYPE pfile_catalog);
+
+query I
+SELECT count(*) FROM g.genotypes WHERE CHROM = '3';
+----
+1000
+
+# ---------------------------------------------------------------------------
+# A kept cell's missing file errors, and names the file
+# ---------------------------------------------------------------------------
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json');
+----
+gone.pgen
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json') WHERE CHROM = '2';
+----
+gone.pgen
+
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gonepvar.pfile.json');
+----
+gone.pvar
+
+# Sample orient reads every cell at bind, so the error shows at bind.
+statement error
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json', orient := 'sample');
+----
+gone.pgen
+
+# A version 1 catalog's first cell still opens at bind (it gives the sample count).
+statement ok
+COPY (SELECT replace(content, 'vs/CHROM=1/data', 'vs/CHROM=1/gone') FROM read_text('{TEST_DIR}/vs.pfile.json'))
+TO '{TEST_DIR}/gone0.pfile.json' (FORMAT csv, header false, quote '');
+
+statement error
+DESCRIBE SELECT * FROM read_pfile(catalog := '{TEST_DIR}/gone0.pfile.json');
+----
+gone.pgen
