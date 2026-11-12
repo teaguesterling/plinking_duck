@@ -632,8 +632,13 @@ from the `.psam` and the PAR bounds from `build :=` (default GRCh38, as in `plin
 - **Errors.** Genotype or sample orient, `dosages := true` (plink_freq's dosage mode weights by
   dosage), `build :=` without `freq`, and a `genotypes := 'columns'` IID with a freq column's name.
 - **COPY.** The writer keeps extra input columns, so `COPY (SELECT * FROM c.genotypes) TO …
-  (FORMAT pfile)` writes the six columns into the `.pvar`. Documented in `pfile_catalog.md`; not
-  refused.
+  (FORMAT pfile)` writes the six columns into the `.pvar`. Documented in `pfile_catalog.md` and
+  `read_pfile.md`; not refused.
+
+**Owner decisions (2026-11-12).** Teague accepted both defaults in PR #113:
+- The parameter names stay `freq :=` and `build :=`.
+- The COPY leak is documented only. The writer does not refuse the six columns. A refusal would
+  also block a user who wants the counts in the `.pvar` on purpose.
 
 Tests: `read_pfile_freq.test`, 70 assertions. The oracle is `plink_freq` joined on `ID`, all six
 columns compared with `IS DISTINCT FROM`. It covers `sexchr_example` (raw counts differ from

@@ -92,6 +92,8 @@ WHERE ALT_FREQ < 0.01 AND HET_CT > 0;
 
 `ATTACH … (TYPE pfile_catalog)` passes `freq := true` for `c.genotypes`, so `SELECT ID, HET_CT FROM c.genotypes` uses this path.
 
+`COPY (SELECT * FROM read_pfile(…, freq := true)) TO … (FORMAT pfile)` writes the six columns into the output `.pvar` as extra columns, because the writer keeps every extra input column. Name the columns to write, or use `SELECT * EXCLUDE (ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT)`.
+
 ## Output Columns
 
 ### Variant Orient Mode (Default)
