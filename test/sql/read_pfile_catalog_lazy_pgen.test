@@ -190,7 +190,12 @@ SELECT count(*) FROM (
 ----
 0
 
-# plinking_pgen_io := 'localize' copies each .pgen at bind, so it keeps the bind-time open.
+# plinking_pgen_io := 'localize' copies a cell's .pgen at InitGlobal, after pruning, and only if the
+# scan keeps the cell (issue #114). Before, it copied every cell at bind: on a remote store, one
+# slice query downloaded the whole cohort.
+statement ok
+SET plinking_localize_dir = '{TEST_DIR}/loc';
+
 statement ok
 SET plinking_pgen_io = 'localize';
 
@@ -202,14 +207,106 @@ SELECT count(*) FROM (
 ----
 0
 
-# The pruned cell is still copied and opened at bind (the error names its local temp copy).
+# A pruned cell is not copied. A garbage .pgen alone cannot show that (a copy does not parse its
+# bytes), so gone.pfile.json is mx's catalog pointed at part/, a grid written without CHROM 2:
+# both CHROM=2 cells have NO .pgen. A copy of a pruned cell would fail with "cannot open".
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM <> '2' ORDER BY CHROM, POS)
+TO '{TEST_DIR}/part' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT replace(content, '"mx/', '"part/') FROM read_text('{TEST_DIR}/mx.pfile.json'))
+TO '{TEST_DIR}/gone.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER E'\x1f');
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json') WHERE CHROM = '1';
+----
+1000
+
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json', orient := 'genotype') WHERE IID = 'SAMP1' AND CHROM = '3';
+----
+1000
+
+# A kept cell that has no .pgen still errors (the copy fails).
 statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/gone.pfile.json', orient := 'genotype') WHERE IID = 'SAMP1' AND CHROM = '2';
+----
+CHROM=2/GROUP=lo/data.pgen
+
+# A pruned cell is not copied or opened: the garbage cell (CHROM=2, hi) is outside the WHERE.
+query I
 SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '1';
 ----
-is not a .pgen file
+1000
+
+# A kept cell is copied, and the scan reads the copy: the error names the local temp copy, not
+# bad/CHROM=2/GROUP=hi/data.pgen. If the deferred open read the original, this would fail.
+statement error
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '2';
+----
+plinking_localize_
+
+# Genotype orient, IID prune: a sample shard with no selected sample is not copied.
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json', orient := 'genotype') WHERE IID = 'SAMP1';
+----
+3000
+
+# Sample orient with no filter defers its headers to InitGlobal too: the hi shards are not copied.
+query I
+SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json', orient := 'sample') WHERE IID = 'SAMP1';
+----
+1
+
+# A prepared statement runs InitGlobal again on the same bind data; the second run reads the
+# copies made by the first.
+statement ok
+PREPARE loc_q AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE CHROM = '3';
+
+query I
+EXECUTE loc_q;
+----
+1000
+
+query I
+EXECUTE loc_q;
+----
+1000
+
+statement ok
+DEALLOCATE loc_q;
+
+# The policy is fixed at bind. A SET after PREPARE does not stop the deferred copy: the kept garbage
+# cell is still read from its temp copy (the error names it).
+statement ok
+PREPARE loc_bad AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/bad.pfile.json') WHERE CHROM = '2';
+
+statement ok
+SET plinking_pgen_io = 'auto';
+
+statement error
+EXECUTE loc_bad;
+----
+plinking_localize_
+
+statement ok
+DEALLOCATE loc_bad;
+
+statement ok
+SET plinking_pgen_io = 'localize';
+
+# Every temp copy is removed when its query ends.
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/loc/plinking_localize_*');
+----
+0
 
 statement ok
 RESET plinking_pgen_io;
+
+statement ok
+RESET plinking_localize_dir;
 
 # ---------------------------------------------------------------------------
 # The deferred header open goes through DuckDB's VFS when the policy says so

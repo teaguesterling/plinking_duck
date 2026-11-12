@@ -371,7 +371,7 @@ SELECT (SELECT count(*) FROM (
 ----
 0	2
 
-# localize copies every .pgen at bind (no deferred header); the deferred fill reads the copies.
+# localize copies each kept cell at InitGlobal (issue #114); the deferred fill reads the copies.
 statement ok
 SET plinking_pgen_io = 'localize';
 

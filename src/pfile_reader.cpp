@@ -541,8 +541,12 @@ struct PfileBindData : public TableFunctionData {
 	//! P13-006 §10.5 / stage 5: a lazy_variants read whose catalog declares the cells' counts also
 	//! leaves their .pgen headers unopened at bind. Bind takes each cell's counts from the catalog;
 	//! EnsureLazyVariants opens the header of each source that survives pruning and checks it against
-	//! them. Off under plinking_pgen_io := 'localize', which copies every .pgen at bind.
+	//! them.
 	bool lazy_pgen = false;
+	//! lazy_pgen under plinking_pgen_io := 'localize' (issue #114): a deferred cell is copied at
+	//! InitGlobal, just before its header opens, so a pruned cell is never copied. Set at bind, so a
+	//! SET between prepare and execute cannot split one read across two policies.
+	bool localize_deferred = false;
 	//! A sample-orient catalog read with no filter parameter: bind reads no genotype, so the deferred
 	//! .pgen headers wait for InitGlobal (EnsureLazyVariants), after the WHERE on IID prune. Counts/stats
 	//! then stream at scan time; a per-element mode fills its matrix there (FillSampleMatrix).
@@ -2226,8 +2230,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		bind_data->smp_headers_at_init = !has_param("af_range") && !has_param("ac_range") &&
 		                                 !has_param("include_genotypes") && !has_param("genotype_range");
 	}
-	bind_data->lazy_pgen = (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent &&
-	                       !PgenIoLocalizes(context);
+	bind_data->lazy_pgen = (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent;
+	bind_data->localize_deferred = bind_data->lazy_pgen && PgenIoLocalizes(context);
 	bind_data->lazy_pgen_catalog_path = grid.path;
 	bind_data->lazy_pgen_sample_extent = grid.has_sample_extent;
 
@@ -3522,8 +3526,10 @@ static constexpr uint32_t MULTI_GENOTYPE_SUBBATCH = 64;
 //! Stage 5: open the .pgen header of each cell of source `src_idx` (one per sample shard in a
 //! matrix) and check it holds the counts bind took from the catalog. The same checks bind runs on
 //! a cell it opens, with the same messages. Re-runs on each InitGlobal until the load succeeds.
-static void CheckDeferredPgenHeaders(ClientContext &context, const PfileBindData &bind_data, idx_t src_idx) {
-	const auto &src = bind_data.sources[src_idx];
+//! Under localize_deferred, each cell is first copied to a local temp, and the source's path is
+//! rewritten to the copy, so every later open reads it. A re-run does not copy a cell again.
+static void CheckDeferredPgenHeaders(ClientContext &context, PfileBindData &bind_data, idx_t src_idx) {
+	auto &src = bind_data.sources[src_idx];
 	const vector<PgenSampleShard> shards =
 	    bind_data.IsConcat() ? bind_data.ShardsFor(src_idx) : vector<PgenSampleShard>();
 	const idx_t n = bind_data.IsConcat() ? shards.size() : 1;
@@ -3536,7 +3542,13 @@ static void CheckDeferredPgenHeaders(ClientContext &context, const PfileBindData
 				continue;
 			}
 		}
-		const string &path = bind_data.IsConcat() ? shards[k].pgen_path : src.pgen_path;
+		string &path = bind_data.IsConcat() ? src.shard_pgen_paths[k] : src.pgen_path;
+		if (bind_data.localize_deferred && !bind_data.localize_guard.Owns(path)) {
+			LocalizePgen(context, path, bind_data.localize_guard); // policy taken at bind
+			if (bind_data.IsConcat() && k == 0) {
+				src.pgen_path = path; // a block's pgen_path is its shard 0 cell, as at bind
+			}
+		}
 		const uint32_t declared_samples = bind_data.IsConcat() ? shards[k].raw_sample_ct : bind_data.raw_sample_ct;
 		uint32_t variant_ct = 0;
 		uint32_t sample_ct = 0;
