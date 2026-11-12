@@ -239,6 +239,21 @@ SELECT (SELECT count(*) FROM h.genotypes) =
 ----
 true
 
+# A holed matrix keeps the per-cell fan-out, and each row's freq columns (P13-006 §5) count only
+# that row's sample block: the oracle is each present cell read on its own. A block holds 2
+# samples, so no row observes more than 4 alleles (the full cohort would give 8).
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM h.genotypes
+          EXCEPT ALL
+          SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM (
+            FROM read_pfile('{TEST_DIR}/data/CHROM=1/GROUP=A/cell', freq := true)
+            UNION ALL FROM read_pfile('{TEST_DIR}/data/CHROM=1/GROUP=B/cell', freq := true)
+            UNION ALL FROM read_pfile('{TEST_DIR}/data/CHROM=2/GROUP=A/cell', freq := true)))),
+       (SELECT max(OBS_CT) <= 4 FROM h.genotypes);
+----
+0	true
+
 # All cells are holes: ATTACH fails loud (no present cells to read), not a crash.
 statement ok
 COPY (SELECT '{"pfile_catalog":2,"dataset":"empty","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":3},{"value":"2","start":3,"stop":4}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":2},{"value":"B","start":2,"stop":4}]}]}],"template":{"pfile":"data/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"refv/CHROM={CHROM}/blk.pvar","psam":"refs/GROUP={GROUP}/blk.psam"},"holes":[{"CHROM":"1"},{"CHROM":"2"}]}')

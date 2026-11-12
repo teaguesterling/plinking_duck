@@ -183,6 +183,40 @@ JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
 ----
 5	0
 
+# A sample subset on the catalog. Integer indices are cohort-wide and 0-based; [3, 4, 5] (F1-F3)
+# drops block a at bind, so SEX must still line up with the kept samples.
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile(catalog := '{TEST_DIR}/sx.pfile.json', freq := true, samples := [3, 4, 5]) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true, samples := ['F1', 'F2', 'F3']) f USING (ID);
+----
+5	0
+
+# An IID subset that spans both blocks.
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile(catalog := '{TEST_DIR}/sx.pfile.json', freq := true, samples := ['M2', 'F3']) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true, samples := ['M2', 'F3']) f USING (ID);
+----
+5	0
+
+# Integer indices that keep one sample of each block.
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile(catalog := '{TEST_DIR}/sx.pfile.json', freq := true, samples := [0, 5]) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true, samples := ['M1', 'F3']) f USING (ID);
+----
+5	0
+
 # A catalog of large_example (3 x 2 grid): autosomes over two sample blocks.
 statement ok
 COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
@@ -245,6 +279,22 @@ query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM sx.genotypes_by_sample) WHERE column_name IN ('HET_CT', 'ALT_FREQ');
 ----
 0
+
+# COPY of the whole view writes the freq columns into the .pvar as extra columns (documented in
+# pfile_catalog.md). Reading the output back with freq := true still works: read_pfile does not
+# emit .pvar extra columns, so the names do not clash.
+statement ok
+COPY (SELECT * FROM sx.genotypes) TO '{TEST_DIR}/leak' (FORMAT pfile, samples ['M1', 'M2', 'M3', 'F1', 'F2', 'F3']);
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pvar('{TEST_DIR}/leak.pvar')) WHERE column_name IN ('ALT_FREQ', 'OBS_CT', 'HOM_REF_CT', 'HET_CT', 'HOM_ALT_CT', 'MISSING_CT');
+----
+6
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/leak', freq := true);
+----
+5
 
 # ---------------------------------------------------------------------------
 # Errors

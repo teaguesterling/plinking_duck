@@ -651,6 +651,15 @@ reader); "after" is this change.
 | `count(POS)` | 0.10–0.12 s | 0.11 s |
 | `count(genotypes[1])` (after: also `sum(HET_CT)`) | 0.24–0.30 s | 0.28–0.29 s |
 
-Both het totals are 11582052. A query that names no freq column pays about 0.01 s more. I (Claude)
-infer the cause is the full `.psam` load that `freq := true` forces at bind (SEX), because bind
-cannot see the projection; I did not isolate it.
+Both het totals are 11582052. Through the view, a query that names no freq column measured about
+0.01 s more. `freq := true` forces the full `.psam` load at bind (for SEX), because bind cannot see
+the projection. On a bare `wes_chr10` read, `count(POS)` with and without `freq := true` measured
+0.09–0.11 s for both a text and a parquet `.psam` (7 runs each; the count-only parquet load reads
+only the row count). So at 10000 samples I see no cost. I (Claude) did not measure a biobank-scale
+`.psam` (500k samples), where the full load can matter. If it does, the fix is to load SEX at
+InitGlobal only when `need_freq` is set.
+
+Tests added after review: a catalog with a sample subset (integer indices that drop a block, an IID
+list across both blocks, one sample per block), a parquet `.psam` (in `parquet_companions.test`,
+which requires parquet), the COPY leak (the six columns reach the `.pvar`, and a `freq := true`
+read of the output works), and a holed matrix (each row counts its own block). All pass.
