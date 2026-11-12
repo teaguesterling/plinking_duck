@@ -15,7 +15,10 @@ writer path is now **P13-007** (penciled, separate).
       2026-11-09.
 - [x] Pruning from pushed filters via `pushdown_complex_filter` (§4): §10.4 stages 1–4, PRs #92,
       #96, #97 (landed through #99), #98 (landed through #100).
-- [ ] Spike: the derived-count fast-path — reuse `plink_freq`/`missing`/`hardy` count kernels (§5)
+- [x] Spike: the derived-count fast-path (§5), 2026-11-11 — §10.11. `read_pfile`'s `counts` /
+      `stats` modes already call the `plink_freq`/`hardy` kernel (`PgrGetCounts`), on a catalog
+      too, at the `plink_*` speed. No new count path is needed. The gap is the surface:
+      `c.genotypes` cannot reach those modes. The surface is an owner decision (§10.11).
 - [x] Refresh against current `read_pfile` (post #84/#85/#86), 2026-11-09 — §10. It changes the
       §4 spike (the hook runs AFTER bind), adds a prerequisite (§10.2, a 2-D read), and puts a new
       owner fork: §10.4. The owner chose **(i) lazy bind** on 2026-11-09.
@@ -546,3 +549,53 @@ The `samples :=` row is 10 runs each; the first 3-run sample showed 0.095 s agai
 10 runs did not reproduce. The array `WHERE` case took 1.65 s on the same reader in §10.9, against
 2.58 s here. I (Claude) did not find the cause; I infer host load, because the reader is unchanged.
 The after/before ratio comes from one session, back to back.
+
+### 10.11 Measured (2026-11-11): the §5 spike — the count kernel is already reused; the surface is not
+
+**Question (§5).** Can the cascade reader reuse the `plink_freq` / `missing` / `hardy` count kernels
+on a projection, rather than add a new count path?
+
+**Answer: yes, and it already does.** `read_pfile(genotypes := 'counts' | 'stats')` in variant
+orient calls `PgrGetCounts` per variant (`pfile_reader.cpp`, the aggregate branch of the scan). A
+catalog read goes through `ConcatPgenReader::GetCounts` (`pgen_concat_reader.cpp:160`), which sums
+`PgrGetCounts` over the sample blocks of each variant. That is the kernel `plink_hardy` and
+`plink_freq` use. No decode happens on this path.
+
+Fixture: the §10.5 grid (10 × 4, 30000 variants × 10000 samples) and the bare `wes_chr10` it was cut
+from. The build is 8416484 (same reader as main at e375536). 4 threads, 5 runs each, wall time.
+
+| Read | wall (s) |
+|---|---|
+| grid catalog, `genotypes := 'counts'`, `sum(genotypes.het)` | 0.10–0.15 |
+| grid catalog, `genotypes := 'stats'`, `sum(genotypes.af)` | 0.10–0.11 |
+| grid catalog, default array, het count by `list_filter` | 1.24–1.26 |
+| bare `wes_chr10`, `counts` | 0.09–0.10 |
+| bare `wes_chr10`, `plink_hardy` / `plink_freq` | 0.09–0.11 |
+| bare `wes_chr10`, default array, het count by `list_filter` | 1.13–1.24 |
+
+- **Correctness.** The catalog `stats` read equals `plink_hardy` + `plink_freq(counts := true)` on
+  the bare fileset, joined on `ID`: hom_ref, het, hom_alt, missing and af (to 1e-12) agree on all
+  30000 variants, 0 mismatches. As for `plink_*`, `PgrGetCounts` buckets REF against any ALT, so a
+  multiallelic variant collapses to one biallelic figure.
+- **Projection through a view works.** On `ATTACH … (TYPE pfile_catalog)`,
+  `SELECT count(POS) FROM g.genotypes` took 0.10 s against 0.25–0.27 s for
+  `count(genotypes[1])` (3 runs each). So an unprojected `genotypes` column is not decoded through
+  the view.
+- **Outliers I could not explain.** Three first runs in a fresh Slurm job took far longer: 71.5 s
+  (grid `counts`), 24.1 s (ATTACH `count(POS)`) and 2.27 s (bare `counts`). None reproduced in the
+  next runs or the 5-run series. I (Claude) infer a cold cache or host load; I did not find the cause.
+
+**The gap is the surface.** `c.genotypes` is `SELECT * FROM read_pfile(catalog := …)`
+(`pfile_catalog_storage.cpp:316`), the default array mode. A view cannot pass `genotypes :=`, so a
+count derived from `c.genotypes` decodes every genotype (about 12× the counts path above). §5's
+fix is scalar count columns (`HOM_REF_CT`, `HET_CT`, `HOM_ALT_CT`, `MISSING_CT`, `OBS_CT`,
+`ALT_FREQ`, `F_MISS`, named as `plink_*` emits them) that the scan computes only when projected.
+Today one `read_pfile` call emits either the `genotypes` decode or the counts struct, never both.
+Where those columns live is an owner decision: on every variant-orient `read_pfile` (changes
+`SELECT *`), behind a parameter that the ATTACH view passes, or as a separate view over
+`genotypes := 'stats'` (no C++).
+
+A cost of the first form: the pfile writer copies each extra input column into the `.pvar` under
+its own name (`docs/functions/write_pfile.md`, extra columns). So `COPY (SELECT * FROM read_pfile(…))
+TO … (FORMAT pfile)` would write the count columns into the output `.pvar`. Those counts go stale
+after a sample subset.

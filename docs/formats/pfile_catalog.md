@@ -729,13 +729,15 @@ verifies every present cell first. Holes are never verified. See
   (an absent cell), it raises an error, because a 2-D read of a holed grid is not defined yet.
   `c.genotypes` and the other relations read a holed matrix normally.
 
-- **Cell skip covers the variant axis only.** A `WHERE` on `CHROM` / `POS` drops variant
-  blocks of `c.genotypes`. A `WHERE` on a sample (`IID`) drops no sample block, and
-  `c.genotypes_by_sample` (sample orient) reads every cell at bind. `read_pfile_catalog` itself
-  returns cell metadata, not genotypes.
-- **No projection fast-path.** `c.genotypes` exposes `read_pfile`'s native genotype
-  columns. The derived counts (het, hom_alt, missing, n_alt) are not a fast-path column
-  set yet.
+- **Cell skip has limits.** A `WHERE` on `CHROM` / `POS` drops variant blocks of
+  `c.genotypes`. A `WHERE IID = …` or `IID IN (…)` drops sample blocks of
+  `c.genotypes_by_sample`, and of a genotype-orient `read_pfile`. In sample orient, a read
+  with `af_range`, `ac_range`, `include_genotypes` or `genotype_range` drops no sample block,
+  because those filters use every sample. Other predicates, and `OR`, drop nothing.
+  `read_pfile_catalog` itself returns cell metadata, not genotypes.
+- **No projection fast-path through `c.genotypes`.** `read_pfile(catalog := …, genotypes :=
+  'counts')` (or `'stats'`) counts genotypes without a decode. The `c.genotypes` view reads
+  the default array mode, so a count derived from the view decodes every genotype.
 - **No analysis over the grid.** The `plink_*` analysis functions do not take a matrix
   catalog.
 - **The writer emits the common grid, not every form.** `COPY … (FORMAT pfile,
