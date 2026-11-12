@@ -257,12 +257,7 @@ SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/g.pfile.json', region := '3:
 # ---------------------------------------------------------------------------
 # GRID ROUND TRIP — every (variant, IID, call) of the M x N cells equals the source, both directions.
 # Each cell is read through the templated companions (its block's .pvar + its sample-block's .psam).
-# NOTE: ATTACH's v2 genotype relations (m.genotypes / m.genotypes_by_sample) are NOT asserted here.
-# They read read_pfile([every cell prefix]) with no pvar/psam overrides, so they (1) need a .pvar
-# co-located with each cell's .pgen — this layout shares one .pvar per variant-block, so they error for
-# EVERY matrix written here, N=1 included — and (2) concatenate along the variant axis, which cannot
-# assemble more than one sample-block. A pre-existing reader gap (see the P13-010 PR); the writer's
-# output is verified by verify_all + this oracle instead.
+# ATTACH's genotype relations are checked against the source after the structural checks below.
 # ---------------------------------------------------------------------------
 
 query III
@@ -294,6 +289,29 @@ query T
 SELECT string_agg(IID, ',' ORDER BY IID) FROM m.samples;
 ----
 SAMP1,SAMP2,SAMP3,SAMP4,SAMP5,SAMP6,SAMP7,SAMP8
+
+# ATTACH m.genotypes reads all 6 cells, each through its templated .pvar/.psam, and joins the
+# 2 sample-blocks into one 8-sample row per variant. Positional array equality means the sample
+# order (a then b) and the variant order (CHROM 1, 2, 3) must both match the source.
+query III
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM m.genotypes
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
+       (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM read_pfile('test/data/large_example')
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM m.genotypes)),
+       (SELECT count(*) FROM m.genotypes);
+----
+0	0	3000
+
+# ATTACH m.genotypes_by_sample: one row per sample, each with all 3000 variants in source order.
+# Samples from both sample-blocks appear, and no block is stacked onto another.
+query III
+SELECT (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM m.genotypes_by_sample
+        EXCEPT ALL SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample')
+        EXCEPT ALL SELECT IID, genotypes::TINYINT[] FROM m.genotypes_by_sample)),
+       (SELECT count(*) FROM m.genotypes_by_sample);
+----
+0	0	8
 
 statement ok
 DETACH m;

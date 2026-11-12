@@ -731,9 +731,10 @@ verifies every present cell first. Holes are never verified. See
 
 - **Cell skip has limits.** A `WHERE` on `CHROM` / `POS` drops variant blocks of
   `c.genotypes`. A `WHERE IID = …` or `IID IN (…)` drops sample blocks of
-  `c.genotypes_by_sample`, and of a genotype-orient `read_pfile`. In sample orient, a read
-  with `af_range`, `ac_range`, `include_genotypes` or `genotype_range` drops no sample block,
-  because those filters use every sample. Other predicates, and `OR`, drop nothing.
+  `c.genotypes_by_sample`, and of a genotype-orient `read_pfile`. A read with `af_range` or
+  `ac_range` drops no sample block, because those filters use every sample. In sample orient,
+  `include_genotypes` and `genotype_range` also stop the sample-block drop. Other predicates,
+  and `OR`, drop nothing.
   `read_pfile_catalog` itself returns cell metadata, not genotypes.
 - **No projection fast-path through `c.genotypes`.** `read_pfile(catalog := …, genotypes :=
   'counts')` (or `'stats'`) counts genotypes without a decode. The `c.genotypes` view reads
