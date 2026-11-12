@@ -660,7 +660,7 @@ The attached database holds seven views. Each one is backed by a shipped reader:
 |---|---|
 | `c.variants` | the distinct variant-block `.pvar` (`read_pvar`) |
 | `c.samples` | the distinct sample-block `.psam` (`read_psam`) |
-| `c.genotypes` | the catalog read, `read_pfile(catalog := …)`: one row per variant with every sample (a matrix with holes: one row per variant per sample block, see below) |
+| `c.genotypes` | the catalog read, `read_pfile(catalog := …)`: one row per variant with every sample, plus the `plink_freq` columns (a matrix with holes: one row per variant per sample block, see below) |
 | `c.genotypes_by_sample` | the same cells, sample-oriented. For a matrix: `read_pfile(catalog := …, orient := 'sample')`, one row per sample across every block |
 | `c.cells` | `read_pfile_catalog` — one row per surviving cell |
 | `c.variant_blocks`, `c.sample_blocks` | the per-axis block tiling |
@@ -691,6 +691,17 @@ block**, each row with only that block's samples. A matrix **with holes** still 
 of a holed grid is not defined yet. There, `count(*) FROM c.genotypes` is variants × sample
 blocks, the `genotypes` column is a fixed `ARRAY` only when every sample block has the same
 width (else a `LIST`), and a `WHERE` drops no cell.
+
+**`c.genotypes` has the `plink_freq` columns.** Every kind passes
+[`freq := true`](../functions/read_pfile.md#frequency-columns-freq), so the view adds `ALT_FREQ`,
+`OBS_CT`, `HOM_REF_CT`, `HET_CT`, `HOM_ALT_CT` and `MISSING_CT`, with `plink_freq(counts := true)`'s
+values over the whole cohort. A query that names only these columns reads counts, not genotypes:
+`SELECT ID, HET_CT FROM c.genotypes WHERE ALT_FREQ < 0.01`. On a matrix with holes, each row counts
+only its own sample block. `c.genotypes_by_sample` does not have these columns.
+
+`COPY (SELECT * FROM c.genotypes) TO … (FORMAT pfile)` writes the six columns into the output
+`.pvar` as extra columns, because the writer keeps every extra input column. Name the columns to
+write, or use `SELECT * EXCLUDE (ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT)`.
 
 ### Inspecting a matrix without reading it
 
@@ -736,9 +747,6 @@ verifies every present cell first. Holes are never verified. See
   `include_genotypes` and `genotype_range` also stop the sample-block drop. Other predicates,
   and `OR`, drop nothing.
   `read_pfile_catalog` itself returns cell metadata, not genotypes.
-- **No projection fast-path through `c.genotypes`.** `read_pfile(catalog := …, genotypes :=
-  'counts')` (or `'stats'`) counts genotypes without a decode. The `c.genotypes` view reads
-  the default array mode, so a count derived from the view decodes every genotype.
 - **No analysis over the grid.** The `plink_*` analysis functions do not take a matrix
   catalog.
 - **The writer emits the common grid, not every form.** `COPY … (FORMAT pfile,
