@@ -151,6 +151,9 @@ static string GenotypesSql(const vector<string> &prefixes, const string &shared_
 	}
 	if (by_sample) {
 		sql += ", orient := 'sample'";
+	} else {
+		// P13-006 §5: plink_freq's per-variant columns, computed only when a query names them.
+		sql += ", freq := true";
 	}
 	sql += ")";
 	return sql;
@@ -179,7 +182,8 @@ static string MatrixGenotypesSql(const vector<MatrixCell> &cells) {
 		if (!uniform) {
 			sql += ", genotypes := 'list'";
 		}
-		sql += ")";
+		// The same columns as every other c.genotypes; here each row counts its own sample block.
+		sql += ", freq := true)";
 	}
 	return sql;
 }
@@ -313,7 +317,8 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	if (is_matrix && matrix_has_holes) {
 		views.emplace_back(Identifier("genotypes"), MatrixGenotypesSql(matrix_cells));
 	} else if (!catalog_path_sql.empty()) {
-		views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(catalog := " + catalog_path_sql + ")");
+		views.emplace_back(Identifier("genotypes"),
+		                   "SELECT * FROM read_pfile(catalog := " + catalog_path_sql + ", freq := true)");
 	} else {
 		views.emplace_back(Identifier("genotypes"),
 		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false));

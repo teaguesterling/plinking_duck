@@ -1,0 +1,280 @@
+# name: test/sql/read_pfile_freq.test
+# description: read_pfile(freq := true) adds plink_freq's per-variant columns, with plink_freq's values
+# group: [sql]
+
+require plinking_duck
+
+# P13-006 §5. freq := true adds plink_freq(counts := true)'s value columns to a variant-orient
+# read: ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT. One name is one concept
+# across the extension, so each column must hold the value plink_freq emits for the same variant
+# and the same samples, on every chromosome. On chrX non-PAR, chrY and chrMT plink_freq counts by
+# sex and ploidy (a haploid call is one allele), so a raw PgrGetCounts answer is wrong there. Every
+# oracle below compares all six columns with IS NOT DISTINCT FROM (a NULL must match a NULL).
+statement ok
+SET threads = 4;
+
+# ---------------------------------------------------------------------------
+# The schema: six columns after genotypes, typed as plink_freq types them
+# ---------------------------------------------------------------------------
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_pfile('test/data/sexchr_example', freq := true));
+----
+CHROM	VARCHAR
+POS	INTEGER
+ID	VARCHAR
+REF	VARCHAR
+ALT	VARCHAR
+genotypes	TINYINT[6]
+ALT_FREQ	DOUBLE
+OBS_CT	INTEGER
+HOM_REF_CT	INTEGER
+HET_CT	INTEGER
+HOM_ALT_CT	INTEGER
+MISSING_CT	INTEGER
+
+# Without the parameter the schema is unchanged.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pfile('test/data/sexchr_example'));
+----
+6
+
+# ---------------------------------------------------------------------------
+# The fixture has variants (mt1, x1, y1) where raw counts and plink_freq disagree. Without this, the
+# oracles below could pass on a reader that ignores sex and ploidy.
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM read_pfile('test/data/sexchr_example', genotypes := 'stats') r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID)
+WHERE 2 * r.genotypes.n IS DISTINCT FROM f.OBS_CT OR r.genotypes.af IS DISTINCT FROM f.ALT_FREQ;
+----
+3
+
+# ---------------------------------------------------------------------------
+# Oracle: plink_freq(counts := true), all samples (chr1, PAR1, X, Y, MT)
+# ---------------------------------------------------------------------------
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('test/data/sexchr_example', freq := true) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
+----
+5	0
+
+# A sample subset: both count over the same three samples.
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('test/data/sexchr_example', freq := true, samples := ['M1', 'F1', 'F2']) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true, samples := ['M1', 'F1', 'F2']) f USING (ID);
+----
+5	0
+
+# No SEX column: plink_freq gives NULLs on X and Y. So must read_pfile.
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('test/data/sexchr_example', freq := true, psam := 'test/data/sexchr_nosex.psam') r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true, psam := 'test/data/sexchr_nosex.psam') f USING (ID);
+----
+5	0
+
+query T
+SELECT list(ID ORDER BY ID) FROM read_pfile('test/data/sexchr_example', freq := true, psam := 'test/data/sexchr_nosex.psam')
+WHERE HET_CT IS NULL;
+----
+[x1, y1]
+
+# The genome build sets the PAR bounds, as in plink_freq. X:1000000 is PAR under GRCh38 (the
+# default) and chrX non-PAR with build := 'none'.
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('test/data/sexchr_example', freq := true, pvar := 'test/data/sexchr_xpar.pvar', build := 'none') r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true, pvar := 'test/data/sexchr_xpar.pvar', build := 'none') f USING (ID);
+----
+5	0
+
+query I
+SELECT (SELECT OBS_CT FROM read_pfile('test/data/sexchr_example', freq := true, pvar := 'test/data/sexchr_xpar.pvar') WHERE ID = 'par1')
+    <> (SELECT OBS_CT FROM read_pfile('test/data/sexchr_example', freq := true, pvar := 'test/data/sexchr_xpar.pvar', build := 'none') WHERE ID = 'par1');
+----
+true
+
+# Autosomes at scale (30000 variants x 10000 samples): the PgrGetCounts path.
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('test/data/wes_chr10', freq := true) r
+JOIN plink_freq('test/data/wes_chr10.pgen', counts := true) f USING (ID);
+----
+30000	0
+
+# ---------------------------------------------------------------------------
+# The columns sit beside the other genotype modes, and are the true counts under a genotype filter
+# ---------------------------------------------------------------------------
+query II
+SELECT count(*), count(*) FILTER (WHERE r.HET_CT IS DISTINCT FROM f.HET_CT OR r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ)
+FROM read_pfile('test/data/sexchr_example', freq := true, genotypes := 'counts') r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
+----
+5	0
+
+# include_genotypes NULLs the non-matching genotypes and skips a variant with none, but the
+# counts of a kept variant are its true counts, not the counts of the matching calls.
+query II
+SELECT count(*), count(*) FILTER (WHERE r.HET_CT IS DISTINCT FROM f.HET_CT OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT
+                                     OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('test/data/wes_chr10', freq := true, include_genotypes := ['hom_alt']) r
+JOIN plink_freq('test/data/wes_chr10.pgen', counts := true) f USING (ID);
+----
+11290	0
+
+# A WHERE on a count column, with only ID projected (the filter column is still computed).
+query I
+SELECT count(*) = (SELECT count(*) FROM plink_freq('test/data/wes_chr10.pgen', counts := true) WHERE HET_CT > 1000 AND ALT_FREQ < 0.2)
+FROM (SELECT ID FROM read_pfile('test/data/wes_chr10', freq := true) WHERE HET_CT > 1000 AND ALT_FREQ < 0.2);
+----
+true
+
+query I
+SELECT count(*) FROM read_pfile('test/data/wes_chr10', freq := true) WHERE HET_CT > 1000 AND ALT_FREQ < 0.2;
+----
+<REGEX>:[1-9][0-9]*
+
+# with_ordinal stays the last column.
+query T
+SELECT list(column_name)[-1] FROM (DESCRIBE SELECT * FROM read_pfile('test/data/sexchr_example', freq := true, with_ordinal := true));
+----
+__ordinal
+
+# ---------------------------------------------------------------------------
+# A matrix catalog: counts over every sample block, sex from each block's .psam
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sx' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['M1', 'M2', 'M3'], b: ['F1', 'F2', 'F3']});
+
+# The writer emits IID-only .psam files. Write each sample block's .psam again, with SEX.
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M1', '1'), ('M2', '1'), ('M3', '1')))
+TO '{TEST_DIR}/sx/GROUP=a/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('F1', '2'), ('F2', '2'), ('F3', '2')))
+TO '{TEST_DIR}/sx/GROUP=b/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile(catalog := '{TEST_DIR}/sx.pfile.json', freq := true) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
+----
+5	0
+
+# A catalog of large_example (3 x 2 grid): autosomes over two sample blocks.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', freq := true) r
+JOIN plink_freq('test/data/large_example.pgen', counts := true) f USING (ID);
+----
+3000	0
+
+# ---------------------------------------------------------------------------
+# ATTACH: c.genotypes carries the columns, so a view query reaches the count path
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH '{TEST_DIR}/sx.pfile.json' AS sx (TYPE pfile_catalog);
+
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM sx.genotypes r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
+----
+5	0
+
+statement ok
+ATTACH '{TEST_DIR}/mx.pfile.json' AS mx (TYPE pfile_catalog);
+
+query I
+SELECT count(*) = (SELECT count(*) FROM plink_freq('test/data/large_example.pgen', counts := true) WHERE HET_CT >= 2 AND CHROM = '2')
+FROM (SELECT ID FROM mx.genotypes WHERE HET_CT >= 2 AND CHROM = '2');
+----
+true
+
+# large_example has HET_CT = 2 on every variant, so this filter keeps none.
+query I
+SELECT count(*) FROM mx.genotypes WHERE HET_CT > 2 AND CHROM = '2';
+----
+0
+
+# A bare fileset attached as a catalog.
+statement ok
+ATTACH 'test/data/sexchr_example' AS bare (TYPE pfile_catalog);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE r.HET_CT IS DISTINCT FROM f.HET_CT OR r.OBS_CT IS DISTINCT FROM f.OBS_CT)
+FROM bare.genotypes r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
+----
+5	0
+
+# The sample-oriented view is unchanged: no count columns there.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM sx.genotypes_by_sample) WHERE column_name IN ('HET_CT', 'ALT_FREQ');
+----
+0
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+statement error
+SELECT * FROM read_pfile('test/data/sexchr_example', freq := true, orient := 'genotype');
+----
+freq := true needs orient := 'variant'
+
+statement error
+SELECT * FROM read_pfile('test/data/sexchr_example', freq := true, orient := 'sample');
+----
+freq := true needs orient := 'variant'
+
+statement error
+SELECT * FROM read_pfile('test/data/sexchr_example', freq := true, dosages := true);
+----
+freq := true is incompatible with dosages := true
+
+statement error
+SELECT * FROM read_pfile('test/data/sexchr_example', build := 'hg19');
+----
+build := needs freq := true
+
+# genotypes := 'columns' names a column per sample. A sample named like a count column clashes.
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID'), ('A'), ('HET_CT'), ('C'), ('D')))
+TO '{TEST_DIR}/clash.psam' (FORMAT csv, header false, quote '');
+
+statement error
+SELECT * FROM read_pfile('test/data/pgen_example', psam := '{TEST_DIR}/clash.psam', genotypes := 'columns', freq := true);
+----
+column 'HET_CT'

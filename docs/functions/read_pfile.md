@@ -37,6 +37,8 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | `include_genotypes` | `LIST(VARCHAR)` | All | Filter by hardcall category: `'hom_ref'`, `'het'`, `'hom_alt'`, `'missing'` (any subset; canonical genotype filter) |
 | `genotype_range` | `STRUCT(min TINYINT, max TINYINT [, include_missing BOOLEAN])` | All | Numeric alias of `include_genotypes` for contiguous ranges over [0, 2] |
 | `with_ordinal` | `BOOLEAN` | `false` | Append a `__ordinal` `BIGINT` column of each variant's natural (original) index; **requires `orient := 'variant'`** (see [Variant Ordinal](#variant-ordinal-with_ordinal)) |
+| `freq` | `BOOLEAN` | `false` | Add `plink_freq(counts := true)`'s columns (`ALT_FREQ`, `OBS_CT`, `HOM_REF_CT`, `HET_CT`, `HOM_ALT_CT`, `MISSING_CT`), with its values; **requires `orient := 'variant'`** (see [Frequency Columns](#frequency-columns-freq)) |
+| `build` | `VARCHAR` | `'GRCh38'` | Genome build for the PAR bounds of the `freq` columns, as in `plink_freq`; needs `freq := true` |
 
 See [Common Parameters](../common-parameters.md) for details on `samples`, `region`, the composable `selection` struct, `with_ordinal`, and the filter parameters.
 
@@ -60,6 +62,35 @@ When both `region` and `variants` are specified, the result is the intersection 
 ### Variant Ordinal (`with_ordinal`)
 
 With `with_ordinal := true`, an extra `__ordinal` `BIGINT` column carries each variant's natural (original) 0-based index. It is supported **only with `orient := 'variant'`** (the default); the other orient modes reject it in bind rather than emit a wrong ordinal. For a multi-file list the ordinal is **per-source** (each shard restarts at 0), matching [`read_pvar`](read_pvar.md#named-parameters) and `pfile_partitions`.
+
+### Frequency Columns (`freq`)
+
+With `freq := true`, six columns follow the genotype columns (and come before `__ordinal`). They are the value columns of [`plink_freq(counts := true)`](plink_freq.md), and each one holds the value `plink_freq` gives for the same variant and the same samples:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `ALT_FREQ` | `DOUBLE` | ALT allele frequency; `NULL` when no allele is observed |
+| `OBS_CT` | `INTEGER` | Observed alleles (2 × non-missing samples on autosomes) |
+| `HOM_REF_CT` | `INTEGER` | Homozygous reference count |
+| `HET_CT` | `INTEGER` | Heterozygous count |
+| `HOM_ALT_CT` | `INTEGER` | Homozygous alternate count |
+| `MISSING_CT` | `INTEGER` | Missing genotype count |
+
+- On autosomes and the PAR, the counts come from pgenlib's `PgrGetCounts`, with no genotype decode.
+- On chrX non-PAR, chrY and chrMT, the counts use sex and ploidy, as in `plink_freq`: a haploid call is one allele. The SEX column of the `.psam` gives the sex. Without it, the four genotype counts and `ALT_FREQ` are `NULL` on chrX and chrY, and `OBS_CT` is 0.
+- `build :=` sets the PAR bounds (default `'GRCh38'`; `'GRCh37'`, `'none'`).
+- `samples :=` changes the counts to the selected samples. A catalog read counts over every sample block.
+- `include_genotypes` and `genotype_range` do not change the counts: a kept variant reports its true counts.
+- A column is computed only when the query names it, in the `SELECT` list or in a `WHERE`.
+- `freq := true` is an error with `orient := 'genotype'`, `orient := 'sample'` or `dosages := true`, and when a `genotypes := 'columns'` sample IID has the name of a `freq` column.
+
+```sql
+-- Rare variants with at least one het, without a genotype decode.
+SELECT ID, ALT_FREQ, HET_CT FROM read_pfile('data/cohort', freq := true)
+WHERE ALT_FREQ < 0.01 AND HET_CT > 0;
+```
+
+`ATTACH … (TYPE pfile_catalog)` passes `freq := true` for `c.genotypes`, so `SELECT ID, HET_CT FROM c.genotypes` uses this path.
 
 ## Output Columns
 
@@ -297,7 +328,7 @@ so it reads every shard.
 
 ### Projection Pushdown
 
-Genotype decoding is skipped when genotype columns (`genotypes` or `genotype`) are not referenced in the query.
+Genotype decoding is skipped when genotype columns (`genotypes` or `genotype`) are not referenced in the query. With `freq := true`, a query that names only the `freq` columns reads counts, not genotypes (except on chrX/Y/MT, which decode).
 
 ### Parallel Scan
 
