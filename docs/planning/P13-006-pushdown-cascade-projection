@@ -16,9 +16,11 @@ writer path is now **P13-007** (penciled, separate).
 - [x] Pruning from pushed filters via `pushdown_complex_filter` (§4): §10.4 stages 1–4, PRs #92,
       #96, #97 (landed through #99), #98 (landed through #100).
 - [x] Spike: the derived-count fast-path (§5), 2026-11-11 — §10.11. `read_pfile`'s `counts` /
-      `stats` modes already call the `plink_freq`/`hardy` kernel (`PgrGetCounts`), on a catalog
-      too, at the `plink_*` speed. No new count path is needed. The gap is the surface:
-      `c.genotypes` cannot reach those modes. The surface is an owner decision (§10.11).
+      `stats` modes already call `PgrGetCounts`, the kernel `plink_freq`/`hardy` use for
+      autosomes, on a catalog too, at the `plink_*` speed. On chrX/Y/MT the `plink_*` functions
+      decode and count by sex and ploidy, and these modes do not. The other gap is the surface:
+      `c.genotypes` cannot reach those modes. Teague chose the surface on 2026-11-11: a
+      `read_pfile` parameter that the ATTACH view passes (§10.11).
 - [x] Refresh against current `read_pfile` (post #84/#85/#86), 2026-11-09 — §10. It changes the
       §4 spike (the hook runs AFTER bind), adds a prerequisite (§10.2, a 2-D read), and puts a new
       owner fork: §10.4. The owner chose **(i) lazy bind** on 2026-11-09.
@@ -550,16 +552,24 @@ The `samples :=` row is 10 runs each; the first 3-run sample showed 0.095 s agai
 2.58 s here. I (Claude) did not find the cause; I infer host load, because the reader is unchanged.
 The after/before ratio comes from one session, back to back.
 
-### 10.11 Measured (2026-11-11): the §5 spike — the count kernel is already reused; the surface is not
+### 10.11 Measured (2026-11-11): the §5 spike — the autosomal count kernel is already reused; the surface is not
 
 **Question (§5).** Can the cascade reader reuse the `plink_freq` / `missing` / `hardy` count kernels
 on a projection, rather than add a new count path?
 
-**Answer: yes, and it already does.** `read_pfile(genotypes := 'counts' | 'stats')` in variant
+**Answer: for autosomes, yes, and it already does.** `read_pfile(genotypes := 'counts' | 'stats')` in variant
 orient calls `PgrGetCounts` per variant (`pfile_reader.cpp`, the aggregate branch of the scan). A
 catalog read goes through `ConcatPgenReader::GetCounts` (`pgen_concat_reader.cpp:160`), which sums
 `PgrGetCounts` over the sample blocks of each variant. That is the kernel `plink_hardy` and
-`plink_freq` use. No decode happens on this path.
+`plink_freq` use for autosomes. No decode happens on this path.
+
+**It is not the whole `plink_*` kernel.** On chrX non-PAR, chrY and chrMT, `plink_freq`,
+`plink_hardy` and `plink_missing` decode the calls and call `ComputeSexAwareCounts` with a sex
+array (`plink_common.hpp:882`). The `counts` / `stats` modes call raw `PgrGetCounts` for every
+variant, so their numbers differ there. The `plink_*` functions also differ from each other on
+chrX: `plink_hardy` counts the female stratum, `plink_freq` counts every included sample, with a
+haploid call as homozygous. The `wes_chr10` oracle below has no sex chromosome, so it cannot show
+either difference.
 
 Fixture: the §10.5 grid (10 × 4, 30000 variants × 10000 samples) and the bare `wes_chr10` it was cut
 from. The build is 8416484 (same reader as main at e375536). 4 threads, 5 runs each, wall time.
@@ -599,3 +609,6 @@ A cost of the first form: the pfile writer copies each extra input column into t
 its own name (`docs/functions/write_pfile.md`, extra columns). So `COPY (SELECT * FROM read_pfile(…))
 TO … (FORMAT pfile)` would write the count columns into the output `.pvar`. Those counts go stale
 after a sample subset.
+
+**Owner decision (2026-11-11).** Teague chose the second form: a `read_pfile` parameter adds the
+count columns, and the ATTACH `c.genotypes` view passes it. Plain `read_pfile` output is unchanged.
