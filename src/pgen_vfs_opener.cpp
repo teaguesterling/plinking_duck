@@ -7,6 +7,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
 
+#include <algorithm>
 #include <atomic>
 
 #ifndef _WIN32
@@ -129,6 +130,10 @@ void PgenLocalizeGuard::Track(FileSystem &fs, string temp_path) {
 	temp_paths_.push_back(std::move(temp_path));
 }
 
+bool PgenLocalizeGuard::Owns(const string &path) const {
+	return std::find(temp_paths_.begin(), temp_paths_.end(), path) != temp_paths_.end();
+}
+
 void PgenLocalizeGuard::Cleanup() noexcept {
 	if (!fs_) {
 		return;
@@ -235,6 +240,10 @@ void LocalizePgenIfRequested(ClientContext &context, string &pgen_path, PgenLoca
 	if (PgenIoPolicy(context) != "localize") {
 		return;
 	}
+	LocalizePgen(context, pgen_path, guard);
+}
+
+void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	string dir = LocalizeDir(context);
 	// The dir may not exist yet (e.g. DuckDB's default temp dir is created lazily,

@@ -17,8 +17,9 @@ namespace duckdb {
 //! LocalizePgenIfRequested). Pure: no I/O, safe to call more than once.
 bool PgenIoUseVfs(ClientContext &context, const string &pgen_path);
 
-//! Whether `plinking_pgen_io == 'localize'`: every .pgen is copied to a local temp at bind
-//! (LocalizePgenIfRequested), so a reader must not defer that bind-time open.
+//! Whether `plinking_pgen_io == 'localize'`: a reader copies each .pgen it reads to a local temp
+//! (LocalizePgenIfRequested) before its first open. Most readers copy at bind. A catalog read
+//! (read_pfile catalog :=) copies a cell at InitGlobal, after pruning, only if the scan keeps it.
 bool PgenIoLocalizes(ClientContext &context);
 
 //! RAII owner of localized (downloaded-to-local-temp) .pgen copies. Lives as a
@@ -39,6 +40,8 @@ public:
 	//! destruction. Call BEFORE writing the temp, so a failed/partial copy is still
 	//! cleaned up.
 	void Track(FileSystem &fs, string temp_path);
+	//! Whether `path` is a temp that this guard tracks (a copy made already).
+	bool Owns(const string &path) const;
 
 private:
 	void Cleanup() noexcept;
@@ -50,8 +53,13 @@ private:
 //! `plinking_localize_dir`, else DuckDB's temp dir), rewrite `pgen_path` in place to
 //! the temp, and register the temp with `guard` for query-end cleanup. Reads through
 //! the context FileSystem so httpfs secrets/settings apply. No-op for every other
-//! policy. Call ONCE per source at bind, before any pgen open on that path.
+//! policy. Call ONCE per source, before any pgen open on that path: at bind, or at InitGlobal
+//! for a deferred catalog cell (see PfileBindData::localize_deferred).
 void LocalizePgenIfRequested(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard);
+
+//! The copy that LocalizePgenIfRequested makes, with no policy check: for a caller that took the
+//! policy at bind and copies later (a deferred catalog cell), when the setting may have changed.
+void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard);
 
 //! RAII: while in scope AND use_vfs, pgen opens on THIS thread are served from the
 //! VFS. A no-op (native fopen) when use_vfs is false. Register/clear is per-thread,
