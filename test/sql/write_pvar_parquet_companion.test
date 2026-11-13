@@ -1,0 +1,199 @@
+# name: test/sql/write_pvar_parquet_companion.test
+# description: COPY ... (FORMAT pfile, pvar_parquet) also writes '<pvar>.parquet' — CHROM, POS, ID, REF, ALT plus an explicit __vidx = the variant's 0-based index in the WRITTEN .pgen/.pvar. Oracle: the text .pvar the same COPY wrote.
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# Plain bundle (pfile_example)
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/pq' (FORMAT pfile, pvar_parquet);
+
+# Same variant rows as the text .pvar, in the same order, with __vidx = that order (0,1,2,...).
+query I
+SELECT count(*) FROM (
+    SELECT p.CHROM, p.POS, p.ID, p.REF, p.ALT, row_number() OVER () - 1 AS vidx FROM read_pvar('{TEST_DIR}/pq.pvar') p
+) t
+JOIN read_parquet('{TEST_DIR}/pq.pvar.parquet') q USING (CHROM, POS, ID, REF, ALT)
+WHERE t.vidx = q.__vidx;
+----
+4
+
+query I
+SELECT count(*) FROM read_pvar('{TEST_DIR}/pq.pvar');
+----
+4
+
+query T
+SELECT list(__vidx ORDER BY __vidx) FROM read_parquet('{TEST_DIR}/pq.pvar.parquet');
+----
+[0, 1, 2, 3]
+
+# Column set, in order, with __vidx BIGINT.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/pq.pvar.parquet'));
+----
+CHROM	VARCHAR
+POS	INTEGER
+ID	VARCHAR
+REF	VARCHAR
+ALT	VARCHAR
+__vidx	BIGINT
+
+# Physical (file) order is write order: no ORDER BY, __vidx ascending.
+query I
+SELECT count(*) FROM (
+    SELECT __vidx - lag(__vidx) OVER () AS d FROM read_parquet('{TEST_DIR}/pq.pvar.parquet')
+) WHERE d IS NOT NULL AND d <> 1;
+----
+0
+
+# zstd, one default row group.
+query II
+SELECT DISTINCT compression, row_group_id FROM parquet_metadata('{TEST_DIR}/pq.pvar.parquet') ORDER BY ALL;
+----
+ZSTD	0
+
+# Without the option no companion is written.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/nopq' (FORMAT pfile);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/nopq.pvar*');
+----
+1
+
+# ===========================================================================
+# 3000 variants, several chromosomes: __vidx tracks write order and POS order within each CHROM
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/big' (FORMAT pfile, pvar_parquet);
+
+query I
+SELECT count(*) FROM (
+    SELECT p.CHROM, p.POS, p.ID, row_number() OVER () - 1 AS vidx FROM read_pvar('{TEST_DIR}/big.pvar') p
+) t
+JOIN read_parquet('{TEST_DIR}/big.pvar.parquet') q USING (CHROM, POS, ID)
+WHERE t.vidx = q.__vidx;
+----
+3000
+
+# __vidx is a dense 0..N-1 sequence.
+query III
+SELECT min(__vidx), max(__vidx), count(DISTINCT __vidx) FROM read_parquet('{TEST_DIR}/big.pvar.parquet');
+----
+0	2999	3000
+
+# POS-sorted within every CHROM in __vidx order.
+query I
+SELECT count(*) FROM (
+    SELECT POS - lag(POS) OVER (PARTITION BY CHROM ORDER BY __vidx) AS d FROM read_parquet('{TEST_DIR}/big.pvar.parquet')
+) WHERE d < 0;
+----
+0
+
+# The genotype the reader serves at index __vidx belongs to that variant: read_pfile in file order
+# lines up with the companion's __vidx on (CHROM, POS, ID).
+query I
+SELECT count(*) FROM (
+    SELECT CHROM, POS, ID, row_number() OVER () - 1 AS vidx FROM read_pfile('{TEST_DIR}/big')
+) t
+JOIN read_parquet('{TEST_DIR}/big.pvar.parquet') q USING (CHROM, POS, ID)
+WHERE t.vidx = q.__vidx;
+----
+3000
+
+# ===========================================================================
+# shard_by: every shard gets its own companion, __vidx 0-based PER FILE
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sh' (FORMAT pfile, shard_by 'CHROM', pvar_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/sh/*/data.pvar.parquet');
+----
+3
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/sh/*/data.pvar');
+----
+3
+
+# Per shard: companion rows == that shard's text .pvar rows, __vidx = file order from 0.
+foreach c 1 2 3
+
+query I
+SELECT count(*) FROM (
+    SELECT CHROM, POS, ID, row_number() OVER () - 1 AS vidx FROM read_pvar('{TEST_DIR}/sh/CHROM={c}/data.pvar')
+) t
+JOIN read_parquet('{TEST_DIR}/sh/CHROM={c}/data.pvar.parquet') q USING (CHROM, POS, ID)
+WHERE t.vidx = q.__vidx;
+----
+1000
+
+query I
+SELECT max(__vidx) FROM read_parquet('{TEST_DIR}/sh/CHROM={c}/data.pvar.parquet');
+----
+999
+
+endloop
+
+# ===========================================================================
+# shard_samples: ONE shared .pvar, so ONE companion
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, pvar_parquet);
+
+query II
+SELECT count(*), max(__vidx) FROM read_parquet('{TEST_DIR}/ss.pvar.parquet');
+----
+3000	2999
+
+# ===========================================================================
+# shard_by + shard_samples (matrix): one companion per variant block
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, pvar_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/mx/*/variants.pvar.parquet');
+----
+3
+
+query I
+SELECT sum(n) FROM (SELECT count(*) AS n FROM read_parquet('{TEST_DIR}/mx/*/variants.pvar.parquet'));
+----
+3000
+
+# ===========================================================================
+# Standalone FORMAT pvar
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/solo.pvar' (FORMAT pvar, pvar_parquet);
+
+query T
+SELECT list(__vidx ORDER BY __vidx) FROM read_parquet('{TEST_DIR}/solo.pvar.parquet');
+----
+[0, 1, 2, 3]
+
+# No staging leftovers from any of the writers above.
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/**/*staging*');
+----
+0

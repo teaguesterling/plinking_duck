@@ -11,6 +11,9 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/appender.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <pgenlib_write.h> // STPgenWriter write path (P9 Phase B, FORMAT pgen)
 
@@ -101,9 +104,16 @@ struct PvarWriteBindData : public FunctionData {
 	idx_t chrom_input_idx = 0;
 	//! File-path override from the `pvar` option; empty means use DuckDB's COPY target.
 	string path_override;
+	//! `pvar_parquet` option: also emit '<pvar>.parquet' (CHROM, POS, ID, REF, ALT, __vidx). The text
+	//! `.pvar` is still written; the parquet is a region-prunable companion of the SAME rows.
+	bool pvar_parquet = false;
+	//! The database, captured at bind, so the companion can be written through its own Connection.
+	DatabaseInstance *db = nullptr;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PvarWriteBindData>();
+		r->pvar_parquet = pvar_parquet;
+		r->db = db;
 		r->out_headers = out_headers;
 		r->out_source_idx = out_source_idx;
 		r->pos_input_idx = pos_input_idx;
@@ -114,7 +124,8 @@ struct PvarWriteBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PvarWriteBindData>();
 		return out_headers == o.out_headers && out_source_idx == o.out_source_idx && pos_input_idx == o.pos_input_idx &&
-		       chrom_input_idx == o.chrom_input_idx && path_override == o.path_override;
+		       chrom_input_idx == o.chrom_input_idx && path_override == o.path_override &&
+		       pvar_parquet == o.pvar_parquet;
 	}
 };
 
@@ -139,6 +150,13 @@ struct PvarWriteGlobalState : public GlobalFunctionData {
 	int64_t first_pos = 0;
 	int64_t pos_max = 0;
 
+	// Parquet companion (`pvar_parquet`): rows are appended, in WRITE ORDER, to a temp table on a private
+	// Connection; `vidx` is the 0-based write-order counter = the variant's index in the written .pgen.
+	// Declared con-before-appender so the appender is destroyed first.
+	unique_ptr<Connection> pq_con;
+	unique_ptr<Appender> pq_app;
+	int64_t vidx = 0;
+
 	//! Close the handle and remove the partial file. Used both on the failure
 	//! path (sink throw) and so cleanup is idempotent. DuckDB only auto-removes
 	//! its single COPY target; a `pvar` override would otherwise be orphaned.
@@ -146,9 +164,14 @@ struct PvarWriteGlobalState : public GlobalFunctionData {
 		if (handle) {
 			handle.reset();
 		}
+		pq_app.reset();
+		pq_con.reset();
 		try {
 			if (!path.empty() && fs.FileExists(path)) {
 				fs.RemoveFile(path);
+			}
+			if (!path.empty() && fs.FileExists(path + ".parquet")) {
+				fs.RemoveFile(path + ".parquet");
 			}
 		} catch (...) {
 			// Best-effort cleanup; never mask the original error.
@@ -266,6 +289,11 @@ unique_ptr<PvarWriteBindData> BuildPvarBind(CopyFunctionBindInput &input, const 
 			if (!opt.second.empty() && !opt.second[0].IsNull()) {
 				bind->path_override = opt.second[0].ToString();
 			}
+		} else if (key == "pvar_parquet") {
+			// bare `pvar_parquet` or `pvar_parquet true` enables; NULL/false disables (as `force`).
+			bind->pvar_parquet =
+			    opt.second.empty() ||
+			    (!opt.second[0].IsNull() && opt.second[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
 		}
 		// Other options (sample_fields / genotype_fields / samples / path
 		// overrides for other members) belong to later increments; ignore here.
@@ -330,9 +358,56 @@ unique_ptr<FunctionData> PvarCopyBind(ClientContext &context, CopyFunctionBindIn
 	// once here so the vector<string>-based helpers below stay unchanged.
 	const vector<string> names = CompatNameStrings(names_in);
 	auto bind = BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
+	bind->db = &DatabaseInstance::GetDatabase(context);
 	RefuseExistingOutput(context, ParseForceOption(input),
 	                     {bind->path_override.empty() ? input.info.file_path : bind->path_override}, "write pvar");
 	return std::move(bind);
+}
+
+// ---- parquet companion ('<pvar>.parquet') -------------------------------------------------------
+// Columns CHROM, POS, ID, REF, ALT, __vidx. Rows are appended in the order the text .pvar writes them,
+// and __vidx is that same 0-based counter, so __vidx == the variant's index in the written .pgen (the
+// writer enforces sorted input, so write order == POS order; it is never re-sorted). Types follow
+// read_pvar's canonical schema (POS INTEGER, others VARCHAR; NULL where the text .pvar writes ".").
+void PvarParquetBegin(PvarWriteGlobalState &g, const PvarWriteBindData &bind) {
+	if (!bind.pvar_parquet) {
+		return;
+	}
+	g.pq_con = make_uniq<Connection>(*bind.db);
+	auto r = g.pq_con->Query("CREATE TEMP TABLE __pvar_pq(CHROM VARCHAR, POS INTEGER, ID VARCHAR, REF VARCHAR, "
+	                         "ALT VARCHAR, __vidx BIGINT)");
+	if (r->HasError()) {
+		throw IOException("write pvar: cannot buffer the parquet companion: %s", r->GetError());
+	}
+	g.pq_app = make_uniq<Appender>(*g.pq_con, "temp", "main", "__pvar_pq");
+	g.vidx = 0;
+}
+
+// Write the buffered rows to `<g.path>.parquet`, in write order. Called once, after the last row.
+void PvarParquetFlush(PvarWriteGlobalState &g) {
+	if (!g.pq_app) {
+		return;
+	}
+	g.pq_app->Close();
+	string target = g.path + ".parquet";
+	auto r = g.pq_con->Query("COPY (SELECT CHROM, POS, ID, REF, ALT, __vidx FROM __pvar_pq ORDER BY __vidx) TO '" +
+	                         StringUtil::Replace(target, "'", "''") + "' (FORMAT parquet, COMPRESSION zstd)");
+	if (r->HasError()) {
+		throw IOException("write pvar: cannot write the parquet companion '%s': %s", target, r->GetError());
+	}
+	g.pq_app.reset();
+	g.pq_con.reset();
+}
+
+// Rename a finished '<staging>' .pvar onto its final path, with its parquet companion if one exists.
+// `drop_stale`: also drop a pre-existing final companion when this write has none (it would describe other rows).
+void PvarMoveWithCompanion(FileSystem &fs, const string &staging, const string &final_path, bool drop_stale) {
+	if (fs.FileExists(staging + ".parquet")) {
+		fs.MoveFile(staging + ".parquet", final_path + ".parquet");
+	} else if (drop_stale && fs.FileExists(final_path + ".parquet")) {
+		fs.RemoveFile(final_path + ".parquet");
+	}
+	fs.MoveFile(staging, final_path);
 }
 
 // Open the `.pvar` handle at `path` (overwrite) and write its header line. Shared
@@ -350,6 +425,7 @@ void PvarOpenAndWriteHeader(PvarWriteGlobalState &g, FileSystem &fs, const PvarW
 	header += StringUtil::Join(bind.out_headers, "\t");
 	header += "\n";
 	g.handle->Write(const_cast<char *>(header.data()), header.size());
+	PvarParquetBegin(g, bind);
 }
 
 unique_ptr<GlobalFunctionData> PvarCopyInitGlobal(ClientContext &context, FunctionData &bind_data,
@@ -432,6 +508,22 @@ void PvarWriteChunk(const PvarWriteBindData &bind, PvarWriteGlobalState &g, Data
 				buffer += CellToField(input.GetValue(bind.out_source_idx[c], row), bind.out_headers[c]);
 			}
 			buffer += '\n';
+			if (g.pq_app) {
+				auto &app = *g.pq_app;
+				app.BeginRow();
+				for (idx_t c = 0; c < 5; c++) { // the five canonical roles are out columns 0..4
+					auto v = input.GetValue(bind.out_source_idx[c], row);
+					if (v.IsNull()) {
+						app.Append(Value(c == 1 ? LogicalType::INTEGER : LogicalType::VARCHAR));
+					} else if (c == 1) {
+						app.Append(v.DefaultCastAs(LogicalType::INTEGER));
+					} else {
+						app.Append(Value(v.ToString()));
+					}
+				}
+				app.Append(Value::BIGINT(g.vidx++));
+				app.EndRow();
+			}
 		}
 		if (!buffer.empty()) {
 			g.handle->Write(const_cast<char *>(buffer.data()), buffer.size());
@@ -465,7 +557,12 @@ void PvarCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionData
 		g.handle->Sync();
 		g.handle.reset();
 	}
-	(void)context;
+	try {
+		PvarParquetFlush(g);
+	} catch (...) {
+		g.CleanupPartial(FileSystem::GetFileSystem(context));
+		throw;
+	}
 }
 
 CopyFunctionExecutionMode PvarCopyExecMode(bool /*preserve_insertion_order*/, bool /*supports_batch_index*/) {
@@ -1606,10 +1703,12 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 			pvar_g.handle.reset();
 		}
 		pgen_g.CleanupPartial(sysfs); // closes STPgenWriter + removes .pgen.staging(+.tmp)
-		for (const string *p : {&psam_path, &pvar_g.path}) {
+		pvar_g.pq_app.reset();
+		pvar_g.pq_con.reset();
+		for (const string &p : {psam_path, pvar_g.path, pvar_g.path + ".parquet"}) {
 			try {
-				if (!p->empty() && sysfs.FileExists(*p)) {
-					sysfs.RemoveFile(*p);
+				if (!p.empty() && p != ".parquet" && sysfs.FileExists(p)) {
+					sysfs.RemoveFile(p);
 				}
 			} catch (...) {
 			}
@@ -1632,7 +1731,7 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 	// is still strictly better than the pre-staging truncate-in-place, which corrupted the
 	// real targets on ANY mid-write failure. We do not claim the group-atomicity we lack.
 	void PromoteStaging(FileSystem &sysfs) {
-		sysfs.MoveFile(pvar_g.path, pvar_final);
+		PvarMoveWithCompanion(sysfs, pvar_g.path, pvar_final, /*drop_stale=*/true);
 		sysfs.MoveFile(psam_path, psam_final);
 		sysfs.MoveFile(pgen_g.path, pgen_final); // LAST
 		finished = true;
@@ -1786,6 +1885,9 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 				if (!cur_pvar_staging.empty() && sysfs.FileExists(cur_pvar_staging)) {
 					sysfs.RemoveFile(cur_pvar_staging);
 				}
+				if (!cur_pvar_staging.empty() && sysfs.FileExists(cur_pvar_staging + ".parquet")) {
+					sysfs.RemoveFile(cur_pvar_staging + ".parquet");
+				}
 			} catch (...) {
 			}
 		}
@@ -1907,6 +2009,7 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 		g.cur_pvar->handle->Sync();
 		g.cur_pvar->handle.reset();
 	}
+	PvarParquetFlush(*g.cur_pvar);
 	ShardEntry e;
 	uint64_t variant_count = g.cur_pgen->appended;
 	e.prefix = g.cur_rel_prefix;
@@ -1931,7 +2034,7 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 	if (g.entries.empty()) {
 		RemoveStaleCatalog(fs, g.catalog_path); // the first shard promotion of this COPY
 	}
-	fs.MoveFile(g.cur_pvar_staging, g.cur_pvar_final);
+	PvarMoveWithCompanion(fs, g.cur_pvar_staging, g.cur_pvar_final, /*drop_stale=*/false);
 	fs.MoveFile(g.cur_pgen_staging, g.cur_pgen_final); // LAST
 
 	g.running_start = static_cast<uint64_t>(e.partition_stop);
@@ -2301,6 +2404,9 @@ struct PfileSampleShardedGlobalState : public GlobalFunctionData {
 			if (!pvar_g.path.empty() && sysfs.FileExists(pvar_g.path)) {
 				sysfs.RemoveFile(pvar_g.path);
 			}
+			if (!pvar_g.path.empty() && sysfs.FileExists(pvar_g.path + ".parquet")) {
+				sysfs.RemoveFile(pvar_g.path + ".parquet");
+			}
 		} catch (...) {
 		}
 		for (auto it = created_dirs.rbegin(); it != created_dirs.rend(); ++it) {
@@ -2474,12 +2580,13 @@ void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g
 			g.pvar_g.handle->Sync();
 			g.pvar_g.handle.reset();
 		}
+		PvarParquetFlush(g.pvar_g);
 		// Promote: the shared .pvar, then every .psam, then every .pgen (each .pgen after its shard's
 		// .psam, as in the bundle), then the catalog LAST. Not atomic as a group — a failure between
 		// renames leaves no catalog (a prior run's catalog is removed first, see RemoveStaleCatalog),
 		// so read_pfile_catalog / ATTACH see the cohort as absent, never stale.
 		RemoveStaleCatalog(fs, g.catalog_path);
-		fs.MoveFile(g.pvar_g.path, g.pvar_final);
+		PvarMoveWithCompanion(fs, g.pvar_g.path, g.pvar_final, /*drop_stale=*/false);
 		for (auto &sh : g.shards) {
 			fs.MoveFile(sh.psam_staging, sh.psam_final);
 		}
@@ -2581,6 +2688,7 @@ struct PfileMatrixGlobalState : public GlobalFunctionData {
 		}
 		if (cur_pvar) {
 			remove_quiet(cur_pvar_staging);
+			remove_quiet(cur_pvar_staging + ".parquet");
 		}
 		for (auto &pg : cur_pgens) {
 			if (pg) {
@@ -2589,6 +2697,7 @@ struct PfileMatrixGlobalState : public GlobalFunctionData {
 		}
 		for (auto &m : pvar_moves) {
 			remove_quiet(m.first);
+			remove_quiet(m.first + ".parquet");
 		}
 		for (auto &m : pgen_moves) {
 			remove_quiet(m.first);
@@ -2701,6 +2810,7 @@ void PfileMatrixBlockClose(PfileMatrixGlobalState &g) {
 		g.cur_pvar->handle->Sync();
 		g.cur_pvar->handle.reset();
 	}
+	PvarParquetFlush(*g.cur_pvar);
 	g.pvar_moves.emplace_back(g.cur_pvar_staging, g.cur_pvar_final);
 
 	MatrixVariantBlock vb;
@@ -2854,7 +2964,7 @@ void PfileMatrixFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileMa
 		// cohort absent (no catalog), never stale.
 		RemoveStaleCatalog(fs, g.catalog_path);
 		for (auto &m : g.pvar_moves) {
-			fs.MoveFile(m.first, m.second);
+			PvarMoveWithCompanion(fs, m.first, m.second, /*drop_stale=*/false);
 		}
 		for (auto &sb : g.sblocks) {
 			fs.MoveFile(sb.psam_staging, sb.psam_final);
@@ -2932,6 +3042,7 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	// never stringified into the .pvar as a bogus extra column).
 	std::set<idx_t> exclude = {bind->pgen_bind->geno_input_idx};
 	bind->pvar_bind = BuildPvarBind(input, names, sql_types, exclude);
+	bind->pvar_bind->db = &DatabaseInstance::GetDatabase(context);
 
 	// Sample identity (the contract): struct field names or a `samples` list; also
 	// rejects sample_fields metadata beyond IID.
@@ -3176,6 +3287,7 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 			g.pvar_g.handle->Sync();
 			g.pvar_g.handle.reset();
 		}
+		PvarParquetFlush(g.pvar_g);
 		// All three staging files are complete — promote them to the final paths
 		// (rename, overwriting any prior fileset intra-filesystem). ONLY here does an
 		// existing fileset change; an earlier failure never reached this point. Under
