@@ -104,6 +104,9 @@ struct PvarWriteBindData : public FunctionData {
 	idx_t chrom_input_idx = 0;
 	//! File-path override from the `pvar` option; empty means use DuckDB's COPY target.
 	string path_override;
+	//! Standalone FORMAT pvar only: the user's final target. DuckDB may hand InitGlobal a `tmp_` name when it
+	//! overwrites, so the finalize-time stale-companion cleanup needs this, not g.path.
+	string target_path;
 	//! `pvar_parquet` option: also emit '<pvar>.parquet' (CHROM, POS, ID, REF, ALT, __vidx). The text
 	//! `.pvar` is still written; the parquet is a region-prunable companion of the SAME rows.
 	bool pvar_parquet = false;
@@ -362,8 +365,8 @@ unique_ptr<FunctionData> PvarCopyBind(ClientContext &context, CopyFunctionBindIn
 	const vector<string> names = CompatNameStrings(names_in);
 	auto bind = BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
 	bind->db = &DatabaseInstance::GetDatabase(context);
-	RefuseExistingOutput(context, ParseForceOption(input),
-	                     {bind->path_override.empty() ? input.info.file_path : bind->path_override}, "write pvar");
+	bind->target_path = bind->path_override.empty() ? input.info.file_path : bind->path_override;
+	RefuseExistingOutput(context, ParseForceOption(input), {bind->target_path}, "write pvar");
 	return std::move(bind);
 }
 
@@ -555,7 +558,8 @@ void PvarCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, L
 	// handle in the sink. Hook is required (DuckDB calls it); nothing to do.
 }
 
-void PvarCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionData &gstate) {
+void PvarCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+	auto &bind = bind_data.Cast<PvarWriteBindData>();
 	auto &g = gstate.Cast<PvarWriteGlobalState>();
 	if (g.handle) {
 		g.handle->Sync();
@@ -566,6 +570,11 @@ void PvarCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionData
 	} catch (...) {
 		g.CleanupPartial(FileSystem::GetFileSystem(context));
 		throw;
+	}
+	// A rewrite without pvar_parquet must not leave a stale companion (its __vidx would mis-seek).
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (!g.pq_on && fs.FileExists(bind.target_path + ".parquet")) {
+		fs.RemoveFile(bind.target_path + ".parquet");
 	}
 }
 
@@ -2063,7 +2072,8 @@ void PfileWriteCatalog(PfileShardedGlobalState &g, const PfileWriteBindData &bin
 		auto &e = g.entries[i];
 		j += "    {\n";
 		j += "      \"prefix\": \"" + JsonEscape(e.prefix) + "\",\n";
-		if (!bind.pvar_bind->pvar_parquet) { // a declared pvar beats discovery; omit it so the .pvar.parquet companion is found
+		if (!bind.pvar_bind
+		         ->pvar_parquet) { // a declared pvar beats discovery; omit it so the .pvar.parquet companion is found
 			j += "      \"pvar\": \"" + JsonEscape(e.pvar) + "\",\n";
 		}
 		j += "      \"partition\": { \"start\": " + std::to_string(e.partition_start) +
@@ -2551,7 +2561,8 @@ void PfileWriteSampleCatalog(PfileSampleShardedGlobalState &g, const PfileWriteB
 	j += "  \"pfile_catalog\": 1,\n";
 	j += "  \"dataset\": \"" + JsonEscape(g.base_name) + "\",\n";
 	j += "  \"concat_dim\": \"samples\",\n";
-	j += "  \"shared\": { \"pvar\": \"" + JsonEscape(g.pvar_rel) + (bind.pvar_bind->pvar_parquet ? ".parquet" : "") + "\" },\n";
+	j += "  \"shared\": { \"pvar\": \"" + JsonEscape(g.pvar_rel) + (bind.pvar_bind->pvar_parquet ? ".parquet" : "") +
+	     "\" },\n";
 	j += "  \"files\": [\n";
 	for (idx_t i = 0; i < g.shards.size(); i++) {
 		auto &sh = g.shards[i];

@@ -349,8 +349,11 @@ companion over the text `.pvar` when it discovers the companion itself.
   that has no `__vidx` column is read in physical row order. That is correct
   only when the rows are stored in `.pgen` order (position order, as the
   writer emits them). A re-sorted companion without `__vidx` gives wrong
-  variant-to-genotype pairing on a `region` read. Add a `__vidx` column to
-  re-sorted companions. A dense read (no `region`) ignores `__vidx`.
+  variant-to-genotype pairing on a `region` read. Adding a `__vidx` column
+  fixes `region` reads only. A dense read (no `region`) ignores `__vidx`, so
+  a re-sorted companion still pairs variants with the wrong genotypes
+  silently. Re-sort the `.pgen` with the companion, or do not use a
+  re-sorted companion for dense reads.
 
 ## What PlinkingDuck validates — and what it leaves to the loader
 

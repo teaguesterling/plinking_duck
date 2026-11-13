@@ -259,3 +259,22 @@ query I
 SELECT count(*) FROM glob('{TEST_DIR}/keep.pvar.parquet');
 ----
 1
+
+# Standalone FORMAT pvar: force-rewrite without pvar_parquet drops the stale companion
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/solo_fr.pvar' (FORMAT pvar, pvar_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/solo_fr.pvar.parquet');
+----
+1
+
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/solo_fr.pvar' (FORMAT pvar, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/solo_fr.pvar.parquet');
+----
+0
