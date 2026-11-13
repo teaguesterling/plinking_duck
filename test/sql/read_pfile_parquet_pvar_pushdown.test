@@ -149,6 +149,73 @@ SELECT count(*) FROM a3 JOIN d3 USING (CHROM, POS, ID) WHERE a3.__ordinal <> d3.
 ----
 0
 
+# --- Pruning proof: a real row-group SKIP over a companion whose physical order != __vidx order.
+#     B is stored POS-DESC in small row groups, so its row groups hold disjoint POS ranges
+#     (measured: ~[100,31800] and ~[31800,100000]). The narrow region '1:1000-5000' lies entirely
+#     inside the low-POS row group, so the high-POS group's POS stats are disjoint and DuckDB skips
+#     it — combining "physical order != __vidx" with an actual prune, which the wide regions above do
+#     not (POS repeats across chroms, so a wide window straddles both groups). (A region on
+#     CHROM DESC,POS DESC ordering was measured NOT to prune: those row groups both span ~[100,100000].)
+
+# Structural prune probe: at least one POS row group is disjoint from [1000,5000], so a skip happens.
+# (stats are VARCHAR; TRY_CAST in a subquery guards the non-POS columns parquet_metadata also lists.)
+query I
+SELECT count(*) >= 1 FROM (
+  SELECT TRY_CAST(stats_min AS BIGINT) AS smin, TRY_CAST(stats_max AS BIGINT) AS smax
+  FROM parquet_metadata('{TEST_DIR}/B.pvar.parquet') WHERE path_in_schema = 'POS'
+) WHERE smax < 1000 OR smin > 5000;
+----
+true
+
+statement ok
+CREATE TEMP TABLE an AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar', region := '1:1000-5000', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE bn AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/B.pvar.parquet', region := '1:1000-5000', with_ordinal := true);
+
+# 41 variants (POS 1000..5000 step 100), ordinals 9..49 in the pgen's (CHROM, POS) order.
+query III
+SELECT count(*), min(__ordinal), max(__ordinal) FROM an;
+----
+41	9	49
+
+# Identity across the pruned skip: pruned re-ordered parquet (b) == text (a). RED before the fix
+# (the surviving rows keep their physical file_row_number, which != __vidx on a POS-DESC companion).
+query I
+SELECT count(*) FROM an JOIN bn USING (CHROM, POS, ID) WHERE an.__ordinal <> bn.__ordinal OR an.g IS DISTINCT FROM bn.g;
+----
+0
+
+# --- Safety: __vidx now drives a .pgen seek and may come from an untrusted companion, so an
+#     out-of-range or duplicate __vidx is rejected rather than used as an index. A.pgen has 3000
+#     variants, so __vidx must be in [0, 3000) and unique. ---
+
+# __vidx past the end of the .pgen (999999 >= 3000) on a region-matching row -> clean error, no OOB seek.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, CASE WHEN POS = 1000 THEN 999999 ELSE __vidx END AS __vidx
+      FROM read_parquet('{TEST_DIR}/A.pvar.parquet'))
+TO '{TEST_DIR}/bad_oob.pvar.parquet' (FORMAT parquet);
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/bad_oob.pvar.parquet', region := '1:1000-5000');
+----
+out of range
+
+# Two region-matching rows share a __vidx -> clean error.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, CASE WHEN POS IN (1000, 1100) THEN 9 ELSE __vidx END AS __vidx
+      FROM read_parquet('{TEST_DIR}/A.pvar.parquet'))
+TO '{TEST_DIR}/bad_dup.pvar.parquet' (FORMAT parquet);
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/bad_dup.pvar.parquet', region := '1:1000-5000');
+----
+duplicate __vidx
+
 # ===========================================================================
 # Section 2 — 2-shard list read: __vidx resets per file, so each shard's ordinal
 #   must be taken from ITS OWN __vidx. shard1 and shard2 are distinct filesets that
