@@ -2546,12 +2546,12 @@ void PfileSampleShardedSink(ExecutionContext &context, const PfileWriteBindData 
 // (test/data/pfile_catalog_le_samples.pfile.json): shared.pvar at the root, a per-file psam, NO
 // per-file pvar (the parser rejects one beside shared.pvar), and partition = global half-open
 // SAMPLE ordinals tiling [0, total) in file order.
-void PfileWriteSampleCatalog(PfileSampleShardedGlobalState &g, FileSystem &fs) {
+void PfileWriteSampleCatalog(PfileSampleShardedGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
 	string j = "{\n";
 	j += "  \"pfile_catalog\": 1,\n";
 	j += "  \"dataset\": \"" + JsonEscape(g.base_name) + "\",\n";
 	j += "  \"concat_dim\": \"samples\",\n";
-	j += "  \"shared\": { \"pvar\": \"" + JsonEscape(g.pvar_rel) + "\" },\n";
+	j += "  \"shared\": { \"pvar\": \"" + JsonEscape(g.pvar_rel) + (bind.pvar_bind->pvar_parquet ? ".parquet" : "") + "\" },\n";
 	j += "  \"files\": [\n";
 	for (idx_t i = 0; i < g.shards.size(); i++) {
 		auto &sh = g.shards[i];
@@ -2574,7 +2574,7 @@ void PfileWriteSampleCatalog(PfileSampleShardedGlobalState &g, FileSystem &fs) {
 	h.reset();
 }
 
-void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g) {
+void PfileSampleShardedFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileSampleShardedGlobalState &g) {
 	try {
 		if (!g.opened) {
 			throw IOException("write pfile: shard_samples produced no variants — the input query returned no rows");
@@ -2599,7 +2599,7 @@ void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g
 		for (auto &sh : g.shards) {
 			fs.MoveFile(sh.pgen_staging, sh.pgen_final);
 		}
-		PfileWriteSampleCatalog(g, fs);
+		PfileWriteSampleCatalog(g, bind, fs);
 		g.finished = true;
 	} catch (...) {
 		g.CleanupPartial(fs);
@@ -2947,7 +2947,7 @@ void PfileWriteMatrixCatalog(PfileMatrixGlobalState &g, const PfileWriteBindData
 	const string sdir = sk + "={" + sk + "}";
 	j += "  \"template\": {\n";
 	j += "    \"pfile\": \"" + vdir + "/" + sdir + "/data\",\n";
-	j += "    \"pvar\": \"" + vdir + "/variants.pvar\",\n";
+	j += "    \"pvar\": \"" + vdir + "/variants.pvar" + (bind.pvar_bind->pvar_parquet ? ".parquet" : "") + "\",\n";
 	j += "    \"psam\": \"" + root + sdir + "/samples.psam\"\n";
 	j += "  }\n}\n";
 	auto h = fs.OpenFile(g.catalog_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
@@ -3276,7 +3276,7 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 		return;
 	}
 	if (bind.sample_shard_mode) {
-		PfileSampleShardedFinalize(fs, gstate.Cast<PfileSampleShardedGlobalState>());
+		PfileSampleShardedFinalize(fs, bind, gstate.Cast<PfileSampleShardedGlobalState>());
 		return;
 	}
 	if (!bind.shard_by.empty()) {
