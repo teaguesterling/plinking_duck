@@ -1,10 +1,11 @@
 # name: test/sql/read_pfile_parquet_pvar_no_vidx_fallback.test
 # description: a hand-made parquet .pvar companion WITHOUT a __vidx column, stored in POS order, read with a
+# group: [sql]
+
 #   region, must fall back to the legacy physical row order for the .pgen ordinal. For an in-order
 #   companion that is correct: rows AND genotypes equal the text-companion read. Also pins that a
 #   catalog (read_pfile(catalog :=)) region read over parquet companions goes through the same
 #   region-pruned companion path and matches the text-companion catalog read.
-# group: [sql]
 
 require plinking_duck
 

@@ -1,5 +1,7 @@
 # name: test/sql/read_pfile_parquet_pvar_pushdown.test
 # description: read_pfile region pushdown into a parquet .pvar companion must take each variant's
+# group: [sql]
+
 #   pgen ordinal from the __vidx COLUMN, not from the companion's physical row position. The invariant:
 #   a region read over a parquet companion whose PHYSICAL order differs from __vidx order must still
 #   return rows AND genotypes byte-identical to the text-companion read. Before the fix the reader used
@@ -7,7 +9,6 @@
 #   CHROM/POS/ID onto another variant's genotypes. The ONLY way file_row_number and __vidx coincide is
 #   when the companion is stored in __vidx order (what the Task-1 writer always does); these fixtures
 #   deliberately store it out of that order to tell the two ordinal sources apart.
-# group: [sql]
 
 require plinking_duck
 

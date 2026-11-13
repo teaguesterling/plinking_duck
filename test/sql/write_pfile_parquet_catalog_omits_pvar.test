@@ -1,6 +1,7 @@
 # name: test/sql/write_pfile_parquet_catalog_omits_pvar.test
 # description: a sharded/matrix COPY with pvar_parquet omits the catalog `pvar` key, so discovery (+ plinking_use_parquet_companions) reads the parquet companion. A declared text pvar would win and bypass it. Without pvar_parquet the catalog still declares pvar.
 # group: [sql]
+
 #
 # shard_by omits the per-shard pvar; shard_samples (shared.pvar) and matrix (template.pvar) are required keys, so they
 # DECLARE the .pvar.parquet path instead.
