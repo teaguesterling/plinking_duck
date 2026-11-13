@@ -197,3 +197,65 @@ query I
 SELECT count(*) FROM glob('{TEST_DIR}/**/*staging*');
 ----
 0
+
+# ===========================================================================
+# force-rewrite WITHOUT pvar_parquet must not leave a stale companion (its __vidx would mis-seek)
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_sh' (FORMAT pfile, shard_by 'CHROM', pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_sh' (FORMAT pfile, shard_by 'CHROM', force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr_sh/*/data.pvar.parquet');
+----
+0
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_ss' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_ss' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr_ss.pvar.parquet');
+----
+0
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr_mx/*/variants.pvar.parquet');
+----
+0
+
+# ===========================================================================
+# A failed standalone FORMAT pvar (no pvar_parquet) must not delete an earlier run's companion
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/keep.pvar' (FORMAT pvar, pvar_parquet);
+
+statement error
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') ORDER BY CHROM DESC, POS DESC)
+TO '{TEST_DIR}/keep.pvar' (FORMAT pvar, force);
+----
+not position-sorted
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/keep.pvar.parquet');
+----
+1

@@ -156,6 +156,7 @@ struct PvarWriteGlobalState : public GlobalFunctionData {
 	unique_ptr<Connection> pq_con;
 	unique_ptr<Appender> pq_app;
 	int64_t vidx = 0;
+	bool pq_on = false; //! a parquet sink was created for this state (gates companion cleanup)
 
 	//! Close the handle and remove the partial file. Used both on the failure
 	//! path (sink throw) and so cleanup is idempotent. DuckDB only auto-removes
@@ -170,7 +171,9 @@ struct PvarWriteGlobalState : public GlobalFunctionData {
 			if (!path.empty() && fs.FileExists(path)) {
 				fs.RemoveFile(path);
 			}
-			if (!path.empty() && fs.FileExists(path + ".parquet")) {
+			// Only a companion THIS state created: in standalone FORMAT pvar `path` is the final target, so an
+			// earlier run's '<path>.parquet' is not ours to delete.
+			if (pq_on && !path.empty() && fs.FileExists(path + ".parquet")) {
 				fs.RemoveFile(path + ".parquet");
 			}
 		} catch (...) {
@@ -381,6 +384,7 @@ void PvarParquetBegin(PvarWriteGlobalState &g, const PvarWriteBindData &bind) {
 	}
 	g.pq_app = make_uniq<Appender>(*g.pq_con, "temp", "main", "__pvar_pq");
 	g.vidx = 0;
+	g.pq_on = true;
 }
 
 // Write the buffered rows to `<g.path>.parquet`, in write order. Called once, after the last row.
@@ -2034,7 +2038,7 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 	if (g.entries.empty()) {
 		RemoveStaleCatalog(fs, g.catalog_path); // the first shard promotion of this COPY
 	}
-	PvarMoveWithCompanion(fs, g.cur_pvar_staging, g.cur_pvar_final, /*drop_stale=*/false);
+	PvarMoveWithCompanion(fs, g.cur_pvar_staging, g.cur_pvar_final, /*drop_stale=*/true);
 	fs.MoveFile(g.cur_pgen_staging, g.cur_pgen_final); // LAST
 
 	g.running_start = static_cast<uint64_t>(e.partition_stop);
@@ -2586,7 +2590,7 @@ void PfileSampleShardedFinalize(FileSystem &fs, PfileSampleShardedGlobalState &g
 		// renames leaves no catalog (a prior run's catalog is removed first, see RemoveStaleCatalog),
 		// so read_pfile_catalog / ATTACH see the cohort as absent, never stale.
 		RemoveStaleCatalog(fs, g.catalog_path);
-		PvarMoveWithCompanion(fs, g.pvar_g.path, g.pvar_final, /*drop_stale=*/false);
+		PvarMoveWithCompanion(fs, g.pvar_g.path, g.pvar_final, /*drop_stale=*/true);
 		for (auto &sh : g.shards) {
 			fs.MoveFile(sh.psam_staging, sh.psam_final);
 		}
@@ -2964,7 +2968,7 @@ void PfileMatrixFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileMa
 		// cohort absent (no catalog), never stale.
 		RemoveStaleCatalog(fs, g.catalog_path);
 		for (auto &m : g.pvar_moves) {
-			PvarMoveWithCompanion(fs, m.first, m.second, /*drop_stale=*/false);
+			PvarMoveWithCompanion(fs, m.first, m.second, /*drop_stale=*/true);
 		}
 		for (auto &sb : g.sblocks) {
 			fs.MoveFile(sb.psam_staging, sb.psam_final);
