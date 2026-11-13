@@ -122,13 +122,14 @@ struct PvarWriteBindData : public FunctionData {
 		r->pos_input_idx = pos_input_idx;
 		r->chrom_input_idx = chrom_input_idx;
 		r->path_override = path_override;
+		r->target_path = target_path;
 		return std::move(r);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PvarWriteBindData>();
 		return out_headers == o.out_headers && out_source_idx == o.out_source_idx && pos_input_idx == o.pos_input_idx &&
 		       chrom_input_idx == o.chrom_input_idx && path_override == o.path_override &&
-		       pvar_parquet == o.pvar_parquet;
+		       target_path == o.target_path && pvar_parquet == o.pvar_parquet;
 	}
 };
 
@@ -571,10 +572,24 @@ void PvarCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFun
 		g.CleanupPartial(FileSystem::GetFileSystem(context));
 		throw;
 	}
-	// A rewrite without pvar_parquet must not leave a stale companion (its __vidx would mis-seek).
+	// Standalone only (target_path is empty otherwise): reconcile the companion with the final .pvar name.
+	if (bind.target_path.empty()) {
+		return;
+	}
 	auto &fs = FileSystem::GetFileSystem(context);
-	if (!g.pq_on && fs.FileExists(bind.target_path + ".parquet")) {
-		fs.RemoveFile(bind.target_path + ".parquet");
+	const string final_pq = bind.target_path + ".parquet";
+	if (!g.pq_on) {
+		// A rewrite without pvar_parquet must not leave a stale companion (its __vidx would mis-seek).
+		if (fs.FileExists(final_pq)) {
+			fs.RemoveFile(final_pq);
+		}
+	} else if (g.path + ".parquet" != final_pq) {
+		// DuckDB overwrote via a tmp_ name and renames only the .pvar: put the new companion at its final
+		// name, replacing the old one.
+		if (fs.FileExists(final_pq)) {
+			fs.RemoveFile(final_pq);
+		}
+		fs.MoveFile(g.path + ".parquet", final_pq);
 	}
 }
 

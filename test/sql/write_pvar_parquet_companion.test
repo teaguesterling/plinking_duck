@@ -278,3 +278,67 @@ query I
 SELECT count(*) FROM glob('{TEST_DIR}/solo_fr.pvar.parquet');
 ----
 0
+
+# ===========================================================================
+# Standalone FORMAT pvar, force-rewrite WITH pvar_parquet over an existing fileset: the NEW companion replaces the old
+# (DuckDB writes via a tmp_ name and renames only the text .pvar)
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/rw.pvar' (FORMAT pvar, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pvar('test/data/pfile_example.pvar') ORDER BY CHROM, POS LIMIT 2)
+TO '{TEST_DIR}/rw.pvar' (FORMAT pvar, pvar_parquet, force);
+
+# (a) companion row count matches the NEW .pvar (2), not the old (4)
+query II
+SELECT (SELECT count(*) FROM read_parquet('{TEST_DIR}/rw.pvar.parquet')),
+       (SELECT count(*) FROM read_pvar('{TEST_DIR}/rw.pvar'));
+----
+2	2
+
+# (a') and it is the new rows, __vidx 0..1
+query T
+SELECT list(__vidx ORDER BY __vidx) FROM read_parquet('{TEST_DIR}/rw.pvar.parquet');
+----
+[0, 1]
+
+# (b) no tmp_ orphan
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/tmp_rw*');
+----
+0
+
+# (c) over a full fileset: regenerate only the .pvar (same rows) with a fresh companion; region read still pairs
+# variants with the right genotypes.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/rwb' (FORMAT pfile, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pvar('{TEST_DIR}/rwb.pvar') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/rwb.pvar' (FORMAT pvar, pvar_parquet, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/tmp_rwb*');
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/rwb', pvar := '{TEST_DIR}/rwb.pvar.parquet', orient := 'genotype', region := '1:15000-35000')
+   EXCEPT
+   SELECT ID, IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype', region := '1:15000-35000'))
+  UNION ALL
+  (SELECT ID, IID, genotype FROM read_pfile('test/data/pfile_example', orient := 'genotype', region := '1:15000-35000')
+   EXCEPT
+   SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/rwb', pvar := '{TEST_DIR}/rwb.pvar.parquet', orient := 'genotype', region := '1:15000-35000')));
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/rwb', pvar := '{TEST_DIR}/rwb.pvar.parquet', orient := 'genotype', region := '1:15000-35000');
+----
+8
