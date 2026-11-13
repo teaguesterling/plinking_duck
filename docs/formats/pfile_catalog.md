@@ -325,6 +325,36 @@ resolved `prefix` and the shared companion the manifest reports. The Python
 `pfile_catalog` library consumes the same catalog to register the cohort as a single
 concatenated diar dataset.
 
+## Reading parquet companions
+
+A fileset written with [`pvar_parquet`](../functions/write_pfile.md#parquet-pvar-companion-pvar_parquet)
+has a `<prefix>.pvar.parquet` companion. The setting
+`plinking_use_parquet_companions` (default `true`) makes `read_pfile` prefer that
+companion over the text `.pvar` when it discovers the companion itself.
+
+- **Use `region :=` for gene queries.** A `region` read pushes the
+  `CHROM`/`POS` range into the parquet scan, so row groups outside the region
+  are skipped. A `WHERE` on the output columns does not get this pruning.
+  The `.pgen` ordinal of each variant comes from the companion's `__vidx` column.
+- **Which `pvar` the writer declares.** With `pvar_parquet`, the `shard_by` writer
+  omits the per-shard `pvar`, so discovery and `plinking_use_parquet_companions`
+  decide. The `shard_samples` writer (`shared.pvar`) and the matrix writer
+  (`template.pvar`) must declare that key, so they declare the
+  `.pvar.parquet` path: the shared `pvar` is always parquet. The text `.pvar` is
+  still written. A catalog entry that names `pvar` reads exactly that file.
+- **Object-store mounts.** For a cohort on an s3 mount, run
+  `SET plinking_pgen_io = 'vfs';` so the `.pgen` bytes also go through
+  DuckDB's VFS.
+- **Limitation: a companion without `__vidx`.** A hand-made parquet companion
+  that has no `__vidx` column is read in physical row order. That is correct
+  only when the rows are stored in `.pgen` order (position order, as the
+  writer emits them). A re-sorted companion without `__vidx` gives wrong
+  variant-to-genotype pairing on a `region` read. Adding a `__vidx` column
+  fixes `region` reads only. A dense read (no `region`) ignores `__vidx`, so
+  a re-sorted companion still pairs variants with the wrong genotypes
+  silently. Re-sort the `.pgen` with the companion, or do not use a
+  re-sorted companion for dense reads.
+
 ## What PlinkingDuck validates — and what it leaves to the loader
 
 PlinkingDuck's reader is a *manifest* over the catalog, not the full dataset loader.

@@ -1,0 +1,368 @@
+# name: test/sql/read_pfile_parquet_pvar_pushdown.test
+# description: read_pfile region pushdown into a parquet .pvar companion must take each variant's
+# group: [sql]
+
+#   pgen ordinal from the __vidx COLUMN, not from the companion's physical row position. The invariant:
+#   a region read over a parquet companion whose PHYSICAL order differs from __vidx order must still
+#   return rows AND genotypes byte-identical to the text-companion read. Before the fix the reader used
+#   DuckDB's file_row_number (= physical position), so a re-ordered companion mapped each variant's
+#   CHROM/POS/ID onto another variant's genotypes. The ONLY way file_row_number and __vidx coincide is
+#   when the companion is stored in __vidx order (what the Task-1 writer always does); these fixtures
+#   deliberately store it out of that order to tell the two ordinal sources apart.
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# Section 1 — single-file three-way identity (large_example, 3000 variants)
+#   CHROM 1/2/3 each hold 1000 variants, POS 100..100000 step 100, written in
+#   (CHROM, POS) order so __vidx == the pgen record index.
+# ===========================================================================
+
+# A: the canonical Task-1 companion (physical order == __vidx order, one row group).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/A' (FORMAT pfile, pvar_parquet);
+
+# B: the SAME rows and the SAME __vidx values, but stored POS-DESC across all chroms and in small
+#    row groups — physical order (file_row_number) now disagrees with __vidx. This is the fixture the
+#    fix is for. Built from A's companion in one pass (no read+write of one file).
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/A.pvar.parquet') ORDER BY POS DESC)
+TO '{TEST_DIR}/B.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+
+# D: in __vidx order but in small row groups, so a region can straddle a row-group boundary.
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/A.pvar.parquet') ORDER BY __vidx)
+TO '{TEST_DIR}/D.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+
+# Structural probe (prune-possibility): B is stored in more than one row group, so a region WHERE
+# can prune at least one. A measured count of the row groups actually read is deferred to review
+# (no in-test hook exposes it); the three-way genotype+ordinal identity below is the binding gate.
+query I
+SELECT count(*) > 1 FROM (SELECT DISTINCT row_group_id FROM parquet_metadata('{TEST_DIR}/B.pvar.parquet'));
+----
+true
+
+# --- The three reads, all over A.pgen, region 1:30000-70000 (variants 300..700, 401 of them) ---
+# (a) text companion, (b) pruned re-ordered parquet, (c) pruned in-order parquet,
+# (c') un-pruned in-order parquet (no region, filtered in SQL — the dense full-read path).
+statement ok
+CREATE TEMP TABLE a AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar', region := '1:30000-70000', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE b AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/B.pvar.parquet', region := '1:30000-70000', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE c AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar.parquet', region := '1:30000-70000', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE c_unpruned AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar.parquet', with_ordinal := true)
+WHERE CHROM = '1' AND POS BETWEEN 30000 AND 70000;
+
+# All four reads select the same 401 variants.
+query IIII
+SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM b), (SELECT count(*) FROM c), (SELECT count(*) FROM c_unpruned);
+----
+401	401	401	401
+
+# (b) pruned re-ordered parquet == (a) text: ordinals identical.  RED before the fix (file_row_number
+# gives a different ordinal for every row); GREEN after (ordinal comes from __vidx).
+query I
+SELECT count(*) FROM a JOIN b USING (CHROM, POS, ID) WHERE a.__ordinal <> b.__ordinal;
+----
+0
+
+# (b) pruned re-ordered parquet == (a) text: genotypes identical.  RED before the fix.
+query I
+SELECT count(*) FROM a JOIN b USING (CHROM, POS, ID) WHERE a.g IS DISTINCT FROM b.g;
+----
+0
+
+# (c) pruned in-order parquet == (a) text (regression guard: the already-correct in-order path).
+query I
+SELECT count(*) FROM a JOIN c USING (CHROM, POS, ID) WHERE a.__ordinal <> c.__ordinal OR a.g IS DISTINCT FROM c.g;
+----
+0
+
+# (c') un-pruned in-order parquet == (a) text (the dense full-read path keeps its ordinal).
+query I
+SELECT count(*) FROM a JOIN c_unpruned USING (CHROM, POS, ID) WHERE a.__ordinal <> c_unpruned.__ordinal OR a.g IS DISTINCT FROM c_unpruned.g;
+----
+0
+
+# --- Edge: bare-contig region '2' over the re-ordered companion (whole chromosome 2, 1000 variants) ---
+statement ok
+CREATE TEMP TABLE a2 AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar', region := '2', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE b2 AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/B.pvar.parquet', region := '2', with_ordinal := true);
+
+query II
+SELECT (SELECT count(*) FROM a2), (SELECT count(*) FROM b2);
+----
+1000	1000
+
+# RED before the fix (1000 mismatches); GREEN after.
+query I
+SELECT count(*) FROM a2 JOIN b2 USING (CHROM, POS, ID) WHERE a2.__ordinal <> b2.__ordinal OR a2.g IS DISTINCT FROM b2.g;
+----
+0
+
+# --- Edge: empty window over the re-ordered companion must not crash and returns no rows ---
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/B.pvar.parquet', region := '1:1-1');
+----
+0
+
+# --- Edge: region straddling a row-group boundary (whole chrom 3 == __vidx 2000..2999, crosses the
+#     boundary at __vidx 2000 in D's 1000-row groups), in-order small-row-group companion ---
+statement ok
+CREATE TEMP TABLE a3 AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar', region := '3:1-100000', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE d3 AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/D.pvar.parquet', region := '3:1-100000', with_ordinal := true);
+
+query I
+SELECT count(*) FROM a3;
+----
+1000
+
+query I
+SELECT count(*) FROM a3 JOIN d3 USING (CHROM, POS, ID) WHERE a3.__ordinal <> d3.__ordinal OR a3.g IS DISTINCT FROM d3.g;
+----
+0
+
+# --- Pruning proof: a real row-group SKIP over a companion whose physical order != __vidx order.
+#     B is stored POS-DESC in small row groups, so its row groups hold disjoint POS ranges
+#     (measured: ~[100,31800] and ~[31800,100000]). The narrow region '1:1000-5000' lies entirely
+#     inside the low-POS row group, so the high-POS group's POS stats are disjoint and DuckDB skips
+#     it — combining "physical order != __vidx" with an actual prune, which the wide regions above do
+#     not (POS repeats across chroms, so a wide window straddles both groups). (A region on
+#     CHROM DESC,POS DESC ordering was measured NOT to prune: those row groups both span ~[100,100000].)
+
+# Structural prune probe: at least one POS row group is disjoint from [1000,5000], so a skip happens.
+# (stats are VARCHAR; TRY_CAST in a subquery guards the non-POS columns parquet_metadata also lists.)
+query I
+SELECT count(*) >= 1 FROM (
+  SELECT TRY_CAST(stats_min AS BIGINT) AS smin, TRY_CAST(stats_max AS BIGINT) AS smax
+  FROM parquet_metadata('{TEST_DIR}/B.pvar.parquet') WHERE path_in_schema = 'POS'
+) WHERE smax < 1000 OR smin > 5000;
+----
+true
+
+statement ok
+CREATE TEMP TABLE an AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar', region := '1:1000-5000', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE bn AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/B.pvar.parquet', region := '1:1000-5000', with_ordinal := true);
+
+# 41 variants (POS 1000..5000 step 100), ordinals 9..49 in the pgen's (CHROM, POS) order.
+query III
+SELECT count(*), min(__ordinal), max(__ordinal) FROM an;
+----
+41	9	49
+
+# Identity across the pruned skip: pruned re-ordered parquet (b) == text (a). RED before the fix
+# (the surviving rows keep their physical file_row_number, which != __vidx on a POS-DESC companion).
+query I
+SELECT count(*) FROM an JOIN bn USING (CHROM, POS, ID) WHERE an.__ordinal <> bn.__ordinal OR an.g IS DISTINCT FROM bn.g;
+----
+0
+
+# --- Safety: __vidx now drives a .pgen seek and may come from an untrusted companion, so an
+#     out-of-range or duplicate __vidx is rejected rather than used as an index. A.pgen has 3000
+#     variants, so __vidx must be in [0, 3000) and unique. ---
+
+# __vidx past the end of the .pgen (999999 >= 3000) on a region-matching row -> clean error, no OOB seek.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, CASE WHEN POS = 1000 THEN 999999 ELSE __vidx END AS __vidx
+      FROM read_parquet('{TEST_DIR}/A.pvar.parquet'))
+TO '{TEST_DIR}/bad_oob.pvar.parquet' (FORMAT parquet);
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/bad_oob.pvar.parquet', region := '1:1000-5000');
+----
+out of range
+
+# Two region-matching rows share a __vidx -> clean error.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, CASE WHEN POS IN (1000, 1100) THEN 9 ELSE __vidx END AS __vidx
+      FROM read_parquet('{TEST_DIR}/A.pvar.parquet'))
+TO '{TEST_DIR}/bad_dup.pvar.parquet' (FORMAT parquet);
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/bad_dup.pvar.parquet', region := '1:1000-5000');
+----
+duplicate __vidx
+
+# The DENSE (no-region) read must IGNORE a stray column named file_row_number — never adopt a
+# user-supplied column as its .pgen seek ordinal. This companion carries an out-of-range (and
+# duplicated) file_row_number on every row; a full read still succeeds (numbered by emit order) and
+# matches the text read. (Before the ordinal source was gated on expect_ordinal, the dense path would
+# have bound that column and errored on its duplicate/out-of-range values.)
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, __vidx, CAST(999999 AS BIGINT) AS file_row_number
+      FROM read_parquet('{TEST_DIR}/A.pvar.parquet'))
+TO '{TEST_DIR}/stray_frn.pvar.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/stray_frn.pvar.parquet');
+----
+3000
+
+statement ok
+CREATE TEMP TABLE dense_stray AS
+SELECT CHROM, POS, ID, genotypes::VARCHAR AS g FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/stray_frn.pvar.parquet');
+
+statement ok
+CREATE TEMP TABLE dense_text AS
+SELECT CHROM, POS, ID, genotypes::VARCHAR AS g FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar');
+
+query I
+SELECT count(*) FROM dense_stray JOIN dense_text USING (CHROM, POS, ID) WHERE dense_stray.g IS DISTINCT FROM dense_text.g;
+----
+0
+
+# ===========================================================================
+# Section 2 — 2-shard list read: __vidx resets per file, so each shard's ordinal
+#   must be taken from ITS OWN __vidx. shard1 and shard2 are distinct filesets that
+#   both carry CHROM 1, so region := '1' reaches both. Each shard's companion is stored
+#   POS-DESC (physical order != __vidx) at the discovery path beside its .pgen.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/shard1', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/P1' (FORMAT pfile);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/shard2', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/P2' (FORMAT pfile);
+
+# Guard against the 2-shard leg going vacuous: BOTH shards must carry CHROM 1 so region := '1'
+# reaches each one (if only one did, the "resets per file" claim would be empty).
+query II
+SELECT (SELECT count(*) FROM read_pvar('{TEST_DIR}/P1.pvar') WHERE CHROM = '1'),
+       (SELECT count(*) FROM read_pvar('{TEST_DIR}/P2.pvar') WHERE CHROM = '1');
+----
+334	333
+
+# Re-ordered companions at the discovered path. __vidx = the 0-based rank in (CHROM, POS) order == the
+# pgen record index this shard was written in; physical layout is POS-DESC so file_row_number differs.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, (row_number() OVER (ORDER BY CHROM, POS)) - 1 AS __vidx
+      FROM read_pvar('{TEST_DIR}/P1.pvar') ORDER BY POS DESC)
+TO '{TEST_DIR}/P1.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 100);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, (row_number() OVER (ORDER BY CHROM, POS)) - 1 AS __vidx
+      FROM read_pvar('{TEST_DIR}/P2.pvar') ORDER BY POS DESC)
+TO '{TEST_DIR}/P2.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 100);
+
+# Oracle: the list read over the TEXT companions (companion discovery off).
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement ok
+CREATE TEMP TABLE shards_text AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile(['{TEST_DIR}/P1', '{TEST_DIR}/P2'], region := '1', with_ordinal := true);
+
+# Under test: the same list read over the re-ordered PARQUET companions (discovery on).
+statement ok
+SET plinking_use_parquet_companions = true;
+
+statement ok
+CREATE TEMP TABLE shards_pq AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile(['{TEST_DIR}/P1', '{TEST_DIR}/P2'], region := '1', with_ordinal := true);
+
+# Both shards contributed: 334 (P1) + 333 (P2) = 667 rows.
+query I
+SELECT count(*) FROM shards_text;
+----
+667
+
+# Same number of rows from both paths.
+query I
+SELECT (SELECT count(*) FROM shards_pq) = (SELECT count(*) FROM shards_text);
+----
+true
+
+# Byte-identical (CHROM, POS, ID, ordinal, genotypes) multiset.  RED before the fix: the per-shard
+# file_row_number maps each shard's variants onto the wrong pgen records; GREEN after: each shard's
+# ordinal is its own __vidx.
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM shards_pq EXCEPT SELECT * FROM shards_text)
+  UNION ALL
+  (SELECT * FROM shards_text EXCEPT SELECT * FROM shards_pq)
+);
+----
+0
+
+# ===========================================================================
+# Section 3 — real sharded writer: __vidx must reset per shard. A `shard_by`
+#   output has one companion per shard with its own 0-based __vidx. Reading the
+#   2nd shard (region := '2') through the parquet companions must equal the text
+#   companions AND keep ordinals in [0, 999]; a GLOBAL __vidx would push the 2nd
+#   shard's ordinals to 1000.. and mis-seek its .pgen. Section 2 synthesizes
+#   __vidx with row_number(); this exercises the writer's own per-shard counter.
+# ===========================================================================
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sh' (FORMAT pfile, shard_by 'CHROM', pvar_parquet);
+
+statement ok
+CREATE TEMP TABLE sh_pq AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/sh', region := '2', with_ordinal := true);
+
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement ok
+CREATE TEMP TABLE sh_text AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/sh', region := '2', with_ordinal := true);
+
+# The 2nd shard holds 1000 variants; its ordinals reset to 0..999 (not 1000..1999).
+query III
+SELECT count(*), min(__ordinal), max(__ordinal) FROM sh_pq;
+----
+1000	0	999
+
+# Parquet companions == text companions for the 2nd shard (byte + genotype + ordinal).
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM sh_pq EXCEPT SELECT * FROM sh_text)
+  UNION ALL
+  (SELECT * FROM sh_text EXCEPT SELECT * FROM sh_pq)
+);
+----
+0

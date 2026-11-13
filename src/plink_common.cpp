@@ -861,11 +861,21 @@ string FindCompanionFileWithParquet(ClientContext &context, FileSystem &fs, cons
 
 //! Columnar ingestion helper. Scans a QueryResult and populates idx with
 //! columnar-typed vectors. Maps columns by name (case-insensitive).
-//! row_number_col: if != INVALID_INDEX, interpreted as a BIGINT file_row_number
-//! column; the resulting index is sparse (idx.vidx_map populated). Otherwise
-//! the index is dense (indexed by emit order).
+//!
+//! `expect_ordinal` selects how the per-variant ordinal is determined:
+//!  * false (the dense full read / generic source) — the index is DENSE, numbered
+//!    by emit order. A `file_row_number` column, if the source happens to carry
+//!    one, is IGNORED: a stray user column must never be adopted as a .pgen seek
+//!    ordinal.
+//!  * true (the region pushdown) — the result MUST carry an ordinal column named
+//!    `file_row_number` (the writer's `__vidx`, aliased); the index is SPARSE
+//!    (idx.vidx_map populated). Every ordinal becomes a .pgen seek index and the
+//!    column may come from an untrusted companion, so each value is validated
+//!    against `vidx_bound` (the block's raw variant count, exclusive upper bound):
+//!    reject < 0, >= vidx_bound, or a duplicate within the block. The bound is
+//!    mandatory — there is no "disable validation" sentinel.
 static void IngestVariantResult(QueryResult &result, const string &source_label, const string &func_name,
-                                VariantMetadataIndex &idx) {
+                                VariantMetadataIndex &idx, bool expect_ordinal, idx_t vidx_bound) {
 	// Copied to strings rather than bound by reference: QueryResult::names is
 	// vector<Identifier> on DuckDB v2.0, and the matching below is plain
 	// lowercase string comparison.
@@ -890,7 +900,9 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 			ref_col = i;
 		} else if (lower == "alt") {
 			alt_col = i;
-		} else if (lower == "file_row_number") {
+		} else if (expect_ordinal && lower == "file_row_number") {
+			// Only bind the ordinal when the caller expects one. In the dense path a column that
+			// happens to be named file_row_number is left as data, never used as a seek index.
 			rn_col = i;
 		}
 	}
@@ -898,6 +910,14 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 	if (chrom_col == DConstants::INVALID_INDEX || pos_col == DConstants::INVALID_INDEX) {
 		throw InvalidInputException("%s: %s missing required columns (need CHROM and POS, found: %s)", func_name,
 		                            source_label, StringUtil::Join(col_names, ", "));
+	}
+
+	// When the caller expects an ordinal (the region pushdown), it must be present — otherwise the
+	// sparse vidx_map would be empty and every variant would mis-seek. Fail loud rather than silently
+	// falling back to a dense/emit-order index for a path that needs real pgen indices.
+	if (expect_ordinal && rn_col == DConstants::INVALID_INDEX) {
+		throw InvalidInputException("%s: %s has no ordinal column (expected 'file_row_number')", func_name,
+		                            source_label);
 	}
 
 	auto pos_type_id = col_types[pos_col].id();
@@ -909,6 +929,18 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 	auto chrom_type_id = col_types[chrom_col].id();
 	bool chrom_is_integer = (chrom_type_id == LogicalTypeId::INTEGER || chrom_type_id == LogicalTypeId::BIGINT ||
 	                         chrom_type_id == LogicalTypeId::UINTEGER || chrom_type_id == LogicalTypeId::UBIGINT);
+
+	// The ordinal column is read below via reinterpret_cast<const int64_t*>, so its physical width
+	// must be 64-bit. The region query CASTs __vidx to BIGINT, but a foreign companion read through a
+	// different path could present it otherwise; guard here before the cast.
+	if (rn_col != DConstants::INVALID_INDEX) {
+		auto rn_type_id = col_types[rn_col].id();
+		if (rn_type_id != LogicalTypeId::BIGINT && rn_type_id != LogicalTypeId::UBIGINT) {
+			throw InvalidInputException("%s: %s ordinal column (__vidx/file_row_number) has unsupported type %s "
+			                            "(expected BIGINT)",
+			                            func_name, source_label, col_types[rn_col].ToString());
+		}
+	}
 
 	unique_ptr<DataChunk> chunk;
 	while ((chunk = result.Fetch()) != nullptr && chunk->size() > 0) {
@@ -1070,9 +1102,24 @@ static void IngestVariantResult(QueryResult &result, const string &source_label,
 				if (!uvf.validity.RowIsValid(si)) {
 					throw IOException("%s: NULL file_row_number encountered (internal error)", func_name);
 				}
-				uint32_t vidx = static_cast<uint32_t>(data[si]);
+				// This ordinal becomes a .pgen seek index and may come from an untrusted companion,
+				// so bound it to [0, vidx_bound) before narrowing to uint32_t. An out-of-range value
+				// would seek past the .pgen (OOB read); a duplicate would double-map a record. The bound
+				// is enforced unconditionally — reached only when expect_ordinal is set, where vidx_bound
+				// is the real raw variant count (an empty block has no rows here, so nothing to check).
+				int64_t raw_vidx = data[si];
+				if (raw_vidx < 0 || static_cast<uint64_t>(raw_vidx) >= vidx_bound) {
+					throw InvalidInputException(
+					    "%s: %s has __vidx %lld out of range [0, %llu) — companion does not match the .pgen", func_name,
+					    source_label, static_cast<long long>(raw_vidx), static_cast<unsigned long long>(vidx_bound));
+				}
+				uint32_t vidx = static_cast<uint32_t>(raw_vidx);
 				uint32_t local = static_cast<uint32_t>(local_base + i);
-				idx.vidx_map.emplace(vidx, local);
+				auto inserted = idx.vidx_map.emplace(vidx, local);
+				if (!inserted.second) {
+					throw InvalidInputException("%s: %s has duplicate __vidx %u — companion is malformed", func_name,
+					                            source_label, vidx);
+				}
 				idx.local_to_vidx[local] = vidx;
 			}
 		}
@@ -1093,7 +1140,8 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 	VariantMetadataIndex idx;
 	idx.is_bim = false;
 	string label = "parquet companion '" + path + "'";
-	IngestVariantResult(*result, label, func_name, idx);
+	// Dense full read: numbered by emit order; any ordinal column is ignored, so no bound applies.
+	IngestVariantResult(*result, label, func_name, idx, /*expect_ordinal=*/false, /*vidx_bound=*/0);
 	idx.variant_ct = idx.chroms.size();
 	idx.has_ids = true;
 	idx.has_alleles = true;
@@ -1107,7 +1155,13 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 //! "#CHROM" (plink2 native) or "CHROM" (custom exports). Introspecting via
 //! a LIMIT 0 scan is cheaper than a wrapped DESCRIBE: DuckDB only reads the
 //! parquet footer to get schema, no row groups touched.
-static string DetectChromColumn(Connection &conn, const string &path, const string &func_name) {
+//!
+//! `has_vidx_out` reports whether the companion carries an explicit `__vidx`
+//! column (the writer's 0-based pgen record index). When present it is the
+//! authoritative ordinal source; the caller reads it instead of the physical
+//! file_row_number, which is only the pgen index when the file is stored in
+//! __vidx order (which a re-sorted or re-written companion need not be).
+static string DetectChromColumn(Connection &conn, const string &path, const string &func_name, bool &has_vidx_out) {
 	auto escaped_path = StringUtil::Replace(path, "'", "''");
 	auto result = conn.Query("SELECT * FROM read_parquet('" + escaped_path + "') LIMIT 0");
 	if (result->HasError()) {
@@ -1115,6 +1169,13 @@ static string DetectChromColumn(Connection &conn, const string &path, const stri
 	}
 	// BaseQueryResult::names is private on v2.0; reach it through the shim.
 	auto schema_names = CompatResultNames(*result);
+	has_vidx_out = false;
+	for (auto &name : schema_names) {
+		if (StringUtil::Lower(name) == "__vidx") {
+			has_vidx_out = true;
+			break;
+		}
+	}
 	for (auto &name : schema_names) {
 		auto lower = StringUtil::Lower(name);
 		if (lower == "#chrom") {
@@ -1147,28 +1208,42 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 
-	// Determine whether the file uses "#CHROM" or "CHROM" for its chrom column.
-	// Introspecting the schema upfront avoids the old error-driven retry that
-	// could mask POS-type or other schema errors as column-name failures.
-	auto chrom_col_name = DetectChromColumn(conn, path, func_name);
-	timer.Note("chrom column: %s", chrom_col_name.c_str());
+	// Determine whether the file uses "#CHROM" or "CHROM" for its chrom column,
+	// and whether it carries an explicit __vidx column. Introspecting the schema
+	// upfront avoids the old error-driven retry that could mask POS-type or other
+	// schema errors as column-name failures.
+	bool has_vidx = false;
+	auto chrom_col_name = DetectChromColumn(conn, path, func_name, has_vidx);
+	timer.Note("chrom column: %s; __vidx: %s", chrom_col_name.c_str(), has_vidx ? "yes" : "no");
 
-	// file_row_number gives pgenlib-compatible global vidx. stats pruning +
-	// column projection keep this O(region_size), not O(total).
+	// The ordinal (pgenlib-compatible global vidx) must be the variant's index in
+	// the .pgen, independent of the companion's physical row order, because row-group
+	// pruning and a re-sorted companion both move rows. When the companion carries the
+	// writer's explicit __vidx column, read THAT (aliased to file_row_number so the
+	// ingest helper's by-name match is unchanged). Only fall back to the physical
+	// file_row_number for a legacy companion that predates __vidx; there the pgen index
+	// is recoverable only from physical position, which is correct for an in-order file.
+	// Either way stats pruning + column projection keep this O(region_size), not O(total).
 	//
 	// Path is embedded via quote-doubling (DuckDB follows SQL-standard string
 	// literals — no backslash escapes — so `''` is sufficient). The user-
 	// controlled chrom and position values use prepared-statement parameters.
 	auto escaped_path = StringUtil::Replace(path, "'", "''");
-	string sql = "SELECT \"" + chrom_col_name +
-	             "\" AS \"#CHROM\", POS, ID, REF, ALT, file_row_number " //
+	// CAST __vidx to BIGINT: a no-op when the writer's companion already stores it as BIGINT, but it
+	// normalizes a foreign companion that wrote __vidx as INT32/UINT so the int64 ingest read is sound.
+	string ordinal_expr = has_vidx ? "CAST(__vidx AS BIGINT) AS file_row_number" : "file_row_number";
+	string read_parquet_args = has_vidx ? "" : ", file_row_number=true";
+	string order_by = has_vidx ? "__vidx" : "file_row_number";
+	string sql = "SELECT \"" + chrom_col_name + "\" AS \"#CHROM\", POS, ID, REF, ALT, " + ordinal_expr +
+	             " " //
 	             "FROM read_parquet('" +
-	             escaped_path +
-	             "', file_row_number=true) " //
+	             escaped_path + "'" + read_parquet_args +
+	             ") " //
 	             "WHERE (CAST(\"" +
 	             chrom_col_name +
 	             "\" AS VARCHAR) = $1) AND POS BETWEEN $2 AND $3 " //
-	             "ORDER BY file_row_number";
+	             "ORDER BY " +
+	             order_by;
 	auto pstmt = conn.Prepare(sql);
 	if (pstmt->HasError()) {
 		throw IOException("%s: region-pushdown prepare failed on '%s': %s", func_name, path, pstmt->GetError());
@@ -1186,7 +1261,9 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	// vidx_map) is not misclassified as dense — see VariantMetadataIndex::is_subset.
 	idx.is_subset = true;
 	string label = "parquet companion '" + path + "' (region pushdown)";
-	IngestVariantResult(*result, label, func_name, idx);
+	// Every ingested ordinal (__vidx, or a legacy file_row_number) must index within the .pgen's
+	// variant_ct_hint variants; IngestVariantResult rejects an out-of-range or duplicate value.
+	IngestVariantResult(*result, label, func_name, idx, /*expect_ordinal=*/true, /*vidx_bound=*/variant_ct_hint);
 	// variant_ct = caller's hint (typically pgen's raw_variant_ct). The post-load
 	// count-mismatch check in the caller becomes a sanity check against pgen;
 	// we don't open the parquet file a second time to count rows.
@@ -1365,7 +1442,8 @@ VariantMetadataIndex LoadVariantMetadataFromSource(ClientContext &context, const
 	VariantMetadataIndex idx;
 	idx.is_bim = false;
 	string label = "source '" + source + "'";
-	IngestVariantResult(*result, label, func_name, idx);
+	// Generic source: dense, emit-order; a stray file_row_number column is not adopted as an ordinal.
+	IngestVariantResult(*result, label, func_name, idx, /*expect_ordinal=*/false, /*vidx_bound=*/0);
 	idx.variant_ct = idx.chroms.size();
 	idx.has_ids = true;
 	idx.has_alleles = true;

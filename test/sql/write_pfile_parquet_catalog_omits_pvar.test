@@ -1,0 +1,174 @@
+# name: test/sql/write_pfile_parquet_catalog_omits_pvar.test
+# description: a sharded/matrix COPY with pvar_parquet omits the catalog `pvar` key, so discovery (+ plinking_use_parquet_companions) reads the parquet companion. A declared text pvar would win and bypass it. Without pvar_parquet the catalog still declares pvar.
+# group: [sql]
+
+#
+# shard_by omits the per-shard pvar; shard_samples (shared.pvar) and matrix (template.pvar) are required keys, so they
+# DECLARE the .pvar.parquet path instead.
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# shard_by (variants concat)
+# ===========================================================================
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs_pq' (FORMAT pfile, shard_by 'CHROM', pvar_parquet);
+
+# control: no pvar_parquet -> catalog declares pvar
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs_txt' (FORMAT pfile, shard_by 'CHROM');
+
+query II
+SELECT
+  (SELECT content LIKE '%"pvar"%' FROM read_text('{TEST_DIR}/vs_pq.pfile.json')),
+  (SELECT content LIKE '%"pvar"%' FROM read_text('{TEST_DIR}/vs_txt.pfile.json'));
+----
+false	true
+
+# the text .pvar is still written beside the parquet companion (one shard checked via the manifest)
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/vs_pq/*/data.pvar.parquet');
+----
+3
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/vs_pq/*/data.pvar');
+----
+3
+
+# the same read, text vs parquet-companion cohort, setting on and off
+query I
+SELECT count(*) FROM (
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/vs_txt.pfile.json')
+  EXCEPT ALL
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/vs_pq.pfile.json'));
+----
+0
+
+statement ok
+SET plinking_use_parquet_companions = false;
+
+query I
+SELECT count(*) = (SELECT count(*) FROM read_pfile('test/data/large_example', region := '1')) FROM read_pfile(catalog := '{TEST_DIR}/vs_pq.pfile.json', region := '1');
+----
+true
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+# PROOF the parquet companion is used: clobber every shard's text .pvar with garbage; a region read must still work.
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/vs_pq/CHROM=1/data.pvar' (FORMAT csv, HEADER false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/vs_pq/CHROM=2/data.pvar' (FORMAT csv, HEADER false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/vs_pq/CHROM=3/data.pvar' (FORMAT csv, HEADER false);
+
+query I
+SELECT count(*) = (SELECT count(*) FROM read_pfile('test/data/large_example', region := '1')) FROM read_pfile(catalog := '{TEST_DIR}/vs_pq.pfile.json', region := '1');
+----
+true
+
+# and the declared-pvar control still reads its text pvar
+query I
+SELECT count(*) = (SELECT count(*) FROM read_pfile('test/data/large_example', region := '1')) FROM read_pfile(catalog := '{TEST_DIR}/vs_txt.pfile.json', region := '1');
+----
+true
+
+# ===========================================================================
+# ss: declares the .pvar.parquet path
+# ===========================================================================
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss_pq' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss_txt' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query III
+SELECT
+  (SELECT content LIKE '%.pvar.parquet"%' FROM read_text('{TEST_DIR}/ss_pq.pfile.json')),
+  (SELECT content LIKE '%.pvar.parquet"%' FROM read_text('{TEST_DIR}/ss_txt.pfile.json')),
+  (SELECT content LIKE '%.pvar"%' FROM read_text('{TEST_DIR}/ss_txt.pfile.json'));
+----
+true	false	true
+
+query I
+SELECT count(*) FROM (
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/ss_txt.pfile.json')
+  EXCEPT ALL
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/ss_pq.pfile.json'));
+----
+0
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/ss_pq.pvar' (FORMAT csv, HEADER false);
+
+query I
+SELECT count(*) = (SELECT count(*) FROM read_pfile('test/data/large_example', region := '1')) FROM read_pfile(catalog := '{TEST_DIR}/ss_pq.pfile.json', region := '1');
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/ss_txt.pfile.json')
+  EXCEPT ALL
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/ss_pq.pfile.json'));
+----
+0
+
+# ===========================================================================
+# mx: declares the .pvar.parquet path
+# ===========================================================================
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx_pq' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx_txt' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query III
+SELECT
+  (SELECT content LIKE '%.pvar.parquet"%' FROM read_text('{TEST_DIR}/mx_pq.pfile.json')),
+  (SELECT content LIKE '%.pvar.parquet"%' FROM read_text('{TEST_DIR}/mx_txt.pfile.json')),
+  (SELECT content LIKE '%.pvar"%' FROM read_text('{TEST_DIR}/mx_txt.pfile.json'));
+----
+true	false	true
+
+query I
+SELECT count(*) FROM (
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx_txt.pfile.json')
+  EXCEPT ALL
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx_pq.pfile.json'));
+----
+0
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/mx_pq/CHROM=1/variants.pvar' (FORMAT csv, HEADER false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/mx_pq/CHROM=2/variants.pvar' (FORMAT csv, HEADER false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/mx_pq/CHROM=3/variants.pvar' (FORMAT csv, HEADER false);
+
+query I
+SELECT count(*) = (SELECT count(*) FROM read_pfile('test/data/large_example', region := '1')) FROM read_pfile(catalog := '{TEST_DIR}/mx_pq.pfile.json', region := '1');
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx_txt.pfile.json')
+  EXCEPT ALL
+  SELECT CHROM, POS, ID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/mx_pq.pfile.json'));
+----
+0

@@ -1,0 +1,137 @@
+# name: test/sql/read_pfile_parquet_pvar_no_vidx_fallback.test
+# description: a hand-made parquet .pvar companion WITHOUT a __vidx column, stored in POS order, read with a
+# group: [sql]
+
+#   region, must fall back to the legacy physical row order for the .pgen ordinal. For an in-order
+#   companion that is correct: rows AND genotypes equal the text-companion read. Also pins that a
+#   catalog (read_pfile(catalog :=)) region read over parquet companions goes through the same
+#   region-pruned companion path and matches the text-companion catalog read.
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# Section 1 - single fileset, companion with no __vidx
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/N' (FORMAT pfile);
+
+# Hand-written companion: NO __vidx, in POS order (== pgen order), small row groups.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT FROM read_pvar('{TEST_DIR}/N.pvar') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/N.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/N.pvar.parquet')) WHERE column_name = '__vidx';
+----
+0
+
+statement ok
+CREATE TEMP TABLE t AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/N', pvar := '{TEST_DIR}/N.pvar', region := '2:30000-70000', with_ordinal := true);
+
+statement ok
+CREATE TEMP TABLE p AS
+SELECT CHROM, POS, ID, __ordinal, genotypes::VARCHAR AS g
+FROM read_pfile('{TEST_DIR}/N', pvar := '{TEST_DIR}/N.pvar.parquet', region := '2:30000-70000', with_ordinal := true);
+
+query I
+SELECT count(*) FROM t;
+----
+401
+
+query I
+SELECT count(*) FROM p;
+----
+401
+
+query I
+SELECT count(*) FROM (SELECT * FROM t EXCEPT SELECT * FROM p);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM t);
+----
+0
+
+# ===========================================================================
+# Section 2 - catalog region read over a parquet companion
+#   A catalog cell that OMITS `pvar` is resolved by read_pfile's discovery, which prefers
+#   `<prefix>.pvar.parquet` while plinking_use_parquet_companions is on; the catalog read then goes
+#   through LoadSourceVariants -> the same region-pruned, __vidx-ordinal companion path. NB: a catalog
+#   that DECLARES `pvar` (as the sharded writer's does: "pvar": "<shard>/data.pvar") reads that
+#   declared text file - the declared path wins - so it gets no parquet pruning.
+#   Provenance proof: the parquet companion's IDs are tagged '_pq'; the text .pvar's are not.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/M' (FORMAT pfile, pvar_parquet);
+
+# Companion stored POS-DESC (so a physical-order read would misalign) with tagged IDs, __vidx kept.
+statement ok
+COPY (SELECT CHROM, POS, ID || '_pq' AS ID, REF, ALT, __vidx FROM read_parquet('{TEST_DIR}/M.pvar.parquet') ORDER BY POS DESC)
+TO '{TEST_DIR}/M_tagged.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/M_tagged.parquet')) TO '{TEST_DIR}/M.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+
+statement ok
+COPY (SELECT '{"pfile_catalog": 1, "dataset": "m", "pfile": {"prefix": "M"}}' AS j)
+TO '{TEST_DIR}/M.pfile.json' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement ok
+CREATE TEMP TABLE ct AS
+SELECT CHROM, POS, ID, genotypes::VARCHAR AS g
+FROM read_pfile(catalog := '{TEST_DIR}/M.pfile.json', region := '2:30000-70000');
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+statement ok
+CREATE TEMP TABLE cp AS
+SELECT CHROM, POS, ID, genotypes::VARCHAR AS g
+FROM read_pfile(catalog := '{TEST_DIR}/M.pfile.json', region := '2:30000-70000');
+
+query I
+SELECT count(*) FROM ct;
+----
+401
+
+query I
+SELECT count(*) FROM cp;
+----
+401
+
+# Provenance: companions ON read the tagged parquet; OFF read the text .pvar.
+query II
+SELECT count(*) FILTER (WHERE ID LIKE '%\_pq' ESCAPE '\'), count(*) FILTER (WHERE ID NOT LIKE '%\_pq' ESCAPE '\') FROM cp;
+----
+401	0
+
+query I
+SELECT count(*) FROM ct WHERE ID LIKE '%\_pq' ESCAPE '\';
+----
+0
+
+# Same variants, same genotypes (parquet path used __vidx, not the DESC physical order).
+query I
+SELECT count(*) FROM (SELECT CHROM, POS, replace(ID, '_pq', ''), g FROM cp EXCEPT SELECT * FROM ct);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM ct EXCEPT SELECT CHROM, POS, replace(ID, '_pq', ''), g FROM cp);
+----
+0
+
+statement ok
+RESET plinking_use_parquet_companions;
