@@ -325,6 +325,31 @@ resolved `prefix` and the shared companion the manifest reports. The Python
 `pfile_catalog` library consumes the same catalog to register the cohort as a single
 concatenated diar dataset.
 
+## Reading parquet companions
+
+A fileset written with [`pvar_parquet`](../functions/write_pfile.md#parquet-pvar-companion-pvar_parquet)
+has a `<prefix>.pvar.parquet` companion. The setting
+`plinking_use_parquet_companions` (default `true`) makes `read_pfile` prefer that
+companion over the text `.pvar` when it discovers the companion itself.
+
+- **Use `region :=` for gene queries.** A `region` read pushes the
+  `CHROM`/`POS` range into the parquet scan, so row groups outside the region
+  are skipped. A `WHERE` on the output columns does not get this pruning.
+  The `.pgen` ordinal of each variant comes from the companion's `__vidx` column.
+- **A declared `pvar` wins.** A catalog entry that names `pvar` (the sharded
+  writer does this: `"pvar": "<shard>/data.pvar"`) reads that file. Discovery,
+  and so the parquet companion, applies only to a catalog entry that omits
+  `pvar`, or that names the `.pvar.parquet` file itself.
+- **Object-store mounts.** For a cohort on an s3 mount, run
+  `SET plinking_pgen_io = 'vfs';` so the `.pgen` bytes also go through
+  DuckDB's VFS.
+- **Limitation: a companion without `__vidx`.** A hand-made parquet companion
+  that has no `__vidx` column is read in physical row order. That is correct
+  only when the rows are stored in `.pgen` order (position order, as the
+  writer emits them). A re-sorted companion without `__vidx` gives wrong
+  variant-to-genotype pairing on a `region` read. Add a `__vidx` column to
+  re-sorted companions. A dense read (no `region`) ignores `__vidx`.
+
 ## What PlinkingDuck validates — and what it leaves to the loader
 
 PlinkingDuck's reader is a *manifest* over the catalog, not the full dataset loader.

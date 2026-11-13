@@ -65,6 +65,7 @@ target is stripped to the prefix, so `TO 'out'` and `TO 'out.pfile'` both write
 | `samples` | `LIST(VARCHAR)` | *(from STRUCT field names)* | Explicit sample IIDs when the genotypes column is a plain `LIST`/`ARRAY` (see [Sample identity](#sample-identity-contract)). |
 | `variant_count` | `INTEGER` | `16777216` (2²⁴) | Upper bound on the variant count (a pgenlib memory knob; see [below](#the-variant_count-bound)). |
 | `pvar` / `pgen` / `psam` | `VARCHAR` | `prefix.{pvar,pgen,psam}` | Per-file path overrides (symmetric with the reader's path overrides). |
+| `pvar_parquet` | flag | off | Also write a region-prunable parquet `.pvar` companion. See [Parquet `.pvar` companion](#parquet-pvar-companion-pvar_parquet). |
 | `shard_by` | `VARCHAR` | *(none)* | Shard along the **variant** axis by a key column. See [Sharded output](#sharded-output-shard_by). |
 | `shard_samples` | `STRUCT` | *(none)* | Shard along the **sample** axis into named IID groups. See [Sample-sharded output](#sample-sharded-output-shard_samples). |
 | `force` | `BOOLEAN` | `false` | Replace existing output. Without it, a `COPY` onto an existing target is an error. See [Existing output](#existing-output-force). |
@@ -99,6 +100,26 @@ length is a bind-time error.
     (`sex`, phenotype, covariates) raises an explicit *"not yet supported"* error —
     requested metadata is never silently dropped. A variant-oriented stream has no
     per-sample axis to carry that metadata; writing it is a follow-on.
+
+### Parquet `.pvar` companion (`pvar_parquet`)
+
+`COPY … TO 'out' (FORMAT pfile, pvar_parquet)` also writes `<pvar>.parquet`
+(for example `out.pvar.parquet`) beside the text `.pvar`. Its columns are
+`CHROM`, `POS`, `ID`, `REF`, `ALT`, and `__vidx`. The text `.pvar` is still
+written and stays the source of truth.
+
+`__vidx` is the variant's 0-based index in the `.pgen` that the same `COPY`
+wrote (`BIGINT`). A reader that opens the parquet companion with a `region`
+uses `__vidx` as the `.pgen` seek ordinal. Parquet row-group statistics on
+`CHROM` and `POS` then skip row groups that lie outside the region. The
+reader does not depend on the physical row order of the companion.
+`__vidx` is per file: each shard and each sample-shard gets its own companion
+with its own `__vidx` range. Bounds are checked on read: a `__vidx` outside
+`[0, variant count)` is an error.
+
+A rewrite with `force` and without `pvar_parquet` removes a stale companion,
+because its `__vidx` would no longer match the new `.pgen`.
+The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#reading-parquet-companions).
 
 ### Local-only
 
