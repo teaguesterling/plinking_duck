@@ -216,6 +216,34 @@ SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/bad_dup.pvar
 ----
 duplicate __vidx
 
+# The DENSE (no-region) read must IGNORE a stray column named file_row_number — never adopt a
+# user-supplied column as its .pgen seek ordinal. This companion carries an out-of-range (and
+# duplicated) file_row_number on every row; a full read still succeeds (numbered by emit order) and
+# matches the text read. (Before the ordinal source was gated on expect_ordinal, the dense path would
+# have bound that column and errored on its duplicate/out-of-range values.)
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, __vidx, CAST(999999 AS BIGINT) AS file_row_number
+      FROM read_parquet('{TEST_DIR}/A.pvar.parquet'))
+TO '{TEST_DIR}/stray_frn.pvar.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/stray_frn.pvar.parquet');
+----
+3000
+
+statement ok
+CREATE TEMP TABLE dense_stray AS
+SELECT CHROM, POS, ID, genotypes::VARCHAR AS g FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/stray_frn.pvar.parquet');
+
+statement ok
+CREATE TEMP TABLE dense_text AS
+SELECT CHROM, POS, ID, genotypes::VARCHAR AS g FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/A.pvar');
+
+query I
+SELECT count(*) FROM dense_stray JOIN dense_text USING (CHROM, POS, ID) WHERE dense_stray.g IS DISTINCT FROM dense_text.g;
+----
+0
+
 # ===========================================================================
 # Section 2 — 2-shard list read: __vidx resets per file, so each shard's ordinal
 #   must be taken from ITS OWN __vidx. shard1 and shard2 are distinct filesets that
