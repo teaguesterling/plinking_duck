@@ -2052,7 +2052,7 @@ void PfileShardClose(PfileShardedGlobalState &g, FileSystem &fs) {
 // shared.psam at the root, one files[] entry per shard). Matches the howard loader's parse_catalog
 // schema (howard/src/howard/core/catalog.py): global half-open partition ordinals tiling [0,total),
 // per-file `pvar` (never a per-file `psam` — that is the shared one), optional `range`.
-void PfileWriteCatalog(PfileShardedGlobalState &g, FileSystem &fs) {
+void PfileWriteCatalog(PfileShardedGlobalState &g, const PfileWriteBindData &bind, FileSystem &fs) {
 	string j = "{\n";
 	j += "  \"pfile_catalog\": 1,\n";
 	j += "  \"dataset\": \"" + JsonEscape(g.dataset_name) + "\",\n";
@@ -2063,7 +2063,9 @@ void PfileWriteCatalog(PfileShardedGlobalState &g, FileSystem &fs) {
 		auto &e = g.entries[i];
 		j += "    {\n";
 		j += "      \"prefix\": \"" + JsonEscape(e.prefix) + "\",\n";
-		j += "      \"pvar\": \"" + JsonEscape(e.pvar) + "\",\n";
+		if (!bind.pvar_bind->pvar_parquet) { // a declared pvar beats discovery; omit it so the .pvar.parquet companion is found
+			j += "      \"pvar\": \"" + JsonEscape(e.pvar) + "\",\n";
+		}
 		j += "      \"partition\": { \"start\": " + std::to_string(e.partition_start) +
 		     ", \"stop\": " + std::to_string(e.partition_stop) +
 		     ", \"source_ordinal\": " + std::to_string(e.source_ordinal) + " },\n";
@@ -2161,7 +2163,7 @@ void PfileShardedSink(ExecutionContext &context, const PfileWriteBindData &bind,
 	}
 }
 
-void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
+void PfileShardedFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileShardedGlobalState &g) {
 	try {
 		if (g.has_active) {
 			PfileShardClose(g, fs); // promote the last shard
@@ -2173,7 +2175,7 @@ void PfileShardedFinalize(FileSystem &fs, PfileShardedGlobalState &g) {
 		}
 		// Promote the shared psam, THEN write the catalog LAST (the completion marker).
 		fs.MoveFile(g.psam_staging, g.psam_final);
-		PfileWriteCatalog(g, fs);
+		PfileWriteCatalog(g, bind, fs);
 		g.finished = true;
 	} catch (...) {
 		g.CleanupPartial(fs);
@@ -3278,7 +3280,7 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 		return;
 	}
 	if (!bind.shard_by.empty()) {
-		PfileShardedFinalize(fs, gstate.Cast<PfileShardedGlobalState>());
+		PfileShardedFinalize(fs, bind, gstate.Cast<PfileShardedGlobalState>());
 		return;
 	}
 	auto &g = gstate.Cast<PfileWriteGlobalState>();

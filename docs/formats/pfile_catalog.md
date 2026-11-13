@@ -336,10 +336,13 @@ companion over the text `.pvar` when it discovers the companion itself.
   `CHROM`/`POS` range into the parquet scan, so row groups outside the region
   are skipped. A `WHERE` on the output columns does not get this pruning.
   The `.pgen` ordinal of each variant comes from the companion's `__vidx` column.
-- **A declared `pvar` wins.** A catalog entry that names `pvar` (the sharded
-  writer does this: `"pvar": "<shard>/data.pvar"`) reads that file. Discovery,
-  and so the parquet companion, applies only to a catalog entry that omits
-  `pvar`, or that names the `.pvar.parquet` file itself.
+- **A declared `pvar` wins.** A catalog entry that names `pvar` reads that file.
+  Discovery, and so the parquet companion, applies only to a catalog entry that
+  omits `pvar`, or that names the `.pvar.parquet` file itself. The `shard_by`
+  writer omits the per-shard `pvar` when `pvar_parquet` is set, so its catalog
+  uses the parquet companion. The `shard_samples` catalog (`shared.pvar`) and the
+  matrix catalog (`template.pvar`) still declare the text `.pvar`: the reader
+  requires that key, and it does not name a discoverable per-cell sidecar.
 - **Object-store mounts.** For a cohort on an s3 mount, run
   `SET plinking_pgen_io = 'vfs';` so the `.pgen` bytes also go through
   DuckDB's VFS.
