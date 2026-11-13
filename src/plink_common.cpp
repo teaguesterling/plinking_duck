@@ -1107,7 +1107,13 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 //! "#CHROM" (plink2 native) or "CHROM" (custom exports). Introspecting via
 //! a LIMIT 0 scan is cheaper than a wrapped DESCRIBE: DuckDB only reads the
 //! parquet footer to get schema, no row groups touched.
-static string DetectChromColumn(Connection &conn, const string &path, const string &func_name) {
+//!
+//! `has_vidx_out` reports whether the companion carries an explicit `__vidx`
+//! column (the writer's 0-based pgen record index). When present it is the
+//! authoritative ordinal source; the caller reads it instead of the physical
+//! file_row_number, which is only the pgen index when the file is stored in
+//! __vidx order (which a re-sorted or re-written companion need not be).
+static string DetectChromColumn(Connection &conn, const string &path, const string &func_name, bool &has_vidx_out) {
 	auto escaped_path = StringUtil::Replace(path, "'", "''");
 	auto result = conn.Query("SELECT * FROM read_parquet('" + escaped_path + "') LIMIT 0");
 	if (result->HasError()) {
@@ -1115,6 +1121,13 @@ static string DetectChromColumn(Connection &conn, const string &path, const stri
 	}
 	// BaseQueryResult::names is private on v2.0; reach it through the shim.
 	auto schema_names = CompatResultNames(*result);
+	has_vidx_out = false;
+	for (auto &name : schema_names) {
+		if (StringUtil::Lower(name) == "__vidx") {
+			has_vidx_out = true;
+			break;
+		}
+	}
 	for (auto &name : schema_names) {
 		auto lower = StringUtil::Lower(name);
 		if (lower == "#chrom") {
@@ -1147,28 +1160,40 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 
-	// Determine whether the file uses "#CHROM" or "CHROM" for its chrom column.
-	// Introspecting the schema upfront avoids the old error-driven retry that
-	// could mask POS-type or other schema errors as column-name failures.
-	auto chrom_col_name = DetectChromColumn(conn, path, func_name);
-	timer.Note("chrom column: %s", chrom_col_name.c_str());
+	// Determine whether the file uses "#CHROM" or "CHROM" for its chrom column,
+	// and whether it carries an explicit __vidx column. Introspecting the schema
+	// upfront avoids the old error-driven retry that could mask POS-type or other
+	// schema errors as column-name failures.
+	bool has_vidx = false;
+	auto chrom_col_name = DetectChromColumn(conn, path, func_name, has_vidx);
+	timer.Note("chrom column: %s; __vidx: %s", chrom_col_name.c_str(), has_vidx ? "yes" : "no");
 
-	// file_row_number gives pgenlib-compatible global vidx. stats pruning +
-	// column projection keep this O(region_size), not O(total).
+	// The ordinal (pgenlib-compatible global vidx) must be the variant's index in
+	// the .pgen, independent of the companion's physical row order, because row-group
+	// pruning and a re-sorted companion both move rows. When the companion carries the
+	// writer's explicit __vidx column, read THAT (aliased to file_row_number so the
+	// ingest helper's by-name match is unchanged). Only fall back to the physical
+	// file_row_number for a legacy companion that predates __vidx; there the pgen index
+	// is recoverable only from physical position, which is correct for an in-order file.
+	// Either way stats pruning + column projection keep this O(region_size), not O(total).
 	//
 	// Path is embedded via quote-doubling (DuckDB follows SQL-standard string
 	// literals — no backslash escapes — so `''` is sufficient). The user-
 	// controlled chrom and position values use prepared-statement parameters.
 	auto escaped_path = StringUtil::Replace(path, "'", "''");
-	string sql = "SELECT \"" + chrom_col_name +
-	             "\" AS \"#CHROM\", POS, ID, REF, ALT, file_row_number " //
+	string ordinal_expr = has_vidx ? "__vidx AS file_row_number" : "file_row_number";
+	string read_parquet_args = has_vidx ? "" : ", file_row_number=true";
+	string order_by = has_vidx ? "__vidx" : "file_row_number";
+	string sql = "SELECT \"" + chrom_col_name + "\" AS \"#CHROM\", POS, ID, REF, ALT, " + ordinal_expr +
+	             " " //
 	             "FROM read_parquet('" +
-	             escaped_path +
-	             "', file_row_number=true) " //
+	             escaped_path + "'" + read_parquet_args +
+	             ") " //
 	             "WHERE (CAST(\"" +
 	             chrom_col_name +
 	             "\" AS VARCHAR) = $1) AND POS BETWEEN $2 AND $3 " //
-	             "ORDER BY file_row_number";
+	             "ORDER BY " +
+	             order_by;
 	auto pstmt = conn.Prepare(sql);
 	if (pstmt->HasError()) {
 		throw IOException("%s: region-pushdown prepare failed on '%s': %s", func_name, path, pstmt->GetError());
