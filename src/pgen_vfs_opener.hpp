@@ -17,6 +17,10 @@ namespace duckdb {
 //! LocalizePgenIfRequested). Pure: no I/O, safe to call more than once.
 bool PgenIoUseVfs(ClientContext &context, const string &pgen_path);
 
+//! The 'auto' rule of PgenIoUseVfs, with no policy: whether a native fopen cannot open `pgen_path`
+//! (a remote or scheme:// path), so the open must go through the VFS.
+bool PgenPathNeedsVfs(const string &pgen_path);
+
 //! Whether `plinking_pgen_io == 'localize'`: a reader copies each .pgen it reads to a local temp
 //! (LocalizePgenIfRequested) before its first open. Most readers copy at bind. A catalog read
 //! (read_pfile catalog :=) copies a cell at InitGlobal, after pruning, only if the scan keeps it.
@@ -42,6 +46,8 @@ public:
 	void Track(FileSystem &fs, string temp_path);
 	//! Whether `path` is a temp that this guard tracks (a copy made already).
 	bool Owns(const string &path) const;
+	//! Remove a tracked temp now (best-effort) and stop tracking it: for a copy that failed.
+	void Discard(const string &path) noexcept;
 
 private:
 	void Cleanup() noexcept;
@@ -57,9 +63,14 @@ private:
 //! for a deferred catalog cell (see PfileBindData::localize_deferred).
 void LocalizePgenIfRequested(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard);
 
-//! The copy that LocalizePgenIfRequested makes, with no policy check: for a caller that took the
-//! policy at bind and copies later (a deferred catalog cell), when the setting may have changed.
-void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard);
+//! Directory for localized temps: plinking_localize_dir if set, else DuckDB's temporary_directory,
+//! else the current directory. Read from the current settings.
+string LocalizeDir(ClientContext &context);
+
+//! The copy that LocalizePgenIfRequested makes, into `dir`, with no policy check: for a caller that
+//! took the policy and the dir (LocalizeDir) at bind and copies later (a deferred catalog cell),
+//! when the settings may have changed.
+void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard, const string &dir);
 
 //! RAII: while in scope AND use_vfs, pgen opens on THIS thread are served from the
 //! VFS. A no-op (native fopen) when use_vfs is false. Register/clear is per-thread,

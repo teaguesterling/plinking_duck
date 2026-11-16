@@ -118,8 +118,12 @@ bool PgenIoUseVfs(ClientContext &context, const string &pgen_path) {
 	if (policy == "native" || policy == "localize") {
 		return false;
 	}
-	// auto: route remote/VFS paths through Path V; plain-local uses native fopen. Any other
-	// scheme:// path (file://, a protocol file system) also goes through the VFS: fopen cannot open it.
+	return PgenPathNeedsVfs(pgen_path);
+}
+
+bool PgenPathNeedsVfs(const string &pgen_path) {
+	// Route remote/VFS paths through Path V; plain-local uses native fopen. Any other scheme:// path
+	// (file://, a protocol file system) also goes through the VFS: fopen cannot open it.
 	return FileSystem::IsRemoteFile(pgen_path) || pgen_path.find("://") != string::npos;
 }
 
@@ -132,6 +136,21 @@ void PgenLocalizeGuard::Track(FileSystem &fs, string temp_path) {
 
 bool PgenLocalizeGuard::Owns(const string &path) const {
 	return std::find(temp_paths_.begin(), temp_paths_.end(), path) != temp_paths_.end();
+}
+
+void PgenLocalizeGuard::Discard(const string &path) noexcept {
+	auto it = std::find(temp_paths_.begin(), temp_paths_.end(), path);
+	if (it == temp_paths_.end()) {
+		return;
+	}
+	try {
+		if (fs_->FileExists(path)) {
+			fs_->RemoveFile(path);
+		}
+	} catch (...) {
+		// best-effort, as in Cleanup.
+	}
+	temp_paths_.erase(it);
 }
 
 void PgenLocalizeGuard::Cleanup() noexcept {
@@ -174,8 +193,6 @@ PgenLocalizeGuard &PgenLocalizeGuard::operator=(PgenLocalizeGuard &&other) noexc
 
 // --- localize: download remote (or any) .pgen to a local temp -------------------
 
-namespace {
-
 //! Directory for localized temps: plinking_localize_dir if set, else DuckDB's
 //! configured temporary_directory, else the current directory.
 string LocalizeDir(ClientContext &context) {
@@ -192,6 +209,8 @@ string LocalizeDir(ClientContext &context) {
 	}
 	return ".";
 }
+
+namespace {
 
 //! Process-unique temp name (PID + monotonic counter) so concurrent queries
 //! localizing the same URL never collide. Skips any name that already exists on
@@ -240,12 +259,11 @@ void LocalizePgenIfRequested(ClientContext &context, string &pgen_path, PgenLoca
 	if (PgenIoPolicy(context) != "localize") {
 		return;
 	}
-	LocalizePgen(context, pgen_path, guard);
+	LocalizePgen(context, pgen_path, guard, LocalizeDir(context));
 }
 
-void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard) {
+void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard, const string &dir) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	string dir = LocalizeDir(context);
 	// The dir may not exist yet (e.g. DuckDB's default temp dir is created lazily,
 	// only when it first spills). FILE_CREATE_NEW won't make parents, so ensure it.
 	// Tolerate a concurrent create from another query (benign EEXIST-style race).
@@ -259,19 +277,28 @@ void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &
 		}
 	}
 	string temp = UniqueTempName(fs, dir);
-	// Track BEFORE the copy so a partial/failed download is still unlinked.
+	string temp_pgi = temp + ".pgi";
+	// Track BEFORE the copy so a partial/failed download is still unlinked if the process unwinds
+	// past here. A failed copy also removes its temps at once: the path is not rewritten, so a retry
+	// (a prepared statement's next EXECUTE) copies again, and each retry would leave one more temp
+	// until the bind data dies.
 	guard.Track(fs, temp);
-	LocalizeCopy(fs, pgen_path, temp);
-	// Split-index fileset: if the source uses an external index, pgenlib will look
-	// for the localized .pgen's derived companion ("<temp>.pgi"). We only copied the
-	// .pgen, so also copy the source's ".pgi" companion (standard name is
-	// "<pgen>.pgi") to that derived name — otherwise the split-index read fails on
-	// the missing index. Embedded-index filesets have no .pgi (skipped).
-	string src_pgi = pgen_path + ".pgi";
-	if (fs.FileExists(src_pgi)) {
-		string temp_pgi = temp + ".pgi";
-		guard.Track(fs, temp_pgi);
-		LocalizeCopy(fs, src_pgi, temp_pgi);
+	try {
+		LocalizeCopy(fs, pgen_path, temp);
+		// Split-index fileset: if the source uses an external index, pgenlib will look
+		// for the localized .pgen's derived companion ("<temp>.pgi"). We only copied the
+		// .pgen, so also copy the source's ".pgi" companion (standard name is
+		// "<pgen>.pgi") to that derived name — otherwise the split-index read fails on
+		// the missing index. Embedded-index filesets have no .pgi (skipped).
+		string src_pgi = pgen_path + ".pgi";
+		if (fs.FileExists(src_pgi)) {
+			guard.Track(fs, temp_pgi);
+			LocalizeCopy(fs, src_pgi, temp_pgi);
+		}
+	} catch (...) {
+		guard.Discard(temp_pgi);
+		guard.Discard(temp);
+		throw;
 	}
 	pgen_path = temp; // downstream opens read the native local temp
 }

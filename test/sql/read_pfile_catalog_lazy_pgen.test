@@ -302,6 +302,178 @@ SELECT count(*) FROM glob('{TEST_DIR}/loc/plinking_localize_*');
 ----
 0
 
+# A prepared statement keeps its temp copies until DEALLOCATE, so a glob between EXECUTE and
+# DEALLOCATE counts the cells that one run copied.
+
+# v1 shard_by: cell 0 opens at bind (its header gives the sample count), but it is copied only if
+# the scan keeps it. Before, cell 0 was copied at bind, so this WHERE made 2 copies.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+PREPARE loc_v1 AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/vs.pfile.json') WHERE CHROM = '2';
+
+query I
+EXECUTE loc_v1;
+----
+1000
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/loc/plinking_localize_*');
+----
+1
+
+statement ok
+DEALLOCATE loc_v1;
+
+# A kept cell 0 is copied.
+statement ok
+PREPARE loc_v1 AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/vs.pfile.json') WHERE CHROM = '1';
+
+query I
+EXECUTE loc_v1;
+----
+1000
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/loc/plinking_localize_*');
+----
+1
+
+statement ok
+DEALLOCATE loc_v1;
+
+# The bind-time header open of an uncopied cell 0 reads the original, so it goes through the VFS
+# when the path needs it (a file:// path here, as an s3:// or http:// path would): a native
+# fopen of 'file://...' fails.
+statement ok
+PREPARE loc_v1 AS SELECT count(*) FROM read_pfile(catalog := 'file://{WORKING_DIR}/{TEST_DIR}/vs.pfile.json') WHERE CHROM = '2';
+
+query I
+EXECUTE loc_v1;
+----
+1000
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/loc/plinking_localize_*');
+----
+1
+
+statement ok
+DEALLOCATE loc_v1;
+
+# A failed copy removes its partial temp. dirg is part/ with its (CHROM=2, lo) .pgen made a
+# directory: the copy opens it, creates the temp, then fails on the first read. A prepared
+# statement retries the copy on each EXECUTE; before, each retry left one more temp.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM <> '2' ORDER BY CHROM, POS)
+TO '{TEST_DIR}/dirg' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT '2' AS CHROM, 'lo' AS "GROUP", 1 AS x) TO '{TEST_DIR}/dirg' (FORMAT csv, PARTITION_BY (CHROM, "GROUP"), OVERWRITE_OR_IGNORE);
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/dirg/CHROM=2/GROUP=lo/data.pgen' (FORMAT csv, PER_THREAD_OUTPUT true);
+
+statement ok
+COPY (SELECT replace(content, '"mx/', '"dirg/') FROM read_text('{TEST_DIR}/mx.pfile.json'))
+TO '{TEST_DIR}/dirg.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER E'\x1f');
+
+statement ok
+PREPARE loc_dir AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/dirg.pfile.json') WHERE CHROM = '2';
+
+statement error
+EXECUTE loc_dir;
+----
+CHROM=2/GROUP=lo/data.pgen
+
+statement error
+EXECUTE loc_dir;
+----
+CHROM=2/GROUP=lo/data.pgen
+
+statement error
+EXECUTE loc_dir;
+----
+CHROM=2/GROUP=lo/data.pgen
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/loc/plinking_localize_*');
+----
+0
+
+statement ok
+DEALLOCATE loc_dir;
+
+# The temp dir is fixed at bind, like the policy: a SET of plinking_localize_dir after PREPARE does
+# not move the copies.
+statement ok
+PREPARE loc_q AS SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE CHROM = '3';
+
+statement ok
+SET plinking_localize_dir = '{TEST_DIR}/loc2';
+
+query I
+EXECUTE loc_q;
+----
+1000
+
+query II
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/loc/plinking_localize_*')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/loc2/plinking_localize_*'));
+----
+2	0
+
+statement ok
+DEALLOCATE loc_q;
+
+statement ok
+SET plinking_localize_dir = '{TEST_DIR}/loc';
+
+# The deferred header open takes its route (native or VFS) from bind, as the scan's opens do. A
+# catalog prepared under 'auto' on a file:// path (the VFS route, as for s3:// or http://) still
+# opens its cells through the VFS after a SET to 'native' or 'localize'. Before, the header open
+# re-read the policy and tried a native fopen of 'file://...'.
+statement ok
+SET plinking_pgen_io = 'auto';
+
+statement ok
+PREPARE url_q AS SELECT count(*) FROM read_pfile(catalog := 'file://{WORKING_DIR}/{TEST_DIR}/mx.pfile.json') WHERE CHROM = '3';
+
+statement ok
+SET plinking_pgen_io = 'native';
+
+query I
+EXECUTE url_q;
+----
+1000
+
+statement ok
+DEALLOCATE url_q;
+
+statement ok
+SET plinking_pgen_io = 'auto';
+
+statement ok
+PREPARE url_q AS SELECT count(*) FROM read_pfile(catalog := 'file://{WORKING_DIR}/{TEST_DIR}/mx.pfile.json') WHERE CHROM = '3';
+
+statement ok
+SET plinking_pgen_io = 'localize';
+
+query I
+EXECUTE url_q;
+----
+1000
+
+statement ok
+DEALLOCATE url_q;
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/loc*/plinking_localize_*');
+----
+0
+
 statement ok
 RESET plinking_pgen_io;
 
