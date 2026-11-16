@@ -547,6 +547,8 @@ struct PfileBindData : public TableFunctionData {
 	//! InitGlobal, just before its header opens, so a pruned cell is never copied. Set at bind, so a
 	//! SET between prepare and execute cannot split one read across two policies.
 	bool localize_deferred = false;
+	//! The temp dir for those copies (plinking_localize_dir), taken at bind for the same reason.
+	string localize_dir;
 	//! A sample-orient catalog read with no filter parameter: bind reads no genotype, so the deferred
 	//! .pgen headers wait for InitGlobal (EnsureLazyVariants), after the WHERE on IID prune. Counts/stats
 	//! then stream at scan time; a per-element mode fills its matrix there (FillSampleMatrix).
@@ -897,11 +899,12 @@ static void LoadSourceVariants(ClientContext &context, PfileSource &src, const R
 	}
 }
 
-//! Open one .pgen header and return its counts. Routes the open through the VFS for a remote/VFS
-//! path (Path V). Called at bind, or at InitGlobal for a cell whose header open is deferred.
-static void ReadPgenHeaderCounts(ClientContext &context, const string &pgen_path, uint32_t &variant_ct_out,
-                                 uint32_t &sample_ct_out) {
-	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, pgen_path));
+//! Open one .pgen header and return its counts. use_vfs routes the open through the VFS (Path V).
+//! Called at bind, or at InitGlobal for a cell whose header open is deferred; there the caller passes
+//! the route that bind chose (PfileBindData::use_vfs), not the current setting.
+static void ReadPgenHeaderCounts(ClientContext &context, const string &pgen_path, bool use_vfs,
+                                 uint32_t &variant_ct_out, uint32_t &sample_ct_out) {
+	PgenVfsScope pgen_vfs_scope(context, use_vfs);
 	plink2::PgenFileInfo pgfi;
 	plink2::PreinitPgfi(&pgfi);
 	char errstr_buf[plink2::kPglErrstrBufBlen];
@@ -940,7 +943,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
                                    const string &override_psam, bool need_psam, bool need_pvar,
                                    const RegionFilter &region, uint32_t &raw_sample_ct_out,
                                    PgenLocalizeGuard &localize_guard, bool load_pvar = true, bool read_header = true,
-                                   bool resolve_overrides = true) {
+                                   bool resolve_overrides = true, bool defer_copy = false) {
 	// need_pvar discovers the .pvar path; load_pvar also parses it now (false: a lazy_variants
 	// catalog read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
 	// .pgen header open too (a lazy_pgen catalog cell; see PfileBindData::lazy_pgen).
@@ -1038,11 +1041,20 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	}
 
 	// --- Read the .pgen header (counts) ---
-	// Under 'localize', materialize a local temp copy of this source's .pgen now
-	// (rewrites src.pgen_path in place) so the header and every later scan open read
-	// the native temp. No-op for other policies.
-	LocalizePgenIfRequested(context, src.pgen_path, localize_guard);
-	ReadPgenHeaderCounts(context, src.pgen_path, src.raw_variant_ct, raw_sample_ct_out);
+	if (defer_copy) {
+		// A localize_deferred catalog's cell 0 that bind must open for its counts: read the header from
+		// the original, through the VFS if a native fopen cannot open it. The caller marks the cell
+		// deferred, so InitGlobal copies it only if the scan keeps it (issue #114).
+		ReadPgenHeaderCounts(context, src.pgen_path, PgenPathNeedsVfs(src.pgen_path), src.raw_variant_ct,
+		                     raw_sample_ct_out);
+	} else {
+		// Under 'localize', materialize a local temp copy of this source's .pgen now
+		// (rewrites src.pgen_path in place) so the header and every later scan open read
+		// the native temp. No-op for other policies.
+		LocalizePgenIfRequested(context, src.pgen_path, localize_guard);
+		ReadPgenHeaderCounts(context, src.pgen_path, PgenIoUseVfs(context, src.pgen_path), src.raw_variant_ct,
+		                     raw_sample_ct_out);
+	}
 
 	if (!need_pvar || !load_pvar) {
 		return src; // a later sample shard (header counts only), or a deferred .pvar parse
@@ -2232,6 +2244,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	}
 	bind_data->lazy_pgen = (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent;
 	bind_data->localize_deferred = bind_data->lazy_pgen && PgenIoLocalizes(context);
+	if (bind_data->localize_deferred) {
+		bind_data->localize_dir = LocalizeDir(context);
+	}
 	bind_data->lazy_pgen_catalog_path = grid.path;
 	bind_data->lazy_pgen_sample_extent = grid.has_sample_extent;
 
@@ -2267,9 +2282,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// A lazy_variants read still DISCOVERS the .pvar path here (a v1 entry may omit "pvar"), and
 		// only defers the parse.
 		const bool defer_header = bind_data->lazy_pgen && (grid.has_sample_extent || (!concat && si > 0));
-		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
-		                                  need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard,
-		                                  !bind_data->lazy_variants && !defer_header, !defer_header, !from_catalog);
+		// A v1 variant concat opens cell 0 here for the sample count. Under localize_deferred it reads the
+		// header without a copy, and waits for InitGlobal like the other cells, so a pruned cell 0 is never
+		// copied. (A v1 sample concat with no declared sample extents still copies its cells here.)
+		const bool defer_copy = bind_data->localize_deferred && !defer_header && !concat;
+		PfileSource src =
+		    LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam, need_pvar,
+		                    bind_data->region, src_sample_ct, bind_data->localize_guard,
+		                    !bind_data->lazy_variants && !defer_header, !defer_header, !from_catalog, defer_copy);
+		if (defer_copy) {
+			src.pgen_header_deferred = true; // CheckDeferredPgenHeaders copies it, then re-checks the copy
+		}
 		if (defer_header) {
 			const auto &cell = grid.cells[si];
 			src.pgen_header_deferred = true;
@@ -3544,7 +3567,7 @@ static void CheckDeferredPgenHeaders(ClientContext &context, PfileBindData &bind
 		}
 		string &path = bind_data.IsConcat() ? src.shard_pgen_paths[k] : src.pgen_path;
 		if (bind_data.localize_deferred && !bind_data.localize_guard.Owns(path)) {
-			LocalizePgen(context, path, bind_data.localize_guard); // policy taken at bind
+			LocalizePgen(context, path, bind_data.localize_guard, bind_data.localize_dir); // as bind chose
 			if (bind_data.IsConcat() && k == 0) {
 				src.pgen_path = path; // a block's pgen_path is its shard 0 cell, as at bind
 			}
@@ -3552,7 +3575,7 @@ static void CheckDeferredPgenHeaders(ClientContext &context, PfileBindData &bind
 		const uint32_t declared_samples = bind_data.IsConcat() ? shards[k].raw_sample_ct : bind_data.raw_sample_ct;
 		uint32_t variant_ct = 0;
 		uint32_t sample_ct = 0;
-		ReadPgenHeaderCounts(context, path, variant_ct, sample_ct);
+		ReadPgenHeaderCounts(context, path, bind_data.use_vfs, variant_ct, sample_ct); // the route bind chose
 		if (variant_ct != src.raw_variant_ct || (bind_data.lazy_pgen_sample_extent && sample_ct != declared_samples)) {
 			throw InvalidInputException(
 			    "read_pfile: catalog '%s': cell '%s' holds %u variants x %u samples, but its blocks declare %u "
