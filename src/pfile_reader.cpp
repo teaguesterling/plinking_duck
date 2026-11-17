@@ -56,6 +56,21 @@
 namespace duckdb {
 
 // ---------------------------------------------------------------------------
+// P13-011 proof-ran counter (test-only, design §6)
+// ---------------------------------------------------------------------------
+// Counts the variants decoded via the sparse (pgen difflist) fast path, as a
+// positive proof that the sparse path actually RAN — a concat sparse==dense
+// test passes even when the path never fires, so equality alone proves nothing.
+// Process-global: the unittest runner is one Catch2 binary that runs each .test
+// file as a case in a shared process, so tests reset this explicitly via
+// plinking_debug_sparse_variants_reset() before each measurement rather than
+// relying on fresh-process semantics. Read via plinking_debug_sparse_variants().
+// Task 1 bumps it only from the single-file path (the IsConcat gate at the
+// want_sparse site is still closed); Task 2 opens that gate and bumps the same
+// counter from the concat combined-carrier path.
+static std::atomic<int64_t> g_sparse_variants_decoded {0};
+
+// ---------------------------------------------------------------------------
 // Region parsing
 // ---------------------------------------------------------------------------
 
@@ -5418,6 +5433,9 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		uint32_t *l_miss = lstate.smp_local_missing.data();
 		uint8_t *l_inr = filter_active ? lstate.smp_local_in_range.data() : nullptr;
 		uint8_t *l_hasm = filter_active ? lstate.smp_local_has_missing.data() : nullptr;
+		// P13-011 proof-ran: variants this thread decoded via the sparse difflist
+		// fast path. Added to the process-global counter once in the merge block.
+		int64_t sparse_decoded = 0;
 
 		// Dense accumulation: decode the whole genovec and touch every sample. Used
 		// by the non-sparse path and as the sparse path's per-variant fallback.
@@ -5504,6 +5522,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 				}
 				// Fast path: majority hom_ref. Non-difflist samples are hom_ref (handled
 				// by derivation); only the difflist carriers touch the counters.
+				sparse_decoded++; // P13-011: this variant decoded via the sparse difflist path
 				for (uint32_t j = 0; j < difflist_len; j++) {
 					uint32_t s = difflist_ids[j];
 					uint32_t g = (raregeno[j / plink2::kBitsPerWordD2] >> (2 * (j % plink2::kBitsPerWordD2))) & 3;
@@ -5545,6 +5564,11 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					gstate.smp_has_missing[s] |= lstate.smp_local_has_missing[s];
 				}
 			}
+		}
+		// P13-011: publish this thread's sparse-decode count once (relaxed — only
+		// read after the scan completes, in plinking_debug_sparse_variants()).
+		if (sparse_decoded) {
+			g_sparse_variants_decoded.fetch_add(sparse_decoded, std::memory_order_relaxed);
 		}
 		lstate.smp_phase1_contributed = true;
 
@@ -6381,6 +6405,22 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 }
 
 // ---------------------------------------------------------------------------
+// P13-011 proof-ran read-back (test-only). Both are VOLATILE so the optimizer
+// never constant-folds them at bind time — the counter must be read at execute
+// time, after the preceding read_pfile statement has finished its scan.
+// ---------------------------------------------------------------------------
+
+static void DebugSparseVariantsFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	int64_t v = g_sparse_variants_decoded.load(std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(v), args.size());
+}
+
+static void DebugSparseVariantsResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	g_sparse_variants_decoded.store(0, std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -6459,6 +6499,21 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	    loader, part_set, {},
 	    "Compute the ordinal-range partitions of a pfile along the variants dimension (half-open [lo, hi)).",
 	    {"SELECT * FROM pfile_partitions('data/cohort')"});
+
+	// P13-011 proof-ran control (test-only): read + reset the sparse-difflist decode counter.
+	ScalarFunction dbg_sparse("plinking_debug_sparse_variants", {}, LogicalType::BIGINT, DebugSparseVariantsFunc);
+	dbg_sparse.SetVolatile();
+	RegisterScalarWithDesc(
+	    loader, dbg_sparse, {},
+	    "Test-only: number of variants decoded via the sparse (pgen difflist) path since the last reset "
+	    "(P13-011 proof-ran control).",
+	    {"SELECT plinking_debug_sparse_variants()"});
+	ScalarFunction dbg_sparse_reset("plinking_debug_sparse_variants_reset", {}, LogicalType::BIGINT,
+	                                DebugSparseVariantsResetFunc);
+	dbg_sparse_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_sparse_reset, {},
+	                       "Test-only: reset the sparse-difflist proof-ran counter to 0, returns 0 (P13-011).",
+	                       {"SELECT plinking_debug_sparse_variants_reset()"});
 }
 
 } // namespace duckdb
