@@ -1,5 +1,5 @@
 # name: test/sql/read_pfile_concat_sparse.test
-# description: P13-011 RED anchor. The sparse (pgen difflist) sample-count path is force-disabled for a sample-sharded (IsConcat) cohort, so a concat carrier/burden query decodes dense. This test adds the proof-ran control (design §6) and the per-sample EXCEPT harness (design §7). Task 1 (this file + the counter) lands in a known RED state: the single-file proof PASSES, the per-sample EXCEPT rows PASS (both paths dense today), and the final concat negative control FAILS because the IsConcat gate is still closed. Task 2 opens the gate and turns the negative control green.
+# description: P13-011. The sparse (pgen difflist) sample-count path on a sample-sharded (IsConcat) cohort, via ConcatPgenReader::GetDifflistOrGenovec. Proof-ran control (design §6): plinking_debug_sparse_variants counts hom_ref-major difflist variants, and plinking_debug_sparse_concat_dense / _altmajor tally the two per-shard fallbacks so a test PROVES both branches ran in the reader under test. Per-sample EXCEPT harness (design §7) over F1 (all-rare), F2 (forces the dense-genovec and ALT-major fallbacks), F3/F4 (sample subsets). Flip control at the end: sparse decodes via the difflist (counter > 0), dense bumps nothing (0 0 0).
 # group: [sql]
 
 require plinking_duck
@@ -161,9 +161,9 @@ true
 # BOTH directions of EXCEPT are empty. PER-SAMPLE, never sum-equality: an
 # out_offset bug moves a shard's carriers onto other samples and preserves
 # sum(het)/sum(hom_alt), so sums cannot catch it. Each fixture pins its exact
-# dense row count so an all-empty pair cannot pass vacuously. Today both paths
-# are dense (the gate is closed) so these pass and record the dense baseline;
-# Task 2 makes the sparse side genuinely use the difflist decode.
+# dense row count so an all-empty pair cannot pass vacuously. The sparse side
+# genuinely uses the concat difflist decode (the flip control at the end proves
+# the path ran); the dense side is the oracle.
 # ===========================================================================
 
 # --- F1: all-rare, all 3 shards ---
@@ -445,10 +445,10 @@ SELECT (SELECT count(*) FROM (SELECT * FROM f2_sparse EXCEPT SELECT * FROM f2_de
 ----
 0	0
 
-# --- F2 concat UNFILTERED: compares every sample's missing count (the carrier
-# filter above can drop a missing-only sample before its missing is compared).
-# With no filter and no hom_ref-inclusive filter, the sparse path still engages,
-# so this pins g==3 emission on the dense / ALT-major fallbacks too. ---
+# --- F2 concat UNFILTERED: compares every sample's missing count. With no filter
+# (and so no hom_ref-inclusive filter) the sparse path still engages — the query III
+# below MEASURES that (tally 3 1 1, same as filtered) — so this pins g==3 emission
+# on the dense / ALT-major fallbacks for every sample, not only carriers. ---
 statement ok
 SET plinking_sample_counts_sparse = false;
 
@@ -459,6 +459,11 @@ FROM read_pfile(['{TEST_DIR}/f2/a/data', '{TEST_DIR}/f2/b/data', '{TEST_DIR}/f2/
                 combine_samples := 'concatenate', pvar := '{TEST_DIR}/f2.pvar',
                 orient := 'sample', genotypes := 'counts');
 
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
 statement ok
 SET plinking_sample_counts_sparse = true;
 
@@ -468,6 +473,15 @@ SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missin
 FROM read_pfile(['{TEST_DIR}/f2/a/data', '{TEST_DIR}/f2/b/data', '{TEST_DIR}/f2/c/data'],
                 combine_samples := 'concatenate', pvar := '{TEST_DIR}/f2.pvar',
                 orient := 'sample', genotypes := 'counts');
+
+# Measured: the unfiltered sparse read engages the concat difflist path and takes
+# both fallbacks (dense 1, ALT-major 1), identical to the filtered read.
+query III
+SELECT plinking_debug_sparse_variants(),
+       plinking_debug_sparse_concat_dense(),
+       plinking_debug_sparse_concat_altmajor();
+----
+3	1	1
 
 query I
 SELECT count(*) FROM f2u_dense;
@@ -481,15 +495,39 @@ SELECT (SELECT count(*) FROM (SELECT * FROM f2u_sparse EXCEPT SELECT * FROM f2u_
 0	0
 
 # ===========================================================================
-# NEGATIVE CONTROL (design §6) — the intended RED. Under sparse, the concat read
-# returns the CORRECT answer (256 carrier rows), but it decodes DENSE because the
-# IsConcat gate (want_sparse && !IsConcat) is still closed in Task 1. So the
-# proof-ran counter stays 0 and the > 0 assertion FAILS. This is the RED anchor:
-# the result is right, only the path is wrong, which isolates the failure to the
-# gate. Task 2 opens the gate and the counter goes > 0. KEEP THIS LAST — the
-# runner stops the file at the first mismatch, so every PASS above must precede it.
+# FLIP CONTROL (design §6, §8): both directions. The concat SPARSE read must RUN
+# the difflist path (counter > 0), and the concat DENSE read must bump NONE of the
+# three read-backs. Result equality cannot prove the path ran, so both halves are
+# asserted on the F1 concat fixture. KEEP THIS LAST — the runner stops the file at
+# the first mismatch, so every PASS above must precede it.
 # ===========================================================================
 
+# DENSE direction: the correct 256 carrier rows, and all three read-backs stay 0
+# (the dense concat path never touches the proof-ran surface).
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+----
+256
+
+query III
+SELECT plinking_debug_sparse_variants(),
+       plinking_debug_sparse_concat_dense(),
+       plinking_debug_sparse_concat_altmajor();
+----
+0	0	0
+
+# SPARSE direction: the same read, now decoding through the concat difflist path.
+# Every F1 variant is hom_ref-major on every shard, so the counter is > 0.
 statement ok
 SET plinking_sample_counts_sparse = true;
 
@@ -498,7 +536,6 @@ SELECT plinking_debug_sparse_variants_reset();
 ----
 0
 
-# Correct result via the (today) dense path: 256 carrier rows.
 query I
 SELECT count(*) FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
                                 combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
@@ -506,8 +543,6 @@ SELECT count(*) FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data',
 ----
 256
 
-# RED: the concat sparse path must have decoded via the difflist (counter > 0).
-# FAILS in Task 1 (counter == 0, gate closed). Task 2 turns this green.
 query I
 SELECT plinking_debug_sparse_variants() > 0;
 ----
