@@ -1576,7 +1576,9 @@ void PsamCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 			if (!g.seen_iids.insert(iid).second) {
 				throw InvalidInputException("write psam: duplicate IID '%s' — .psam IIDs must be unique", iid);
 			}
-			g.streamed_iids.push_back(iid); // write-order IIDs for the parquet companion
+			if (bind.psam_parquet) {
+				g.streamed_iids.push_back(iid); // write-order IIDs for the parquet companion (only when needed)
+			}
 			buffer += iid;
 			buffer += '\n';
 		}

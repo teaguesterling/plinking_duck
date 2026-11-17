@@ -154,6 +154,25 @@ SELECT count(*) FROM glob('{TEST_DIR}/y.psam.parquet');
 ----
 0
 
+# Override + error path: the §6a InitGlobal drop keys on the `psam` override (target_path), so even a
+# throwing out-of-band rewrite leaves no stale companion at the override location.
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/ig3.psam' (FORMAT psam, psam '{TEST_DIR}/ovr3.psam', samples ['e1'], psam_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/ovr3.psam.parquet');
+----
+1
+
+statement error
+COPY (SELECT 1 // (i - 2) AS boom FROM range(5) t(i)) TO '{TEST_DIR}/ig3.psam' (FORMAT psam, psam '{TEST_DIR}/ovr3.psam', samples ['e2'], force);
+----
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/ovr3.psam.parquet');
+----
+0
+
 # ===========================================================================
 # Fresh write with psam_parquet to a path DuckDB's ExpandPath rewrites (file:// here, also ~). The
 # COPY target is expanded before InitGlobal (g.path), but target_path is captured raw at bind; if the
