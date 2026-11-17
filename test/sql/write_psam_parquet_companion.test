@@ -1,0 +1,324 @@
+# name: test/sql/write_psam_parquet_companion.test
+# description: COPY ... (FORMAT pfile, psam_parquet) also writes '<prefix>.psam.parquet' — the same sample rows as the text .psam, in the same order. The reader already reads a .psam.parquet companion (discovery, or a catalog that declares the path); this feeds it from the writer. Oracle: the text .psam / the source pfile the same COPY was built from.
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# Plain bundle (pfile_example): psam_parquet emits '<prefix>.psam.parquet'
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/pq' (FORMAT pfile, psam_parquet);
+
+# The companion exists.
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/pq.psam.parquet');
+----
+1
+
+# Same IIDs, in the same order, as the text .psam the same COPY wrote.
+query I
+SELECT count(*) FROM (
+    SELECT IID, row_number() OVER () - 1 AS sidx FROM read_psam('{TEST_DIR}/pq.psam')
+) t
+JOIN (
+    SELECT IID, row_number() OVER () - 1 AS sidx FROM read_parquet('{TEST_DIR}/pq.psam.parquet')
+) q USING (IID, sidx);
+----
+4
+
+# Row count matches the text .psam.
+query I
+SELECT (SELECT count(*) FROM read_parquet('{TEST_DIR}/pq.psam.parquet'))
+     = (SELECT count(*) FROM read_psam('{TEST_DIR}/pq.psam'));
+----
+true
+
+# Minimal IID-only column set, IID VARCHAR.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/pq.psam.parquet'));
+----
+IID	VARCHAR
+
+# zstd, one default row group.
+query II
+SELECT DISTINCT compression, row_group_id FROM parquet_metadata('{TEST_DIR}/pq.psam.parquet') ORDER BY ALL;
+----
+ZSTD	0
+
+# ===========================================================================
+# The companion is USED by the reader. The runner has no rm, so overwrite the text .psam with a
+# DIFFERENT (valid, same-count) IID set; a companions-ON read must still return the ORIGINAL IIDs
+# (the parquet), and a companions-OFF read must return the overwritten IIDs (the text) — the
+# negative control that proves the overwrite took effect, so the ON read truly used the parquet.
+# The overwrite is a NATIVE tab-csv '#IID' write (not FORMAT psam), so it touches only the text
+# .psam and never the .psam.parquet — the control stays independent of the deferred standalone
+# FORMAT psam companion gap (a FORMAT psam rewrite would also drop the parquet once that is fixed).
+# ===========================================================================
+
+statement ok
+CREATE TEMP TABLE oracle_iids AS SELECT IID FROM read_psam('{TEST_DIR}/pq.psam');
+
+statement ok
+COPY (SELECT 'ZZZ' || i AS "#IID" FROM range(1, 5) t(i)) TO '{TEST_DIR}/pq.psam' (FORMAT csv, HEADER true, QUOTE '');
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+# ON: the .psam.parquet satisfies the read — every original IID is present (none missing).
+query I
+SELECT count(*) FROM (
+    SELECT IID FROM oracle_iids
+    EXCEPT SELECT DISTINCT IID FROM read_pfile('{TEST_DIR}/pq', orient := 'sample')
+);
+----
+0
+
+statement ok
+SET plinking_use_parquet_companions = false;
+
+# OFF (negative control): the overwritten text .psam is read — all 4 original IIDs are absent.
+query I
+SELECT count(*) FROM (
+    SELECT IID FROM oracle_iids
+    EXCEPT SELECT DISTINCT IID FROM read_pfile('{TEST_DIR}/pq', orient := 'sample')
+);
+----
+4
+
+statement ok
+RESET plinking_use_parquet_companions;
+
+# ===========================================================================
+# Plain bundle: force-rewrite WITHOUT psam_parquet must drop the stale companion (its IID order
+# would otherwise be served over a .psam the reader thinks is a different sample set).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr' (FORMAT pfile, psam_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr.psam.parquet');
+----
+1
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr' (FORMAT pfile, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr.psam.parquet');
+----
+0
+
+# ===========================================================================
+# Without the option no companion is written.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/nopq' (FORMAT pfile);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/nopq.psam.parquet');
+----
+0
+
+# ===========================================================================
+# Catalog writers (large_example: 3000 variants x 8 samples, CHROM 1/2/3). Each declares the psam
+# as '*.psam.parquet' under psam_parquet; a control without the option declares the text '.psam' and
+# writes no companion. The parquet companion is PROVEN used: overwrite the text .psam with garbage,
+# then a catalog read (companions on) still returns the correct IIDs/genotypes (the declared
+# '.psam.parquet' path bypasses the garbage text file entirely).
+# ===========================================================================
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+# ---------------------------------------------------------------------------
+# shard_by (variants concat): ONE shared root .psam, declared '<base>.psam.parquet'.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs_pq' (FORMAT pfile, shard_by 'CHROM', psam_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs_txt' (FORMAT pfile, shard_by 'CHROM');
+
+# The catalog declares the parquet path under the option, the text path without it.
+query III
+SELECT
+  (SELECT content LIKE '%.psam.parquet"%' FROM read_text('{TEST_DIR}/vs_pq.pfile.json')),
+  (SELECT content LIKE '%.psam.parquet"%' FROM read_text('{TEST_DIR}/vs_txt.pfile.json')),
+  (SELECT content LIKE '%.psam"%' FROM read_text('{TEST_DIR}/vs_txt.pfile.json'));
+----
+true	false	true
+
+# The companion and the text .psam are both written.
+query II
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/vs_pq.psam.parquet')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/vs_pq.psam'));
+----
+1	1
+
+# PROOF the parquet companion is used: clobber the text .psam; a sample-orient read still returns
+# the right IIDs + genotypes (IID-sensitive), matching the large_example oracle.
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/vs_pq.psam' (FORMAT csv, HEADER false);
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/vs_pq.pfile.json', orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/vs_pq.pfile.json', orient := 'sample'));
+----
+0	8
+
+# ---------------------------------------------------------------------------
+# shard_samples (samples concat): per-shard .psam, each declared '<rel>.psam.parquet'.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss_pq' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, psam_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss_txt' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query III
+SELECT
+  (SELECT content LIKE '%.psam.parquet"%' FROM read_text('{TEST_DIR}/ss_pq.pfile.json')),
+  (SELECT content LIKE '%.psam.parquet"%' FROM read_text('{TEST_DIR}/ss_txt.pfile.json')),
+  (SELECT content LIKE '%.psam"%' FROM read_text('{TEST_DIR}/ss_txt.pfile.json'));
+----
+true	false	true
+
+# one companion per shard (a, b, c)
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/ss_pq/*/data.psam.parquet');
+----
+3
+
+# Clobber every shard's text .psam; the declared parquet companions carry the read.
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/ss_pq/a/data.psam' (FORMAT csv, HEADER false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/ss_pq/b/data.psam' (FORMAT csv, HEADER false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/ss_pq/c/data.psam' (FORMAT csv, HEADER false);
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile(catalog := '{TEST_DIR}/ss_pq.pfile.json', orient := 'sample')
+          EXCEPT ALL
+          SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/ss_pq.pfile.json', orient := 'sample'));
+----
+0	8
+
+# ---------------------------------------------------------------------------
+# matrix (shard_by x shard_samples): per sample-block .psam, template declares '*.psam.parquet'.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx_pq' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, psam_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx_txt' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query III
+SELECT
+  (SELECT content LIKE '%.psam.parquet"%' FROM read_text('{TEST_DIR}/mx_pq.pfile.json')),
+  (SELECT content LIKE '%.psam.parquet"%' FROM read_text('{TEST_DIR}/mx_txt.pfile.json')),
+  (SELECT content LIKE '%.psam"%' FROM read_text('{TEST_DIR}/mx_txt.pfile.json'));
+----
+true	false	true
+
+# one companion per sample-block (lo, hi)
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/mx_pq/*/samples.psam.parquet');
+----
+2
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/mx_pq/GROUP=lo/samples.psam' (FORMAT csv, HEADER false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/mx_pq/GROUP=hi/samples.psam' (FORMAT csv, HEADER false);
+
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx_pq.pfile.json', orient := 'genotype')
+          EXCEPT ALL
+          SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype'))),
+       (SELECT count(*) FROM read_pfile(catalog := '{TEST_DIR}/mx_pq.pfile.json', orient := 'genotype'));
+----
+0	24000
+
+statement ok
+RESET plinking_use_parquet_companions;
+
+# ===========================================================================
+# Catalog writers: a force-rewrite WITHOUT psam_parquet drops every stale '.psam.parquet'.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_vs' (FORMAT pfile, shard_by 'CHROM', psam_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_vs' (FORMAT pfile, shard_by 'CHROM', force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr_vs.psam.parquet');
+----
+0
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_ss' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, psam_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_ss' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr_ss/*/data.psam.parquet');
+----
+0
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, psam_parquet);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/fr_mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/fr_mx/*/samples.psam.parquet');
+----
+0
+
+# ===========================================================================
+# No '.psam.staging.parquet' (or any staging) left behind by any writer above.
+# ===========================================================================
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/**/*staging*');
+----
+0
