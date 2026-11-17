@@ -28,6 +28,9 @@
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+#ifdef DUCKDB_HAS_LEGACY_TABLE_FILTERS
+#include "duckdb/planner/filter/expression_filter.hpp"
+#endif
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -3285,11 +3288,217 @@ static bool PruneTryGetStr(const Value &v, string &out) {
 	return true;
 }
 
+//! Tighten inclusive [lo, hi] by one `column <cmp> c` comparison. Returns false for a
+//! comparison kind that is not a bound (<>, DISTINCT FROM, ...), leaving lo/hi as-is.
+static bool PruneApplyIntCompare(ExpressionType cmp, int64_t c, int64_t &lo, int64_t &hi) {
+	switch (cmp) {
+	case ExpressionType::COMPARE_GREATERTHAN:
+		if (c != std::numeric_limits<int64_t>::max()) {
+			lo = std::max(lo, c + 1);
+		}
+		return true;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		lo = std::max(lo, c);
+		return true;
+	case ExpressionType::COMPARE_LESSTHAN:
+		if (c != std::numeric_limits<int64_t>::min()) {
+			hi = std::min(hi, c - 1);
+		}
+		return true;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		hi = std::min(hi, c);
+		return true;
+	case ExpressionType::COMPARE_EQUAL:
+		lo = std::max(lo, c);
+		hi = std::min(hi, c);
+		return true;
+	default:
+		return false;
+	}
+}
+
+#ifdef DUCKDB_HAS_LEGACY_TABLE_FILTERS
+// DuckDB v2.0 pushes every filter as an ExpressionFilter: one Expression over a
+// BoundReference(0) placeholder for the filtered column. These walkers recognize the
+// same exact shapes as the legacy recognizers below, with the same conservative rule:
+// an unrecognized shape returns false and is left to ApplyResidualFilters.
+
+//! Strip optional-filter wrappers (optional / selectivity-optional). As with the
+//! legacy OptionalFilter case, the wrapped child is implied by the query.
+static const Expression &PruneUnwrapOptionalExpr(const Expression &expr) {
+	auto child = ExpressionFilter::GetOptionalFilterChild(expr);
+	return child ? PruneUnwrapOptionalExpr(*child) : expr;
+}
+
+//! `column <cmp> constant`, either side. Null if `expr` is not that shape.
+static optional_ptr<const BoundConstantExpression> PruneExprColumnConstant(const Expression &expr,
+                                                                           ExpressionType &cmp) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+	    !BoundComparisonExpression::IsComparison(expr)) {
+		return nullptr;
+	}
+	return ExpressionFilter::TryGetColumnConstantComparison(expr.Cast<BoundFunctionExpression>(), cmp);
+}
+
+//! `column IN (c1, c2, ...)` with all-constant members. Null if not that shape.
+static optional_ptr<const BoundOperatorExpression> PruneExprColumnIn(const Expression &expr) {
+	if (expr.GetExpressionType() != ExpressionType::COMPARE_IN ||
+	    expr.GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
+		return nullptr;
+	}
+	auto &op = expr.Cast<BoundOperatorExpression>();
+	auto &children = op.GetChildren();
+	if (children.size() < 2 || !ExpressionFilter::IsSimpleFilterColumnRef(*children[0])) {
+		return nullptr;
+	}
+	for (idx_t i = 1; i < children.size(); i++) {
+		if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return nullptr;
+		}
+	}
+	return &op;
+}
+
+//! String set (CHROM/ID): =, IN, OR of those (union), AND (intersection of the
+//! recognized children; each is a superset of the kept values, so their
+//! intersection is too).
+static bool PruneExprStringSet(const Expression &expr_p, unordered_set<string> &out) {
+	auto &expr = PruneUnwrapOptionalExpr(expr_p);
+	ExpressionType cmp;
+	if (auto c = PruneExprColumnConstant(expr, cmp)) {
+		string s;
+		if (cmp != ExpressionType::COMPARE_EQUAL || !PruneTryGetStr(c->GetValue(), s)) {
+			return false;
+		}
+		out.insert(std::move(s));
+		return true;
+	}
+	if (auto in = PruneExprColumnIn(expr)) {
+		auto &children = in->GetChildren();
+		for (idx_t i = 1; i < children.size(); i++) {
+			string s;
+			if (!PruneTryGetStr(children[i]->Cast<BoundConstantExpression>().GetValue(), s)) {
+				return false;
+			}
+			out.insert(std::move(s));
+		}
+		return true;
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION) {
+		return false;
+	}
+	auto &children = expr.Cast<BoundConjunctionExpression>().GetChildren();
+	if (children.empty()) {
+		return false;
+	}
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+		for (auto &child : children) {
+			if (!PruneExprStringSet(*child, out)) {
+				return false; // one unrecognized branch could keep rows the union omits
+			}
+		}
+		return true;
+	}
+	if (expr.GetExpressionType() != ExpressionType::CONJUNCTION_AND) {
+		return false;
+	}
+	bool have = false;
+	unordered_set<string> acc;
+	for (auto &child : children) {
+		unordered_set<string> s;
+		if (!PruneExprStringSet(*child, s)) {
+			continue; // e.g. IS NOT NULL: no set constraint, AND keeps it conservative
+		}
+		if (!have) {
+			acc = std::move(s);
+			have = true;
+		} else {
+			unordered_set<string> both;
+			for (auto &v : acc) {
+				if (s.count(v)) {
+					both.insert(v);
+				}
+			}
+			acc = std::move(both);
+		}
+	}
+	if (!have) {
+		return false;
+	}
+	out.insert(acc.begin(), acc.end());
+	return true;
+}
+
+//! Inclusive int bounds (POS/__ordinal): >, >=, <, <=, =, BETWEEN, AND (intersect).
+//! IN and OR are not bounds here; see PruneCollectIntSet for an exact IN.
+static bool PruneExprIntBounds(const Expression &expr_p, int64_t &lo, int64_t &hi) {
+	auto &expr = PruneUnwrapOptionalExpr(expr_p);
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN &&
+	    expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &between = expr.Cast<BoundFunctionExpression>();
+		// LowerInclusive/UpperInclusive dereference the built-in BETWEEN bind data
+		// unchecked (duckdb between.cpp), so refuse a BETWEEN that lacks it.
+		if (!BoundBetweenExpression::HasValidBindData(between) ||
+		    !ExpressionFilter::IsSimpleFilterColumnRef(BoundBetweenExpression::Input(between))) {
+			return false;
+		}
+		bool any = false;
+		auto &lower = BoundBetweenExpression::LowerBound(between);
+		auto &upper = BoundBetweenExpression::UpperBound(between);
+		int64_t c;
+		if (lower.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+		    PruneTryGetInt(lower.Cast<BoundConstantExpression>().GetValue(), c)) {
+			any |= PruneApplyIntCompare(BoundBetweenExpression::LowerComparisonType(between), c, lo, hi);
+		}
+		if (upper.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+		    PruneTryGetInt(upper.Cast<BoundConstantExpression>().GetValue(), c)) {
+			any |= PruneApplyIntCompare(BoundBetweenExpression::UpperComparisonType(between), c, lo, hi);
+		}
+		return any;
+	}
+	ExpressionType cmp;
+	if (auto c = PruneExprColumnConstant(expr, cmp)) {
+		int64_t v;
+		return PruneTryGetInt(c->GetValue(), v) && PruneApplyIntCompare(cmp, v, lo, hi);
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+	    expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		bool any = false;
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			any |= PruneExprIntBounds(*child, lo, hi);
+		}
+		return any;
+	}
+	return false;
+}
+
+//! Exact int set from `column IN (...)` (__ordinal). False if not that shape.
+static bool PruneExprIntSet(const Expression &expr_p, unordered_set<int64_t> &out) {
+	auto in = PruneExprColumnIn(PruneUnwrapOptionalExpr(expr_p));
+	if (!in) {
+		return false;
+	}
+	auto &children = in->GetChildren();
+	for (idx_t i = 1; i < children.size(); i++) {
+		int64_t c;
+		if (!PruneTryGetInt(children[i]->Cast<BoundConstantExpression>().GetValue(), c)) {
+			return false;
+		}
+		out.insert(c);
+	}
+	return true;
+}
+#endif // DUCKDB_HAS_LEGACY_TABLE_FILTERS
+
 //! Accumulate a string-set (CHROM/ID) constraint from one filter. Returns false if the
 //! filter shape is not an exact equality/IN/OR-of-equalities (caller then leaves it to
 //! the applicator). On true, `out` holds the complete allowed set for this column.
 static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<string> &out) {
 	switch (filter.filter_type) {
+#ifdef DUCKDB_HAS_LEGACY_TABLE_FILTERS
+	case ExpressionFilter::TYPE:
+		return PruneExprStringSet(*filter.Cast<ExpressionFilter>().expr, out);
+#endif
 	case CompatConstantFilterType: {
 		auto &cf = filter.Cast<CompatConstantFilter>();
 		if (cf.comparison_type != ExpressionType::COMPARE_EQUAL) {
@@ -3343,36 +3552,17 @@ static bool PruneCollectStringSet(const TableFilter &filter, unordered_set<strin
 //! handling exact-or-residual avoids a future refactor silently introducing a gap.)
 static bool PruneCollectIntBounds(const TableFilter &filter, int64_t &lo, int64_t &hi) {
 	switch (filter.filter_type) {
+#ifdef DUCKDB_HAS_LEGACY_TABLE_FILTERS
+	case ExpressionFilter::TYPE:
+		return PruneExprIntBounds(*filter.Cast<ExpressionFilter>().expr, lo, hi);
+#endif
 	case CompatConstantFilterType: {
 		auto &cf = filter.Cast<CompatConstantFilter>();
 		int64_t c;
 		if (!PruneTryGetInt(cf.constant, c)) {
 			return false;
 		}
-		switch (cf.comparison_type) {
-		case ExpressionType::COMPARE_GREATERTHAN:
-			if (c != std::numeric_limits<int64_t>::max()) {
-				lo = std::max(lo, c + 1);
-			}
-			return true;
-		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-			lo = std::max(lo, c);
-			return true;
-		case ExpressionType::COMPARE_LESSTHAN:
-			if (c != std::numeric_limits<int64_t>::min()) {
-				hi = std::min(hi, c - 1);
-			}
-			return true;
-		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-			hi = std::min(hi, c);
-			return true;
-		case ExpressionType::COMPARE_EQUAL:
-			lo = std::max(lo, c);
-			hi = std::min(hi, c);
-			return true;
-		default:
-			return false;
-		}
+		return PruneApplyIntCompare(cf.comparison_type, c, lo, hi);
 	}
 	case CompatConjunctionAndFilterType: {
 		auto &conj = filter.Cast<CompatConjunctionAndFilter>();
@@ -3389,6 +3579,28 @@ static bool PruneCollectIntBounds(const TableFilter &filter, int64_t &lo, int64_
 	default:
 		return false;
 	}
+}
+
+//! Exact int set (__ordinal) from an IN filter, legacy or v2.0 expression. False if the
+//! filter is not an all-integer IN.
+static bool PruneCollectIntSet(const TableFilter &filter, unordered_set<int64_t> &out) {
+#ifdef DUCKDB_HAS_LEGACY_TABLE_FILTERS
+	if (filter.filter_type == ExpressionFilter::TYPE) {
+		return PruneExprIntSet(*filter.Cast<ExpressionFilter>().expr, out);
+	}
+#endif
+	if (filter.filter_type != CompatInFilterType) {
+		return false;
+	}
+	auto &inf = filter.Cast<CompatInFilter>();
+	for (auto &v : inf.values) {
+		int64_t c;
+		if (!PruneTryGetInt(v, c)) {
+			return false;
+		}
+		out.insert(c);
+	}
+	return !inf.values.empty();
 }
 
 //! Build the conservative prune plan from the pushed filters. `column_ids` maps each
@@ -3431,23 +3643,11 @@ static PfilePrunePlan BuildPrunePlan(TableFilterSet &fs, const vector<column_t> 
 			}
 		} else if (bind_data.with_ordinal && file_col == static_cast<column_t>(bind_data.ordinal_col_idx)) {
 			// __ordinal: try an exact IN-set first, else inclusive bounds.
-			if (filter.filter_type == CompatInFilterType) {
-				auto &inf = filter.Cast<CompatInFilter>();
-				bool ok = !inf.values.empty();
-				unordered_set<int64_t> s;
-				for (auto &v : inf.values) {
-					int64_t c;
-					if (!PruneTryGetInt(v, c)) {
-						ok = false;
-						break;
-					}
-					s.insert(c);
-				}
-				if (ok) {
-					plan.ord_allowed = std::move(s);
-					plan.has_ord_set = true;
-					plan.any = true;
-				}
+			unordered_set<int64_t> s;
+			if (PruneCollectIntSet(filter, s)) {
+				plan.ord_allowed = std::move(s);
+				plan.has_ord_set = true;
+				plan.any = true;
 			} else {
 				int64_t lo = std::numeric_limits<int64_t>::min(), hi = std::numeric_limits<int64_t>::max();
 				if (PruneCollectIntBounds(filter, lo, hi)) {

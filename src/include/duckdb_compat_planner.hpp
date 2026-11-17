@@ -58,9 +58,10 @@ namespace duckdb {
 // simply never matches. In a best-effort pruner that costs the pushdown
 // OPTIMIZATION and nothing else -- correctness must live in a residual applicator
 // that re-applies every filter through the virtual TableFilter::ToExpression,
-// which ExpressionFilter implements. So the v2.0 build returns the same rows,
-// reading more than it strictly must. Teaching the pushdown to unwrap an
-// ExpressionFilter is a real feature, not a compatibility shim, and is left out.
+// which ExpressionFilter implements. read_pfile's pruner therefore also walks
+// ExpressionFilter::expr on v2.0 (PruneExpr* in pfile_reader.cpp); without that
+// walk the v2.0 build returned the same rows but read every variant of the file.
+// The walk is a feature of that reader, not a shim, so it lives there.
 #ifdef DUCKDB_HAS_LEGACY_TABLE_FILTERS
 using CompatConstantFilter = LegacyConstantFilter;
 using CompatInFilter = LegacyInFilter;

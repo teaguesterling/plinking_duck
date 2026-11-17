@@ -1,0 +1,198 @@
+# name: test/sql/read_pfile_where_prune.test
+# description: A WHERE on CHROM, POS, ID or __ordinal must narrow the variants read_pfile reads from the .pgen, not only the rows it returns. On DuckDB v2.0 every pushed filter arrives as an EXPRESSION_FILTER, which the prune once ignored, so each such query read the whole file. The signal is the .pgen bytes in DuckDB's FileSystem log under plinking_pgen_io='vfs' (local, no network). wes_chr10.pgen is 11.2 MB; a few hundred kept variants read under 2 MB.
+# group: [sql]
+
+require plinking_duck
+
+# One thread: the read pattern is deterministic, and one cookie block cache.
+statement ok
+SET threads = 1;
+
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+statement ok
+CALL enable_logging('FileSystem', storage = 'memory');
+
+# Bytes read from any .pgen since the last truncate_duckdb_logs().
+statement ok
+CREATE MACRO pgen_bytes() AS (
+    SELECT coalesce(sum(regexp_extract(message, '"bytes":"([0-9]+)"', 1)::BIGINT), 0)
+    FROM duckdb_logs
+    WHERE message LIKE '%.pgen"%' AND message LIKE '%"op":"READ"%');
+
+# --- Control: a full genotype scan reads the whole file. If this fails, the
+# --- signal is broken and every "< 2 MB" assertion below proves nothing.
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT pgen_bytes() > 10000000;
+----
+true
+
+# --- Baseline: region := reads only the region's records.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- POS BETWEEN: the same 183 variants as the region above.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE POS BETWEEN 100000000 AND 100500000;
+----
+183
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- POS >= AND POS <=
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE POS >= 100000000 AND POS <= 100500000;
+----
+183
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- POS = x
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE POS = 100062490;
+----
+1
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- ID = x
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE ID = 'v22673';
+----
+1
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- ID IN (...), two variants far apart in the file
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE ID IN ('v100', 'v29000');
+----
+2
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- OR of ID equalities
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE ID = 'v100' OR ID = 'v29000';
+----
+2
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- CHROM IN (...) that keeps nothing in this one-contig file
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE CHROM IN ('11', '12');
+----
+0
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- __ordinal BETWEEN
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', with_ordinal := true) WHERE __ordinal BETWEEN 22672 AND 22680;
+----
+9
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- __ordinal IN (...)
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', with_ordinal := true) WHERE __ordinal IN (100, 29000);
+----
+2
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- genotype orient: the variant-axis filter narrows the variants too
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotype) FROM read_pfile('test/data/wes_chr10', orient := 'genotype') WHERE POS = 100062490;
+----
+10000
+
+query I
+SELECT pgen_bytes() < 2000000;
+----
+true
+
+# --- An unrecognized shape (<>) is left to the residual filter. The row count pins
+# --- the conservative side: a prune that dropped a kept variant would show here.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10') WHERE POS <> 100062490;
+----
+29999
