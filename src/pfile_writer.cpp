@@ -1408,6 +1408,14 @@ struct PsamWriteBindData : public FunctionData {
 	vector<string> iids;     //! OUT_OF_BAND: the full IID list (written once at init)
 	idx_t iid_input_idx = 0; //! ROW_STREAM: input column index of the per-row IID
 	string path_override;    //! `psam` option; empty -> use the COPY target
+	//! The user's final `.psam` target. DuckDB may hand InitGlobal a `tmp_` name on overwrite, so the
+	//! companion reconciliation (the InitGlobal stale-drop and the Finalize move) needs this, not g.path.
+	string target_path;
+	//! `psam_parquet` option: also emit '<psam>.parquet' (single IID VARCHAR column, same rows + order
+	//! as the text .psam). Mirrors the standalone pvar writer's `pvar_parquet`.
+	bool psam_parquet = false;
+	//! The database, captured at bind, so the companion can be written through its own Connection.
+	DatabaseInstance *db = nullptr;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto r = make_uniq<PsamWriteBindData>();
@@ -1415,18 +1423,24 @@ struct PsamWriteBindData : public FunctionData {
 		r->iids = iids;
 		r->iid_input_idx = iid_input_idx;
 		r->path_override = path_override;
+		r->target_path = target_path;
+		r->psam_parquet = psam_parquet;
+		r->db = db;
 		return std::move(r);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PsamWriteBindData>();
-		return mode == o.mode && iids == o.iids && iid_input_idx == o.iid_input_idx && path_override == o.path_override;
+		return mode == o.mode && iids == o.iids && iid_input_idx == o.iid_input_idx &&
+		       path_override == o.path_override && target_path == o.target_path && psam_parquet == o.psam_parquet;
 	}
 };
 
 struct PsamWriteGlobalState : public GlobalFunctionData {
 	unique_ptr<FileHandle> handle;
 	string path;
-	std::set<string> seen_iids; //! ROW_STREAM dup-IID guard (read_psam rejects dups)
+	std::set<string> seen_iids;   //! ROW_STREAM dup-IID guard (read_psam rejects dups)
+	vector<string> streamed_iids; //! ROW_STREAM: IIDs in write (= row) order, for the parquet companion
+	bool pq_on = false;           //! a parquet companion was started for this state (gates cleanup)
 
 	void CleanupPartial(FileSystem &fs) {
 		if (handle) {
@@ -1435,6 +1449,10 @@ struct PsamWriteGlobalState : public GlobalFunctionData {
 		try {
 			if (!path.empty() && fs.FileExists(path)) {
 				fs.RemoveFile(path);
+			}
+			// Only a companion THIS state created (keyed on g.path, like PvarWriteGlobalState).
+			if (pq_on && !path.empty() && fs.FileExists(path + ".parquet")) {
+				fs.RemoveFile(path + ".parquet");
 			}
 		} catch (...) {
 		}
@@ -1449,8 +1467,14 @@ unique_ptr<FunctionData> PsamCopyBind(ClientContext &context, CopyFunctionBindIn
 	auto bind = make_uniq<PsamWriteBindData>();
 
 	for (auto &opt : input.info.options) {
-		if (StringUtil::Lower(CompatNameStr(opt.first)) == "psam" && !opt.second.empty() && !opt.second[0].IsNull()) {
+		const string key = StringUtil::Lower(CompatNameStr(opt.first));
+		if (key == "psam" && !opt.second.empty() && !opt.second[0].IsNull()) {
 			bind->path_override = opt.second[0].ToString();
+		} else if (key == "psam_parquet") {
+			// bare `psam_parquet` or `psam_parquet true` enables; NULL/false disables (as pvar_parquet).
+			bind->psam_parquet =
+			    opt.second.empty() ||
+			    (!opt.second[0].IsNull() && opt.second[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
 		}
 	}
 
@@ -1488,8 +1512,9 @@ unique_ptr<FunctionData> PsamCopyBind(ClientContext &context, CopyFunctionBindIn
 		}
 		bind->iid_input_idx = idx;
 	}
-	RefuseExistingOutput(context, ParseForceOption(input),
-	                     {bind->path_override.empty() ? input.info.file_path : bind->path_override}, "write psam");
+	bind->target_path = bind->path_override.empty() ? input.info.file_path : bind->path_override;
+	bind->db = &DatabaseInstance::GetDatabase(context);
+	RefuseExistingOutput(context, ParseForceOption(input), {bind->target_path}, "write psam");
 	return std::move(bind);
 }
 
@@ -1538,6 +1563,7 @@ void PsamCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 			if (!g.seen_iids.insert(iid).second) {
 				throw InvalidInputException("write psam: duplicate IID '%s' — .psam IIDs must be unique", iid);
 			}
+			g.streamed_iids.push_back(iid); // write-order IIDs for the parquet companion
 			buffer += iid;
 			buffer += '\n';
 		}
@@ -1553,13 +1579,34 @@ void PsamCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 void PsamCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
 }
 
-void PsamCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionData &gstate) {
+void PsamCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+	auto &bind = bind_data.Cast<PsamWriteBindData>();
 	auto &g = gstate.Cast<PsamWriteGlobalState>();
 	if (g.handle) {
 		g.handle->Sync();
 		g.handle.reset();
 	}
-	(void)context;
+	if (!bind.psam_parquet) {
+		return; // no companion requested; the InitGlobal stale-drop (Task 2) handles the off case
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	try {
+		g.pq_on = true;
+		const vector<string> &iids = bind.mode == PsamWriteMode::OUT_OF_BAND ? bind.iids : g.streamed_iids;
+		WritePsamParquetFromIids(*bind.db, g.path, iids);
+		if (g.path != bind.target_path) {
+			// DuckDB overwrote via a tmp_ name and renames only the .psam: put the new companion at its
+			// final name, replacing the old one (mirrors PvarCopyFinalize).
+			const string final_pq = bind.target_path + ".parquet";
+			if (fs.FileExists(final_pq)) {
+				fs.RemoveFile(final_pq);
+			}
+			fs.MoveFile(g.path + ".parquet", final_pq);
+		}
+	} catch (...) {
+		g.CleanupPartial(fs);
+		throw;
+	}
 }
 
 CopyFunctionExecutionMode PsamCopyExecMode(bool, bool) {

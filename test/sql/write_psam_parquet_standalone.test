@@ -1,0 +1,91 @@
+# name: test/sql/write_psam_parquet_standalone.test
+# description: standalone COPY ... (FORMAT psam, psam_parquet) emits '<psam>.parquet' (both identity modes), and a rewrite without the option drops a stale companion at InitGlobal — before the new text .psam is written — so even an upstream-query error cannot leave a new .psam beside an old companion.
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# OUT_OF_BAND identity (samples [...]) + psam_parquet writes the companion.
+# ===========================================================================
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/oob.psam' (FORMAT psam, samples ['s1', 's2', 's3'], psam_parquet);
+
+query I
+SELECT IID FROM read_parquet('{TEST_DIR}/oob.psam.parquet');
+----
+s1
+s2
+s3
+
+# Minimal IID-only column set, IID VARCHAR (a fixture that stops writing the parquet, or writes a
+# different schema, fails here).
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/oob.psam.parquet'));
+----
+IID	VARCHAR
+
+# ===========================================================================
+# ROW_STREAM identity (per-row IID column): the companion holds the IIDs in WRITE order, not sorted.
+# ===========================================================================
+
+statement ok
+COPY (SELECT iid FROM (VALUES ('b'), ('a'), ('c')) t(iid)) TO '{TEST_DIR}/rs.psam' (FORMAT psam, psam_parquet);
+
+query I
+SELECT IID FROM read_parquet('{TEST_DIR}/rs.psam.parquet');
+----
+b
+a
+c
+
+# ===========================================================================
+# Zero-row ROW_STREAM: a header-only .psam writes a valid, empty single-column companion (not a crash).
+# (OUT_OF_BAND `samples []` is rejected by the text writer — "a .psam needs at least one IID" — so the
+# zero-row case must be a row-stream with no rows.)
+# ===========================================================================
+
+statement ok
+COPY (SELECT iid FROM (VALUES ('x')) t(iid) WHERE false) TO '{TEST_DIR}/empty.psam' (FORMAT psam, psam_parquet);
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/empty.psam.parquet');
+----
+0
+
+# ===========================================================================
+# `psam` path override: the companion follows the OVERRIDE, not the COPY target.
+# ===========================================================================
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/ignored.psam' (FORMAT psam, psam '{TEST_DIR}/ovr.psam', samples ['o1'], psam_parquet);
+
+query I
+SELECT IID FROM read_parquet('{TEST_DIR}/ovr.psam.parquet');
+----
+o1
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/ignored.psam.parquet');
+----
+0
+
+# ===========================================================================
+# force rewrite WITH psam_parquet replaces the old companion in place — exactly one, new IIDs.
+# ===========================================================================
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/oob.psam' (FORMAT psam, samples ['n1', 'n2'], psam_parquet, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/oob.psam.parquet');
+----
+1
+
+query I
+SELECT IID FROM read_parquet('{TEST_DIR}/oob.psam.parquet');
+----
+n1
+n2
