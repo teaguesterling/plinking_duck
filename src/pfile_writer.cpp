@@ -1607,9 +1607,14 @@ void PsamCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFun
 		g.pq_on = true;
 		const vector<string> &iids = bind.mode == PsamWriteMode::OUT_OF_BAND ? bind.iids : g.streamed_iids;
 		WritePsamParquetFromIids(*bind.db, g.path, iids);
-		if (g.path != bind.target_path) {
-			// DuckDB overwrote via a tmp_ name and renames only the .psam: put the new companion at its
-			// final name, replacing the old one (mirrors PvarCopyFinalize).
+		// Move only when g.path is a DIFFERENT file from the final target — i.e. DuckDB wrote via a
+		// `tmp_` name. Compare EXPANDED paths: DuckDB runs the COPY target through fs.ExpandPath before
+		// InitGlobal (so g.path is expanded), while target_path is captured raw at bind. A raw compare
+		// would see a fresh write to an ExpandPath-rewritten target (`~`, `file://`) as "different" and
+		// move the companion onto itself, deleting it. Expanded-vs-expanded is also correct for a `psam`
+		// override (g.path is the raw override, never a tmp_).
+		if (fs.ExpandPath(g.path) != fs.ExpandPath(bind.target_path)) {
+			// put the new companion at its final name, replacing the old one (mirrors PvarCopyFinalize).
 			const string final_pq = bind.target_path + ".parquet";
 			if (fs.FileExists(final_pq)) {
 				fs.RemoveFile(final_pq);

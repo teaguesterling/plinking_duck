@@ -153,3 +153,25 @@ query I
 SELECT count(*) FROM glob('{TEST_DIR}/y.psam.parquet');
 ----
 0
+
+# ===========================================================================
+# Fresh write with psam_parquet to a path DuckDB's ExpandPath rewrites (file:// here, also ~). The
+# COPY target is expanded before InitGlobal (g.path), but target_path is captured raw at bind; if the
+# Finalize move compares them as RAW strings they differ for a fresh (no-tmp_) write, and the move
+# branch deletes the just-written companion (and cleanup then the .psam). The comparison must be
+# expanded-vs-expanded. Regression test: both the companion and the text .psam must survive.
+# ===========================================================================
+
+statement ok
+COPY (SELECT 1 AS x) TO 'file://{TEMP_DIR_ABSOLUTE}/furl.psam' (FORMAT psam, samples ['f1', 'f2'], psam_parquet);
+
+query I
+SELECT IID FROM read_parquet('{TEMP_DIR_ABSOLUTE}/furl.psam.parquet');
+----
+f1
+f2
+
+query I
+SELECT count(*) FROM glob('{TEMP_DIR_ABSOLUTE}/furl.psam');
+----
+1
