@@ -3436,7 +3436,10 @@ static bool PruneExprIntBounds(const Expression &expr_p, int64_t &lo, int64_t &h
 	if (expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN &&
 	    expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &between = expr.Cast<BoundFunctionExpression>();
-		if (!ExpressionFilter::IsSimpleFilterColumnRef(BoundBetweenExpression::Input(between))) {
+		// LowerInclusive/UpperInclusive dereference the built-in BETWEEN bind data
+		// unchecked (duckdb between.cpp), so refuse a BETWEEN that lacks it.
+		if (!BoundBetweenExpression::HasValidBindData(between) ||
+		    !ExpressionFilter::IsSimpleFilterColumnRef(BoundBetweenExpression::Input(between))) {
 			return false;
 		}
 		bool any = false;
