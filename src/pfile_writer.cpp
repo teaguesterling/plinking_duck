@@ -1234,6 +1234,40 @@ void WritePsamFromIids(FileSystem &fs, const string &path, const vector<string> 
 	h.reset();
 }
 
+// ---- parquet companion ('<psam>.parquet') -----------------------------------------------------
+// A single `IID VARCHAR` column, the SAME IIDs as the text `.psam` the writer produced, in the SAME
+// (sample) order. The text `.psam` is still written; this is its region/axis-prunable companion. The
+// reader reads it natively when `plinking_use_parquet_companions` is on (discovery), or when a
+// catalog declares the `.psam.parquet` path (ResolveExistingCompanion). zstd, one default row group.
+// There is NO ordinal column and NO sort of the VALUES — the reader reads the companion in row order.
+// But the row order itself is pinned with an explicit `__sidx` + `ORDER BY __sidx` on the COPY: the
+// private Connection inherits the DB's `preserve_insertion_order`, and with it off a parallel COPY of
+// more than one row group could otherwise reorder rows silently (a small test never shows it). `__sidx`
+// is dropped from the output, so the companion stays IID-only. Mirrors PvarParquetFlush's __vidx guard.
+void WritePsamParquetFromIids(DatabaseInstance &db, const string &psam_path, const vector<string> &iids) {
+	Connection con(db);
+	auto r = con.Query("CREATE TEMP TABLE __psam_pq(IID VARCHAR, __sidx BIGINT)");
+	if (r->HasError()) {
+		throw IOException("write psam: cannot buffer the parquet companion: %s", r->GetError());
+	}
+	{
+		Appender app(con, "temp", "main", "__psam_pq");
+		for (idx_t i = 0; i < iids.size(); i++) {
+			app.BeginRow();
+			app.Append(Value(iids[i]));
+			app.Append(Value::BIGINT(static_cast<int64_t>(i)));
+			app.EndRow();
+		}
+		app.Close();
+	}
+	string target = psam_path + ".parquet";
+	auto c = con.Query("COPY (SELECT IID FROM __psam_pq ORDER BY __sidx) TO '" +
+	                   StringUtil::Replace(target, "'", "''") + "' (FORMAT parquet, COMPRESSION zstd)");
+	if (c->HasError()) {
+		throw IOException("write psam: cannot write the parquet companion '%s': %s", target, c->GetError());
+	}
+}
+
 // Parse the `samples ['a','b', …]` option. Returns true iff the option is present
 // (even if empty); fills `out` with the IIDs. A LIST literal arrives as a single
 // LIST Value; be tolerant of a scalar-per-entry spelling too.
@@ -1557,6 +1591,11 @@ struct PfileWriteBindData : public FunctionData {
 	//! Plain bundle with `force`: '<prefix>.pfile.json', removed just before promotion (a catalog
 	//! there would describe some OTHER output at this prefix, and read_pfile prefers it). Empty otherwise.
 	string stale_catalog_path;
+	//! `psam_parquet` option: also emit '<psam>.parquet' (single IID VARCHAR column, same rows + order as
+	//! the text .psam). The text `.psam` is still written; the parquet is its companion, read natively by
+	//! the reader (plinking_use_parquet_companions / a catalog that declares the `.psam.parquet` path).
+	//! Mirrors `pvar_parquet` (which lives on pvar_bind). db is read from `pvar_bind->db`.
+	bool psam_parquet = false;
 
 	//! `shard_by '<col>'` — empty means the plain (single-fileset) bundle. When set, the one
 	//! ordered COPY fans out one pfile per contiguous key value under a hive layout, a single
@@ -1588,6 +1627,7 @@ struct PfileWriteBindData : public FunctionData {
 		r->pvar_override = pvar_override;
 		r->pgen_override = pgen_override;
 		r->psam_override = psam_override;
+		r->psam_parquet = psam_parquet;
 		r->shard_by = shard_by;
 		r->shard_key_input_idx = shard_key_input_idx;
 		r->shard_key_header = shard_key_header;
@@ -1603,7 +1643,7 @@ struct PfileWriteBindData : public FunctionData {
 		auto &o = other_p.Cast<PfileWriteBindData>();
 		return pvar_bind->Equals(*o.pvar_bind) && pgen_bind->Equals(*o.pgen_bind) && iids == o.iids &&
 		       pvar_override == o.pvar_override && pgen_override == o.pgen_override &&
-		       psam_override == o.psam_override && shard_by == o.shard_by &&
+		       psam_override == o.psam_override && psam_parquet == o.psam_parquet && shard_by == o.shard_by &&
 		       shard_key_input_idx == o.shard_key_input_idx && shard_key_header == o.shard_key_header &&
 		       sample_shard_mode == o.sample_shard_mode && shard_labels == o.shard_labels && shard_lo == o.shard_lo &&
 		       shard_hi == o.shard_hi && matrix_mode == o.matrix_mode && matrix_over_chrom == o.matrix_over_chrom;
@@ -1733,7 +1773,7 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 		pgen_g.CleanupPartial(sysfs); // closes STPgenWriter + removes .pgen.staging(+.tmp)
 		pvar_g.pq_app.reset();
 		pvar_g.pq_con.reset();
-		for (const string &p : {psam_path, pvar_g.path, pvar_g.path + ".parquet"}) {
+		for (const string &p : {psam_path, psam_path + ".parquet", pvar_g.path, pvar_g.path + ".parquet"}) {
 			try {
 				if (!p.empty() && p != ".parquet" && sysfs.FileExists(p)) {
 					sysfs.RemoveFile(p);
@@ -1760,7 +1800,11 @@ struct PfileWriteGlobalState : public GlobalFunctionData {
 	// real targets on ANY mid-write failure. We do not claim the group-atomicity we lack.
 	void PromoteStaging(FileSystem &sysfs) {
 		PvarMoveWithCompanion(sysfs, pvar_g.path, pvar_final, /*drop_stale=*/true);
-		sysfs.MoveFile(psam_path, psam_final);
+		// psam_path → psam_final, carrying '<psam>.parquet' if psam_parquet wrote one; drop_stale drops a
+		// pre-existing final '<psam>.parquet' on a force-rewrite WITHOUT psam_parquet (a stale companion
+		// would make the reader serve mismatched IIDs). PvarMoveWithCompanion is a generic staging→final
+		// move + '.parquet' sibling; reused here (not pvar-specific).
+		PvarMoveWithCompanion(sysfs, psam_path, psam_final, /*drop_stale=*/true);
 		sysfs.MoveFile(pgen_g.path, pgen_final); // LAST
 		finished = true;
 	}
@@ -1937,6 +1981,9 @@ struct PfileShardedGlobalState : public GlobalFunctionData {
 			if (!psam_staging.empty() && sysfs.FileExists(psam_staging)) {
 				sysfs.RemoveFile(psam_staging);
 			}
+			if (!psam_staging.empty() && sysfs.FileExists(psam_staging + ".parquet")) {
+				sysfs.RemoveFile(psam_staging + ".parquet");
+			}
 		} catch (...) {
 		}
 	}
@@ -2081,7 +2128,7 @@ void PfileWriteCatalog(PfileShardedGlobalState &g, const PfileWriteBindData &bin
 	j += "  \"pfile_catalog\": 1,\n";
 	j += "  \"dataset\": \"" + JsonEscape(g.dataset_name) + "\",\n";
 	j += "  \"concat_dim\": \"variants\",\n";
-	j += "  \"shared\": { \"psam\": \"" + JsonEscape(g.psam_rel) + "\" },\n";
+	j += "  \"shared\": { \"psam\": \"" + JsonEscape(g.psam_rel) + (bind.psam_parquet ? ".parquet" : "") + "\" },\n";
 	j += "  \"files\": [\n";
 	for (idx_t i = 0; i < g.entries.size(); i++) {
 		auto &e = g.entries[i];
@@ -2140,6 +2187,9 @@ unique_ptr<GlobalFunctionData> PfileShardedInitGlobal(FileSystem &fs, const Pfil
 	// the out/ hive dirs are created lazily per shard. Promoted at finalize, just before the catalog.
 	try {
 		WritePsamFromIids(fs, g->psam_staging, bind.iids);
+		if (bind.psam_parquet) {
+			WritePsamParquetFromIids(*bind.pvar_bind->db, g->psam_staging, bind.iids);
+		}
 	} catch (...) {
 		g->CleanupPartial(fs);
 		throw;
@@ -2198,8 +2248,9 @@ void PfileShardedFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileS
 			// nothing valid to emit. Distinct message from the non-sharded "zero variants" throw.
 			throw IOException("write pfile: shard_by produced no shards — the input query returned no rows");
 		}
-		// Promote the shared psam, THEN write the catalog LAST (the completion marker).
-		fs.MoveFile(g.psam_staging, g.psam_final);
+		// Promote the shared psam (+ its '.parquet' companion; drop_stale drops a stale final companion on a
+		// force-rewrite without psam_parquet), THEN write the catalog LAST (the completion marker).
+		PvarMoveWithCompanion(fs, g.psam_staging, g.psam_final, /*drop_stale=*/true);
 		PfileWriteCatalog(g, bind, fs);
 		g.finished = true;
 	} catch (...) {
@@ -2428,6 +2479,9 @@ struct PfileSampleShardedGlobalState : public GlobalFunctionData {
 				if (!sh.psam_staging.empty() && sysfs.FileExists(sh.psam_staging)) {
 					sysfs.RemoveFile(sh.psam_staging);
 				}
+				if (!sh.psam_staging.empty() && sysfs.FileExists(sh.psam_staging + ".parquet")) {
+					sysfs.RemoveFile(sh.psam_staging + ".parquet");
+				}
 			} catch (...) {
 			}
 		}
@@ -2521,6 +2575,9 @@ void PfileSampleShardedOpen(PfileSampleShardedGlobalState &g, const PfileWriteBi
 		vector<string> slice(bind.iids.begin() + static_cast<std::ptrdiff_t>(sh.lo),
 		                     bind.iids.begin() + static_cast<std::ptrdiff_t>(sh.hi));
 		WritePsamFromIids(fs, sh.psam_staging, slice);
+		if (bind.psam_parquet) {
+			WritePsamParquetFromIids(*bind.pvar_bind->db, sh.psam_staging, slice);
+		}
 		sh.pgen = make_uniq<PgenWriteGlobalState>();
 		sh.pgen->path = sh.pgen_staging;
 		sh.pgen->sample_ct_known = true;
@@ -2583,7 +2640,7 @@ void PfileWriteSampleCatalog(PfileSampleShardedGlobalState &g, const PfileWriteB
 		auto &sh = g.shards[i];
 		j += "    {\n";
 		j += "      \"prefix\": \"" + JsonEscape(sh.rel_prefix) + "\",\n";
-		j += "      \"psam\": \"" + JsonEscape(sh.rel_psam) + "\",\n";
+		j += "      \"psam\": \"" + JsonEscape(sh.rel_psam) + (bind.psam_parquet ? ".parquet" : "") + "\",\n";
 		j += "      \"partition\": { \"start\": " + std::to_string(sh.lo) + ", \"stop\": " + std::to_string(sh.hi) +
 		     ", \"source_ordinal\": " + std::to_string(i) + " }\n";
 		j += "    }";
@@ -2620,7 +2677,8 @@ void PfileSampleShardedFinalize(FileSystem &fs, const PfileWriteBindData &bind, 
 		RemoveStaleCatalog(fs, g.catalog_path);
 		PvarMoveWithCompanion(fs, g.pvar_g.path, g.pvar_final, /*drop_stale=*/true);
 		for (auto &sh : g.shards) {
-			fs.MoveFile(sh.psam_staging, sh.psam_final);
+			// each shard's .psam + its '.parquet' companion (drop_stale: force-rewrite without psam_parquet)
+			PvarMoveWithCompanion(fs, sh.psam_staging, sh.psam_final, /*drop_stale=*/true);
 		}
 		for (auto &sh : g.shards) {
 			fs.MoveFile(sh.pgen_staging, sh.pgen_final);
@@ -2737,6 +2795,7 @@ struct PfileMatrixGlobalState : public GlobalFunctionData {
 		}
 		for (auto &sb : sblocks) {
 			remove_quiet(sb.psam_staging);
+			remove_quiet(sb.psam_staging + ".parquet");
 		}
 		for (auto it = created_dirs.rbegin(); it != created_dirs.rend(); ++it) {
 			try {
@@ -2788,6 +2847,9 @@ void PfileMatrixOpen(PfileMatrixGlobalState &g, const PfileWriteBindData &bind, 
 		vector<string> slice(bind.iids.begin() + static_cast<std::ptrdiff_t>(sb.lo),
 		                     bind.iids.begin() + static_cast<std::ptrdiff_t>(sb.hi));
 		WritePsamFromIids(fs, sb.psam_staging, slice);
+		if (bind.psam_parquet) {
+			WritePsamParquetFromIids(*bind.pvar_bind->db, sb.psam_staging, slice);
+		}
 	}
 }
 
@@ -2974,7 +3036,7 @@ void PfileWriteMatrixCatalog(PfileMatrixGlobalState &g, const PfileWriteBindData
 	j += "  \"template\": {\n";
 	j += "    \"pfile\": \"" + vdir + "/" + sdir + "/data\",\n";
 	j += "    \"pvar\": \"" + vdir + "/variants.pvar" + (bind.pvar_bind->pvar_parquet ? ".parquet" : "") + "\",\n";
-	j += "    \"psam\": \"" + root + sdir + "/samples.psam\"\n";
+	j += "    \"psam\": \"" + root + sdir + "/samples.psam" + (bind.psam_parquet ? ".parquet" : "") + "\"\n";
 	j += "  }\n}\n";
 	auto h = fs.OpenFile(g.catalog_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
 	h->Write(const_cast<char *>(j.data()), j.size());
@@ -2999,7 +3061,8 @@ void PfileMatrixFinalize(FileSystem &fs, const PfileWriteBindData &bind, PfileMa
 			PvarMoveWithCompanion(fs, m.first, m.second, /*drop_stale=*/true);
 		}
 		for (auto &sb : g.sblocks) {
-			fs.MoveFile(sb.psam_staging, sb.psam_final);
+			// each sample-block's .psam + its '.parquet' companion (drop_stale: force-rewrite, no psam_parquet)
+			PvarMoveWithCompanion(fs, sb.psam_staging, sb.psam_final, /*drop_stale=*/true);
 		}
 		for (auto &m : g.pgen_moves) {
 			fs.MoveFile(m.first, m.second);
@@ -3034,6 +3097,11 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 		} else if (key == "shard_samples") {
 			has_shard_samples = true;
 			shard_samples_spec = opt.second.empty() ? Value() : opt.second[0];
+		} else if (key == "psam_parquet") {
+			// bare `psam_parquet` or `psam_parquet true` enables; NULL/false disables (as `force`/`pvar_parquet`).
+			bind->psam_parquet =
+			    opt.second.empty() ||
+			    (!opt.second[0].IsNull() && opt.second[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
 		}
 	}
 
@@ -3256,6 +3324,9 @@ void PfileEnsureStagingOpened(FileSystem &fs, const PfileWriteBindData &bind, Pf
 	g.staging_opened = true;
 	PvarOpenAndWriteHeader(g.pvar_g, fs, *bind.pvar_bind, g.pvar_staging_path);
 	WritePsamFromIids(fs, g.psam_path, bind.iids);
+	if (bind.psam_parquet) {
+		WritePsamParquetFromIids(*bind.pvar_bind->db, g.psam_path, bind.iids);
+	}
 }
 
 unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, FunctionData &) {
