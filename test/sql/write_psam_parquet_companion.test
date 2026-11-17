@@ -55,13 +55,16 @@ ZSTD	0
 # DIFFERENT (valid, same-count) IID set; a companions-ON read must still return the ORIGINAL IIDs
 # (the parquet), and a companions-OFF read must return the overwritten IIDs (the text) — the
 # negative control that proves the overwrite took effect, so the ON read truly used the parquet.
+# The overwrite is a NATIVE tab-csv '#IID' write (not FORMAT psam), so it touches only the text
+# .psam and never the .psam.parquet — the control stays independent of the deferred standalone
+# FORMAT psam companion gap (a FORMAT psam rewrite would also drop the parquet once that is fixed).
 # ===========================================================================
 
 statement ok
 CREATE TEMP TABLE oracle_iids AS SELECT IID FROM read_psam('{TEST_DIR}/pq.psam');
 
 statement ok
-COPY (SELECT 'ZZZ' || i AS IID FROM range(1, 5) t(i)) TO '{TEST_DIR}/pq.psam' (FORMAT psam, force);
+COPY (SELECT 'ZZZ' || i AS "#IID" FROM range(1, 5) t(i)) TO '{TEST_DIR}/pq.psam' (FORMAT csv, HEADER true, QUOTE '');
 
 statement ok
 SET plinking_use_parquet_companions = true;
