@@ -1,0 +1,23 @@
+# name: test/sql/write_pvar_parquet_standalone.test
+# description: standalone COPY ... (FORMAT pvar, pvar_parquet) to a path DuckDB's ExpandPath rewrites (file://, also ~) must not self-delete its companion. The Finalize move branch compared raw g.path vs raw target_path; for a fresh (no-tmp_) write to an expanded target they differ as strings, so the companion is moved onto itself and lost (and cleanup then removes the .pvar). This is the twin of the standalone FORMAT psam bug.
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Fresh standalone pvar write with pvar_parquet to a file:// target: both the companion and the text
+# .pvar must survive. {TEMP_DIR_ABSOLUTE} (not {TEST_DIR}) because file:// needs an absolute path.
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO 'file://{TEMP_DIR_ABSOLUTE}/f.pvar' (FORMAT pvar, pvar_parquet);
+
+query I
+SELECT count(*) FROM read_parquet('{TEMP_DIR_ABSOLUTE}/f.pvar.parquet');
+----
+4
+
+query I
+SELECT count(*) FROM glob('{TEMP_DIR_ABSOLUTE}/f.pvar');
+----
+1
