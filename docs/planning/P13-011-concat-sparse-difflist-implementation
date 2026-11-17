@@ -1,0 +1,140 @@
+# P13-011 implementation plan: sparse difflist on sample-sharded reads
+
+**For agentic workers:** execute task-by-task via subagent-driven development. A fresh
+implementer per task, a fresh reviewer before the next starts, then a whole-branch
+review. Steps use `- [ ]`.
+
+**Goal:** the per-sample carrier / burden query on a sample-sharded (`IsConcat`) cohort
+uses the pgenlib difflist (sparse) decode, which is force-disabled today.
+
+**Architecture:** add a combined-carrier-list method to `ConcatPgenReader`; flip the
+`!IsConcat()` exclusion at `pfile_reader.cpp:3936`; wire the concat branch into the
+sparse Phase-1 scan. Read-side only.
+
+**Tech stack:** C++ DuckDB extension, pgenlib (`third_party/plink-ng`), sqllogictest
+`.test` files, DuckDB v2.0.0 only.
+
+**Spec:** `docs/planning/P13-011-concat-sparse-difflist` (read it — it carries the
+design, the measured ceiling, §5 correctness requirements, §7 test method, §8 Review
+Focus). Branch `feat/concat-sparse` off `e484213`.
+
+## Global Constraints
+
+- DuckDB **v2.0.0 only**. No v1.5 compatibility shim needed.
+- **Never commit `third_party/plink-ng`** — the CMake configure patches it (a 0-line
+  diff, pgenlib_read.cc VFS shim); it shows dirty, pointer unchanged. Exclude it from
+  every commit.
+- `clang-format` clean (`make format-fix`), or Format CI reddens.
+- Match surrounding conventions: the `Get*` methods, `OrBitsAtOffset`, `EnsureScratch`,
+  `AlignedBuffer`, the `make_uniq<Member>` pattern.
+- Do not touch the shared `main` worktree. Work only in `trees/feat-concat-sparse`.
+- Build on Slurm `batch` (cold build needs > 30 min): `srun -n 1 -c 12 --mem=24G -p
+  batch -t 90 bash -lc 'VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake
+  GEN=ninja make release'`. Later incremental builds fit `ci` (`-t 30`).
+- A **new** `.test` file is discovered only at configure/build time; editing an existing
+  one needs no rebuild. So build after adding the new `.test`.
+
+## Review Focus (spec §8 — each pinned by a task's tests)
+
+- ALT-major re-decode binds the shard's reader (`m.pgr`/`m.pssi`/`m.out_ct`), not
+  lstate's (§5.3). — Task 2
+- Combined carrier list sized to `OutputSampleCt()`, not `osc/8` (§5.2). — Task 2
+- Per-shard threshold `max(1, m.out_ct/8)`, not combined (§5.1). — Task 2
+- The proof-ran mechanism flips between concat sparse and dense (§6). — Task 1 proves it
+  on single-file; Task 2 flips it on concat.
+- `g==3` (missing) on both difflist and dense-fallback paths (§5.5). — Task 2, F2/fixtures
+- Per-sample `EXCEPT`, not sum equality — an offset bug preserves sums (§7). — Task 1
+  writes the harness; Task 2 turns it green.
+
+---
+
+## Task 1: proof-ran mechanism + fixtures + the concat `.test` (RED anchor)
+
+**Files:**
+- Create: `test/sql/read_pfile_concat_sparse.test`
+- Modify: `src/pfile_reader.cpp` (+ `src/plinking_duck_extension.cpp` if the mechanism is
+  a session setting) — the proof-ran mechanism ONLY (no gate change, no reader method).
+- Modify: `src/include/pgen_concat_reader.hpp` only if the mechanism lives there.
+
+**Interfaces:**
+- Produces: a resettable proof-ran read-back (spec §6). Prefer a session setting read via
+  `current_setting('plinking_debug_sparse_concat_variants')` reset at scan start, or an
+  equivalent. It must report the count of variants the **concat** sparse path decoded.
+  Document whether the unittest runner shares a process across files; reset accordingly.
+- Consumes: nothing from later tasks.
+
+- [ ] **Step 1 — the mechanism, and prove it on the single-file path.** Add the
+  proof-ran read-back. In the new `.test`, on the existing single-file REF-major fixture
+  (`test/data/rare_small`): with `plinking_sample_counts_sparse=true` the read-back is
+  `> 0`; with it reset, `0`. This checks the check before the concat path exists.
+- [ ] **Step 2 — fixtures, generated in-test (spec §7).** Write `COPY (…) TO
+  '{TEST_DIR}/…' (FORMAT PGEN, shard_samples := …)` to make multi-shard fixtures. Mirror
+  `test/sql/write_psam_parquet_companion.test` for the COPY shape. Add a fixture-guard
+  query per spec §7 F2 that fails if a shard stops being difflist-encoded or stops having
+  the mixed ALT-major / dense variants. Confirm the shards are difflist-encoded (a guard
+  on hom_ref majority, like the single-file test's guard).
+- [ ] **Step 3 — per-sample equivalence harness (spec §7).** For each fixture, two CTEs
+  / temp tables: dense (`plinking_sample_counts_sparse=false`) and sparse
+  (`=true`), each `SELECT IID, genotypes.het, genotypes.hom_alt, genotypes.missing FROM
+  read_pfile(<shards>, combine_samples:='concatenate', orient:='sample',
+  genotypes:='counts', include_genotypes:=['het','hom_alt'])`. Assert BOTH
+  `sparse EXCEPT dense` and `dense EXCEPT sparse` return zero rows. Include F1/F3/F4; add
+  F2 once Task 2's fallback exists (Task 1 may leave F2's EXCEPT assertions present — they
+  pass trivially while both paths are dense).
+- [ ] **Step 4 — the negative control, expected RED.** Assert the concat proof-ran
+  read-back is `> 0` under sparse on the concat fixture. **This FAILS now** (gate at
+  `:3936` still closed → concat decodes dense → read-back stays 0). The `EXCEPT` rows
+  PASS now (both paths dense), recording the dense baseline. This is the intended RED.
+- [ ] **Step 5 — build (adds the new `.test`) and run.** Slurm `batch` build, then run
+  the suite. Expected: the single-file proof (Step 1) PASSES; the concat negative control
+  (Step 4) FAILS; the `EXCEPT` rows PASS. Record which assertion is red and why.
+- [ ] **Step 6 — commit** (exclude `third_party/plink-ng`): the mechanism + the `.test`.
+
+## Task 2: the concat difflist decoder + gate flip (GREEN)
+
+**Files:**
+- Modify: `src/pgen_concat_reader.hpp` — new method decl + per-`Member` sparse scratch.
+- Modify: `src/pgen_concat_reader.cpp` — `GetDifflistOrGenovec` implementation.
+- Modify: `src/pfile_reader.cpp` — drop `!IsConcat()` at `:3936`; wire the concat branch
+  into the sparse Phase-1 scan (~5460–5528) so a concat read calls the new method and
+  feeds the existing carrier switch; set the concat proof-ran read-back.
+
+**Interfaces:**
+- Consumes: Task 1's proof-ran read-back; the `.test` fixtures and `EXCEPT` harness.
+- Produces: `ConcatPgenReader::GetDifflistOrGenovec(uint32_t vidx, <combined carrier
+  out>)` returning a combined list of `(combined_sample_idx, genotype)` for every
+  non-hom_ref sample (spec §4.2). Caller passes no `si_ptr`/`pssi`.
+
+- [ ] **Step 1 — the reader method (spec §4.2, §5).** Add per-`Member` raregeno +
+  difflist-ids scratch via `EnsureScratch`, sized to `m.out_ct`. Combined output sized to
+  `OutputSampleCt()`. Per shard: `PgrGetDifflistOrGenovec` with `m.SampleInclude()` /
+  `m.pssi` / `m.out_ct` and per-shard threshold `max(1, m.out_ct/8)`; hom_ref-major →
+  append carriers at `m.out_offset + s`; dense / ALT-major → re-decode with **`m`'s**
+  reader (NOT lstate) and append non-zero samples. Emit `g==3`.
+- [ ] **Step 2 — gate flip + scan wiring.** At `:3936` drop `!bind_data.IsConcat()`. In
+  the Phase-1 scan, when `lstate.concat && smp_use_sparse`, call the new method and run
+  the existing carrier switch over the combined list; bump the concat proof-ran read-back
+  by the decoded-variant count. Keep the single-file path unchanged.
+- [ ] **Step 3 — add F2's mixed-case assertions** (if not fully present): one variant
+  `> out_ct/8` carriers in a shard (dense genovec, `common_geno==UINT32_MAX`), one ~95%
+  hom_alt in a shard (ALT-major difflist, `common_geno==2`), each with the fixture-guard.
+- [ ] **Step 4 — `make format-fix`, build (Slurm), run the suite.** Expected: ALL
+  fixtures' per-sample `EXCEPT` empty (both directions); the concat negative control
+  read-back `> 0` under sparse, `0` under dense; the single-file proof still passes; the
+  full suite green. Read the suite tail; record counts.
+- [ ] **Step 5 — commit** (exclude `third_party/plink-ng`).
+
+## Final: measurement + whole-branch review
+
+- [ ] **Measure against the new build.** Point `perf-bench/c5_carrier.sh` section A
+  `DUCK`/`EXT` at `trees/feat-concat-sparse/build/release`. Run the concat carrier query
+  with `plinking_sample_counts_sparse=true`, parquet psam, median-of-5. Assert R=700212.
+  Record the measured time against the predicted 0.27–0.29s (spec §3). A result far above
+  0.35s means the per-shard merge is costing more than the bound predicted — investigate
+  before claiming the win.
+- [ ] **Whole-branch review** on the most capable model, against the spec's §8 Review
+  Focus and §5 correctness requirements. Fix Critical/Important in one pass, each
+  reproduced by a failing test first.
+- [ ] **STOP. Do not push or open a PR.** "Coordinate and build" authorizes local work
+  through green + review. Report the measured number and the review outcome, and ask the
+  owner before `ship`.

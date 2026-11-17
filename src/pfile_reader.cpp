@@ -56,6 +56,30 @@
 namespace duckdb {
 
 // ---------------------------------------------------------------------------
+// P13-011 proof-ran counter (test-only, design §6)
+// ---------------------------------------------------------------------------
+// Counts the variants decoded via the sparse (pgen difflist) fast path, as a
+// positive proof that the sparse path actually RAN — a concat sparse==dense
+// test passes even when the path never fires, so equality alone proves nothing.
+// Process-global: the unittest runner is one Catch2 binary that runs each .test
+// file as a case in a shared process, so tests reset this explicitly via
+// plinking_debug_sparse_variants_reset() before each measurement rather than
+// relying on fresh-process semantics. Read via plinking_debug_sparse_variants().
+// The single-file path and the concat combined-carrier path both bump it: one
+// count per variant whose difflist was actually consumed hom_ref-major (for the
+// concat path, that is any variant with at least one hom_ref-major shard).
+static std::atomic<int64_t> g_sparse_variants_decoded {0};
+
+// P13-011 Task 2: concat (sample-sharded) sparse FALLBACK tallies. A hom_ref-major
+// shard bumps g_sparse_variants_decoded above; these count the two per-SHARD
+// fallbacks ConcatPgenReader::GetDifflistOrGenovec can take, so a test can PROVE
+// both branches ran in the code under test. Which branch fires is decided by the
+// on-disk record encoding (not just the data distribution), so only a read through
+// the concat reader itself can prove it. Reset together with the variant counter.
+static std::atomic<int64_t> g_sparse_concat_dense_shards {0};
+static std::atomic<int64_t> g_sparse_concat_altmajor_shards {0};
+
+// ---------------------------------------------------------------------------
 // Region parsing
 // ---------------------------------------------------------------------------
 
@@ -3931,9 +3955,12 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 			bool want_sparse = context.TryGetCurrentSetting("plinking_sample_counts_sparse", sparse_val) &&
 			                   sparse_val.GetValue<bool>();
 			bool filter_allows_hom_ref = bind_data.genotype_filter.active && bind_data.genotype_filter.AllowsCall(0.0);
-			// A sample-sharded cohort decodes densely: the difflist's sample ids are
-			// shard-relative, and the concat reader only offers the dense Get.
-			if (want_sparse && !filter_allows_hom_ref && !bind_data.IsConcat()) {
+			// A sample-sharded cohort (IsConcat) decodes through ConcatPgenReader, whose
+			// GetDifflistOrGenovec (P13-011) runs the difflist per shard and merges the
+			// shard-relative carrier ids into combined-sample space — so the sparse path
+			// now applies to concat reads too. smp_max_difflist_len is the single-file
+			// cutoff; the concat path computes a per-shard threshold inside the reader.
+			if (want_sparse && !filter_allows_hom_ref) {
 				state->smp_use_sparse = true;
 				state->smp_max_difflist_len = std::max<uint32_t>(1, osc / 8);
 			}
@@ -5418,6 +5445,13 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 		uint32_t *l_miss = lstate.smp_local_missing.data();
 		uint8_t *l_inr = filter_active ? lstate.smp_local_in_range.data() : nullptr;
 		uint8_t *l_hasm = filter_active ? lstate.smp_local_has_missing.data() : nullptr;
+		// P13-011 proof-ran: variants this thread decoded via the sparse difflist
+		// fast path. Added to the process-global counter once in the merge block.
+		int64_t sparse_decoded = 0;
+		// P13-011 Task 2: per-shard concat fallback tallies (dense genovec / ALT-major
+		// re-decode), published to the process-global atomics once in the merge block.
+		int64_t concat_dense_shards = 0;
+		int64_t concat_altmajor_shards = 0;
 
 		// Dense accumulation: decode the whole genovec and touch every sample. Used
 		// by the non-sparse path and as the sparse path's per-variant fallback.
@@ -5475,6 +5509,54 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					continue;
 				}
 
+				// Concat (sample-sharded) sparse: lstate.pgr is not valid for a concat read;
+				// ConcatPgenReader::GetDifflistOrGenovec runs the per-shard difflist/genovec
+				// decode and returns a combined carrier list (P13-011 §4.2) that the SAME
+				// carrier switch below consumes. It replaces the single-file difflist call.
+				if (lstate.concat) {
+					const uint32_t *cids = nullptr;
+					const uint8_t *cgeno = nullptr;
+					uint32_t clen = 0;
+					ConcatSparseStats cstats;
+					plink2::PglErr perr = lstate.concat->GetDifflistOrGenovec(vidx, &cids, &cgeno, &clen, &cstats);
+					if (perr != plink2::kPglRetSuccess) {
+						throw IOException("read_pfile: concat GetDifflistOrGenovec failed for variant %u", vidx);
+					}
+					// Proof-ran: one count per variant with at least one hom_ref-major shard
+					// (matches the single-file one-count-per-variant meaning). The fallback
+					// tallies prove the dense / ALT-major branches ran in the reader under test.
+					if (cstats.difflist_shards > 0) {
+						sparse_decoded++;
+					}
+					concat_dense_shards += cstats.dense_shards;
+					concat_altmajor_shards += cstats.altmajor_shards;
+					for (uint32_t j = 0; j < clen; j++) {
+						uint32_t s = cids[j];
+						uint32_t g = cgeno[j];
+						switch (g) {
+						case 1:
+							l_het[s]++;
+							break;
+						case 2:
+							l_homalt[s]++;
+							break;
+						case 3:
+							l_miss[s]++;
+							break;
+						default:
+							break; // g==0 never enters the combined carrier list
+						}
+						if (filter_active) {
+							if (g == 3) {
+								l_hasm[s] = 1;
+							} else if (gf.AllowsCall(static_cast<double>(g))) {
+								l_inr[s] = 1;
+							}
+						}
+					}
+					continue;
+				}
+
 				// Sparse path: pgen hands back the difflist for rare variants (only the
 				// non-common samples) or a genovec for common ones. For the common case
 				// (majority hom_ref) we touch only the carriers; everything else falls
@@ -5504,6 +5586,7 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 				}
 				// Fast path: majority hom_ref. Non-difflist samples are hom_ref (handled
 				// by derivation); only the difflist carriers touch the counters.
+				sparse_decoded++; // P13-011: this variant decoded via the sparse difflist path
 				for (uint32_t j = 0; j < difflist_len; j++) {
 					uint32_t s = difflist_ids[j];
 					uint32_t g = (raregeno[j / plink2::kBitsPerWordD2] >> (2 * (j % plink2::kBitsPerWordD2))) & 3;
@@ -5545,6 +5628,17 @@ static void PfileSampleOrientScan(ClientContext &context, TableFunctionInput &da
 					gstate.smp_has_missing[s] |= lstate.smp_local_has_missing[s];
 				}
 			}
+		}
+		// P13-011: publish this thread's sparse-decode count once (relaxed — only
+		// read after the scan completes, in plinking_debug_sparse_variants()).
+		if (sparse_decoded) {
+			g_sparse_variants_decoded.fetch_add(sparse_decoded, std::memory_order_relaxed);
+		}
+		if (concat_dense_shards) {
+			g_sparse_concat_dense_shards.fetch_add(concat_dense_shards, std::memory_order_relaxed);
+		}
+		if (concat_altmajor_shards) {
+			g_sparse_concat_altmajor_shards.fetch_add(concat_altmajor_shards, std::memory_order_relaxed);
 		}
 		lstate.smp_phase1_contributed = true;
 
@@ -6381,6 +6475,35 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 }
 
 // ---------------------------------------------------------------------------
+// P13-011 proof-ran read-back (test-only). Both are VOLATILE so the optimizer
+// never constant-folds them at bind time — the counter must be read at execute
+// time, after the preceding read_pfile statement has finished its scan.
+// ---------------------------------------------------------------------------
+
+static void DebugSparseVariantsFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	int64_t v = g_sparse_variants_decoded.load(std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(v), args.size());
+}
+
+static void DebugSparseVariantsResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	g_sparse_variants_decoded.store(0, std::memory_order_relaxed);
+	g_sparse_concat_dense_shards.store(0, std::memory_order_relaxed);
+	g_sparse_concat_altmajor_shards.store(0, std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
+}
+
+// P13-011 Task 2: per-shard concat fallback read-backs (dense genovec / ALT-major).
+static void DebugSparseConcatDenseFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	int64_t v = g_sparse_concat_dense_shards.load(std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(v), args.size());
+}
+
+static void DebugSparseConcatAltmajorFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	int64_t v = g_sparse_concat_altmajor_shards.load(std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(v), args.size());
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -6459,6 +6582,35 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	    loader, part_set, {},
 	    "Compute the ordinal-range partitions of a pfile along the variants dimension (half-open [lo, hi)).",
 	    {"SELECT * FROM pfile_partitions('data/cohort')"});
+
+	// P13-011 proof-ran control (test-only): read + reset the sparse-difflist decode counter.
+	ScalarFunction dbg_sparse("plinking_debug_sparse_variants", {}, LogicalType::BIGINT, DebugSparseVariantsFunc);
+	dbg_sparse.SetVolatile();
+	RegisterScalarWithDesc(
+	    loader, dbg_sparse, {},
+	    "Test-only: number of variants decoded via the sparse (pgen difflist) path since the last reset "
+	    "(P13-011 proof-ran control).",
+	    {"SELECT plinking_debug_sparse_variants()"});
+	ScalarFunction dbg_sparse_reset("plinking_debug_sparse_variants_reset", {}, LogicalType::BIGINT,
+	                                DebugSparseVariantsResetFunc);
+	dbg_sparse_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_sparse_reset, {},
+	                       "Test-only: reset the sparse-difflist proof-ran counter to 0, returns 0 (P13-011).",
+	                       {"SELECT plinking_debug_sparse_variants_reset()"});
+	ScalarFunction dbg_concat_dense("plinking_debug_sparse_concat_dense", {}, LogicalType::BIGINT,
+	                                DebugSparseConcatDenseFunc);
+	dbg_concat_dense.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_concat_dense, {},
+	                       "Test-only: per-shard dense-genovec fallbacks taken by the concat sparse path "
+	                       "since the last reset (P13-011 Task 2 branch proof).",
+	                       {"SELECT plinking_debug_sparse_concat_dense()"});
+	ScalarFunction dbg_concat_alt("plinking_debug_sparse_concat_altmajor", {}, LogicalType::BIGINT,
+	                              DebugSparseConcatAltmajorFunc);
+	dbg_concat_alt.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_concat_alt, {},
+	                       "Test-only: per-shard ALT/missing-major difflist fallbacks taken by the concat "
+	                       "sparse path since the last reset (P13-011 Task 2 branch proof).",
+	                       {"SELECT plinking_debug_sparse_concat_altmajor()"});
 }
 
 } // namespace duckdb

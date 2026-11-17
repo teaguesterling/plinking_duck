@@ -142,6 +142,24 @@ void ConcatPgenReader::EnsureScratch(Member &m, bool need_bits_a, bool need_bits
 	}
 }
 
+void ConcatPgenReader::EnsureSparseScratch(Member &m) {
+	// genovec (dense fallback / dense-genovec return), raregeno (difflist 2-bit payload),
+	// difflist_ids (shard-local ids; pgenlib appends sample_ct, so +2 slots). Sized to the
+	// shard's out_ct, an upper bound on any difflist this shard can return.
+	if (!m.genovec.ptr) {
+		uintptr_t wc = plink2::NypCtToAlignedWordCt(m.out_ct);
+		m.genovec.Allocate(wc * sizeof(uintptr_t));
+		std::memset(m.genovec.ptr, 0, wc * sizeof(uintptr_t));
+	}
+	if (!m.raregeno.ptr) {
+		uintptr_t wc = plink2::NypCtToAlignedWordCt(m.out_ct);
+		m.raregeno.Allocate(wc * sizeof(uintptr_t));
+	}
+	if (!m.difflist_ids.ptr) {
+		m.difflist_ids.Allocate((static_cast<idx_t>(m.out_ct) + 2) * sizeof(uint32_t));
+	}
+}
+
 plink2::PglErr ConcatPgenReader::Get(uint32_t vidx, uintptr_t *genovec) {
 	std::memset(genovec, 0, plink2::NypCtToWordCt(output_sample_ct) * sizeof(uintptr_t));
 	for (auto &mp : members) {
@@ -229,6 +247,91 @@ plink2::PglErr ConcatPgenReader::GetP(uint32_t vidx, uintptr_t *genovec, uintptr
 		}
 	}
 	*phasepresent_ct = total;
+	return plink2::kPglRetSuccess;
+}
+
+plink2::PglErr ConcatPgenReader::GetDifflistOrGenovec(uint32_t vidx, const uint32_t **out_ids, const uint8_t **out_geno,
+                                                      uint32_t *out_len, ConcatSparseStats *stats) {
+	constexpr uint32_t WD2 = plink2::kBitsPerWordD2;
+	if (combined_ids.size() < output_sample_ct) {
+		combined_ids.resize(output_sample_ct);
+		combined_geno.resize(output_sample_ct);
+	}
+	if (stats) {
+		*stats = ConcatSparseStats();
+	}
+	uint32_t n = 0;
+	for (auto &mp : members) {
+		auto &m = *mp;
+		EnsureSparseScratch(m);
+		auto *genovec = m.genovec.As<uintptr_t>();
+		// Per-shard threshold, NOT the combined osc/8 (P13-011 §5.1).
+		const uint32_t threshold = std::max<uint32_t>(1, m.out_ct / 8);
+		uint32_t common_geno = 0;
+		uint32_t difflist_len = 0;
+		if (threshold >= m.out_ct) {
+			// A difflist needs max_difflist_len < sample_ct; a tiny shard (out_ct 1) cannot
+			// satisfy it — read the dense genovec directly and treat it as the dense branch.
+			plink2::PglErr err = plink2::PgrGet(m.SampleInclude(), m.pssi, m.out_ct, vidx, &m.pgr, genovec);
+			if (err != plink2::kPglRetSuccess) {
+				return err;
+			}
+			common_geno = UINT32_MAX;
+		} else {
+			plink2::PglErr err = plink2::PgrGetDifflistOrGenovec(
+			    m.SampleInclude(), m.pssi, m.out_ct, threshold, vidx, &m.pgr, genovec, &common_geno,
+			    m.raregeno.As<uintptr_t>(), m.difflist_ids.As<uint32_t>(), &difflist_len);
+			if (err != plink2::kPglRetSuccess) {
+				return err;
+			}
+		}
+		if (common_geno == 0) {
+			// hom_ref-major difflist: non-difflist samples are hom_ref (derived), only the
+			// carriers contribute. Append each at combined offset m.out_offset + s.
+			if (stats) {
+				stats->difflist_shards++;
+			}
+			auto *raregeno = m.raregeno.As<uintptr_t>();
+			auto *ids = m.difflist_ids.As<uint32_t>();
+			for (uint32_t j = 0; j < difflist_len; j++) {
+				uint32_t s = ids[j];
+				uint8_t g = (raregeno[j / WD2] >> (2 * (j % WD2))) & 3;
+				combined_ids[n] = m.out_offset + s;
+				combined_geno[n] = g;
+				n++;
+			}
+		} else {
+			// Dense genovec (common_geno == UINT32_MAX) OR an ALT/missing-major difflist
+			// (common_geno in {1,2,3}). The dense genovec already sits in `genovec`; an
+			// ALT-major difflist did NOT fill it, so re-decode this shard densely with ITS
+			// OWN reader (P13-011 §5.3 — never lstate's). Then walk out_ct 2-bit calls (the
+			// genovec's trailing bits are not zeroed) and append every non-hom_ref sample.
+			if (common_geno == UINT32_MAX) {
+				if (stats) {
+					stats->dense_shards++;
+				}
+			} else {
+				if (stats) {
+					stats->altmajor_shards++;
+				}
+				plink2::PglErr err = plink2::PgrGet(m.SampleInclude(), m.pssi, m.out_ct, vidx, &m.pgr, genovec);
+				if (err != plink2::kPglRetSuccess) {
+					return err;
+				}
+			}
+			for (uint32_t s = 0; s < m.out_ct; s++) {
+				uint8_t g = (genovec[s / WD2] >> (2 * (s % WD2))) & 3;
+				if (g != 0) {
+					combined_ids[n] = m.out_offset + s;
+					combined_geno[n] = g;
+					n++;
+				}
+			}
+		}
+	}
+	*out_ids = combined_ids.data();
+	*out_geno = combined_geno.data();
+	*out_len = n;
 	return plink2::kPglRetSuccess;
 }
 

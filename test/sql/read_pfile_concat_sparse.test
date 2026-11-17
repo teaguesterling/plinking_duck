@@ -1,0 +1,859 @@
+# name: test/sql/read_pfile_concat_sparse.test
+# description: P13-011. The sparse (pgen difflist) sample-count path on a sample-sharded (IsConcat) cohort, via ConcatPgenReader::GetDifflistOrGenovec. Proof-ran control (design §6): plinking_debug_sparse_variants counts hom_ref-major difflist variants, and plinking_debug_sparse_concat_dense / _altmajor tally the two per-shard fallbacks so a test PROVES both branches ran in the reader under test. Per-sample EXCEPT harness (design §7) over F1 (all-rare), F2 (forces the dense-genovec and ALT-major fallbacks), F3/F4 (sample subsets). Flip control at the end: sparse decodes via the difflist (counter > 0), dense bumps nothing (0 0 0).
+# group: [sql]
+
+require plinking_duck
+
+# ===========================================================================
+# Proof-ran mechanism (design §6): plinking_debug_sparse_variants() reports the
+# count of variants decoded via the sparse difflist path since the last reset.
+# A concat sparse==dense test passes even when the sparse path never fires, so
+# equality alone cannot prove the path RAN. This counter is the positive proof.
+# It is process-global; every measurement resets it first, so it does not depend
+# on whether the unittest runner shares a process across .test files (it does).
+# ===========================================================================
+
+# The reset returns 0.
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+# --- Check the check on the single-file path: dense => counter stays 0 ---
+# Same query SHAPE as the concat negative control below (orient/counts/carrier
+# filter), so a 0 there can be blamed on the gate, not on the query shape.
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE sf_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts',
+                include_genotypes := ['het', 'hom_alt']);
+
+# Dense single-file read decoded 0 variants via the sparse path.
+query I
+SELECT plinking_debug_sparse_variants();
+----
+0
+
+# --- Single-file sparse => counter > 0 (the mechanism works) ---
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+statement ok
+CREATE TEMP TABLE sf_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile('test/data/rare_small', orient := 'sample', genotypes := 'counts',
+                include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT plinking_debug_sparse_variants() > 0;
+----
+true
+
+# Per-sample EXCEPT on the single file: the sparse path produces IDENTICAL rows
+# to the dense path (both directions empty). This pins design §7 on the single
+# file before the concat fixtures exercise it.
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM sf_sparse EXCEPT SELECT * FROM sf_dense)),
+       (SELECT count(*) FROM (SELECT * FROM sf_dense EXCEPT SELECT * FROM sf_sparse));
+----
+0	0
+
+# ===========================================================================
+# F1: an all-rare, multi-shard fixture. Shard rare_small's 256 samples into 3
+# UNEVEN contiguous blocks (40 / 88 / 128) via COPY ... shard_samples (design
+# §7, mirroring write_psam_parquet_companion.test). Uneven sizes also catch an
+# out_offset bug that assumes equal shards. No committed binary — generated into
+# {TEST_DIR}. The writer emits f1/{a,b,c}/data.pgen + one shared f1.pvar.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/rare_small', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/f1' (FORMAT pfile, shard_samples {
+  a: ['S' || x FOR x IN range(0, 40)],
+  b: ['S' || x FOR x IN range(40, 128)],
+  c: ['S' || x FOR x IN range(128, 256)]
+});
+
+# Three shard .pgen files + one shared .pvar were written.
+query II
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/f1/*/data.pgen')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/f1.pvar'));
+----
+3	1
+
+# Fixture guard A (REF-major): the concat cohort reproduces the unsharded
+# rare_small totals, and hom_ref is the majority. If a regenerated fixture
+# stopped being REF-major, the sparse fast path would never apply and this pins
+# it. Totals match test/data/rare_small (hom_ref 99217, het 1947, hom_alt 224,
+# missing 1012).
+query IIII
+SELECT sum(genotypes.hom_ref), sum(genotypes.het), sum(genotypes.hom_alt), sum(genotypes.missing)
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts');
+----
+99217	1947	224	1012
+
+# Fixture guard B (difflist-encoded shards): read EACH shard ALONE (single-file,
+# NOT concat) with sparse on. A single-prefix read is not IsConcat, so the gate
+# allows the sparse path; the counter must be > 0, which proves the writer
+# emitted a difflist-encoded shard. If a shard were too small or dense, this
+# fails loudly here instead of mis-attributing the concat RED below.
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE guard_a AS
+SELECT IID FROM read_pfile('{TEST_DIR}/f1/a/data', pvar := '{TEST_DIR}/f1.pvar',
+                           orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT plinking_debug_sparse_variants() > 0;
+----
+true
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE guard_b AS
+SELECT IID FROM read_pfile('{TEST_DIR}/f1/b/data', pvar := '{TEST_DIR}/f1.pvar',
+                           orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT plinking_debug_sparse_variants() > 0;
+----
+true
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE guard_c AS
+SELECT IID FROM read_pfile('{TEST_DIR}/f1/c/data', pvar := '{TEST_DIR}/f1.pvar',
+                           orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT plinking_debug_sparse_variants() > 0;
+----
+true
+
+# ===========================================================================
+# Per-sample EXCEPT harness (design §7). For each fixture, materialize the dense
+# and sparse reads as two relations of (IID, het, hom_alt, missing) and assert
+# BOTH directions of EXCEPT are empty. PER-SAMPLE, never sum-equality: an
+# out_offset bug moves a shard's carriers onto other samples and preserves
+# sum(het)/sum(hom_alt), so sums cannot catch it. Each fixture pins its exact
+# dense row count so an all-empty pair cannot pass vacuously. The sparse side
+# genuinely uses the concat difflist decode (the flip control at the end proves
+# the path ran); the dense side is the oracle.
+# ===========================================================================
+
+# --- F1: all-rare, all 3 shards ---
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE f1_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+statement ok
+CREATE TEMP TABLE f1_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT count(*) FROM f1_dense;
+----
+256
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM f1_sparse EXCEPT SELECT * FROM f1_dense)),
+       (SELECT count(*) FROM (SELECT * FROM f1_dense EXCEPT SELECT * FROM f1_sparse));
+----
+0	0
+
+# --- F3: a sample subset dropping a WHOLE shard (omit all of shard c, S128..S255).
+# Shard c leaves the member set; the read is shards a+b only. ---
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE f3_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt'],
+                samples := ['S' || x FOR x IN range(0, 128)]);
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+statement ok
+CREATE TEMP TABLE f3_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt'],
+                samples := ['S' || x FOR x IN range(0, 128)]);
+
+query I
+SELECT count(*) FROM f3_dense;
+----
+128
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM f3_sparse EXCEPT SELECT * FROM f3_dense)),
+       (SELECT count(*) FROM (SELECT * FROM f3_dense EXCEPT SELECT * FROM f3_sparse));
+----
+0	0
+
+# --- F4: a sample subset SPLITTING a shard (keep S0..S99 = all of a + part of b).
+# Shard b is read through its own pssi (sample-include). ---
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE f4_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt'],
+                samples := ['S' || x FOR x IN range(0, 100)]);
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+statement ok
+CREATE TEMP TABLE f4_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt'],
+                samples := ['S' || x FOR x IN range(0, 100)]);
+
+query I
+SELECT count(*) FROM f4_dense;
+----
+100
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM f4_sparse EXCEPT SELECT * FROM f4_dense)),
+       (SELECT count(*) FROM (SELECT * FROM f4_dense EXCEPT SELECT * FROM f4_sparse));
+----
+0	0
+
+# ===========================================================================
+# F2: a synthetic multi-shard fixture that forces BOTH per-shard fallback
+# branches in ConcatPgenReader::GetDifflistOrGenovec (design §7 F2, §5.3). The
+# other fixtures are all hom_ref-major, so nothing else exercises these branches.
+#
+# 256 samples, zero-padded IIDs S000..S255 (so the struct field order the writer
+# uses as the sample order sorts numerically, which shard_samples needs), sharded
+# a(S000..S039, 40) / b(S040..S127, 88) / c(S128..S255, 128). Per-shard difflist
+# threshold is max(1, out_ct/8): a->5, b->11, c->16.
+#
+# Three variants, each engineered by its shard-a distribution:
+#   vR     : 1 het in shard a (minority 1 <= 5) -> hom_ref-major difflist.
+#   vDense : shard a has 9 het + 1 hom_alt + 1 missing = minority 11 > 5 ->
+#            pgenlib returns a DENSE genovec (common_geno == UINT32_MAX).
+#   vAlt   : shard a has 38 hom_alt (majority) + 1 het + 1 missing = minority 2
+#            <= 5 -> an ALT-major difflist (common_geno == 2), re-decoded densely.
+# In shards b and c every variant has one lone carrier -> hom_ref-major difflist.
+# Carriers differ per shard across variants so no two records are identical (a
+# hedge against LD re-encoding that could change the branch).
+# ===========================================================================
+
+statement ok
+CREATE TEMP TABLE f2tall AS
+WITH vars(vid, chrom, pos, id, ref, alt) AS (
+  VALUES (0, '1', 100, 'vR', 'A', 'G'), (1, '1', 200, 'vDense', 'A', 'G'), (2, '1', 300, 'vAlt', 'A', 'G')
+)
+SELECT v.vid, v.chrom AS "CHROM", v.pos AS "POS", v.id AS "ID", v.ref AS "REF", v.alt AS "ALT", s AS sidx,
+  (CASE
+    WHEN v.vid = 0 THEN (CASE WHEN s IN (3, 50, 140) THEN 1 ELSE 0 END)
+    WHEN v.vid = 1 THEN (CASE WHEN s < 9 THEN 1 WHEN s = 9 THEN 2 WHEN s = 10 THEN NULL WHEN s IN (55, 145) THEN 1 ELSE 0 END)
+    WHEN v.vid = 2 THEN (CASE WHEN s = 0 THEN NULL WHEN s BETWEEN 1 AND 38 THEN 2 WHEN s = 39 THEN 1 WHEN s IN (60, 150) THEN 1 ELSE 0 END)
+  END)::TINYINT AS g
+FROM vars v, range(0, 256) u(s);
+
+statement ok
+CREATE TEMP TABLE f2gw AS
+PIVOT f2tall ON printf('S%03d', sidx) USING first(g) GROUP BY vid, "CHROM", "POS", "ID", "REF", "ALT" ORDER BY vid;
+
+statement ok
+CREATE TEMP TABLE f2src AS
+SELECT "CHROM", "POS", "ID", "REF", "ALT",
+  (SELECT x FROM (SELECT g2.* EXCLUDE (vid, "CHROM", "POS", "ID", "REF", "ALT") FROM f2gw g2 WHERE g2.vid = f2gw.vid) AS x) AS genotypes
+FROM f2gw ORDER BY "CHROM", "POS";
+
+statement ok
+COPY (SELECT * FROM f2src) TO '{TEST_DIR}/f2' (FORMAT pfile, shard_samples {
+  a: [printf('S%03d', x) FOR x IN range(0, 40)],
+  b: [printf('S%03d', x) FOR x IN range(40, 128)],
+  c: [printf('S%03d', x) FOR x IN range(128, 256)]
+});
+
+# Three shard .pgen files + one shared .pvar were written.
+query II
+SELECT (SELECT count(*) FROM glob('{TEST_DIR}/f2/*/data.pgen')),
+       (SELECT count(*) FROM glob('{TEST_DIR}/f2.pvar'));
+----
+3	1
+
+# Fixture guard A (shard-a distribution). Reading shard a ALONE in variant orient
+# pins the per-variant genotype counts (hom_ref, het, hom_alt, missing) over its
+# 40 samples. With the fixed threshold 5, this distribution DETERMINES the branch:
+# vDense's minority (9+1+1 = 11) > 5 => dense genovec; vAlt's majority is hom_alt
+# with minority 2 <= 5 => ALT-major difflist. If a regenerated fixture changed
+# these counts, the branch would change and this guard fails loudly.
+query TIIII
+SELECT ID, genotypes.hom_ref, genotypes.het, genotypes.hom_alt, genotypes.missing
+FROM read_pfile('{TEST_DIR}/f2/a/data', pvar := '{TEST_DIR}/f2.pvar', orient := 'variant', genotypes := 'counts')
+ORDER BY ID;
+----
+vAlt	0	1	38	1
+vDense	29	9	1	1
+vR	39	1	0	0
+
+# Fixture guard B (on-disk encoding, per shard alone, single-file sparse path).
+# The single-file counter bumps ONLY for a hom_ref-major difflist, so it proves
+# what the writer actually encoded: shard a has exactly ONE hom_ref-major variant
+# (vR) — vDense and vAlt are NOT hom_ref-major — while shards b and c have all 3.
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE f2ga AS
+SELECT IID FROM read_pfile('{TEST_DIR}/f2/a/data', pvar := '{TEST_DIR}/f2.pvar',
+                           orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT plinking_debug_sparse_variants();
+----
+1
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE f2gb AS
+SELECT IID FROM read_pfile('{TEST_DIR}/f2/b/data', pvar := '{TEST_DIR}/f2.pvar',
+                           orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT plinking_debug_sparse_variants();
+----
+3
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE f2gc AS
+SELECT IID FROM read_pfile('{TEST_DIR}/f2/c/data', pvar := '{TEST_DIR}/f2.pvar',
+                           orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+query I
+SELECT plinking_debug_sparse_variants();
+----
+3
+
+# --- F2 concat: dense vs sparse, carrier-filtered. ---
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE f2_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f2/a/data', '{TEST_DIR}/f2/b/data', '{TEST_DIR}/f2/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f2.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+# Reset the variant counter AND both fallback tallies, then run the sparse concat
+# read so the tallies reflect exactly this read.
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+statement ok
+CREATE TEMP TABLE f2_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f2/a/data', '{TEST_DIR}/f2/b/data', '{TEST_DIR}/f2/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f2.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+
+# BRANCH PROOF (measured, not inferred): the concat reader under test took exactly
+# one dense-genovec fallback (vDense, shard a) and one ALT-major fallback (vAlt,
+# shard a) on THIS read. 3 variants decoded hom_ref-major on >=1 shard -> counter 3.
+query III
+SELECT plinking_debug_sparse_variants(),
+       plinking_debug_sparse_concat_dense(),
+       plinking_debug_sparse_concat_altmajor();
+----
+3	1	1
+
+# Per-sample EXCEPT (both directions empty): the sparse path — difflist carriers,
+# dense-genovec walk, AND ALT-major re-decode — reproduces the dense path per
+# sample, so an out_offset or genotype error in either fallback would surface here.
+query I
+SELECT count(*) FROM f2_dense;
+----
+46
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM f2_sparse EXCEPT SELECT * FROM f2_dense)),
+       (SELECT count(*) FROM (SELECT * FROM f2_dense EXCEPT SELECT * FROM f2_sparse));
+----
+0	0
+
+# --- F2 concat UNFILTERED: compares every sample's missing count. With no filter
+# (and so no hom_ref-inclusive filter) the sparse path still engages — the query III
+# below MEASURES that (tally 3 1 1, same as filtered) — so this pins g==3 emission
+# on the dense / ALT-major fallbacks for every sample, not only carriers. ---
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE f2u_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f2/a/data', '{TEST_DIR}/f2/b/data', '{TEST_DIR}/f2/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f2.pvar',
+                orient := 'sample', genotypes := 'counts');
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+statement ok
+CREATE TEMP TABLE f2u_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f2/a/data', '{TEST_DIR}/f2/b/data', '{TEST_DIR}/f2/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f2.pvar',
+                orient := 'sample', genotypes := 'counts');
+
+# Measured: the unfiltered sparse read engages the concat difflist path and takes
+# both fallbacks (dense 1, ALT-major 1), identical to the filtered read.
+query III
+SELECT plinking_debug_sparse_variants(),
+       plinking_debug_sparse_concat_dense(),
+       plinking_debug_sparse_concat_altmajor();
+----
+3	1	1
+
+query I
+SELECT count(*) FROM f2u_dense;
+----
+256
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM f2u_sparse EXCEPT SELECT * FROM f2u_dense)),
+       (SELECT count(*) FROM (SELECT * FROM f2u_dense EXCEPT SELECT * FROM f2u_sparse));
+----
+0	0
+
+# ===========================================================================
+# F5 (Gap 1, the MOTIVATING case): a `catalog :=` matrix that shards the SAMPLE axis
+# across MULTIPLE variant blocks. Every fixture above is a single-variant-block
+# list-of-prefixes concat; none crosses the per-block `lstate.concat` rebuild a real
+# matrix catalog hits mid-Phase-1. rare_small is relabeled into 2 variant blocks
+# (CHROM 1 = first 200 variants by POS, CHROM 2 = next 200) x 2 UNEVEN sample shards
+# (GROUP A = S0..S87 = 88, GROUP B = S88..S255 = 168). The shards are large and
+# REF-major, so the hom_ref-major difflist FAST PATH fires across the catalog. (A
+# fixture with DENSE data, e.g. large_example at ~3 non-hom_ref calls per shard per
+# variant, would instead take the dense-genovec fallback — the branch F2 covers. The
+# shard being large is what lets the difflist fire, but the DATA being rare is why it
+# does.) Uneven widths also catch an out_offset bug that assumes equal shards.
+# Self-contained; no committed binary. Read under `threads = 1` so ONE local state
+# walks variant block 1 into block 2, which rebuilds its `lstate.concat` on the block
+# change (OpenSourceReader, src/pfile_reader.cpp) — the per-block rebuild this gap is
+# about. Many threads could give each block its own lstate and never rebuild.
+# ===========================================================================
+
+# Relabel rare_small into 2 ordered variant blocks (ORDER BY POS, ID is stable).
+statement ok
+CREATE TEMP TABLE mxrr AS
+SELECT (CASE WHEN rn <= 200 THEN '1' ELSE '2' END) AS CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] AS g
+FROM (SELECT row_number() OVER (ORDER BY POS, ID) AS rn, POS, ID, REF, ALT, genotypes
+      FROM read_pfile('test/data/rare_small'));
+
+# Hive skeletons the pfile writer needs (flat dirs — PARTITION_BY does not mkdir parents).
+statement ok
+COPY (SELECT c AS CHROM, g AS "GROUP", 0 AS x FROM (VALUES ('1'),('2')) a(c), (VALUES ('A'),('B')) b(g))
+TO '{TEST_DIR}/mxdata' (FORMAT csv, PARTITION_BY (CHROM, "GROUP"));
+
+statement ok
+COPY (SELECT c AS CHROM, 0 AS x FROM (VALUES ('1'),('2')) a(c)) TO '{TEST_DIR}/mxrefv' (FORMAT csv, PARTITION_BY (CHROM));
+
+statement ok
+COPY (SELECT g AS "GROUP", 0 AS x FROM (VALUES ('A'),('B')) b(g)) TO '{TEST_DIR}/mxrefs' (FORMAT csv, PARTITION_BY ("GROUP"));
+
+# One shared .pvar per variant block (width = sample block A = 88).
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 1, 88) AS genotypes FROM mxrr WHERE CHROM = '1' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxrefv/CHROM=1/blk' (FORMAT pfile, samples ['S' || x FOR x IN range(0, 88)]);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 1, 88) AS genotypes FROM mxrr WHERE CHROM = '2' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxrefv/CHROM=2/blk' (FORMAT pfile, samples ['S' || x FOR x IN range(0, 88)]);
+
+# One shared .psam per sample block (A = S0..S87, B = S88..S255).
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 1, 88) AS genotypes FROM mxrr WHERE CHROM = '1' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxrefs/GROUP=A/blk' (FORMAT pfile, samples ['S' || x FOR x IN range(0, 88)]);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 89, 256) AS genotypes FROM mxrr WHERE CHROM = '1' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxrefs/GROUP=B/blk' (FORMAT pfile, samples ['S' || x FOR x IN range(88, 256)]);
+
+# The 4 cells (variant block x sample block).
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 1, 88) AS genotypes FROM mxrr WHERE CHROM = '1' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxdata/CHROM=1/GROUP=A/cell' (FORMAT pfile, samples ['S' || x FOR x IN range(0, 88)]);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 89, 256) AS genotypes FROM mxrr WHERE CHROM = '1' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxdata/CHROM=1/GROUP=B/cell' (FORMAT pfile, samples ['S' || x FOR x IN range(88, 256)]);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 1, 88) AS genotypes FROM mxrr WHERE CHROM = '2' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxdata/CHROM=2/GROUP=A/cell' (FORMAT pfile, samples ['S' || x FOR x IN range(0, 88)]);
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, list_slice(g, 89, 256) AS genotypes FROM mxrr WHERE CHROM = '2' ORDER BY POS, ID)
+TO '{TEST_DIR}/mxdata/CHROM=2/GROUP=B/cell' (FORMAT pfile, samples ['S' || x FOR x IN range(88, 256)]);
+
+statement ok
+COPY (SELECT '{"pfile_catalog":2,"dataset":"mx","axes":[{"name":"variants","keys":[{"name":"CHROM","type":"enum","values":[{"value":"1","start":0,"stop":200},{"value":"2","start":200,"stop":400}]}]},{"name":"samples","keys":[{"name":"GROUP","type":"enum","values":[{"value":"A","start":0,"stop":88},{"value":"B","start":88,"stop":256}]}]}],"template":{"pfile":"mxdata/CHROM={CHROM}/GROUP={GROUP}/cell","pvar":"mxrefv/CHROM={CHROM}/blk.pvar","psam":"mxrefs/GROUP={GROUP}/blk.psam"}}')
+TO '{TEST_DIR}/mx.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+# 4 cells parse.
+query I
+SELECT count(*) FROM read_pfile_catalog('{TEST_DIR}/mx.pfile.json');
+----
+4
+
+# Force ONE local state to span both variant blocks (see header).
+statement ok
+SET threads = 1;
+
+# DENSE carrier read on the catalog. Reset first (the counters still hold F2u's 3 1 1),
+# then assert the dense catalog read bumps none of the three read-backs.
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE mx_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample', genotypes := 'counts',
+                include_genotypes := ['het', 'hom_alt']);
+
+query III
+SELECT plinking_debug_sparse_variants(),
+       plinking_debug_sparse_concat_dense(),
+       plinking_debug_sparse_concat_altmajor();
+----
+0	0	0
+
+# SPARSE carrier read on the same catalog.
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE mx_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'sample', genotypes := 'counts',
+                include_genotypes := ['het', 'hom_alt']);
+
+# BRANCH PROOF across blocks (measured): the hom_ref-major difflist fast path fired on
+# > 200 of the 400 variants, so BOTH 200-variant blocks' concats decoded via the
+# difflist (the counter maxes at 400). The concat dense-genovec fallback also fired
+# (> 0; only the concat reader bumps that tally), so a few high-carrier variants took
+# the dense branch across the catalog too.
+query II
+SELECT plinking_debug_sparse_variants() > 200,
+       plinking_debug_sparse_concat_dense() > 0;
+----
+true	true
+
+# Pin the non-empty row count, then per-sample EXCEPT both directions.
+query I
+SELECT count(*) FROM mx_dense;
+----
+256
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM mx_sparse EXCEPT SELECT * FROM mx_dense)),
+       (SELECT count(*) FROM (SELECT * FROM mx_dense EXCEPT SELECT * FROM mx_sparse));
+----
+0	0
+
+statement ok
+RESET threads;
+
+# ===========================================================================
+# Gap 2: genotypes := 'stats' on the F1 concat. Scope §2 lists {counts, stats}; only
+# 'counts' was tested above. Per-sample EXCEPT of the integer stat fields (the derived
+# rates af/maf/het_rate are the same formula on the same counts, so the integer fields
+# are the load-bearing comparison). The stats sparse read engages the concat difflist
+# path (counter > 0).
+# ===========================================================================
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE f1s_dense AS
+SELECT IID, genotypes.hom_ref AS hr, genotypes.het AS het, genotypes.hom_alt AS ha,
+       genotypes.missing AS miss, genotypes.n AS n, genotypes.carrier_count AS cc
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'stats');
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE f1s_sparse AS
+SELECT IID, genotypes.hom_ref AS hr, genotypes.het AS het, genotypes.hom_alt AS ha,
+       genotypes.missing AS miss, genotypes.n AS n, genotypes.carrier_count AS cc
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'stats');
+
+# The stats sparse read decoded via the concat difflist path.
+query I
+SELECT plinking_debug_sparse_variants() > 0;
+----
+true
+
+query I
+SELECT count(*) FROM f1s_dense;
+----
+256
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM f1s_sparse EXCEPT SELECT * FROM f1s_dense)),
+       (SELECT count(*) FROM (SELECT * FROM f1s_dense EXCEPT SELECT * FROM f1s_sparse));
+----
+0	0
+
+# ===========================================================================
+# Gap 3: the 1-sample-shard degenerate path (ruling R2, threshold >= out_ct).
+# samples := ['S0'] leaves shard a with out_ct = 1 (shards b, c drop out of members).
+# R2 reads that tiny shard dense and tallies it as a dense-genovec fallback, so this
+# pins the degenerate concat path. 1 output row.
+# ===========================================================================
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE g3_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt'],
+                samples := ['S0']);
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE g3_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt'],
+                samples := ['S0']);
+
+# R2 ran (measured): no hom_ref-major difflist (0); the degenerate out_ct=1 shard
+# decoded dense for each of the 12 variants S0 carries, and only those — the Phase-1
+# loop iterates src.effective_variant_indices (src/pfile_reader.cpp), which an empty
+# selected-AC prunes to the 12 S0 carries; no ALT-major.
+query III
+SELECT plinking_debug_sparse_variants(),
+       plinking_debug_sparse_concat_dense(),
+       plinking_debug_sparse_concat_altmajor();
+----
+0	12	0
+
+query I
+SELECT count(*) FROM g3_dense;
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM g3_sparse EXCEPT SELECT * FROM g3_dense)),
+       (SELECT count(*) FROM (SELECT * FROM g3_dense EXCEPT SELECT * FROM g3_sparse));
+----
+0	0
+
+# ===========================================================================
+# Gap 4: g==3 (missing) on the hom_ref-major difflist branch, for EVERY sample.
+# F1's filtered reads compare missing only for filter-kept samples. This UNFILTERED
+# read (no include_genotypes) compares every sample's het/hom_alt/missing, so the
+# difflist branch's g==3 emission is pinned for all 256 samples. rare_small carries
+# 1012 missing calls in total.
+# ===========================================================================
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+statement ok
+CREATE TEMP TABLE f1u_dense AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts');
+
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+statement ok
+CREATE TEMP TABLE f1u_sparse AS
+SELECT IID, genotypes.het AS het, genotypes.hom_alt AS hom_alt, genotypes.missing AS missing
+FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                orient := 'sample', genotypes := 'counts');
+
+# Difflist path engaged, and total missing across all samples is intact (guards a
+# regenerated fixture that lost its missing calls). That the missing calls land on
+# difflist variants rather than the dense fallbacks is inferred, not measured here.
+query II
+SELECT plinking_debug_sparse_variants() > 0,
+       (SELECT sum(missing) FROM f1u_sparse) = 1012;
+----
+true	true
+
+query I
+SELECT count(*) FROM f1u_dense;
+----
+256
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM f1u_sparse EXCEPT SELECT * FROM f1u_dense)),
+       (SELECT count(*) FROM (SELECT * FROM f1u_dense EXCEPT SELECT * FROM f1u_sparse));
+----
+0	0
+
+# ===========================================================================
+# FLIP CONTROL (design §6, §8): both directions. The concat SPARSE read must RUN
+# the difflist path (counter > 0), and the concat DENSE read must bump NONE of the
+# three read-backs. Result equality cannot prove the path ran, so both halves are
+# asserted on the F1 concat fixture. KEEP THIS LAST — the runner stops the file at
+# the first mismatch, so every PASS above must precede it.
+# ===========================================================================
+
+# DENSE direction: the correct 256 carrier rows, and all three read-backs stay 0
+# (the dense concat path never touches the proof-ran surface).
+statement ok
+SET plinking_sample_counts_sparse = false;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+----
+256
+
+query III
+SELECT plinking_debug_sparse_variants(),
+       plinking_debug_sparse_concat_dense(),
+       plinking_debug_sparse_concat_altmajor();
+----
+0	0	0
+
+# SPARSE direction: the same read, now decoding through the concat difflist path.
+# Every F1 variant is hom_ref-major on every shard, so the counter is > 0.
+statement ok
+SET plinking_sample_counts_sparse = true;
+
+query I
+SELECT plinking_debug_sparse_variants_reset();
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile(['{TEST_DIR}/f1/a/data', '{TEST_DIR}/f1/b/data', '{TEST_DIR}/f1/c/data'],
+                                combine_samples := 'concatenate', pvar := '{TEST_DIR}/f1.pvar',
+                                orient := 'sample', genotypes := 'counts', include_genotypes := ['het', 'hom_alt']);
+----
+256
+
+query I
+SELECT plinking_debug_sparse_variants() > 0;
+----
+true
+
+statement ok
+RESET plinking_sample_counts_sparse;
