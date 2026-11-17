@@ -187,8 +187,8 @@ SELECT pgen_bytes() < 2000000;
 ----
 true
 
-# --- An unrecognized shape is left to the residual filter: correct rows, whole read.
-# --- This pins the conservative side: <> must never prune.
+# --- An unrecognized shape (<>) is left to the residual filter. The row count pins
+# --- the conservative side: a prune that dropped a kept variant would show here.
 statement ok
 CALL truncate_duckdb_logs();
 
