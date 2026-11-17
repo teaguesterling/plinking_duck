@@ -1,0 +1,206 @@
+# P13-011: sparse difflist decode on sample-sharded (`IsConcat`) carrier reads
+
+Restore the pgenlib **difflist** (sparse) sample-count path for a **sample-sharded**
+cohort. Today it is force-disabled for any `IsConcat` read, so a matrix
+`pfile_catalog` that shards the sample axis cannot use it. This build adds a
+multi-shard difflist decoder to `ConcatPgenReader` and removes the exclusion.
+
+Branch: `feat/concat-sparse` (off `origin/main` `e484213`, which already contains
+P13-008 sample-concat reader, #116 parquet-pvar, #117 localize, #119 parquet-psam
+writer, #120 v2.0 filter-prune). Plan: `P13-011-concat-sparse-difflist-implementation`.
+Follow-up to P13-008 (`docs/planning/P13-008-sample-concat-reader`).
+
+## Status
+
+- [x] Design settled: combined carrier-list, per-shard difflist + offset (§4)
+- [x] Ceiling measured post-#119 (§3)
+- [ ] Build test-first (plan: `-implementation`)
+- [ ] Whole-branch review, then ask before push/PR
+
+## 1. Intent
+
+The sample-sharded read decodes through `ConcatPgenReader` (one `.pgen` per shard,
+same variants, disjoint samples). The sparse difflist decode — which touches only
+the carriers of a rare variant, not the hom_ref majority — is force-disabled for
+`IsConcat` at `src/pfile_reader.cpp:3936`:
+
+```cpp
+if (want_sparse && !filter_allows_hom_ref && !bind_data.IsConcat()) {
+    state->smp_use_sparse = true;                         // :3937
+    state->smp_max_difflist_len = std::max<uint32_t>(1, osc / 8);  // :3938
+```
+
+The reason (comment above the gate): "the difflist's sample ids are shard-relative,
+and the concat reader only offers the dense `Get`." P13-011 gives the concat reader
+a difflist decoder so the per-sample carrier and burden queries regain the path.
+
+## 2. Scope
+
+**In:** `orient:='sample'`, `genotypes` in `{counts, stats}`, with a carrier filter
+(`include_genotypes` het / hom_alt / missing), on `IsConcat` reads. This is the
+sparse Phase-1 accumulation path at `src/pfile_reader.cpp` ~5460–5530.
+
+**Out — sequenced follow-up (owner's decision, "both eventually"):** the
+per-(sample, variant) `orient:='genotype'` shape ("who carries WHICH variant")
+decodes densely on every layout and has no difflist path anywhere. Speeding it up is
+a separate, larger build (a difflist-driven genotype emit). Not this build. Writer
+and catalog layout are untouched; P13-011 is read-side only.
+
+## 3. Measured ceiling (post-#119)
+
+Fixture: 1M samples × 200 rare variants, 4 sample-shards (`mx_sb0..3`), parquet psam
+companions, median-of-5, query-only, R verified. Measured on longbottom via Slurm.
+
+Per-sample carrier query — `orient:='sample', genotypes:='counts',
+include_genotypes:=['het','hom_alt']`, 700212 carriers:
+
+| Path | median | note |
+|---|---:|---|
+| concat dense, parquet psam | **0.646s** | the layout today |
+| single sparse, parquet psam | 0.265s | single-file optimum (hard floor) |
+| concat-sparse upper bound | 0.291s | Σ of 4 per-shard sparse medians (0.076/0.073/0.068/0.074), R-sum 700212 ✓ |
+
+**Realistic target ≈ 0.27–0.29s (~2.3×).** The window is tight: the per-query fixed
+cost (bind, open, psam load) is small next to decode, so counting it four times (the
+Σ bound) adds only ~0.026s over the floor; concat pays it once.
+
+Burden COUNT (same fixture, R=1200412 ✓): concat dense 0.434s → single sparse
+0.147s; per-shard Σ bound 0.215s.
+
+Decomposition: concat dense == single dense on parquet, so **sharding overhead ≈ 0**;
+the whole gap is dense-vs-sparse decode. Parquet psam (#119) did not shrink this gap
+— it dropped the shared psam floor, so the decode cost is now most of what remains.
+
+**N = 4 sample-shards here.** Each variant costs N per-shard difflist calls, so the
+ratio holds near N=4. A production matrix with a much higher sample-block count
+erodes the per-call win; state the real block count when applying this.
+
+## 4. Design
+
+### 4.1 Why it is reader internals, not a gate flip
+
+`ConcatPgenReader` (`src/pgen_concat_reader.{hpp,cpp}`) exposes `Get` / `GetCounts` /
+`GetD` / `GetP`. Each loops `members` (shards with `out_ct > 0`), calls the pgenlib
+primitive per shard with that shard's own `SampleInclude()` / `pssi` / `out_ct`, and
+merges into combined space with `OrBitsAtOffset(dst, 2·m.out_offset, …)`.
+
+The difflist decode does not fit that bit-buffer merge. Its output is per-sample
+accumulation, and each shard independently returns a difflist OR a dense genovec with
+its own `common_geno`.
+
+### 4.2 Combined carrier list
+
+Add a `ConcatPgenReader::GetDifflistOrGenovec` analog that returns one combined list
+of `(combined_sample_idx, genotype)` for every non-hom_ref sample across shards. The
+reader keeps its convention — combined-space output, caller passes no `si_ptr`/`pssi`
+— and the scan's existing carrier loop (`src/pfile_reader.cpp` ~5505–5528) consumes
+it unchanged.
+
+Per shard `m`:
+
+1. Call `PgrGetDifflistOrGenovec` with `m.SampleInclude()` / `m.pssi` / `m.out_ct` and
+   a **per-shard** threshold `max(1, m.out_ct / 8)`.
+2. **hom_ref-major difflist** (`common_geno == 0`): for each shard-local carrier id
+   `s`, append `(m.out_offset + s, g)`.
+3. **dense genovec** (`common_geno == UINT32_MAX`) **or ALT/missing-major**
+   (`common_geno` ∉ `{0, UINT32_MAX}`): decode that shard densely with `m.pgr` /
+   `m.SampleInclude()` / `m.pssi` / `m.out_ct`, walk its genovec, append
+   `(m.out_offset + local, g)` for every non-zero local sample.
+
+The scan's carrier switch then runs unchanged: `g==1`→het, `2`→hom_alt, `3`→miss +
+has_missing, and under a filter `g`→in_range. hom_ref (`g==0`) never enters the list,
+which matches `accumulate_dense`'s `case 0: break` at `:5424` ("hom_ref derived at
+emit time").
+
+### 4.3 Gate change
+
+At `src/pfile_reader.cpp:3936`, drop `!bind_data.IsConcat()`. The single-file
+`gstate.smp_max_difflist_len` stays for the single path; the concat path computes its
+threshold per shard inside the reader.
+
+## 5. Correctness requirements
+
+1. **Per-shard threshold** `max(1, m.out_ct/8)`, not the combined `osc/8`. A combined
+   threshold mis-sizes a shard's difflist against pgenlib's own limit.
+2. **Per-shard scratch; combined list sized to `OutputSampleCt()`.** Each `Member`
+   gets its own raregeno + difflist-ids buffers (via `EnsureScratch`), sized to its
+   `out_ct`. The combined list is sized to `OutputSampleCt()`, NOT `osc/8`: a dense or
+   ALT-major shard can append ~`out_ct` entries, so the combined list can reach `osc`.
+   Do not reuse `smp_difflist_sample_ids` / `smp_raregeno_buf` (sized to
+   `smp_max_difflist_len`).
+3. **Fallback binds the shard's reader**, not lstate. The ALT-major re-decode must use
+   `m.pgr` / `m.SampleInclude()` / `m.pssi` / `m.out_ct`. Copying the single-path lines
+   (~5496–5501) verbatim reads `lstate.pgr` / `si_ptr` — the wrong shard.
+4. **Sample subset + concat.** The carrier id is in the shard OUTPUT space
+   (`0..out_ct`); `m.out_offset` maps it to combined output space (consistent with
+   `Get`'s `2·m.out_offset`). A subset dropping a whole shard removes it from `members`
+   (`out_ct==0`). A subset splitting a shard uses that shard's `pssi`.
+5. **Missing calls.** difflist `g==3` → miss + has_missing; the dense fallback must
+   emit `g==3` too.
+6. **Zero-carrier shard.** `difflist_len==0`, `common_geno==0` → contributes nothing.
+7. **Disjoint samples.** A sample lives in exactly one shard — no dedup, no
+   boundary-spanning carrier.
+
+## 6. Proof the sparse path RAN (negative control)
+
+A concat `sparse == dense` test passes **today**, with the gate closed, so equality
+alone cannot prove the new path ran. A gate change that silently never fires would
+still ship green. This is the analog of #119's companions ON/OFF control.
+
+**Require a positive proof:** a resettable test-only mechanism that reports the concat
+sparse path ran — asserted `> 0` under sparse on a concat fixture, `0` under dense.
+Prove the mechanism on the **single-file** sparse path first (sparse on → `>0`, off →
+`0`): that checks the check. The existing single-file sparse test
+(`test/sql/read_pfile_sample_counts_sparse.test`) has no such mechanism — it relies on
+a REF-major fixture — so P13-011 adds one.
+
+A per-query mechanism (operator extra-info) is preferable to global state, but
+`read_pfile` exposes no such hook today, so a resettable session counter read in the
+same `.test` file is acceptable. Confirm whether the unittest runner shares one
+process across files; if it does, the counter must reset per query or per read.
+
+## 7. Equivalence testing — compare per sample, not sums
+
+**An `out_offset` bug moves a shard's carriers onto other samples' slots and leaves
+`sum(het)` / `sum(hom_alt)` unchanged.** The existing single-file test checks only
+sums — sufficient there, not here. Every fixture must materialize dense and sparse
+into two tables and assert an empty symmetric `EXCEPT` on `(IID, het, hom_alt,
+missing)` (both directions).
+
+Fixtures (the `mx_sb` perf shards are all-rare; generate in-test via `COPY …
+shard_samples` into `{TEST_DIR}`, as `write_psam_parquet_companion.test` does — no
+committed binaries; confirm the writer emits difflist-encoded shards):
+
+- **F1** all-rare multi-shard: per-sample `EXCEPT` empty, sparse vs dense.
+- **F2** mixed per-shard, with a fixture-guard query (so a regenerated fixture cannot
+  quietly stop testing these branches): one variant with `> out_ct/8` carriers in one
+  shard (returns a dense genovec, `common_geno==UINT32_MAX`), and one variant ~95%
+  hom_alt in that shard (returns an ALT-major difflist, `common_geno==2`). Exercises
+  both fallback branches.
+- **F3** sample subset dropping a whole shard: that shard leaves `members`;
+  per-sample `EXCEPT` empty.
+- **F4** sample subset splitting a shard: shard `pssi` path; per-sample `EXCEPT` empty.
+- **Negative control** (§6): the proof-ran mechanism `> 0` on the concat fixture under
+  sparse, `0` under dense.
+
+## 8. Review Focus (failure modes the tests above pin)
+
+- ALT-major re-decode binds the shard's reader, not lstate's. [§5.3]
+- Combined carrier list sized to `OutputSampleCt()`, not `osc/8`. [§5.2]
+- Per-shard threshold, not combined. [§5.1]
+- The proof-ran mechanism actually flips between concat sparse and dense. [§6]
+- `g==3` (missing) emitted on both the difflist and the dense-fallback paths. [§5.5]
+- Per-sample `EXCEPT`, not sum equality (an offset bug preserves sums). [§7]
+
+## 9. Not changed
+
+- Single-file sparse path untouched (`gstate.smp_max_difflist_len`, ~5460–5528).
+- `orient:='genotype'` per-variant rows — out of scope (§2 follow-up).
+- Writer and catalog layout — read-side build only.
+
+---
+*Anchors (`e484213`): gate `pfile_reader.cpp:3936`; `smp_use_sparse` set `:3937`;
+`smp_max_difflist_len` `:3938`; `accumulate_dense` `:5424`; single-path
+`PgrGetDifflistOrGenovec` `:5486`; carrier switch ~5505–5528. `ConcatPgenReader` in
+`src/pgen_concat_reader.{hpp,cpp}`. #120 shifted line numbers ~220 from earlier reads;
+re-grep before editing.*
