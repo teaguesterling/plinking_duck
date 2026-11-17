@@ -89,3 +89,67 @@ SELECT IID FROM read_parquet('{TEST_DIR}/oob.psam.parquet');
 ----
 n1
 n2
+
+# ===========================================================================
+# Stale-drop (§6a): a rewrite WITHOUT psam_parquet drops a pre-existing companion. The standalone
+# psam writer never produces a consistent companion across a rewrite, so any surviving one is stale
+# and would be read as current (wrong sample identity).
+# ===========================================================================
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/x.psam' (FORMAT psam, samples ['a', 'b', 'c'], psam_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/x.psam.parquet');
+----
+1
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/x.psam' (FORMAT psam, samples ['p', 'q'], force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/x.psam.parquet');
+----
+0
+
+# Override variant: the drop keys on target_path (= the `psam` override), not the COPY target.
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/ig2.psam' (FORMAT psam, psam '{TEST_DIR}/ovr2.psam', samples ['a'], psam_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/ovr2.psam.parquet');
+----
+1
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/ig2.psam' (FORMAT psam, psam '{TEST_DIR}/ovr2.psam', samples ['z'], force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/ovr2.psam.parquet');
+----
+0
+
+# ===========================================================================
+# Error-path invariant (§6a): an OUT_OF_BAND rewrite whose feeding query throws mid-stream skips
+# Finalize, but the stale companion is dropped at InitGlobal — before the new text .psam is written —
+# so no stale companion survives. The throw is column-dependent (1 // (i-2) hits 0 at i=2) so it is a
+# RUNTIME error after InitGlobal, not a constant-folded bind error before it. A Finalize-only drop
+# fails this case.
+# ===========================================================================
+
+statement ok
+COPY (SELECT 1 AS x) TO '{TEST_DIR}/y.psam' (FORMAT psam, samples ['a1', 'a2'], psam_parquet);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/y.psam.parquet');
+----
+1
+
+statement error
+COPY (SELECT 1 // (i - 2) AS boom FROM range(5) t(i)) TO '{TEST_DIR}/y.psam' (FORMAT psam, samples ['b1', 'b2'], force);
+----
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/y.psam.parquet');
+----
+0

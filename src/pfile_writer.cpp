@@ -1525,6 +1525,19 @@ unique_ptr<GlobalFunctionData> PsamCopyInitGlobal(ClientContext &context, Functi
 	auto &fs = FileSystem::GetFileSystem(context);
 	g->path = bind.path_override.empty() ? file_path : bind.path_override;
 
+	// Stale-companion drop (§6a): the standalone psam writer never produces a consistent companion
+	// across a rewrite, so drop any pre-existing '<psam>.parquet' HERE — before the new text .psam is
+	// written — not in Finalize. An upstream-query error skips Finalize but not InitGlobal, so this
+	// placement is what keeps a failed rewrite from leaving a new .psam beside an old companion. Keyed
+	// on target_path (the real final target, immune to DuckDB's tmp_ overwrite-rename). Unconditional of
+	// psam_parquet: when on, Finalize writes the fresh companion; when off, none is written.
+	if (!bind.target_path.empty()) {
+		const string stale_pq = bind.target_path + ".parquet";
+		if (fs.FileExists(stale_pq)) {
+			fs.RemoveFile(stale_pq);
+		}
+	}
+
 	if (bind.mode == PsamWriteMode::OUT_OF_BAND) {
 		// Identity is fully known at bind — write the whole .psam now; the sink is a
 		// no-op. (A zero-row variant stream still produces the correct .psam.)
