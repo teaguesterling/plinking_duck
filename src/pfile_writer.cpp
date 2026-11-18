@@ -583,9 +583,12 @@ void PvarCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFun
 		if (fs.FileExists(final_pq)) {
 			fs.RemoveFile(final_pq);
 		}
-	} else if (g.path + ".parquet" != final_pq) {
+	} else if (fs.ExpandPath(g.path) != fs.ExpandPath(bind.target_path)) {
 		// DuckDB overwrote via a tmp_ name and renames only the .pvar: put the new companion at its final
-		// name, replacing the old one.
+		// name, replacing the old one. Compare EXPANDED paths: DuckDB runs the COPY target through
+		// fs.ExpandPath before InitGlobal (so g.path is expanded), while target_path is captured raw at
+		// bind. A raw compare would see a fresh write to an ExpandPath-rewritten target (`~`, `file://`)
+		// as "different" and move the companion onto itself, deleting it.
 		if (fs.FileExists(final_pq)) {
 			fs.RemoveFile(final_pq);
 		}
