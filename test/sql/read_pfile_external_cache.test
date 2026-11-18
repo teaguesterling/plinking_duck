@@ -10,6 +10,11 @@ SET plinking_pgen_io = 'vfs';
 statement ok
 SET enable_external_file_cache = true;
 
+# DuckDB caches a local file only with cache_local_files (default false: the OS page cache serves
+# repeated local reads). A remote file is cached without it. Here the local file stands in for one.
+statement ok
+SET cache_local_files = true;
+
 statement ok
 CALL enable_logging('FileSystem', storage = 'memory');
 
