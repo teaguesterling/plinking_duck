@@ -89,10 +89,47 @@ SELECT pgen_block0_reads();
 ----
 1
 
-# --- The shared blocks live for one query only. A file rewritten between two queries is read fresh.
+# --- read_pgen: the same bind open and scan open, through the same store.
 statement ok
 SET threads = 1;
 
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pgen('test/data/wes_chr10.pgen');
+----
+30000
+
+query I
+SELECT pgen_block0_reads();
+----
+1
+
+# --- The shared blocks live for one query only. The same query run twice fetches the header
+# --- block again the second time: a store that outlived the first query would serve it (0 reads).
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+query I
+SELECT pgen_block0_reads();
+----
+1
+
+# --- A file rewritten between two queries is read fresh.
 statement ok
 COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '1')
 TO '{TEST_DIR}/rw' (FORMAT pfile);

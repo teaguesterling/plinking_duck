@@ -59,6 +59,7 @@ DuckDB extension for reading PLINK 2 genomics file formats in SQL.
 - `pgen_example.bim`: .bim companion for pgen_example (4 variants)
 - `pgen_orphan.*`: .pgen + .pvar only, no .psam (index-only mode)
 - `all_missing.*`: 2 variants × 2 samples, all genotypes missing
+- `pgen_trunc_index.*`: the first 12 bytes (header only) of `pgen_example.pgen`, with its `.pvar`/`.psam`: binds, then errors at the scan's index read (`read_pfile_bind_header_only.test`)
 - `large_example.*`: 3000 variants × 8 samples, 3 chroms × 1000 each (multi-batch/parallel tests)
 - `streaming_example.*`: 50000 variants × 8 samples, 3 chroms (20K/15K/15K), biallelic A/G (streaming/threading tests)
 - `wes_chr10.*`: 30000 variants × 10000 samples, chr10 WES-scale dataset (~11MB .pgen, parallel correctness tests)
