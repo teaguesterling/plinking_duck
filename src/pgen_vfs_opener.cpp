@@ -94,7 +94,15 @@ struct PgenVfsHandle {
 void *PgenVfsOpen(const char *fname, void *user) {
 	auto *u = static_cast<PgenVfsUser *>(user);
 	try {
-		auto handle = u->fs->OpenFile(fname, FileFlags::FILE_FLAGS_READ);
+		// Read through DuckDB's external file cache (enable_external_file_cache), as its CSV and JSON
+		// readers do: a block is fetched once and then served to later queries and to every scan thread,
+		// while the file's ETag / last-modified time is unchanged. ALWAYS_CACHE, not CACHE_REMOTE_ONLY:
+		// for a local file (plinking_pgen_io = 'vfs') it leaves the choice to DuckDB's own
+		// cache_local_files setting (default false), where CACHE_REMOTE_ONLY would never cache it.
+		// read_pfile_external_cache.test sets it, so a local file stands in for a remote one.
+		FileOpenFlags flags(FileFlags::FILE_FLAGS_READ);
+		flags.SetCachingMode(CachingMode::ALWAYS_CACHE);
+		auto handle = u->fs->OpenFile(fname, flags);
 		if (!handle) {
 			return nullptr;
 		}
