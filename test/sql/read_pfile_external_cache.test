@@ -1,0 +1,105 @@
+# name: test/sql/read_pfile_external_cache.test
+# description: A .pgen opened through the VFS (remote, or plinking_pgen_io='vfs') reads through DuckDB's external file cache (enable_external_file_cache), as DuckDB's own CSV and JSON readers do. A block fetched once is then not fetched again by a later query, or by another scan thread, while the file is unchanged. Over HTTP each fetch is a GET, so without the cache every query re-fetched the header and index, and every scan thread re-fetched the index. The signal is DuckDB's FileSystem log: a cached read never reaches the underlying file system.
+# group: [sql]
+
+require plinking_duck
+
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+statement ok
+SET enable_external_file_cache = true;
+
+statement ok
+CALL enable_logging('FileSystem', storage = 'memory');
+
+# READs of any .pgen since the last truncate_duckdb_logs().
+statement ok
+CREATE MACRO pgen_reads() AS (
+    SELECT count(*)
+    FROM duckdb_logs
+    WHERE message LIKE '%.pgen"%' AND message LIKE '%"op":"READ"%');
+
+# READs that repeat an earlier READ of the same .pgen at the same pos.
+statement ok
+CREATE MACRO pgen_dup_reads() AS (
+    SELECT count(*) - count(DISTINCT (regexp_extract(message, '"path":"([^"]+)"', 1),
+                                      regexp_extract(message, '"pos":"([0-9]+)"', 1)))
+    FROM duckdb_logs
+    WHERE message LIKE '%.pgen"%' AND message LIKE '%"op":"READ"%');
+
+# --- A later query takes the blocks an earlier query fetched.
+statement ok
+SET threads = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+# Control: the first query reads the file. If this fails, the zero below proves nothing.
+query I
+SELECT pgen_reads() > 0;
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+query I
+SELECT pgen_reads();
+----
+0
+
+# --- Four scan threads read each block of the file once between them.
+statement ok
+SET threads = 4;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT pgen_reads() > 0;
+----
+true
+
+query I
+SELECT pgen_dup_reads();
+----
+0
+
+# --- A file rewritten between two queries is read fresh, not from the cache.
+statement ok
+SET threads = 1;
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '1')
+TO '{TEST_DIR}/rw' (FORMAT pfile);
+
+query II
+SELECT count(*), sum(list_sum(genotypes::INT[])) IS NOT NULL FROM read_pfile('{TEST_DIR}/rw');
+----
+1000	true
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '2')
+TO '{TEST_DIR}/rw' (FORMAT pfile, force true);
+
+query I
+SELECT sum(list_sum(genotypes::INT[])) = (SELECT sum(list_sum(genotypes::INT[])) FROM read_pfile('test/data/large_example', region := '2'))
+FROM read_pfile('{TEST_DIR}/rw');
+----
+true
