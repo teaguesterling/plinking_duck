@@ -223,7 +223,7 @@ static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunc
 	// --- Initialize pgenlib (Phase 1) to get counts ---
 	LocalizePgenIfRequested(context, bind_data->pgen_path, bind_data->localize_guard);
 	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
-	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
+	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs, PgenVfsRole::HEADER); // bind: the scan reuses its blocks
 
 	plink2::PgenFileInfo pgfi;
 	plink2::PreinitPgfi(&pgfi);

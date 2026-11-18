@@ -6,9 +6,15 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb_compat.hpp" // CompatRegisteredState
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <mutex>
+#include <string>
 
 #ifndef _WIN32
 #include <unistd.h> // getpid
@@ -19,13 +25,70 @@
 
 namespace duckdb {
 
-// --- The C-ABI opener callbacks: a void* handle is a FileHandle* ---------------
+// --- Per-query store of the blocks that header opens read (issue #121) -----------
+// Each VFS open has its own cookie block cache, so the scan's open re-fetched every block that
+// the bind (or InitGlobal) header open had read: over HTTP, a second GET of the same bytes, per
+// file, per query, and once more per scan thread. A HEADER open adds each block it reads here;
+// every open of the same path takes a stored block from memory. The store lives for one query
+// (cleared at QueryEnd), so a file rewritten between two queries is read fresh.
+class PgenHeaderBlockStore : public ClientContextState {
+public:
+	static constexpr const char *KEY = "plinking_duck_pgen_header_blocks";
+	//! A bound on the store's memory, per query. A header open past it adds nothing; the scan then
+	//! fetches those blocks itself, as before.
+	static constexpr idx_t CAP_BYTES = 64ULL << 20; // 64 MiB
+
+	bool TryGet(const string &key, void *buf, int64_t n) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto it = blocks.find(key);
+		if (it == blocks.end()) {
+			return false;
+		}
+		std::memcpy(buf, it->second.data(), static_cast<size_t>(n));
+		return true;
+	}
+
+	void Put(const string &key, const void *buf, int64_t n) {
+		std::lock_guard<std::mutex> guard(lock);
+		if (bytes + static_cast<idx_t>(n) > CAP_BYTES || blocks.count(key)) {
+			return;
+		}
+		auto *p = static_cast<const char *>(buf);
+		blocks.emplace(key, string(p, p + n));
+		bytes += static_cast<idx_t>(n);
+	}
+
+	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
+		std::lock_guard<std::mutex> guard(lock);
+		blocks.clear();
+		bytes = 0;
+	}
+
+private:
+	std::mutex lock;
+	//! Key: path, NUL, offset, NUL, length (the length differs only at the end of the file).
+	unordered_map<string, string> blocks;
+	idx_t bytes = 0;
+};
+
+// --- The C-ABI opener callbacks: a void* handle is a PgenVfsHandle* ----------------
 // user payload = the FileSystem to open through (the context's OpenerFileSystem,
 // which injects the ClientContext opener -> httpfs secrets/settings automatically).
 namespace {
 
 struct PgenVfsUser {
 	FileSystem *fs;
+	shared_ptr<PgenHeaderBlockStore> store;
+	bool header; // PgenVfsRole::HEADER: add the blocks this open reads to the store
+};
+
+//! One open file. It holds its own reference to the store, because a scan reader's FILE* outlives
+//! the PgenVfsScope that opened it.
+struct PgenVfsHandle {
+	unique_ptr<FileHandle> fh;
+	string path;
+	shared_ptr<PgenHeaderBlockStore> store;
+	bool header;
 };
 
 void *PgenVfsOpen(const char *fname, void *user) {
@@ -35,17 +98,36 @@ void *PgenVfsOpen(const char *fname, void *user) {
 		if (!handle) {
 			return nullptr;
 		}
-		return handle.release(); // ownership passes to the cookie (freed in close)
+		auto *h = new PgenVfsHandle();
+		h->fh = std::move(handle);
+		h->path = fname;
+		h->store = u->store;
+		h->header = u->header;
+		return h; // ownership passes to the cookie (freed in close)
 	} catch (...) {
 		return nullptr; // decline -> shim falls back to fopen (fails clearly on a URL)
 	}
 }
 
 int64_t PgenVfsPread(void *handle, void *buf, int64_t n, uint64_t offset) {
-	auto *fh = static_cast<FileHandle *>(handle);
+	auto *h = static_cast<PgenVfsHandle *>(handle);
 	try {
+		string key;
+		if (h->store) {
+			key = h->path;
+			key += '\0';
+			key += std::to_string(offset);
+			key += '\0';
+			key += std::to_string(n);
+			if (h->store->TryGet(key, buf, n)) {
+				return n;
+			}
+		}
 		// The shim clamps n to the file size, so this exact positioned read fits.
-		fh->Read(buf, static_cast<idx_t>(n), static_cast<idx_t>(offset));
+		h->fh->Read(buf, static_cast<idx_t>(n), static_cast<idx_t>(offset));
+		if (h->store && h->header) {
+			h->store->Put(key, buf, n); // only a read that completed: Read throws on a short read
+		}
 		return n;
 	} catch (...) {
 		return -1;
@@ -53,16 +135,16 @@ int64_t PgenVfsPread(void *handle, void *buf, int64_t n, uint64_t offset) {
 }
 
 int64_t PgenVfsSize(void *handle) {
-	auto *fh = static_cast<FileHandle *>(handle);
+	auto *h = static_cast<PgenVfsHandle *>(handle);
 	try {
-		return static_cast<int64_t>(fh->GetFileSize());
+		return static_cast<int64_t>(h->fh->GetFileSize());
 	} catch (...) {
 		return -1;
 	}
 }
 
 void PgenVfsClose(void *handle) {
-	delete static_cast<FileHandle *>(handle);
+	delete static_cast<PgenVfsHandle *>(handle);
 }
 
 } // namespace
@@ -72,12 +154,14 @@ struct PgenVfsScope::State {
 	PlinkingPgenVfsOpener opener;
 };
 
-PgenVfsScope::PgenVfsScope(ClientContext &context, bool use_vfs) : active_(use_vfs) {
+PgenVfsScope::PgenVfsScope(ClientContext &context, bool use_vfs, PgenVfsRole role) : active_(use_vfs) {
 	if (!active_) {
 		return;
 	}
 	state_ = make_uniq<State>();
 	state_->user.fs = &FileSystem::GetFileSystem(context);
+	state_->user.store = CompatRegisteredState(context).GetOrCreate<PgenHeaderBlockStore>(PgenHeaderBlockStore::KEY);
+	state_->user.header = role == PgenVfsRole::HEADER;
 	state_->opener.user = &state_->user;
 	state_->opener.open = PgenVfsOpen;
 	state_->opener.pread = PgenVfsPread;

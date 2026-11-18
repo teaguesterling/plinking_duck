@@ -1,0 +1,149 @@
+# name: test/sql/read_pfile_header_reuse.test
+# description: Over the VFS (remote, or plinking_pgen_io='vfs'), one query reads each .pgen block at most once across its header opens and its scan opens. Bind (or, for a catalog cell, InitGlobal) opens each .pgen for its counts, and the scan opens it again; each open has its own block cache, so the scan once re-fetched every block the header open had read (issue #121). Over HTTP that is a second GET of the same bytes per file per query. The signal is DuckDB's FileSystem log: a READ of the same .pgen at the same pos, twice in one query.
+# group: [sql]
+
+require plinking_duck
+
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+statement ok
+CALL enable_logging('FileSystem', storage = 'memory');
+
+# READs since the last truncate_duckdb_logs() that repeat an earlier READ of the same .pgen at the same pos.
+statement ok
+CREATE MACRO pgen_dup_reads() AS (
+    SELECT count(*) - count(DISTINCT (regexp_extract(message, '"path":"([^"]+)"', 1),
+                                      regexp_extract(message, '"pos":"([0-9]+)"', 1)))
+    FROM duckdb_logs
+    WHERE message LIKE '%.pgen"%' AND message LIKE '%"op":"READ"%');
+
+# READs at pos 0 of any .pgen since the last truncate.
+statement ok
+CREATE MACRO pgen_block0_reads() AS (
+    SELECT count(*)
+    FROM duckdb_logs
+    WHERE message LIKE '%.pgen"%' AND message LIKE '%"op":"READ"%' AND message LIKE '%"pos":"0"%');
+
+# --- One file, one thread: the bind header open and the scan open share the header block.
+statement ok
+SET threads = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+# Control: the signal sees the reads at all. If this fails, the zero below proves nothing.
+query I
+SELECT pgen_block0_reads() >= 1;
+----
+true
+
+query I
+SELECT pgen_dup_reads();
+----
+0
+
+# --- A catalog matrix: the deferred header check (InitGlobal) and the scan open share each cell's header block.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE CHROM = '2';
+----
+1000
+
+# The two cells of CHROM=2 are each read.
+query I
+SELECT pgen_block0_reads();
+----
+2
+
+query I
+SELECT pgen_dup_reads();
+----
+0
+
+# --- Four threads: each scan thread opens the file, and all of them take the header block from the one read.
+statement ok
+SET threads = 4;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT pgen_block0_reads();
+----
+1
+
+# --- read_pgen: the same bind open and scan open, through the same store.
+statement ok
+SET threads = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pgen('test/data/wes_chr10.pgen');
+----
+30000
+
+query I
+SELECT pgen_block0_reads();
+----
+1
+
+# --- The shared blocks live for one query only. The same query run twice fetches the header
+# --- block again the second time: a store that outlived the first query would serve it (0 reads).
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10', region := '10:100000000-100500000');
+----
+183
+
+query I
+SELECT pgen_block0_reads();
+----
+1
+
+# --- A file rewritten between two queries is read fresh.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '1')
+TO '{TEST_DIR}/rw' (FORMAT pfile);
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/rw');
+----
+1000
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM IN ('1', '2'))
+TO '{TEST_DIR}/rw' (FORMAT pfile, force true);
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/rw');
+----
+2000

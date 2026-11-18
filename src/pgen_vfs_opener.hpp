@@ -72,12 +72,19 @@ string LocalizeDir(ClientContext &context);
 //! when the settings may have changed.
 void LocalizePgen(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard, const string &dir);
 
+//! What a VFS open is for. A HEADER open (bind, or a catalog cell's InitGlobal header check)
+//! reads a file for its counts and closes it. The blocks it reads are kept for the rest of the
+//! query, and every later open of the same path, on any thread, takes them from memory instead
+//! of fetching them again (issue #121). A SCAN open reads from that store but never adds to it,
+//! so a scan's record blocks never fill it.
+enum class PgenVfsRole { SCAN, HEADER };
+
 //! RAII: while in scope AND use_vfs, pgen opens on THIS thread are served from the
 //! VFS. A no-op (native fopen) when use_vfs is false. Register/clear is per-thread,
 //! so construct one around each pgenlib open region (bind, per-thread reader init).
 class PgenVfsScope {
 public:
-	PgenVfsScope(ClientContext &context, bool use_vfs);
+	PgenVfsScope(ClientContext &context, bool use_vfs, PgenVfsRole role = PgenVfsRole::SCAN);
 	~PgenVfsScope();
 	PgenVfsScope(const PgenVfsScope &) = delete;
 	PgenVfsScope &operator=(const PgenVfsScope &) = delete;

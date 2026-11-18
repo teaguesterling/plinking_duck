@@ -287,6 +287,8 @@ static unique_ptr<FunctionData> PlinkPcaBind(ClientContext &context, TableFuncti
 	// --- Initialize pgenlib (temporary, for header + allele freq counting) ---
 	LocalizePgenIfRequested(context, bind_data->pgen_path, bind_data->localize_guard);
 	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
+	// Not a HEADER open: this bind reads every variant record (allele frequencies), which would fill
+	// the header block store (pgen_vfs_opener.cpp) with record blocks.
 	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
 
 	plink2::PgenFileInfo pgfi;

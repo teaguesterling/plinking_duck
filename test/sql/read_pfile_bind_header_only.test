@@ -1,0 +1,23 @@
+# name: test/sql/read_pfile_bind_header_only.test
+# description: read_pfile's bind reads only the .pgen header (PgfiInitPhase1), not the variant-record index (PgfiInitPhase2). The index grows with the variant count, and the scan's own open reads and checks it, so reading it at bind too fetched it twice over the VFS (issue #121). A damaged index therefore errors when the scan opens the file, and the error names the file. Fixture: pgen_trunc_index.pgen, the first 12 bytes (the header) of pgen_example.pgen.
+# group: [sql]
+
+require plinking_duck
+
+# The header holds 4 variants x 4 samples, so bind succeeds and the schema is complete.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pfile('test/data/pgen_trunc_index'));
+----
+6
+
+# The scan's open reads the index, finds it missing, and names the file.
+statement error
+SELECT count(genotypes) FROM read_pfile('test/data/pgen_trunc_index');
+----
+pgen_trunc_index.pgen
+
+# A read with no genotype column never opens the .pgen for the index.
+query I
+SELECT count(*) FROM read_pfile('test/data/pgen_trunc_index');
+----
+4
