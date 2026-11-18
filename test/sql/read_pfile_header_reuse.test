@@ -7,6 +7,11 @@ require plinking_duck
 statement ok
 SET plinking_pgen_io = 'vfs';
 
+# This file tests the per-query header block store alone. DuckDB's external file cache, which VFS
+# opens also use, would hide the store's effect; read_pfile_external_cache.test covers the cache.
+statement ok
+SET enable_external_file_cache = false;
+
 statement ok
 CALL enable_logging('FileSystem', storage = 'memory');
 
