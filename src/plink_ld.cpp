@@ -862,7 +862,7 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	// 2 per worker duplicates large var_fpos/vrtype arrays on whole-genome PGENs.
 	LocalizePgenIfRequested(context, bind_data->pgen_path, bind_data->localize_guard);
 	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
-	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs);
+	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs, PgenVfsRole::HEADER); // bind: the scan reuses its blocks
 
 	char errstr_buf[plink2::kPglErrstrBufBlen];
 	plink2::PgenHeaderCtrl header_ctrl;

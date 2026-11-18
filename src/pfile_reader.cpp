@@ -929,9 +929,13 @@ static void LoadSourceVariants(ClientContext &context, PfileSource &src, const R
 //! Open one .pgen header and return its counts. use_vfs routes the open through the VFS (Path V).
 //! Called at bind, or at InitGlobal for a cell whose header open is deferred; there the caller passes
 //! the route that bind chose (PfileBindData::use_vfs), not the current setting.
+//! It reads the header only (PgfiInitPhase1), not the variant-record index (PgfiInitPhase2): the
+//! index grows with the variant count, and the scan's own open reads and checks it, so a damaged
+//! index errors when the scan opens the file, not here. Over the VFS this is a HEADER open: the
+//! scan's open takes the header block from memory, not from a second fetch (issue #121).
 static void ReadPgenHeaderCounts(ClientContext &context, const string &pgen_path, bool use_vfs,
                                  uint32_t &variant_ct_out, uint32_t &sample_ct_out) {
-	PgenVfsScope pgen_vfs_scope(context, use_vfs);
+	PgenVfsScope pgen_vfs_scope(context, use_vfs, PgenVfsRole::HEADER);
 	plink2::PgenFileInfo pgfi;
 	plink2::PreinitPgfi(&pgfi);
 	char errstr_buf[plink2::kPglErrstrBufBlen];
@@ -948,21 +952,8 @@ static void ReadPgenHeaderCounts(ClientContext &context, const string &pgen_path
 
 	variant_ct_out = pgfi.raw_variant_ct;
 	sample_ct_out = pgfi.raw_sample_ct;
-
-	AlignedBuffer pgfi_alloc;
-	if (pgfi_alloc_cacheline_ct > 0) {
-		pgfi_alloc.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-	}
-
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct, &max_vrec_width, &pgfi,
-	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
 	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
 	plink2::CleanupPgfi(&pgfi, &cleanup_err);
-	if (err != plink2::kPglRetSuccess) {
-		throw IOException("read_pfile: failed to initialize '%s' (phase 2): %s", pgen_path, errstr_buf);
-	}
 }
 
 static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const string &prefix,
@@ -6043,7 +6034,7 @@ static uint32_t PfilePartitionsVariantCount(ClientContext &context, FileSystem &
 
 	// Route the header open through the VFS for a remote/VFS path (Path V), matching
 	// LoadPfileSource. No localize: the header read is a tiny range read.
-	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, pgen_path));
+	PgenVfsScope pgen_vfs_scope(context, PgenIoUseVfs(context, pgen_path), PgenVfsRole::HEADER);
 	plink2::PgenFileInfo pgfi;
 	plink2::PreinitPgfi(&pgfi);
 	char errstr_buf[plink2::kPglErrstrBufBlen];
