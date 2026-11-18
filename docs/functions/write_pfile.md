@@ -66,6 +66,7 @@ target is stripped to the prefix, so `TO 'out'` and `TO 'out.pfile'` both write
 | `variant_count` | `INTEGER` | `16777216` (2²⁴) | Upper bound on the variant count (a pgenlib memory knob; see [below](#the-variant_count-bound)). |
 | `pvar` / `pgen` / `psam` | `VARCHAR` | `prefix.{pvar,pgen,psam}` | Per-file path overrides (symmetric with the reader's path overrides). |
 | `pvar_parquet` | flag | off | Also write a region-prunable parquet `.pvar` companion. See [Parquet `.pvar` companion](#parquet-pvar-companion-pvar_parquet). |
+| `psam_parquet` | flag | off | Also write a parquet `.psam` companion (a single `IID` column). See [Parquet `.psam` companion](#parquet-psam-companion-psam_parquet). |
 | `shard_by` | `VARCHAR` | *(none)* | Shard along the **variant** axis by a key column. See [Sharded output](#sharded-output-shard_by). |
 | `shard_samples` | `STRUCT` | *(none)* | Shard along the **sample** axis into named IID groups. See [Sample-sharded output](#sample-sharded-output-shard_samples). |
 | `force` | `BOOLEAN` | `false` | Replace existing output. Without it, a `COPY` onto an existing target is an error. See [Existing output](#existing-output-force). |
@@ -119,6 +120,21 @@ with its own `__vidx` range. Bounds are checked on read: a `__vidx` outside
 
 A rewrite with `force` and without `pvar_parquet` removes a stale companion,
 because its `__vidx` would no longer match the new `.pgen`.
+The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#reading-parquet-companions).
+
+### Parquet `.psam` companion (`psam_parquet`)
+
+`COPY … TO 'out' (FORMAT pfile, psam_parquet)` also writes `<psam>.parquet`
+(for example `out.psam.parquet`) beside the text `.psam`. It has a single `IID`
+column (`VARCHAR`) — the same IIDs, in the same order, as the text `.psam`, which
+is still written and stays the source of truth.
+
+The reader takes the sample list from the parquet companion natively — under
+`plinking_use_parquet_companions`, or from a catalog that declares the
+`.psam.parquet` path — so the text `.psam` need not be re-parsed. A sharded or
+matrix write emits one `.psam.parquet` per sample axis, and the catalog declares
+each. As with `pvar_parquet`, a rewrite with `force` and without `psam_parquet`
+removes a stale companion.
 The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#reading-parquet-companions).
 
 ### Local-only
@@ -393,7 +409,7 @@ query `c.genotypes_by_sample` (one row per sample, with every variant).
 
 ```sql
 COPY (SELECT … ORDER BY CHROM, POS) TO 'out.pvar' (FORMAT pvar
-  [, variant_fields {…}] [, pvar 'override.pvar']);
+  [, variant_fields {…}] [, pvar 'override.pvar'] [, pvar_parquet]);
 ```
 
 Writes a tab-delimited text `.pvar` re-readable by [`read_pvar`](read_pvar.md).
@@ -402,7 +418,10 @@ Output headers are always canonical (`#CHROM POS ID REF ALT`) even when
 are written as `.` (and read back as `NULL`). A cell containing a tab, newline, or
 carriage return is **rejected** (it cannot be represented in a tab-delimited
 `.pvar` without corrupting the layout). The same `(CHROM, POS)` monotonicity check
-as the bundle applies.
+as the bundle applies. With `pvar_parquet`, it also writes the `.pvar.parquet`
+companion described [above](#parquet-pvar-companion-pvar_parquet) — standalone, so
+with no shared catalog to declare it; a reader finds it through
+`plinking_use_parquet_companions`.
 
 ### `FORMAT pgen`
 
@@ -434,7 +453,7 @@ default is safe to exceed — it is a memory knob, not a hard cap. A value above
 
 ```sql
 COPY (query) TO 'out.psam' (FORMAT psam
-  [, samples ['id1', …]] [, sample_fields {iid: '<col>'}] [, psam 'override.psam']);
+  [, samples ['id1', …]] [, sample_fields {iid: '<col>'}] [, psam 'override.psam'] [, psam_parquet]);
 ```
 
 Writes a minimal `#IID`-only `.psam` re-readable by [`read_psam`](read_psam.md).
@@ -449,6 +468,8 @@ The IID source is resolved in **priority order**:
 
 Duplicate IIDs are rejected (`read_psam` cannot read a dup-IID file). As with the
 bundle, `sample_fields` roles beyond `iid` raise a *"not yet supported"* error.
+With `psam_parquet`, it also writes the `.psam.parquet` companion described
+[above](#parquet-psam-companion-psam_parquet).
 
 ## Examples
 
@@ -510,8 +531,10 @@ The writer is deliberately scoped. These are honest cuts, not oversights:
   reconstructed, so a round-trip is **value-equal, not byte-equal**.
 - **Position-sorted, chromosome-contiguous input is required** (the monotonicity
   check), and the whole fileset is **local-only**.
-- **Parquet companions, `.pgi` split index, and PLINK-VCF export are deferred**
-  (Phases D–E).
+- **The `.pgi` split index and PLINK-VCF export are deferred** (Phases D–E).
+  (Parquet `.pvar`/`.psam` companions have shipped — see
+  [`pvar_parquet`](#parquet-pvar-companion-pvar_parquet) and
+  [`psam_parquet`](#parquet-psam-companion-psam_parquet).)
 
 ## See Also
 
