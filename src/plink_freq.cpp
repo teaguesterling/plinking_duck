@@ -4,6 +4,7 @@
 #include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
+#include "catalog_cohort.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -69,6 +70,13 @@ struct PlinkFreqBindData : public TableFunctionData {
 
 	// Dynamic column index for IMP_R2 (depends on whether counts is enabled)
 	idx_t imp_r2_col_idx = 0;
+
+	// A catalog read (cohort set): the scan reads the cohort's segments through a ConcatPgenReader
+	// per variant block. raw_sample_ct is then the cohort's sample count, and the subset is held as
+	// sorted cohort-wide indices (ConcatPgenReader splits it per sample block).
+	unique_ptr<CatalogCohort> cohort;
+	bool cohort_has_subset = false;
+	vector<uint32_t> cohort_subset_sorted;
 };
 
 // ---------------------------------------------------------------------------
@@ -108,6 +116,10 @@ struct PlinkFreqLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
+	// Catalog read: the reader of the variant block last read.
+	CatalogCohortReader cohort_reader;
+	bool cohort_ready = false;
+
 	~PlinkFreqLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
@@ -121,10 +133,40 @@ struct PlinkFreqLocalState : public LocalTableFunctionState {
 // Bind
 // ---------------------------------------------------------------------------
 
+static void SetFreqColumns(PlinkFreqBindData &bind_data, vector<LogicalType> &return_types, vector<CompatName> &names);
+
+//! Bind over a pfile catalog: every variant block in catalog order, counted over every sample block.
+//! samples, region, selection, counts and build work as over one fileset. dosage := true does not:
+//! ConcatPgenReader has no dosage count (pvar and psam are rejected by ResolveAnalysisCatalog).
+static void BindFreqCatalog(ClientContext &context, TableFunctionBindInput &input, PlinkFreqBindData &bind_data,
+                            const string &catalog_path) {
+	if (bind_data.include_dosage) {
+		throw InvalidInputException("plink_freq: dosage := true is not supported with a catalog (%s)", catalog_path);
+	}
+	bind_data.cohort = LoadCatalogCohort(context, catalog_path, "plink_freq");
+	auto &cohort = *bind_data.cohort;
+	Selection selection = ParseSelection(input.named_parameters);
+	ResolvedSelection resolved = ResolveCohortSelection(selection, cohort, "plink_freq");
+	bind_data.raw_sample_ct = cohort.sample_ct;
+	bind_data.raw_variant_ct = cohort.variant_ct;
+	bind_data.effective_sample_ct = resolved.effective_sample_ct;
+	bind_data.cohort_has_subset = resolved.has_subset;
+	bind_data.cohort_subset_sorted = resolved.subset_sorted;
+	bind_data.has_sample_info = true;
+	if (!cohort.samples.sexes.empty()) {
+		bind_data.aligned_sex =
+		    BuildAlignedSex(cohort.samples, resolved.has_subset ? &resolved.subset_sorted : nullptr);
+		bind_data.have_sex = !bind_data.aligned_sex.empty();
+	}
+}
+
 static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkFreqBindData>();
-	bind_data->pgen_path = input.inputs[0].GetValue<string>();
+	const string catalog_path = ResolveAnalysisCatalog(context, input, {"pvar", "psam"}, "plink_freq");
+	if (catalog_path.empty()) {
+		bind_data->pgen_path = input.inputs[0].GetValue<string>();
+	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
 
@@ -146,6 +188,12 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 		}
 	}
 	bind_data->par_bounds = ResolveParBounds(build_str, "plink_freq");
+
+	if (!catalog_path.empty()) {
+		BindFreqCatalog(context, input, *bind_data, catalog_path);
+		SetFreqColumns(*bind_data, return_types, names);
+		return std::move(bind_data);
+	}
 
 	// --- Auto-discover companion files ---
 	if (bind_data->pvar_path.empty()) {
@@ -258,7 +306,13 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 		bind_data->have_sex = !bind_data->aligned_sex.empty();
 	}
 
-	// --- Register output columns ---
+	SetFreqColumns(*bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
+static void SetFreqColumns(PlinkFreqBindData &bind_data_ref, vector<LogicalType> &return_types,
+                           vector<CompatName> &names) {
+	auto *bind_data = &bind_data_ref;
 	names = {"CHROM", "POS", "ID", "REF", "ALT", "ALT_FREQ", "OBS_CT"};
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::INTEGER};
@@ -274,8 +328,6 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 		names.push_back("IMP_R2");
 		return_types.push_back(LogicalType::DOUBLE);
 	}
-
-	return std::move(bind_data);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +338,11 @@ static unique_ptr<GlobalTableFunctionState> PlinkFreqInitGlobal(ClientContext &c
 	auto &bind_data = input.bind_data->Cast<PlinkFreqBindData>();
 	auto state = make_uniq<PlinkFreqGlobalState>();
 
-	if (bind_data.variant_range.has_filter) {
+	if (bind_data.cohort) {
+		// A catalog read scans positions over the cohort's segments.
+		state->start_variant_idx = 0;
+		state->end_variant_idx = bind_data.cohort->scan_ct;
+	} else if (bind_data.variant_range.has_filter) {
 		state->start_variant_idx = bind_data.variant_range.start_idx;
 		state->end_variant_idx = bind_data.variant_range.end_idx;
 	} else {
@@ -300,7 +356,11 @@ static unique_ptr<GlobalTableFunctionState> PlinkFreqInitGlobal(ClientContext &c
 
 	// Warn once per query, here rather than in the scan, because the scan runs on
 	// several threads and only this point knows the final selected range.
-	WarnOnMultiallelicCollapse(bind_data.variants, state->start_variant_idx, state->end_variant_idx, "plink_freq");
+	if (bind_data.cohort) {
+		WarnOnMultiallelicCount(bind_data.cohort->CountMultiallelic(), "plink_freq");
+	} else {
+		WarnOnMultiallelicCollapse(bind_data.variants, state->start_variant_idx, state->end_variant_idx, "plink_freq");
+	}
 
 	// Check if any frequency/count/dosage columns are projected
 	state->need_frequencies = false;
@@ -332,6 +392,17 @@ static unique_ptr<LocalTableFunctionState> PlinkFreqInitLocal(ExecutionContext &
 	auto state = make_uniq<PlinkFreqLocalState>();
 
 	if (!gstate.need_frequencies) {
+		return std::move(state);
+	}
+
+	if (bind_data.cohort) {
+		// The scan opens one ConcatPgenReader per variant block (CatalogCohortReader). Only the
+		// decode buffers for the sex-aware path are needed here, sized to the selected samples.
+		uintptr_t genovec_word_ct = plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
+		state->genovec_buf.Allocate(genovec_word_ct * sizeof(uintptr_t));
+		std::memset(state->genovec_buf.ptr, 0, genovec_word_ct * sizeof(uintptr_t));
+		state->geno_bytes.resize(bind_data.effective_sample_ct);
+		state->cohort_ready = true;
 		return std::move(state);
 	}
 
@@ -436,14 +507,29 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 		}
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
-		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
+		for (uint32_t pos = batch_start; pos < batch_end; pos++) {
+			// One fileset: the scan position is the file's variant index. A catalog: the position
+			// maps to a variant block and a block-local index, read through that block's reader.
+			const VariantMetadataIndex *variants_ptr = &bind_data.variants;
+			uint32_t vidx = pos;
+			ConcatPgenReader *cat = nullptr;
+			if (bind_data.cohort) {
+				auto &seg = bind_data.cohort->SegmentAt(pos);
+				variants_ptr = &bind_data.cohort->blocks[seg.block].variants;
+				vidx = seg.start + (pos - seg.scan_start);
+				if (lstate.cohort_ready) {
+					cat = &lstate.cohort_reader.Open(context, *bind_data.cohort, seg.block, bind_data.cohort_has_subset,
+					                                 bind_data.cohort_subset_sorted);
+				}
+			}
+			const VariantMetadataIndex &variants = *variants_ptr;
+
 			// Classify ploidy from the chromosome (and X position vs PAR). Autosomes
 			// and the PAR keep the fast diploid PgrGetCounts path (no behavior change);
 			// chrX non-PAR / chrY / chrMT take the ploidy/sex-aware hardcall path.
 			ChromPloidy ploidy = ChromPloidy::AUTOSOMAL;
 			if (gstate.need_frequencies) {
-				ploidy = ClassifyChromPloidy(bind_data.variants.GetChrom(vidx), bind_data.variants.GetPos(vidx),
-				                             bind_data.par_bounds);
+				ploidy = ClassifyChromPloidy(variants.GetChrom(vidx), variants.GetPos(vidx), bind_data.par_bounds);
 			}
 			bool sex_aware = (ploidy != ChromPloidy::AUTOSOMAL);
 
@@ -454,10 +540,11 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 			double imp_r2 = 0.0;
 			SexAwareCounts sac;
 
-			if (gstate.need_frequencies && lstate.initialized) {
+			if (gstate.need_frequencies && (lstate.initialized || cat)) {
 				if (sex_aware) {
-					plink2::PglErr err = plink2::PgrGet(sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
-					                                    lstate.genovec_buf.As<uintptr_t>());
+					plink2::PglErr err = cat ? cat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
+					                         : plink2::PgrGet(sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
+					                                          lstate.genovec_buf.As<uintptr_t>());
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("plink_freq: PgrGet failed for variant %u", vidx);
 					}
@@ -475,8 +562,9 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 						throw IOException("plink_freq: PgrGetDCounts failed for variant %u", vidx);
 					}
 				} else {
-					plink2::PglErr err = plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi, sample_ct,
-					                                          vidx, &lstate.pgr, genocounts);
+					plink2::PglErr err = cat ? cat->GetCounts(vidx, genocounts)
+					                         : plink2::PgrGetCounts(sample_include, interleaved_vec, lstate.pssi,
+					                                                sample_ct, vidx, &lstate.pgr, genocounts);
 					if (err != plink2::kPglRetSuccess) {
 						throw IOException("plink_freq: PgrGetCounts failed for variant %u", vidx);
 					}
@@ -570,16 +658,16 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 
 				switch (file_col) {
 				case COL_CHROM: {
-					auto val = bind_data.variants.GetChrom(vidx);
+					auto val = variants.GetChrom(vidx);
 					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_POS: {
-					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = variants.GetPos(vidx);
 					break;
 				}
 				case COL_ID: {
-					auto val = bind_data.variants.GetId(vidx);
+					auto val = variants.GetId(vidx);
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -588,12 +676,12 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 					break;
 				}
 				case COL_REF: {
-					auto val = bind_data.variants.GetRef(vidx);
+					auto val = variants.GetRef(vidx);
 					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case COL_ALT: {
-					auto val = bind_data.variants.GetAlt(vidx);
+					auto val = variants.GetAlt(vidx);
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -662,23 +750,29 @@ static void PlinkFreqScan(ClientContext &context, TableFunctionInput &data_p, Da
 // ---------------------------------------------------------------------------
 
 void RegisterPlinkFreq(ExtensionLoader &loader) {
-	TableFunction plink_freq("plink_freq", {LogicalType::VARCHAR}, PlinkFreqScan, PlinkFreqBind, PlinkFreqInitGlobal,
-	                         PlinkFreqInitLocal);
+	// Two overloads: a .pgen or catalog path, and none (catalog := '<path>' names the inputs).
+	TableFunctionSet set("plink_freq");
+	for (auto &args : vector<vector<LogicalType>> {{LogicalType::VARCHAR}, {}}) {
+		TableFunction plink_freq("plink_freq", args, PlinkFreqScan, PlinkFreqBind, PlinkFreqInitGlobal,
+		                         PlinkFreqInitLocal);
 
-	plink_freq.projection_pushdown = true;
+		plink_freq.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_freq, {{"pvar", LogicalType::VARCHAR},
-	                                    {"psam", LogicalType::VARCHAR},
-	                                    {"samples", LogicalType::ANY},
-	                                    {"region", LogicalType::VARCHAR},
-	                                    {"selection", LogicalType::ANY},
-	                                    {"counts", LogicalType::BOOLEAN},
-	                                    {"dosage", LogicalType::BOOLEAN},
-	                                    {"build", LogicalType::VARCHAR}});
-	CompatSetCaptureArgumentAliases(plink_freq);
+		DeclareNamedParameters(plink_freq, {{"pvar", LogicalType::VARCHAR},
+		                                    {"psam", LogicalType::VARCHAR},
+		                                    {"samples", LogicalType::ANY},
+		                                    {"region", LogicalType::VARCHAR},
+		                                    {"selection", LogicalType::ANY},
+		                                    {"counts", LogicalType::BOOLEAN},
+		                                    {"dosage", LogicalType::BOOLEAN},
+		                                    {"build", LogicalType::VARCHAR},
+		                                    {"catalog", LogicalType::ANY}});
+		CompatSetCaptureArgumentAliases(plink_freq);
+		set.AddFunction(plink_freq);
+	}
 
-	RegisterTableWithDesc(loader, plink_freq, {}, "Compute allele frequencies and counts from PLINK files.",
-	                      {"SELECT * FROM plink_freq('data/cohort.pgen')"});
+	RegisterTableSetWithDesc(loader, set, {}, "Compute allele frequencies and counts from PLINK files.",
+	                         {"SELECT * FROM plink_freq('data/cohort.pgen')"});
 }
 
 } // namespace duckdb

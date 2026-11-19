@@ -1986,7 +1986,10 @@ uint64_t CountMultiallelicInRange(const VariantMetadataIndex &variants, uint32_t
 
 void WarnOnMultiallelicCollapse(const VariantMetadataIndex &variants, uint32_t start_vidx, uint32_t end_vidx,
                                 const char *func_name) {
-	const auto multiallelic_ct = CountMultiallelicInRange(variants, start_vidx, end_vidx);
+	WarnOnMultiallelicCount(CountMultiallelicInRange(variants, start_vidx, end_vidx), func_name);
+}
+
+void WarnOnMultiallelicCount(uint64_t multiallelic_ct, const char *func_name) {
 	if (multiallelic_ct == 0) {
 		return;
 	}

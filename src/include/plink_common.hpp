@@ -350,6 +350,8 @@ uint64_t CountMultiallelicInRange(const VariantMetadataIndex &variants, uint32_t
 //! silent. Mirrors read_plink_vcf's multiallelic warning.
 void WarnOnMultiallelicCollapse(const VariantMetadataIndex &variants, uint32_t start_vidx, uint32_t end_vidx,
                                 const char *func_name);
+//! The same warning for a count already made (a catalog read counts over several blocks).
+void WarnOnMultiallelicCount(uint64_t multiallelic_ct, const char *func_name);
 
 // ---------------------------------------------------------------------------
 // File utilities

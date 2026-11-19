@@ -4,6 +4,7 @@
 #include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
 #include "plink_common.hpp"
 #include "pgen_vfs_opener.hpp"
+#include "catalog_cohort.hpp"
 
 #include "duckdb/parallel/task_scheduler.hpp"
 
@@ -74,6 +75,24 @@ struct PlinkMissingBindData : public TableFunctionData {
 
 	// Mode
 	bool sample_mode = false;
+
+	// A catalog read (cohort set): the scan reads the cohort's segments through a ConcatPgenReader
+	// per variant block. raw_sample_ct is then the cohort's sample count; sample_info is the
+	// cohort's samples, and subset_original_indices are sorted cohort-wide indices.
+	unique_ptr<CatalogCohort> cohort;
+
+	//! The variant metadata and block-local index of scan position `pos`.
+	const VariantMetadataIndex &VariantsAt(uint32_t pos, uint32_t &vidx, idx_t &block) const {
+		if (!cohort) {
+			vidx = pos;
+			block = 0;
+			return variants;
+		}
+		auto &seg = cohort->SegmentAt(pos);
+		vidx = seg.start + (pos - seg.scan_start);
+		block = seg.block;
+		return cohort->blocks[seg.block].variants;
+	}
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +160,20 @@ struct PlinkMissingLocalState : public LocalTableFunctionState {
 
 	bool initialized = false;
 
+	// Catalog read: the reader of the variant block last read, and a genovec over the selected
+	// samples (ConcatPgenReader has no missingness call; the missingness comes from the genovec).
+	CatalogCohortReader cohort_reader;
+	bool cohort_ready = false;
+
+	//! The ConcatPgenReader for `block`, or nullptr for a one-fileset read.
+	ConcatPgenReader *CohortReader(ClientContext &context, const PlinkMissingBindData &bind_data, idx_t block) {
+		if (!cohort_ready) {
+			return nullptr;
+		}
+		return &cohort_reader.Open(context, *bind_data.cohort, block, bind_data.has_sample_subset,
+		                           bind_data.subset_original_indices);
+	}
+
 	~PlinkMissingLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
@@ -154,10 +187,38 @@ struct PlinkMissingLocalState : public LocalTableFunctionState {
 // Bind
 // ---------------------------------------------------------------------------
 
+static void BuildMissingSex(PlinkMissingBindData &bind_data);
+static void SetMissingColumns(const PlinkMissingBindData &bind_data, vector<LogicalType> &return_types,
+                              vector<CompatName> &names);
+
+//! Bind over a pfile catalog: variant blocks in catalog order, each over every sample block. mode,
+//! samples, region and selection work as over one fileset (pvar and psam are rejected by
+//! ResolveAnalysisCatalog). SEX (for chrY) comes from each sample block's .psam.
+static void BindMissingCatalog(ClientContext &context, TableFunctionBindInput &input, PlinkMissingBindData &bind_data,
+                               const string &catalog_path) {
+	bind_data.cohort = LoadCatalogCohort(context, catalog_path, "plink_missing");
+	auto &cohort = *bind_data.cohort;
+	bind_data.sample_info = cohort.samples;
+	bind_data.has_sample_info = true;
+	bind_data.raw_sample_ct = cohort.sample_ct;
+	bind_data.raw_variant_ct = cohort.variant_ct;
+	Selection selection = ParseSelection(input.named_parameters);
+	ResolvedSelection resolved = ResolveCohortSelection(selection, cohort, "plink_missing");
+	bind_data.effective_sample_ct = resolved.effective_sample_ct;
+	if (resolved.has_subset) {
+		bind_data.subset_original_indices = resolved.subset_sorted;
+		bind_data.has_sample_subset = true; // the subset lives in the ConcatPgenReader; sample_subset stays null
+	}
+	BuildMissingSex(bind_data);
+}
+
 static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind_data = make_uniq<PlinkMissingBindData>();
-	bind_data->pgen_path = input.inputs[0].GetValue<string>();
+	const string catalog_path = ResolveAnalysisCatalog(context, input, {"pvar", "psam"}, "plink_missing");
+	if (catalog_path.empty()) {
+		bind_data->pgen_path = input.inputs[0].GetValue<string>();
+	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
 
@@ -179,6 +240,12 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 		} else if (kv.first == "samples" || kv.first == "region") {
 			// Handled after pgenlib init
 		}
+	}
+
+	if (!catalog_path.empty()) {
+		BindMissingCatalog(context, input, *bind_data, catalog_path);
+		SetMissingColumns(*bind_data, return_types, names);
+		return std::move(bind_data);
 	}
 
 	// --- Auto-discover companion files ---
@@ -285,6 +352,13 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 	}
 	bind_data->variant_range = resolved.variant_range;
 
+	BuildMissingSex(*bind_data);
+	SetMissingColumns(*bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
+static void BuildMissingSex(PlinkMissingBindData &bind_data_ref) {
+	auto *bind_data = &bind_data_ref;
 	// --- Sex (chrY only) ---
 	// Missingness counts SAMPLES, not alleles, so chrX and chrMT need no ploidy
 	// adjustment: a hemizygous sample either has a call or it does not. chrY is the
@@ -304,8 +378,11 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 			}
 		}
 	}
+}
 
-	// --- Register output columns based on mode ---
+static void SetMissingColumns(const PlinkMissingBindData &bind_data_ref, vector<LogicalType> &return_types,
+                              vector<CompatName> &names) {
+	auto *bind_data = &bind_data_ref;
 	if (bind_data->sample_mode) {
 		names = {"FID", "IID", "MISSING_CT", "OBS_CT", "F_MISS"};
 		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER,
@@ -315,8 +392,6 @@ static unique_ptr<FunctionData> PlinkMissingBind(ClientContext &context, TableFu
 		return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
 		                LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::DOUBLE};
 	}
-
-	return std::move(bind_data);
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +405,11 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 
 	state->sample_mode = bind_data.sample_mode;
 
-	if (bind_data.variant_range.has_filter) {
+	if (bind_data.cohort) {
+		// A catalog read scans positions over the cohort's segments.
+		state->start_variant_idx = 0;
+		state->end_variant_idx = bind_data.cohort->scan_ct;
+	} else if (bind_data.variant_range.has_filter) {
 		state->start_variant_idx = bind_data.variant_range.start_idx;
 		state->end_variant_idx = bind_data.variant_range.end_idx;
 	} else {
@@ -369,9 +448,11 @@ static unique_ptr<GlobalTableFunctionState> PlinkMissingInitGlobal(ClientContext
 
 		// chrY variants in range: they do not apply to females/unknown-sex samples.
 		const ParBounds no_par; // PAR is irrelevant to chrY detection
-		for (uint32_t v = state->start_variant_idx; v < state->end_variant_idx; v++) {
-			if (ClassifyChromPloidy(bind_data.variants.GetChrom(v), bind_data.variants.GetPos(v), no_par) ==
-			    ChromPloidy::CHR_Y) {
+		for (uint32_t pos = state->start_variant_idx; pos < state->end_variant_idx; pos++) {
+			uint32_t v;
+			idx_t block;
+			auto &variants = bind_data.VariantsAt(pos, v, block);
+			if (ClassifyChromPloidy(variants.GetChrom(v), variants.GetPos(v), no_par) == ChromPloidy::CHR_Y) {
 				state->chry_variant_ct++;
 			}
 		}
@@ -402,6 +483,20 @@ static unique_ptr<LocalTableFunctionState> PlinkMissingInitLocal(ExecutionContex
 	auto state = make_uniq<PlinkMissingLocalState>();
 
 	if (!gstate.need_missingness) {
+		return std::move(state);
+	}
+
+	if (bind_data.cohort) {
+		// The scan opens one ConcatPgenReader per variant block. Its genovec holds the selected
+		// samples only, so both buffers are sized to effective_sample_ct.
+		uintptr_t missingness_alloc_ct = plink2::BitCtToAlignedWordCt(bind_data.effective_sample_ct);
+		state->missingness_buf.Allocate(missingness_alloc_ct * sizeof(uintptr_t));
+		uintptr_t genovec_alloc_ct = plink2::NypCtToAlignedWordCt(bind_data.effective_sample_ct);
+		state->genovec_buf.Allocate(genovec_alloc_ct * sizeof(uintptr_t));
+		if (bind_data.sample_mode) {
+			state->local_missing_counts.resize(bind_data.effective_sample_ct, 0);
+		}
+		state->cohort_ready = true;
 		return std::move(state);
 	}
 
@@ -485,8 +580,9 @@ static unique_ptr<LocalTableFunctionState> PlinkMissingInitLocal(ExecutionContex
 
 static constexpr uint32_t MISSING_BATCH_SIZE = 128;
 
-static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, PlinkMissingGlobalState &gstate,
-                                    PlinkMissingLocalState &lstate, DataChunk &output) {
+static void PlinkMissingScanVariant(ClientContext &context, const PlinkMissingBindData &bind_data,
+                                    PlinkMissingGlobalState &gstate, PlinkMissingLocalState &lstate,
+                                    DataChunk &output) {
 	auto &column_ids = gstate.column_ids;
 	uint32_t end_idx = gstate.end_variant_idx;
 	uint32_t sample_ct = bind_data.effective_sample_ct;
@@ -510,7 +606,10 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 		}
 		uint32_t batch_end = std::min(batch_start + claim_size, end_idx);
 
-		for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
+		for (uint32_t pos = batch_start; pos < batch_end; pos++) {
+			uint32_t vidx;
+			idx_t block;
+			const VariantMetadataIndex &variants = bind_data.VariantsAt(pos, vidx, block);
 			// chrY is the only chromosome whose missingness denominator is sex-dependent.
 			// Missingness counts SAMPLES rather than alleles, so a hemizygous chrX or
 			// chrMT call is simply a call — no ploidy adjustment applies. On chrY,
@@ -518,8 +617,8 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 			// inflates both the numerator and the denominator. plink2 matches this: its
 			// .vmiss uses a males-only denominator on chrY (chry_missingstat_sample_ct)
 			// and the full sample count everywhere else.
-			const bool is_y = (ClassifyChromPloidy(bind_data.variants.GetChrom(vidx), bind_data.variants.GetPos(vidx),
-			                                       no_par) == ChromPloidy::CHR_Y);
+			const bool is_y =
+			    (ClassifyChromPloidy(variants.GetChrom(vidx), variants.GetPos(vidx), no_par) == ChromPloidy::CHR_Y);
 
 			uint32_t missing_ct = 0;
 			uint32_t denom = sample_ct;
@@ -534,12 +633,29 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 				}
 			}
 
-			if (!stats_are_null && gstate.need_missingness && lstate.initialized) {
+			auto *cat = lstate.CohortReader(context, bind_data, block);
+			if (!stats_are_null && gstate.need_missingness && cat && !is_y) {
+				// Catalog, not chrY: the missing count is the summed genotype count.
+				STD_ARRAY_DECL(uint32_t, 4, genocounts);
+				if (cat->GetCounts(vidx, genocounts) != plink2::kPglRetSuccess) {
+					throw IOException("plink_missing: reading counts failed for variant %u", vidx);
+				}
+				missing_ct = genocounts[3];
+			} else if (!stats_are_null && gstate.need_missingness && (lstate.initialized || cat)) {
 				auto *missingness = lstate.missingness_buf.As<uintptr_t>();
 				auto *genovec = lstate.genovec_buf.As<uintptr_t>();
 
-				plink2::PglErr err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx,
-				                                               &lstate.pgr, missingness, genovec);
+				plink2::PglErr err;
+				if (cat) {
+					// ConcatPgenReader has no missingness call: derive it from the genovec.
+					err = cat->Get(vidx, genovec);
+					if (err == plink2::kPglRetSuccess) {
+						plink2::GenoarrToMissingnessUnsafe(genovec, sample_ct, missingness);
+					}
+				} else {
+					err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
+					                                missingness, genovec);
+				}
 
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
@@ -564,16 +680,16 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 
 				switch (file_col) {
 				case VCOL_CHROM: {
-					auto val = bind_data.variants.GetChrom(vidx);
+					auto val = variants.GetChrom(vidx);
 					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case VCOL_POS: {
-					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = bind_data.variants.GetPos(vidx);
+					CompatFlatDataMutable<int32_t>(vec)[rows_emitted] = variants.GetPos(vidx);
 					break;
 				}
 				case VCOL_ID: {
-					auto val = bind_data.variants.GetId(vidx);
+					auto val = variants.GetId(vidx);
 					if (val.empty()) {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -582,12 +698,12 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 					break;
 				}
 				case VCOL_REF: {
-					auto val = bind_data.variants.GetRef(vidx);
+					auto val = variants.GetRef(vidx);
 					CompatFlatDataMutable<string_t>(vec)[rows_emitted] = StringVector::AddString(vec, val);
 					break;
 				}
 				case VCOL_ALT: {
-					auto val = bind_data.variants.GetAlt(vidx);
+					auto val = variants.GetAlt(vidx);
 					if (val.empty() || val == ".") {
 						FlatVector::SetNull(vec, rows_emitted, true);
 					} else {
@@ -635,15 +751,15 @@ static void PlinkMissingScanVariant(const PlinkMissingBindData &bind_data, Plink
 // Scan — sample mode (parallel Phase 1 via DuckDB thread pool, then Phase 2)
 // ---------------------------------------------------------------------------
 
-static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkMissingGlobalState &gstate,
-                                   PlinkMissingLocalState &lstate, DataChunk &output) {
+static void PlinkMissingScanSample(ClientContext &context, const PlinkMissingBindData &bind_data,
+                                   PlinkMissingGlobalState &gstate, PlinkMissingLocalState &lstate, DataChunk &output) {
 	uint32_t sample_ct = bind_data.effective_sample_ct;
 
 	// Phase 1: All DuckDB scan threads claim variant batches in parallel,
 	// accumulate into thread-local counts, then merge. The last thread to
 	// finish Phase 1 sets variant_scan_done and falls through to Phase 2.
-	if (!gstate.variant_scan_done.load(std::memory_order_acquire) && gstate.need_missingness && lstate.initialized &&
-	    !lstate.phase1_done) {
+	if (!gstate.variant_scan_done.load(std::memory_order_acquire) && gstate.need_missingness &&
+	    (lstate.initialized || lstate.cohort_ready) && !lstate.phase1_done) {
 		gstate.phase1_active.fetch_add(1, std::memory_order_acq_rel);
 
 		uint32_t end_idx = gstate.end_variant_idx;
@@ -667,9 +783,21 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 
 			const ParBounds no_par; // PAR is irrelevant here: only chrY is sex-dependent
 
-			for (uint32_t vidx = batch_start; vidx < batch_end; vidx++) {
-				plink2::PglErr err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx,
-				                                               &lstate.pgr, missingness, genovec);
+			for (uint32_t pos = batch_start; pos < batch_end; pos++) {
+				uint32_t vidx;
+				idx_t block;
+				const VariantMetadataIndex &variants = bind_data.VariantsAt(pos, vidx, block);
+				plink2::PglErr err;
+				if (auto *cat = lstate.CohortReader(context, bind_data, block)) {
+					// ConcatPgenReader has no missingness call: derive it from the genovec.
+					err = cat->Get(vidx, genovec);
+					if (err == plink2::kPglRetSuccess) {
+						plink2::GenoarrToMissingnessUnsafe(genovec, sample_ct, missingness);
+					}
+				} else {
+					err = plink2::PgrGetMissingness(sample_include, lstate.pssi, sample_ct, vidx, &lstate.pgr,
+					                                missingness, genovec);
+				}
 				if (err != plink2::kPglRetSuccess) {
 					throw IOException("plink_missing: PgrGetMissingness failed for variant %u", vidx);
 				}
@@ -679,8 +807,8 @@ static void PlinkMissingScanSample(const PlinkMissingBindData &bind_data, PlinkM
 				// LoadSampleMissingCtsThread) and drops the same chrY variants from her
 				// denominator, so the rate stays coherent. We do both: mask here, and
 				// subtract chry_variant_ct from non-males' denominator below.
-				const bool is_y = (ClassifyChromPloidy(bind_data.variants.GetChrom(vidx),
-				                                       bind_data.variants.GetPos(vidx), no_par) == ChromPloidy::CHR_Y);
+				const bool is_y =
+				    (ClassifyChromPloidy(variants.GetChrom(vidx), variants.GetPos(vidx), no_par) == ChromPloidy::CHR_Y);
 
 				for (uintptr_t w = 0; w < word_ct; w++) {
 					uintptr_t word = missingness[w];
@@ -801,9 +929,9 @@ static void PlinkMissingScan(ClientContext &context, TableFunctionInput &data_p,
 	auto &lstate = data_p.local_state->Cast<PlinkMissingLocalState>();
 
 	if (gstate.sample_mode) {
-		PlinkMissingScanSample(bind_data, gstate, lstate, output);
+		PlinkMissingScanSample(context, bind_data, gstate, lstate, output);
 	} else {
-		PlinkMissingScanVariant(bind_data, gstate, lstate, output);
+		PlinkMissingScanVariant(context, bind_data, gstate, lstate, output);
 	}
 }
 
@@ -812,21 +940,27 @@ static void PlinkMissingScan(ClientContext &context, TableFunctionInput &data_p,
 // ---------------------------------------------------------------------------
 
 void RegisterPlinkMissing(ExtensionLoader &loader) {
-	TableFunction plink_missing("plink_missing", {LogicalType::VARCHAR}, PlinkMissingScan, PlinkMissingBind,
-	                            PlinkMissingInitGlobal, PlinkMissingInitLocal);
+	// Two overloads: a .pgen or catalog path, and none (catalog := '<path>' names the inputs).
+	TableFunctionSet set("plink_missing");
+	for (auto &args : vector<vector<LogicalType>> {{LogicalType::VARCHAR}, {}}) {
+		TableFunction plink_missing("plink_missing", args, PlinkMissingScan, PlinkMissingBind, PlinkMissingInitGlobal,
+		                            PlinkMissingInitLocal);
 
-	plink_missing.projection_pushdown = true;
+		plink_missing.projection_pushdown = true;
 
-	DeclareNamedParameters(plink_missing, {{"pvar", LogicalType::VARCHAR},
-	                                       {"psam", LogicalType::VARCHAR},
-	                                       {"mode", LogicalType::VARCHAR},
-	                                       {"samples", LogicalType::ANY},
-	                                       {"region", LogicalType::VARCHAR},
-	                                       {"selection", LogicalType::ANY}});
-	CompatSetCaptureArgumentAliases(plink_missing);
+		DeclareNamedParameters(plink_missing, {{"pvar", LogicalType::VARCHAR},
+		                                       {"psam", LogicalType::VARCHAR},
+		                                       {"mode", LogicalType::VARCHAR},
+		                                       {"samples", LogicalType::ANY},
+		                                       {"region", LogicalType::VARCHAR},
+		                                       {"selection", LogicalType::ANY},
+		                                       {"catalog", LogicalType::ANY}});
+		CompatSetCaptureArgumentAliases(plink_missing);
+		set.AddFunction(plink_missing);
+	}
 
-	RegisterTableWithDesc(loader, plink_missing, {}, "Compute missingness rates per variant or per sample.",
-	                      {"SELECT * FROM plink_missing('data/cohort.pgen', mode := 'variant')"});
+	RegisterTableSetWithDesc(loader, set, {}, "Compute missingness rates per variant or per sample.",
+	                         {"SELECT * FROM plink_missing('data/cohort.pgen', mode := 'variant')"});
 }
 
 } // namespace duckdb
