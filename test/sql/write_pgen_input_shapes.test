@@ -1,0 +1,177 @@
+# name: test/sql/write_pgen_input_shapes.test
+# description: The .pgen writer packs the same calls from every accepted genotypes column shape and element type
+# group: [sql]
+
+require plinking_duck
+
+# The writer reads the genotypes column straight from DuckDB's vectors. These tests pin
+# what it must accept, so that reader cannot drop a shape: every integer element type, a
+# LIST, a fixed ARRAY, a STRUCT of mixed field types, a filtered (sliced) column, more than
+# one chunk, and the exact text of each per-call error.
+#
+# Data: the 4 variants x 4 samples of test/data/pfile_example. write_pgen.test shows that
+# these calls pack to the last 4 bytes E4851E90 of the .pgen:
+#   v1 {0,1,2,miss} -> E4   v2 {1,1,0,2} -> 85   v3 {2,miss,1,0} -> 1E   v4 {0,0,1,2} -> 90
+# A signed type writes "miss" as -9; an unsigned type cannot hold -9, so it uses NULL.
+
+statement ok
+CREATE TABLE g_signed AS SELECT * FROM (VALUES
+    (1, [0, 1, 2, -9]), (2, [1, 1, 0, 2]), (3, [2, -9, 1, 0]), (4, [0, 0, 1, 2])) t(k, g);
+
+statement ok
+CREATE TABLE g_unsigned AS SELECT * FROM (VALUES
+    (1, [0, 1, 2, NULL]), (2, [1, 1, 0, 2]), (3, [2, NULL, 1, 0]), (4, [0, 0, 1, 2])) t(k, g);
+
+# ---------------------------------------------------------------------------
+# LIST of each signed integer type
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT g::SMALLINT[] AS genotypes FROM g_signed ORDER BY k) TO '__TEST_DIR__/l_i16.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::INTEGER[] AS genotypes FROM g_signed ORDER BY k) TO '__TEST_DIR__/l_i32.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::BIGINT[] AS genotypes FROM g_signed ORDER BY k) TO '__TEST_DIR__/l_i64.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::HUGEINT[] AS genotypes FROM g_signed ORDER BY k) TO '__TEST_DIR__/l_i128.pgen' (FORMAT pgen);
+
+query TTTT
+SELECT (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_i16.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_i32.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_i64.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_i128.pgen'));
+----
+E4851E90	E4851E90	E4851E90	E4851E90
+
+# ---------------------------------------------------------------------------
+# LIST of each unsigned integer type (missing as NULL)
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT g::UTINYINT[] AS genotypes FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/l_u8.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::USMALLINT[] AS genotypes FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/l_u16.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::UINTEGER[] AS genotypes FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/l_u32.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::UBIGINT[] AS genotypes FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/l_u64.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::UHUGEINT[] AS genotypes FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/l_u128.pgen' (FORMAT pgen);
+
+query TTTTT
+SELECT (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_u8.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_u16.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_u32.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_u64.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_u128.pgen'));
+----
+E4851E90	E4851E90	E4851E90	E4851E90	E4851E90
+
+# ---------------------------------------------------------------------------
+# Fixed ARRAY of non-TINYINT types, and NULL (not -9) as missing in a signed list
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT g::INTEGER[4] AS genotypes FROM g_signed ORDER BY k) TO '__TEST_DIR__/a_i32.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::UBIGINT[4] AS genotypes FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/a_u64.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT g::TINYINT[] AS genotypes FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/l_i8_null.pgen' (FORMAT pgen);
+
+query TTT
+SELECT (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/a_i32.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/a_u64.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/l_i8_null.pgen'));
+----
+E4851E90	E4851E90	E4851E90
+
+# ---------------------------------------------------------------------------
+# STRUCT whose fields have different integer types (each field is one sample)
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT struct_pack(s1 := g[1]::TINYINT, s2 := g[2]::INTEGER, s3 := g[3]::BIGINT, s4 := g[4]::HUGEINT) AS genotypes
+      FROM g_signed ORDER BY k) TO '__TEST_DIR__/s_mixed.pgen' (FORMAT pgen);
+
+statement ok
+COPY (SELECT struct_pack(s1 := g[1]::UTINYINT, s2 := g[2]::SMALLINT, s3 := g[3]::UINTEGER, s4 := g[4]::UBIGINT) AS genotypes
+      FROM g_unsigned ORDER BY k) TO '__TEST_DIR__/s_mixed_u.pgen' (FORMAT pgen);
+
+query TT
+SELECT (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/s_mixed.pgen')),
+       (SELECT right(hex(content), 8) FROM read_blob('__TEST_DIR__/s_mixed_u.pgen'));
+----
+E4851E90	E4851E90
+
+# ---------------------------------------------------------------------------
+# More than one chunk, and a filtered (sliced) column: 5000 rows filtered to 3333 variants.
+# Each variant's calls depend only on its POS, so a read-back can check every variant.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE many AS
+SELECT '1' AS CHROM, (i + 1)::INTEGER AS POS, 'v' || i AS ID, 'A' AS REF, 'G' AS ALT, i,
+       CASE i % 4 WHEN 0 THEN [0, 1, 2, -9] WHEN 1 THEN [1, 1, 0, 2] WHEN 2 THEN [2, -9, 1, 0] ELSE [0, 0, 1, 2] END::TINYINT[] AS genotypes
+FROM range(5000) r(i);
+
+statement ok
+SET threads = 1;
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM many WHERE i % 3 <> 0)
+TO '__TEST_DIR__/many' (FORMAT pfile, samples ['s1', 's2', 's3', 's4']);
+
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.genotypes::TINYINT[] IS DISTINCT FROM m.genotypes)
+FROM read_pfile('__TEST_DIR__/many') r JOIN
+     (SELECT ID, list_transform(genotypes, lambda x: CASE WHEN x = -9 THEN NULL ELSE x END) AS genotypes FROM many) m
+     USING (ID);
+----
+3333	0
+
+statement ok
+RESET threads;
+
+# ---------------------------------------------------------------------------
+# Exact error texts: the variant index counts across chunks; the sample index is the input position
+# ---------------------------------------------------------------------------
+statement error
+COPY (SELECT [0, 1, 2, -9]::TINYINT[] AS genotypes UNION ALL SELECT [1, 3, 0, 2]::TINYINT[])
+TO '__TEST_DIR__/err_oor.pgen' (FORMAT pgen);
+----
+genotype value 3 (variant 1, sample 1) is out of range
+
+statement error
+COPY (SELECT CASE WHEN i = 2500 THEN [0, 0, 0, 5] ELSE [0, 1, 2, 0] END::INTEGER[] AS genotypes FROM range(3000) r(i) ORDER BY i)
+TO '__TEST_DIR__/err_oor_chunk.pgen' (FORMAT pgen);
+----
+genotype value 5 (variant 2500, sample 3) is out of range
+
+statement error
+COPY (SELECT struct_pack(s1 := 0::TINYINT, s2 := -1::INTEGER) AS genotypes)
+TO '__TEST_DIR__/err_oor_struct.pgen' (FORMAT pgen);
+----
+genotype value -1 (variant 0, sample 1) is out of range
+
+statement error
+COPY (SELECT [0, 1]::TINYINT[] AS genotypes, 1 AS k UNION ALL SELECT NULL::TINYINT[], 2 ORDER BY k)
+TO '__TEST_DIR__/err_null.pgen' (FORMAT pgen, genotype_fields 'genotypes');
+----
+the genotypes cell is NULL for a variant
+
+# A sample-sharded write names the INPUT sample position, not the position inside the shard.
+statement error
+COPY (SELECT CHROM, POS, ID, REF, ALT,
+             CASE WHEN ID = 'var2500'
+                  THEN struct_pack(SAMP1 := 0::TINYINT, SAMP2 := 0::TINYINT, SAMP3 := 0::TINYINT, SAMP4 := 0::TINYINT,
+                                   SAMP5 := 0::TINYINT, SAMP6 := 7::TINYINT, SAMP7 := 0::TINYINT, SAMP8 := 0::TINYINT)
+                  ELSE genotypes END AS genotypes
+      FROM (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS))
+TO '__TEST_DIR__/err_shard' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], b: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+----
+sample 5) is out of range
