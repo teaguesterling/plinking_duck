@@ -5,7 +5,7 @@ Compute per-variant allele frequencies using pgenlib's fast counting path.
 ## Synopsis
 
 ```sql
-plink_freq(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
+plink_freq([path VARCHAR] [, catalog := ..., pvar := ..., psam := ..., samples := ...,
            region := ..., selection := ..., counts := ...]) -> TABLE
 ```
 
@@ -13,7 +13,8 @@ plink_freq(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `path` | `VARCHAR` | *(required)* | Path to the `.pgen` file |
+| `path` | `VARCHAR` | *(required unless `catalog :=`)* | Path to the `.pgen` file, or to a [catalog](#catalogs) |
+| `catalog` | `VARCHAR` or `BOOLEAN` | Discovery | A `.pfile.json` [catalog](#catalogs) path; `false` turns discovery off; `true` requires a catalog |
 | `pvar` | `VARCHAR` | Auto-discovered | Path to `.pvar` or `.bim` file |
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` file |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
@@ -102,6 +103,35 @@ FROM plink_freq('data/example.pgen',
 SELECT ID, ALT_FREQ
 FROM plink_freq('data/example.pgen',
     region := '22:1-50000000');
+```
+
+## Catalogs
+
+`plink_freq` reads a pfile catalog (`<prefix>.pfile.json`, v1 or v2) as one cohort. All catalog kinds work:
+variant-sharded, sample-sharded and matrix. The rows are the rows of the same call on the un-sharded
+fileset.
+
+The inputs name a catalog as they do for [`read_pfile`](read_pfile.md):
+
+- a positional `'<x>.pfile.json'`;
+- a positional local prefix `'<p>'` (not ending in `.pgen`) when `<p>.pfile.json` exists;
+- `catalog := '<x>.pfile.json'`, with no positional argument.
+
+An explicit `.pgen` path is always a file. `catalog := false` turns discovery off, and
+`catalog := true` requires a catalog at the prefix.
+
+- Variant blocks concatenate in catalog order.
+- Counts add across sample blocks.
+- SEX comes from each sample block's `.psam`. The writer makes IID-only `.psam` files, so add SEX
+  to them before you read chrX, chrY or chrMT. Without SEX in every block, the cohort has no SEX.
+- `samples` takes IIDs, or 0-based indices over the whole cohort. `region` applies to each
+  variant block. `selection := {variant_range: [lo, hi)}` takes cohort-wide ordinals.
+- `counts` and `build` work as for one fileset.
+- `pvar`, `psam` and `dosage := true` are errors with a catalog.
+
+```sql
+SELECT * FROM plink_freq('cohort.pfile.json');
+SELECT * FROM plink_freq(catalog := 'data/cohort.pfile.json');
 ```
 
 ## Sex chromosomes and ploidy

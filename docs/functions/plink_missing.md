@@ -5,7 +5,7 @@ Compute per-variant or per-sample missingness rates.
 ## Synopsis
 
 ```sql
-plink_missing(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
+plink_missing([path VARCHAR] [, catalog := ..., pvar := ..., psam := ..., samples := ...,
               region := ..., selection := ..., mode := ...]) -> TABLE
 ```
 
@@ -13,7 +13,8 @@ plink_missing(path VARCHAR [, pvar := ..., psam := ..., samples := ...,
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `path` | `VARCHAR` | *(required)* | Path to the `.pgen` file |
+| `path` | `VARCHAR` | *(required unless `catalog :=`)* | Path to the `.pgen` file, or to a [catalog](#catalogs) |
+| `catalog` | `VARCHAR` or `BOOLEAN` | Discovery | A `.pfile.json` [catalog](#catalogs) path; `false` turns discovery off; `true` requires a catalog |
 | `pvar` | `VARCHAR` | Auto-discovered | Path to `.pvar` or `.bim` file |
 | `psam` | `VARCHAR` | Auto-discovered | Path to `.psam` or `.fam` file |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Subset to specific samples |
@@ -99,6 +100,36 @@ WHERE F_MISS > 0.1;
 SELECT ID, F_MISS
 FROM plink_missing('data/example.pgen',
     region := '1:1-50000000');
+```
+
+## Catalogs
+
+`plink_missing` reads a pfile catalog (`<prefix>.pfile.json`, v1 or v2) as one cohort. All catalog kinds work:
+variant-sharded, sample-sharded and matrix. The rows are the rows of the same call on the un-sharded
+fileset.
+
+The inputs name a catalog as they do for [`read_pfile`](read_pfile.md):
+
+- a positional `'<x>.pfile.json'`;
+- a positional local prefix `'<p>'` (not ending in `.pgen`) when `<p>.pfile.json` exists;
+- `catalog := '<x>.pfile.json'`, with no positional argument.
+
+An explicit `.pgen` path is always a file. `catalog := false` turns discovery off, and
+`catalog := true` requires a catalog at the prefix.
+
+- Variant blocks concatenate in catalog order.
+- Counts add across sample blocks. In sample mode, the sample rows concatenate across sample blocks, and each sample's counts add
+  across variant blocks.
+- SEX comes from each sample block's `.psam`. The writer makes IID-only `.psam` files, so add SEX
+  to them before you read chrX, chrY or chrMT. Without SEX in every block, the cohort has no SEX.
+- `samples` takes IIDs, or 0-based indices over the whole cohort. `region` applies to each
+  variant block. `selection := {variant_range: [lo, hi)}` takes cohort-wide ordinals.
+- `mode` works as for one fileset.
+- `pvar` and `psam` are errors with a catalog.
+
+```sql
+SELECT * FROM plink_missing('cohort.pfile.json');
+SELECT * FROM plink_missing(catalog := 'data/cohort.pfile.json');
 ```
 
 ## Sex chromosomes and ploidy
