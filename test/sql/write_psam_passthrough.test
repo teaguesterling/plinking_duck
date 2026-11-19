@@ -84,9 +84,9 @@ statement ok
 COPY (SELECT * FROM read_psam('test/data/pfile_example.psam')) TO '{TEST_DIR}/rt.psam' (FORMAT psam);
 
 query I
-SELECT list(column_name || ':' || column_type) FROM (DESCRIBE SELECT * FROM read_psam('{TEST_DIR}/rt.psam'));
+SELECT string_agg(column_name || ':' || column_type, ', ') FROM (DESCRIBE SELECT * FROM read_psam('{TEST_DIR}/rt.psam'));
 ----
-[FID:VARCHAR, IID:VARCHAR, SEX:INTEGER]
+FID:VARCHAR, IID:VARCHAR, SEX:INTEGER
 
 query II
 SELECT
@@ -176,9 +176,9 @@ a	99
 c	98
 
 query I
-SELECT list(column_name) FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/internal.psam.parquet'));
+SELECT string_agg(column_name, ', ') FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/internal.psam.parquet'));
 ----
-[IID, __sidx]
+IID, __sidx
 
 # ===========================================================================
 # The .psam.parquet companion carries the same columns, in the same order, with SQL types
@@ -191,9 +191,9 @@ COPY (SELECT * FROM (VALUES ('S1', '1', 'EUR', 1.5::DOUBLE, 'f1', 7), ('S2', 'F'
 TO '{TEST_DIR}/pq.psam' (FORMAT psam, psam_parquet);
 
 query I
-SELECT list(column_name || ':' || column_type) FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/pq.psam.parquet'));
+SELECT string_agg(column_name || ':' || column_type, ', ') FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/pq.psam.parquet'));
 ----
-[FID:VARCHAR, IID:VARCHAR, SEX:INTEGER, ancestry:VARCHAR, pheno:DOUBLE, group:INTEGER]
+FID:VARCHAR, IID:VARCHAR, SEX:INTEGER, ancestry:VARCHAR, pheno:DOUBLE, group:INTEGER
 
 query TTITRI
 SELECT * FROM read_parquet('{TEST_DIR}/pq.psam.parquet');
@@ -219,9 +219,9 @@ statement ok
 COPY (SELECT i AS IID, i % 2 AS FID FROM range(3) t(i)) TO '{TEST_DIR}/numid.psam' (FORMAT psam, psam_parquet);
 
 query I
-SELECT list(column_name || ':' || column_type) FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/numid.psam.parquet'));
+SELECT string_agg(column_name || ':' || column_type, ', ') FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/numid.psam.parquet'));
 ----
-[FID:VARCHAR, IID:VARCHAR]
+FID:VARCHAR, IID:VARCHAR
 
 query TT
 SELECT FID, IID FROM read_parquet('{TEST_DIR}/numid.psam.parquet');
@@ -239,6 +239,16 @@ SELECT FID, IID FROM read_parquet('{TEST_DIR}/numid.psam.parquet');
 statement ok
 COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
 TO '{TEST_DIR}/sxb' (FORMAT pfile);
+
+# Negative control: with the bundle's IID-only .psam there is no SEX, so chrX has no counts.
+# This shows that the checks below depend on the SEX that the passthrough write supplies.
+query II
+SELECT r.OBS_CT, f.OBS_CT
+FROM read_pfile('{TEST_DIR}/sxb', freq := true) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID)
+WHERE r.CHROM = 'X';
+----
+0	9
 
 statement ok
 COPY (SELECT *, CASE WHEN SEX = 1 THEN 'EUR' ELSE 'AFR' END AS ancestry, row_number() OVER () * 0.5 AS pheno FROM read_psam('test/data/sexchr_example.psam'))
