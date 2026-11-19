@@ -8,7 +8,7 @@ formats** — one bundle and three standalone writers:
 | `pfile` | a whole fileset: `prefix.pvar` + `prefix.pgen` + `prefix.psam` | one row per variant; genotypes as a per-sample `LIST`/`ARRAY` or `STRUCT` |
 | `pvar` | a text `.pvar` | variant-metadata columns |
 | `pgen` | a binary `.pgen` (biallelic hardcalls) | one row per variant; genotypes column |
-| `psam` | a minimal `#IID`-only `.psam` | sample IIDs (out-of-band or per row) |
+| `psam` | a text `.psam`: every input column for a per-row sample stream, else `#IID` only | sample IIDs out of band, or one row per sample |
 
 These are **writers**, invoked through `COPY (query) TO 'target' (FORMAT …)`, not
 table functions — so they do not appear in the [function reference
@@ -66,7 +66,7 @@ target is stripped to the prefix, so `TO 'out'` and `TO 'out.pfile'` both write
 | `variant_count` | `INTEGER` | `16777216` (2²⁴) | Upper bound on the variant count (a pgenlib memory knob; see [below](#the-variant_count-bound)). |
 | `pvar` / `pgen` / `psam` | `VARCHAR` | `prefix.{pvar,pgen,psam}` | Per-file path overrides (symmetric with the reader's path overrides). |
 | `pvar_parquet` | flag | off | Also write a region-prunable parquet `.pvar` companion. See [Parquet `.pvar` companion](#parquet-pvar-companion-pvar_parquet). |
-| `psam_parquet` | flag | off | Also write a parquet `.psam` companion (a single `IID` column). See [Parquet `.psam` companion](#parquet-psam-companion-psam_parquet). |
+| `psam_parquet` | flag | off | Also write a parquet `.psam` companion (a single `IID` column for the bundle). See [Parquet `.psam` companion](#parquet-psam-companion-psam_parquet). |
 | `shard_by` | `VARCHAR` | *(none)* | Shard along the **variant** axis by a key column. See [Sharded output](#sharded-output-shard_by). |
 | `shard_samples` | `STRUCT` | *(none)* | Shard along the **sample** axis into named IID groups. See [Sample-sharded output](#sample-sharded-output-shard_samples). |
 | `force` | `BOOLEAN` | `false` | Replace existing output. Without it, a `COPY` onto an existing target is an error. See [Existing output](#existing-output-force). |
@@ -95,12 +95,14 @@ explicit `samples` is never silently ignored. When the genotypes column fixes th
 sample count (a fixed-size `ARRAY`, or a `STRUCT`), a `samples` list of a different
 length is a bind-time error.
 
-!!! note "Per-sample metadata is IID-only in this release"
+!!! note "The bundle's `.psam` is IID-only"
 
-    The `.psam` carries **only `#IID`**. `sample_fields` for anything beyond `iid`
-    (`sex`, phenotype, covariates) raises an explicit *"not yet supported"* error —
-    requested metadata is never silently dropped. A variant-oriented stream has no
-    per-sample axis to carry that metadata; writing it is a follow-on.
+    The `.psam` that `FORMAT pfile` writes (plain, sharded or matrix) carries **only
+    `#IID`**. `sample_fields` for anything beyond `iid` (`sex`, phenotype,
+    covariates) raises an explicit *"not yet supported"* error — requested metadata
+    is never silently dropped. A variant-oriented stream has no per-sample axis to
+    carry that metadata. To keep SEX and other per-sample columns, write the `.psam`
+    from a sample stream with the standalone [`FORMAT psam`](#format-psam) writer.
 
 ### Parquet `.pvar` companion (`pvar_parquet`)
 
@@ -125,8 +127,8 @@ The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#r
 ### Parquet `.psam` companion (`psam_parquet`)
 
 `COPY … TO 'out' (FORMAT pfile, psam_parquet)` also writes `<psam>.parquet`
-(for example `out.psam.parquet`) beside the text `.psam`. It has a single `IID`
-column (`VARCHAR`) — the same IIDs, in the same order, as the text `.psam`, which
+(for example `out.psam.parquet`) beside the text `.psam`. For the bundle it has a
+single `IID` column (`VARCHAR`) — the same IIDs, in the same order, as the text `.psam`, which
 is still written and stays the source of truth.
 
 The reader takes the sample list from the parquet companion natively — under
@@ -456,7 +458,7 @@ COPY (query) TO 'out.psam' (FORMAT psam
   [, samples ['id1', …]] [, sample_fields {iid: '<col>'}] [, psam 'override.psam'] [, psam_parquet]);
 ```
 
-Writes a minimal `#IID`-only `.psam` re-readable by [`read_psam`](read_psam.md).
+Writes a `.psam` re-readable by [`read_psam`](read_psam.md).
 The IID source is resolved in **priority order**:
 
 1. a **STRUCT genotypes column** (its field names are the IIDs) — written once,
@@ -466,10 +468,39 @@ The IID source is resolved in **priority order**:
    `sample_fields {iid: '<col>'}`) — one `.psam` line per input row, for a
    sample-oriented input such as `SELECT IID FROM read_psam('x')`.
 
-Duplicate IIDs are rejected (`read_psam` cannot read a dup-IID file). As with the
-bundle, `sample_fields` roles beyond `iid` raise a *"not yet supported"* error.
+Sources 1 and 2 write a minimal `#IID`-only `.psam`: the rows are variants, not
+samples. Duplicate IIDs are rejected (`read_psam` cannot read a dup-IID file).
+
+**A per-row sample stream (source 3) keeps every input column.**
+
+- The header starts `#FID IID` when the input has an `FID` column (any case), else
+  `#IID`. All other columns follow in input order, under their own names.
+- `FID`, `IID` and `SEX` are written with those upper-case names, so `read_psam`
+  types `SEX` as `INTEGER`.
+- `SEX` is written in PLINK coding: `1` = male, `2` = female, `NA` = unknown. The
+  input can be a number (`1`/`2`/`0`), the text codes `1`/`M`, `2`/`F`, `0`/`N`,
+  or NULL. Any other value is an error.
+- A NULL is written as `NA`. An empty string, `.`, `NA` and `na` are also written
+  as `NA`, because `read_psam` reads them as NULL.
+- A value or a column name that contains a tab, a newline or a carriage return is
+  an error, and no file is left. A nested column (`LIST`, `STRUCT`, …) is an
+  error: cast it to `VARCHAR` or drop it.
+- `sample_fields` accepts only `iid`. Rename other columns in the query instead
+  (`gender AS SEX`).
+
+So a `read_psam` → `COPY` → `read_psam` round trip keeps the columns, names,
+order and values:
+
+```sql
+COPY (SELECT * FROM read_psam('in.psam')) TO 'out.psam' (FORMAT psam);
+```
+
 With `psam_parquet`, it also writes the `.psam.parquet` companion described
-[above](#parquet-psam-companion-psam_parquet).
+[above](#parquet-psam-companion-psam_parquet). For a per-row sample stream, the
+companion has the same columns as the text `.psam`, in the same order. `FID` and
+`IID` are `VARCHAR`, `SEX` is `INTEGER` (`1`, `2` or NULL), and the other columns
+keep their SQL types. So a numeric column is `DOUBLE` (for example) in the
+companion but `VARCHAR` in the text `.psam`.
 
 ## Examples
 
@@ -512,8 +543,10 @@ TO 'data/out.pvar' (FORMAT pvar,
 The writer is deliberately scoped. These are honest cuts, not oversights:
 
 - **Per-sample metadata beyond IID** (SEX, phenotype, covariates) is **not
-  written** — the `.psam` is `#IID`-only, and `sample_fields` beyond `iid` errors.
-  A variant-oriented stream has no per-sample axis to carry it.
+  written by `FORMAT pfile`** (plain, sharded or matrix) — its `.psam` is
+  `#IID`-only, and `sample_fields` beyond `iid` errors. A variant-oriented stream
+  has no per-sample axis to carry it. The standalone `FORMAT psam` writer keeps
+  every column of a per-row sample stream; see [`FORMAT psam`](#format-psam).
 - **Phased genotypes and dosages are rejected.** A phased (`TINYINT[2][N]`) or
   dosage (`DOUBLE[N]`) genotypes column raises an actionable error at bind. Only
   biallelic diploid hardcalls are written (Phase B.2 follow-on).
