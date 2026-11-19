@@ -6,6 +6,8 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "psam_reader.hpp"
+#include "pfile_catalog.hpp"
+#include "pfile_catalog_matrix.hpp"
 #include "named_parameter_compat.hpp" // NamedParamMap — bind-input param map type on DuckDB v2.0
 
 #include <pgenlib_read.h>
@@ -900,5 +902,34 @@ uint32_t GetPlinkingMaxThreads(ClientContext &context);
 //! If config_max_threads > 0, returns min(computed, config_max_threads).
 //! Otherwise returns min(computed, 16) (existing default behavior).
 idx_t ApplyMaxThreadsCap(idx_t computed, uint32_t config_max_threads);
+
+// ---------------------------------------------------------------------------
+// pfile catalogs as a grid of cells (read_pfile, plink_freq, plink_missing)
+// ---------------------------------------------------------------------------
+
+//! catalog := '<x>.pfile.json': a v2 MATRIX catalog's cells as a full V x K grid, row-major
+//! (variant block, then sample block), so cell i sits at variant block i / K, sample block i % K.
+//! Each cell carries its TEMPLATE-resolved .pvar (its variant block's) and .psam (its sample
+//! block's), and its declared extents, which bind checks against the .pgen header.
+struct CatalogGrid {
+	string path;
+	vector<MatrixCell> cells;
+	idx_t sample_block_ct = 0;
+	//! Whether the catalog declares each cell's extent on that axis. A v2 matrix declares both. A v1
+	//! catalog declares only its concat axis (its partitions); its shared axis has no declared extent.
+	bool has_variant_extent = true;
+	bool has_sample_extent = true;
+	//! Per variant block (index = variant_block): the genomic range the catalog declares, held as a
+	//! ShardEntry so ShardEntry::RangeOverlaps decides a prune. has_range == false keeps the block.
+	vector<ShardEntry> variant_ranges;
+	//! The grid as the catalog declares it, before pruning. Guards on the cohort's shape use these,
+	//! so pruning never changes which queries are valid.
+	idx_t declared_variant_block_ct = 0;
+	idx_t declared_sample_block_ct = 0;
+};
+
+//! Load a v1 or v2 catalog as a CatalogGrid. Errors name `func_name`. A v2 matrix with a hole is an
+//! error. The cells keep the catalog's declared extents; the caller checks them against the files.
+CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const string &path, const string &func_name);
 
 } // namespace duckdb

@@ -2812,4 +2812,126 @@ void FillGenotypeVector(Vector &vec, idx_t row_idx, GenotypeMode mode, uint32_t 
 	}
 }
 
+// ---------------------------------------------------------------------------
+// pfile catalog grid
+// ---------------------------------------------------------------------------
+
+//! A v1 catalog as a grid: concat_dim "variants" is N variant blocks x 1 sample block, "samples"
+//! is 1 x K, and a single-fileset catalog is 1 x 1. The parser has already folded the shared
+//! companion (.psam or .pvar) into every entry and resolved every path.
+static void LoadV1CatalogGrid(FileSystem &fs, const string &content, CatalogGrid &grid, const string &func_name) {
+	auto cat = ParseV1Catalog(fs, grid.path, content);
+	auto files = cat.files;
+	std::stable_sort(files.begin(), files.end(),
+	                 [](const ShardEntry &a, const ShardEntry &b) { return a.partition_start < b.partition_start; });
+	const bool by_samples = cat.concat_dim == "samples";
+	grid.has_variant_extent = !cat.is_single && !by_samples;
+	grid.has_sample_extent = !cat.is_single && by_samples;
+	grid.sample_block_ct = by_samples ? files.size() : 1;
+	for (idx_t i = 0; i < files.size(); i++) {
+		MatrixCell cell;
+		cell.prefix = files[i].prefix;
+		cell.pvar = files[i].pvar;
+		cell.psam = files[i].psam;
+		cell.variant_block = by_samples ? 0 : static_cast<int64_t>(i);
+		cell.sample_block = by_samples ? static_cast<int64_t>(i) : 0;
+		auto &start = by_samples ? cell.sample_start : cell.variant_start;
+		auto &stop = by_samples ? cell.sample_stop : cell.variant_stop;
+		start = files[i].partition_start;
+		stop = files[i].partition_stop;
+		grid.cells.push_back(std::move(cell));
+	}
+	if (grid.cells.empty()) {
+		throw InvalidInputException("%s: catalog '%s' lists no files", func_name, grid.path);
+	}
+	if (by_samples || cat.is_single) {
+		grid.variant_ranges.resize(1); // one variant block, no declared range: never pruned
+	} else {
+		grid.variant_ranges = files; // each shard's own `range` (CHROM list, POS extent)
+	}
+}
+
+CatalogGrid LoadCatalogGrid(ClientContext &context, FileSystem &fs, const string &path, const string &func_name) {
+	CatalogGrid grid;
+	grid.path = ResolveExistingPath(context, fs, path);
+	if (grid.path.empty()) {
+		throw InvalidInputException("%s: catalog file not found: '%s'", func_name, path);
+	}
+	string content;
+	{
+		auto handle = fs.OpenFile(grid.path, FileFlags::FILE_FLAGS_READ);
+		content.resize(handle->GetFileSize());
+		if (!content.empty()) {
+			handle->Read(reinterpret_cast<void *>(&content[0]), content.size());
+		}
+	}
+	if (!IsMatrixCatalog(content)) {
+		LoadV1CatalogGrid(fs, content, grid, func_name);
+		grid.declared_variant_block_ct = grid.variant_ranges.size();
+		grid.declared_sample_block_ct = grid.sample_block_ct;
+		return grid;
+	}
+	auto matrix = ParseMatrixCatalog(fs, grid.path, content);
+	grid.cells = BuildCells(matrix, fs, /*include_holes=*/true);
+	for (auto &cell : grid.cells) {
+		if (!cell.present) {
+			string where;
+			for (auto &kv : cell.keys) {
+				where += (where.empty() ? "" : ", ") + kv.first + "=" + kv.second;
+			}
+			throw InvalidInputException("%s: catalog '%s' has a hole (an absent cell) at {%s}. A 2-D read of "
+			                            "a matrix with holes is not supported yet.",
+			                            func_name, path, where);
+		}
+	}
+	std::stable_sort(grid.cells.begin(), grid.cells.end(), [](const MatrixCell &a, const MatrixCell &b) {
+		return a.variant_block != b.variant_block ? a.variant_block < b.variant_block : a.sample_block < b.sample_block;
+	});
+	grid.sample_block_ct = matrix.samples.blocks.size();
+	const idx_t variant_block_ct = matrix.variants.blocks.size();
+	if (grid.cells.empty() || grid.sample_block_ct == 0 ||
+	    grid.cells.size() != variant_block_ct * grid.sample_block_ct) {
+		throw InvalidInputException("%s: catalog '%s' does not describe a full grid (%llu cells for %llu "
+		                            "variant blocks x %llu sample blocks)",
+		                            func_name, path, static_cast<unsigned long long>(grid.cells.size()),
+		                            static_cast<unsigned long long>(variant_block_ct),
+		                            static_cast<unsigned long long>(grid.sample_block_ct));
+	}
+	for (idx_t i = 0; i < grid.cells.size(); i++) {
+		auto &cell = grid.cells[i];
+		if (static_cast<idx_t>(cell.variant_block) != i / grid.sample_block_ct ||
+		    static_cast<idx_t>(cell.sample_block) != i % grid.sample_block_ct) {
+			throw InvalidInputException("%s: catalog '%s' does not describe a full grid", func_name, path);
+		}
+	}
+	// Each variant block's declared range: its CHROM enum value, and the inclusive POS bounds of an
+	// ordinal_interval key over POS. A block that declares neither has no range and is never pruned.
+	const AxisKey *contig_key = matrix.variants.ContigKey();
+	const AxisKey *pos_key = nullptr;
+	for (auto &k : matrix.variants.keys) {
+		if (k.type == AxisKeyType::ORDINAL_INTERVAL && k.over == "POS") {
+			pos_key = &k;
+			break;
+		}
+	}
+	for (auto &block : matrix.variants.blocks) {
+		ShardEntry r;
+		if (contig_key) {
+			r.chrom.push_back(block.ValueOf(contig_key->name));
+			r.has_range = true;
+		}
+		const BlockBound *b = pos_key ? block.FindBound(pos_key->name) : nullptr;
+		if (b) {
+			r.has_pos = true;
+			r.pos_min = b->lo;
+			r.pos_max = b->hi;
+			r.has_range = true;
+		}
+		grid.variant_ranges.push_back(std::move(r));
+	}
+	grid.declared_variant_block_ct = variant_block_ct;
+	grid.declared_sample_block_ct = grid.sample_block_ct;
+	return grid;
+}
+
 } // namespace duckdb
