@@ -1,0 +1,287 @@
+# name: test/sql/plink_missing_catalog.test
+# description: plink_missing reads pfile catalogs (variant-sharded, sample-sharded, matrix) with the values of the un-sharded source
+# group: [sql]
+
+require plinking_duck
+
+# The oracle for every query is plink_missing over the un-sharded source .pgen. Variant mode: rows
+# concatenate in catalog variant order, and each variant's counts add across sample blocks. Sample
+# mode: rows concatenate across sample blocks, and each sample's counts add across variant blocks.
+# On chrY only males count (the denominator is the male count), so SEX comes from each sample
+# block's .psam. The writer emits IID-only .psam files, so the setup below writes them again with SEX.
+#
+# Each row comparison is EXCEPT ALL in both directions over the full row (a NULL matches a NULL), so
+# the order of the rows does not matter at threads = 4. The order is checked at threads = 1.
+
+# ---------------------------------------------------------------------------
+# Catalogs over large_example (3000 variants x 8 samples, chromosomes 1, 2, 3; 6000 missing calls)
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/lv' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ls' (FORMAT pfile, shard_samples {a: ['SAMP1'], b: ['SAMP2', 'SAMP3'], c: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/lm' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# The fixture has missing calls, so a reader that drops a block's missingness fails the oracle.
+query I
+SELECT sum(MISSING_CT) FROM plink_missing('test/data/large_example.pgen');
+----
+6000
+
+# ---------------------------------------------------------------------------
+# Catalogs over sexchr_example (chromosomes 1, PAR1, X, Y, MT; males M1-M3, females F1-F3)
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sv' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M1', '1'), ('M2', '1'), ('M3', '1'), ('F1', '2'), ('F2', '2'), ('F3', '2')))
+TO '{TEST_DIR}/sv.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['M1', 'M2'], b: ['M3', 'F1', 'F2', 'F3']});
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M1', '1'), ('M2', '1')))
+TO '{TEST_DIR}/ss/a/data.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M3', '1'), ('F1', '2'), ('F2', '2'), ('F3', '2')))
+TO '{TEST_DIR}/ss/b/data.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sm' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['M1', 'M2', 'M3'], b: ['F1', 'F2', 'F3']});
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M1', '1'), ('M2', '1'), ('M3', '1')))
+TO '{TEST_DIR}/sm/GROUP=a/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('F1', '2'), ('F2', '2'), ('F3', '2')))
+TO '{TEST_DIR}/sm/GROUP=b/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+# A matrix whose .psam files are the writer's IID-only ones: no SEX.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/snosex' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['M1', 'M2', 'M3'], b: ['F1', 'F2', 'F3']});
+
+# The fixture must make SEX matter: on y1 only the 3 males count.
+query II
+SELECT MISSING_CT, OBS_CT FROM plink_missing('test/data/sexchr_example.pgen') WHERE ID = 'y1';
+----
+0	3
+
+# ---------------------------------------------------------------------------
+# Order at one thread: variant rows in catalog variant order, sample rows in cohort sample order.
+# For these large_example catalogs both are the source order.
+# ---------------------------------------------------------------------------
+statement ok
+SET threads = 1;
+
+foreach cat lv ls lm
+
+query I
+SELECT (SELECT list(m) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json') m)
+    IS NOT DISTINCT FROM (SELECT list(m) FROM plink_missing('test/data/large_example.pgen') m);
+----
+true
+
+query I
+SELECT (SELECT list(m) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := 'sample') m)
+    IS NOT DISTINCT FROM (SELECT list(m) FROM plink_missing('test/data/large_example.pgen', mode := 'sample') m);
+----
+true
+
+endloop
+
+# The sexchr matrix catalog orders its samples by sample block, then by .psam row.
+query T
+SELECT list(IID) FROM plink_missing('{TEST_DIR}/sm.pfile.json', mode := 'sample');
+----
+[M1, M2, M3, F1, F2, F3]
+
+# ---------------------------------------------------------------------------
+# The oracle, at threads = 1 and threads = 4
+# ---------------------------------------------------------------------------
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+foreach cat lv ls lm
+
+foreach mode variant sample
+
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}')),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}')
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}'))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}')
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}')));
+----
+<REGEX>:(3000|8)	0	0
+
+# A sample subset by IID that spans sample blocks.
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := ['SAMP2', 'SAMP5', 'SAMP8'])),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := ['SAMP2', 'SAMP5', 'SAMP8'])
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', samples := ['SAMP2', 'SAMP5', 'SAMP8']))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', samples := ['SAMP2', 'SAMP5', 'SAMP8'])
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := ['SAMP2', 'SAMP5', 'SAMP8'])));
+----
+<REGEX>:(3000|3)	0	0
+
+# Integer sample indices are cohort-wide and 0-based.
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := [0, 4, 7])),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := [0, 4, 7])
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', samples := [0, 4, 7]))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', samples := [0, 4, 7])
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := [0, 4, 7])));
+----
+<REGEX>:(3000|3)	0	0
+
+# A region inside one variant block (sample mode counts over it only).
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', region := '2:1-5000000')),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', region := '2:1-5000000')
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', region := '2:1-5000000'))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', region := '2:1-5000000')
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', region := '2:1-5000000')));
+----
+<REGEX>:[1-9][0-9]*	0	0
+
+# selection := variant_range is a cohort-wide [lo, hi) ordinal range; this one crosses a block edge.
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', selection := {variant_range: [900, 2100]})),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', selection := {variant_range: [900, 2100]})
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', selection := {variant_range: [900, 2100]}))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/large_example.pgen', mode := '${mode}', selection := {variant_range: [900, 2100]})
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', selection := {variant_range: [900, 2100]})));
+----
+<REGEX>:(1200|8)	0	0
+
+endloop
+
+endloop
+
+# sexchr_example, all three kinds: chrY counts males only.
+foreach cat sv ss sm
+
+foreach mode variant sample
+
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}')),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}')
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/sexchr_example.pgen', mode := '${mode}'))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/sexchr_example.pgen', mode := '${mode}')
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}')));
+----
+<REGEX>:(5|6)	0	0
+
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := ['M2', 'F1', 'F3'])),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := ['M2', 'F1', 'F3'])
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/sexchr_example.pgen', mode := '${mode}', samples := ['M2', 'F1', 'F3']))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/sexchr_example.pgen', mode := '${mode}', samples := ['M2', 'F1', 'F3'])
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/${cat}.pfile.json', mode := '${mode}', samples := ['M2', 'F1', 'F3'])));
+----
+<REGEX>:(5|3)	0	0
+
+endloop
+
+endloop
+
+# A catalog whose .psam files have no SEX: variant mode NULLs chrY, as over a .psam without SEX.
+query III
+SELECT (SELECT count(*) FROM plink_missing('{TEST_DIR}/snosex.pfile.json')),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/snosex.pfile.json')
+                              EXCEPT ALL SELECT * FROM plink_missing('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam'))),
+       (SELECT count(*) FROM (SELECT * FROM plink_missing('test/data/sexchr_example.pgen', psam := 'test/data/sexchr_nosex.psam')
+                              EXCEPT ALL SELECT * FROM plink_missing('{TEST_DIR}/snosex.pfile.json')));
+----
+5	0	0
+
+endloop
+
+# Sample mode over chrY needs SEX, as over a .psam without SEX.
+statement error
+SELECT * FROM plink_missing('{TEST_DIR}/snosex.pfile.json', mode := 'sample');
+----
+no SEX column
+
+# ---------------------------------------------------------------------------
+# Discovery: the same inputs as read_pfile
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/lm', mode := 'sample')
+                      EXCEPT ALL SELECT * FROM plink_missing('test/data/large_example.pgen', mode := 'sample'));
+----
+0
+
+query I
+SELECT count(*) FROM plink_missing('{TEST_DIR}/lm');
+----
+3000
+
+query I
+SELECT count(*) FROM plink_missing(catalog := '{TEST_DIR}/ls.pfile.json', mode := 'sample');
+----
+8
+
+query I
+SELECT count(*) FROM plink_missing('{TEST_DIR}/lv', catalog := true);
+----
+3000
+
+statement error
+SELECT * FROM plink_missing('test/data/large_example', catalog := true);
+----
+no catalog at 'test/data/large_example.pfile.json'
+
+statement error
+SELECT * FROM plink_missing('{TEST_DIR}/lm', catalog := false);
+----
+plink_missing: cannot find .pvar or .bim companion
+
+query I
+SELECT count(*) FROM plink_missing('test/data/large_example.pgen');
+----
+3000
+
+# ---------------------------------------------------------------------------
+# Errors: parameters that a catalog read cannot honor
+# ---------------------------------------------------------------------------
+statement error
+SELECT * FROM plink_missing('{TEST_DIR}/lm.pfile.json', pvar := 'test/data/large_example.pvar');
+----
+plink_missing: a catalog
+
+statement error
+SELECT * FROM plink_missing('{TEST_DIR}/lm.pfile.json', psam := 'test/data/large_example.psam');
+----
+plink_missing: a catalog
+
+statement error
+SELECT * FROM plink_missing('test/data/large_example.pgen', catalog := '{TEST_DIR}/lm.pfile.json');
+----
+cannot be combined with a positional
+
+statement error
+SELECT * FROM plink_missing(catalog := '{TEST_DIR}/nope.pfile.json');
+----
+plink_missing: catalog file not found
+
+statement error
+SELECT * FROM plink_missing('{TEST_DIR}/lm.pfile.json', mode := 'bogus');
+----
+mode must be 'variant' or 'sample'
