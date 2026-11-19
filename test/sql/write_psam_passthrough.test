@@ -1,0 +1,289 @@
+# name: test/sql/write_psam_passthrough.test
+# description: standalone row-stream COPY ... (FORMAT psam) passes every input column through to the .psam (and its .psam.parquet companion): FID/IID first, SEX in PLINK coding, NULL -> NA, unrepresentable values are a clean error. Oracle for SEX: plink_freq on chrX of the original sexchr_example fileset.
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# ===========================================================================
+# SEX + an ancestry VARCHAR + a numeric phenotype, with NULLs. The raw text pins
+# the header, the column order, the SEX coding and NA for NULL.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM (VALUES ('S1', 1, 'EUR', 1.5::DOUBLE), ('S2', 2, NULL, NULL), ('S3', NULL, 'AFR', -0.25::DOUBLE))
+      t(IID, SEX, ancestry, pheno))
+TO '{TEST_DIR}/pt.psam' (FORMAT psam);
+
+query T
+SELECT replace(replace(content, chr(9), '|'), chr(10), ';') FROM read_text('{TEST_DIR}/pt.psam');
+----
+#IID|SEX|ancestry|pheno;S1|1|EUR|1.5;S2|2|NA|NA;S3|NA|AFR|-0.25;
+
+# read_psam types SEX as INTEGER (only when the header says exactly SEX), the rest VARCHAR.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_psam('{TEST_DIR}/pt.psam'));
+----
+IID	VARCHAR
+SEX	INTEGER
+ancestry	VARCHAR
+pheno	VARCHAR
+
+query TITT
+SELECT * FROM read_psam('{TEST_DIR}/pt.psam');
+----
+S1	1	EUR	1.5
+S2	2	NULL	NULL
+S3	NULL	AFR	-0.25
+
+# ===========================================================================
+# SEX coding from other spellings: a lowercase `sex` column, VARCHAR codes, 0 = unknown,
+# M/F letters (PLINK 2 accepts them). The header is always the canonical `SEX`.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM (VALUES ('A', '1'), ('B', '2'), ('C', '0'), ('D', 'M'), ('E', 'f'), ('F', NULL)) t(IID, sex))
+TO '{TEST_DIR}/sexv.psam' (FORMAT psam);
+
+query T
+SELECT replace(replace(content, chr(9), '|'), chr(10), ';') FROM read_text('{TEST_DIR}/sexv.psam');
+----
+#IID|SEX;A|1;B|2;C|NA;D|1;E|2;F|NA;
+
+# A SEX value that is not a PLINK code is an error, not a silent 'unknown'.
+statement error
+COPY (SELECT 'A' AS IID, 3 AS SEX) TO '{TEST_DIR}/sexbad.psam' (FORMAT psam);
+----
+SEX
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/sexbad.psam*');
+----
+0
+
+# ===========================================================================
+# FID present (any case, any position): the header starts #FID IID, then the rest in input order.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM (VALUES ('i1', 'x1', 'f1', 2), ('i2', NULL, 'f2', 1)) t(IID, note, fid, SEX))
+TO '{TEST_DIR}/fid.psam' (FORMAT psam);
+
+query T
+SELECT replace(replace(content, chr(9), '|'), chr(10), ';') FROM read_text('{TEST_DIR}/fid.psam');
+----
+#FID|IID|note|SEX;f1|i1|x1|2;f2|i2|NA|1;
+
+# ===========================================================================
+# Round trip: read_psam -> COPY -> read_psam gives the same columns, names, order and values.
+# pfile_example has #FID IID SEX with a SEX of 0 (read back as NULL).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_psam('test/data/pfile_example.psam')) TO '{TEST_DIR}/rt.psam' (FORMAT psam);
+
+query I
+SELECT list(column_name || ':' || column_type) FROM (DESCRIBE SELECT * FROM read_psam('{TEST_DIR}/rt.psam'));
+----
+[FID:VARCHAR, IID:VARCHAR, SEX:INTEGER]
+
+query II
+SELECT
+  (SELECT count(*) FROM (SELECT * FROM read_psam('{TEST_DIR}/rt.psam') EXCEPT ALL SELECT * FROM read_psam('test/data/pfile_example.psam'))),
+  (SELECT count(*) FROM (SELECT * FROM read_psam('test/data/pfile_example.psam') EXCEPT ALL SELECT * FROM read_psam('{TEST_DIR}/rt.psam')));
+----
+0	0
+
+query TTI
+SELECT * FROM read_psam('{TEST_DIR}/rt.psam');
+----
+FAM001	SAMPLE1	1
+FAM001	SAMPLE2	2
+FAM002	SAMPLE3	NULL
+FAM002	SAMPLE4	1
+
+# The IID remap still works, and the remapped column is written as #IID (first).
+statement ok
+COPY (SELECT 1 AS SEX, 's1' AS sid) TO '{TEST_DIR}/remap.psam' (FORMAT psam, sample_fields {iid: 'sid'});
+
+query T
+SELECT replace(replace(content, chr(9), '|'), chr(10), ';') FROM read_text('{TEST_DIR}/remap.psam');
+----
+#IID|SEX;s1|1;
+
+# A remap that leaves a second IID column would write IID twice: a clean bind error.
+statement error
+COPY (SELECT 's1' AS sid, 'x' AS IID) TO '{TEST_DIR}/dupcol.psam' (FORMAT psam, sample_fields {iid: 'sid'});
+----
+appears twice
+
+# ===========================================================================
+# Values that break the tab-delimited format are a clean error, and no file is left.
+# An empty string is written as NA (read_psam reads an empty field as NULL anyway).
+# ===========================================================================
+
+statement error
+COPY (SELECT 'A' AS IID, 'a' || chr(9) || 'b' AS ancestry) TO '{TEST_DIR}/tab.psam' (FORMAT psam);
+----
+contains a tab
+
+statement error
+COPY (SELECT 'A' AS IID, 'a' || chr(10) || 'b' AS ancestry) TO '{TEST_DIR}/nl.psam' (FORMAT psam);
+----
+contains a tab
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/tab.psam*') UNION ALL SELECT count(*) FROM glob('{TEST_DIR}/nl.psam*');
+----
+0
+0
+
+statement ok
+COPY (SELECT 'A' AS IID, '' AS ancestry) TO '{TEST_DIR}/empty.psam' (FORMAT psam);
+
+query T
+SELECT replace(replace(content, chr(9), '|'), chr(10), ';') FROM read_text('{TEST_DIR}/empty.psam');
+----
+#IID|ancestry;A|NA;
+
+# A nested value (LIST/STRUCT/...) has no .psam text form: a clean bind error.
+statement error
+COPY (SELECT 'A' AS IID, [1, 2] AS g) TO '{TEST_DIR}/nested.psam' (FORMAT psam);
+----
+nested
+
+# ===========================================================================
+# A `__`-prefixed input column is an ordinary column: it is written to the .psam and the companion.
+# An input `__sidx` (the name of the companion's internal row-order pin) does not disturb the row
+# order: the companion keeps write order b, a, c, not the order of the user's __sidx values.
+# ===========================================================================
+
+statement ok
+COPY (SELECT iid, 100 - n AS __sidx FROM (VALUES ('b', 3), ('a', 1), ('c', 2)) t(iid, n))
+TO '{TEST_DIR}/internal.psam' (FORMAT psam, psam_parquet);
+
+query T
+SELECT replace(replace(content, chr(9), '|'), chr(10), ';') FROM read_text('{TEST_DIR}/internal.psam');
+----
+#IID|__sidx;b|97;a|99;c|98;
+
+query TI
+SELECT IID, __sidx FROM read_parquet('{TEST_DIR}/internal.psam.parquet');
+----
+b	97
+a	99
+c	98
+
+query I
+SELECT list(column_name) FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/internal.psam.parquet'));
+----
+[IID, __sidx]
+
+# ===========================================================================
+# The .psam.parquet companion carries the same columns, in the same order, with SQL types
+# (IID/FID VARCHAR, SEX INTEGER in PLINK coding, the rest as the input typed them).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM (VALUES ('S1', '1', 'EUR', 1.5::DOUBLE, 'f1', 7), ('S2', 'F', NULL, NULL, 'f2', 8), ('S3', '0', '', -0.25::DOUBLE, 'f3', 9))
+      t(IID, SEX, ancestry, pheno, FID, "group"))
+TO '{TEST_DIR}/pq.psam' (FORMAT psam, psam_parquet);
+
+query I
+SELECT list(column_name || ':' || column_type) FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/pq.psam.parquet'));
+----
+[FID:VARCHAR, IID:VARCHAR, SEX:INTEGER, ancestry:VARCHAR, pheno:DOUBLE, group:INTEGER]
+
+query TTITRI
+SELECT * FROM read_parquet('{TEST_DIR}/pq.psam.parquet');
+----
+f1	S1	1	EUR	1.5	7
+f2	S2	2	NULL	NULL	8
+f3	S3	NULL	NULL	-0.25	9
+
+# The text and the companion hold the same values (compared as text).
+query II
+SELECT
+  (SELECT count(*) FROM (
+     SELECT FID, IID, SEX, ancestry, pheno, "group" FROM read_psam('{TEST_DIR}/pq.psam')
+     EXCEPT ALL
+     SELECT FID, IID, SEX, ancestry, pheno::VARCHAR, "group"::VARCHAR FROM read_parquet('{TEST_DIR}/pq.psam.parquet'))),
+  (SELECT count(*) FROM read_parquet('{TEST_DIR}/pq.psam.parquet'));
+----
+0	3
+
+# A non-VARCHAR IID / FID is written as text, and the companion types both VARCHAR (the reader
+# reads IID and FID as strings).
+statement ok
+COPY (SELECT i AS IID, i % 2 AS FID FROM range(3) t(i)) TO '{TEST_DIR}/numid.psam' (FORMAT psam, psam_parquet);
+
+query I
+SELECT list(column_name || ':' || column_type) FROM (DESCRIBE SELECT * FROM read_parquet('{TEST_DIR}/numid.psam.parquet'));
+----
+[FID:VARCHAR, IID:VARCHAR]
+
+query TT
+SELECT FID, IID FROM read_parquet('{TEST_DIR}/numid.psam.parquet');
+----
+0	0
+1	1
+0	2
+
+# ===========================================================================
+# SEX oracle on chrX. The bundle writer emits an IID-only .psam. Replace it with a passthrough
+# FORMAT psam write of the original .psam (+ an ancestry column), then read_pfile's chrX counts
+# must equal plink_freq on the ORIGINAL fileset — with companions off (text SEX) and on (parquet SEX).
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sxb' (FORMAT pfile);
+
+statement ok
+COPY (SELECT *, CASE WHEN SEX = 1 THEN 'EUR' ELSE 'AFR' END AS ancestry, row_number() OVER () * 0.5 AS pheno FROM read_psam('test/data/sexchr_example.psam'))
+TO '{TEST_DIR}/sxb.psam' (FORMAT psam, psam_parquet, force);
+
+statement ok
+SET plinking_use_parquet_companions = false;
+
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('{TEST_DIR}/sxb', freq := true) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID)
+WHERE r.CHROM = 'X';
+----
+1	0
+
+statement ok
+CREATE TEMP TABLE meta_off AS
+SELECT IID, SEX, ancestry, pheno::VARCHAR AS pheno FROM read_pfile('{TEST_DIR}/sxb', orient := 'sample');
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+query II
+SELECT count(*),
+       count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
+                          OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
+                          OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
+FROM read_pfile('{TEST_DIR}/sxb', freq := true) r
+JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID)
+WHERE r.CHROM = 'X';
+----
+1	0
+
+# Companions on gives the same per-sample values as companions off.
+query III
+SELECT
+  (SELECT count(*) FROM (SELECT IID, SEX, ancestry, pheno::VARCHAR FROM read_pfile('{TEST_DIR}/sxb', orient := 'sample') EXCEPT ALL SELECT * FROM meta_off)),
+  (SELECT count(*) FROM (SELECT * FROM meta_off EXCEPT ALL SELECT IID, SEX, ancestry, pheno::VARCHAR FROM read_pfile('{TEST_DIR}/sxb', orient := 'sample'))),
+  (SELECT count(*) FROM meta_off WHERE SEX IN (1, 2) AND ancestry IS NOT NULL AND pheno IS NOT NULL);
+----
+0	0	6
+
+statement ok
+RESET plinking_use_parquet_companions;
