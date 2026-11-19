@@ -109,17 +109,31 @@ unique_ptr<CatalogCohort> LoadCatalogCohort(ClientContext &context, const string
 	const idx_t K = grid.sample_block_ct;
 	const idx_t V = grid.cells.size() / K;
 
+	// A cell whose catalog entry omits a companion (a pvar_parquet catalog omits `pvar`) finds it beside
+	// its .pgen, parquet companion first, as read_pfile does.
+	auto companion = [&](const MatrixCell &cell, const string &declared, const vector<string> &exts, const char *what,
+	                     const char *axis, idx_t block_idx) {
+		if (!declared.empty()) {
+			return declared;
+		}
+		auto found = FindCompanionFileWithParquet(context, fs, cell.prefix + ".pgen", exts);
+		if (found.empty()) {
+			throw InvalidInputException("%s: catalog '%s' names no %s for %s block %llu, and none is beside '%s.pgen'",
+			                            func_name, grid.path, what, axis, static_cast<unsigned long long>(block_idx),
+			                            cell.prefix);
+		}
+		return found;
+	};
+
 	// The samples: sample block sb's .psam is the one its cells name (row 0 holds one cell per block).
 	vector<uint32_t> block_sample_ct(K);
 	bool all_sexes = true;
 	bool any_fids = false;
 	vector<SampleInfo> parts(K);
+	vector<string> psam_paths(K);
 	for (idx_t sb = 0; sb < K; sb++) {
-		auto &psam = grid.cells[sb].psam;
-		if (psam.empty()) {
-			throw InvalidInputException("%s: catalog '%s' names no .psam for sample block %llu", func_name, grid.path,
-			                            static_cast<unsigned long long>(sb));
-		}
+		auto psam = companion(grid.cells[sb], grid.cells[sb].psam, {".psam", ".fam"}, ".psam", "sample", sb);
+		psam_paths[sb] = psam;
 		parts[sb] = LoadSampleMetadata(context, psam);
 		block_sample_ct[sb] = static_cast<uint32_t>(parts[sb].sample_ct);
 		all_sexes = all_sexes && parts[sb].sexes.size() == parts[sb].sample_ct;
@@ -146,11 +160,7 @@ unique_ptr<CatalogCohort> LoadCatalogCohort(ClientContext &context, const string
 	// The variant blocks, in catalog order. Check every cell's .pgen against its .pvar and .psam.
 	for (idx_t vb = 0; vb < V; vb++) {
 		CatalogCohort::Block block;
-		auto &pvar = grid.cells[vb * K].pvar;
-		if (pvar.empty()) {
-			throw InvalidInputException("%s: catalog '%s' names no .pvar for variant block %llu", func_name, grid.path,
-			                            static_cast<unsigned long long>(vb));
-		}
+		auto pvar = companion(grid.cells[vb * K], grid.cells[vb * K].pvar, {".pvar", ".bim"}, ".pvar", "variant", vb);
 		block.variants = LoadVariantMetadata(context, pvar, func_name);
 		block.variant_ct = static_cast<uint32_t>(block.variants.variant_ct);
 		uint32_t offset = 0;
@@ -175,8 +185,8 @@ unique_ptr<CatalogCohort> LoadCatalogCohort(ClientContext &context, const string
 			if (shard.raw_sample_ct != block_sample_ct[sb]) {
 				throw InvalidInputException("%s: sample count mismatch: .pgen '%s' has %u samples, .psam/.fam '%s' has "
 				                            "%u samples",
-				                            func_name, shard.pgen_path, shard.raw_sample_ct,
-				                            grid.cells[vb * K + sb].psam, block_sample_ct[sb]);
+				                            func_name, shard.pgen_path, shard.raw_sample_ct, psam_paths[sb],
+				                            block_sample_ct[sb]);
 			}
 			shard.sample_offset = offset;
 			offset += shard.raw_sample_ct;
