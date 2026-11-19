@@ -1,0 +1,36 @@
+# name: test/sql/plink_freq_missing_catalog_parquet.test
+# description: plink_freq and plink_missing read a catalog that omits the pvar key (pvar_parquet companions)
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# A catalog that omits the cells' pvar key (pvar_parquet): each block's .pvar is discovered beside
+# its .pgen, parquet companion first, as read_pfile does.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/lpq' (FORMAT pfile, shard_by 'CHROM', pvar_parquet);
+
+query I
+SELECT count(*) FROM (SELECT * FROM plink_freq('{TEST_DIR}/lpq.pfile.json')
+                      EXCEPT ALL SELECT * FROM plink_freq('test/data/large_example.pgen'));
+----
+0
+
+query I
+SELECT count(*) FROM plink_freq('{TEST_DIR}/lpq.pfile.json');
+----
+3000
+
+query I
+SELECT count(*) FROM (SELECT * FROM plink_missing('{TEST_DIR}/lpq.pfile.json', mode := 'sample')
+                      EXCEPT ALL SELECT * FROM plink_missing('test/data/large_example.pgen', mode := 'sample'));
+----
+0
+
+query I
+SELECT count(*) FROM plink_missing('{TEST_DIR}/lpq.pfile.json');
+----
+3000
+

@@ -291,6 +291,21 @@ SELECT count(*) FROM plink_freq('test/data/large_example.pgen');
 ----
 3000
 
+# An explicit .pgen path is a file even when '<p>.pfile.json' sits beside it. Here 'one.pgen' is
+# sexchr_example (5 variants) and 'one.pfile.json' is a copy of the large_example matrix catalog
+# (3000 variants; its paths are relative to the same folder, so it reads).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct')) TO '{TEST_DIR}/one' (FORMAT pfile);
+
+statement ok
+COPY (SELECT content FROM read_text('{TEST_DIR}/lm.pfile.json'))
+TO '{TEST_DIR}/one.pfile.json' (FORMAT csv, header false, quote '', escape '', delim '\x01');
+
+query II
+SELECT (SELECT count(*) FROM plink_freq('{TEST_DIR}/one.pgen')), (SELECT count(*) FROM plink_freq('{TEST_DIR}/one'));
+----
+5	3000
+
 # ---------------------------------------------------------------------------
 # Errors: parameters that a catalog read cannot honor
 # ---------------------------------------------------------------------------
