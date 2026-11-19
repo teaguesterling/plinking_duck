@@ -989,50 +989,225 @@ unique_ptr<LocalFunctionData> PgenCopyInitLocal(ExecutionContext &, FunctionData
 	return make_uniq<PgenWriteLocalState>();
 }
 
-// Fetch one variant row's genotype cell after the row-level guards (best-effort
-// multiallelic ALT guard; a NULL cell). The returned Value owns the per-sample calls
-// (see GenotypeCalls). Shared by the bundle and the sample-sharded writer, so a row is
-// checked ONCE however many shard writers it feeds.
-Value PgenRowGenotypes(const PgenWriteBindData &bind, DataChunk &input, idx_t row) {
-	// --- best-effort multiallelic guard (only when ALT is in the stream) ---
-	// A genotypes-only input carries NO multiallelic signal (PgrGet collapses
-	// a multiallelic site to biallelic 0/1/2/missing). When the natural
-	// round-trip query carries ALT, a comma reveals it; reject those.
-	if (bind.has_alt) {
-		auto alt_val = input.GetValue(bind.alt_input_idx, row);
-		if (!alt_val.IsNull() && alt_val.ToString().find(',') != string::npos) {
-			throw InvalidInputException(
-			    "write pgen: variant has a multiallelic ALT ('%s') — multiallelic .pgen writing is not "
-			    "supported in this increment (biallelic hardcalls only)",
-			    alt_val.ToString());
+// ---------------------------------------------------------------------------
+// GenotypeColumnReader — the genotypes column of one chunk, read straight from
+// DuckDB's vectors. It is built ONCE per chunk; a per-row Value (one child Value
+// per sample) cost about 200 ms per variant at 1,000,000 samples.
+// ---------------------------------------------------------------------------
+
+// Map one call to its 2-bit code: 0 -> 0b00, 1 -> 0b01, 2 -> 0b10, -9 -> 0b11 (missing).
+// Any other value returns 4. An unsigned type cannot hold -9, so it writes missing as NULL.
+template <class T>
+inline uintptr_t CallCode(T v) {
+	if (v == T(0)) {
+		return 0;
+	}
+	if (v == T(1)) {
+		return 1;
+	}
+	if (v == T(2)) {
+		return 2;
+	}
+	if (std::is_signed<T>::value && v == static_cast<T>(-9)) {
+		return 3;
+	}
+	return 4;
+}
+template <>
+inline uintptr_t CallCode(hugeint_t v) {
+	if (v == hugeint_t(0)) {
+		return 0;
+	}
+	if (v == hugeint_t(1)) {
+		return 1;
+	}
+	if (v == hugeint_t(2)) {
+		return 2;
+	}
+	return v == hugeint_t(-9) ? 3 : 4;
+}
+template <>
+inline uintptr_t CallCode(uhugeint_t v) {
+	if (v == uhugeint_t(0)) {
+		return 0;
+	}
+	if (v == uhugeint_t(1)) {
+		return 1;
+	}
+	return v == uhugeint_t(2) ? 2 : 4;
+}
+
+[[noreturn]] void ThrowCallOutOfRange(const string &value, idx_t variant_idx, idx_t sample_idx) {
+	throw InvalidInputException("write pgen: genotype value %s (variant %llu, sample %llu) is out of range — a "
+	                            "biallelic hardcall must be 0, 1, 2, or -9/NULL (missing)",
+	                            value, static_cast<unsigned long long>(variant_idx),
+	                            static_cast<unsigned long long>(sample_idx));
+}
+
+// The 2-bit code of the call at data index `di` of `f` (NULL -> missing). Throws on a value
+// outside {-9, 0, 1, 2}; `sample_idx` is the INPUT position, so a shard writer names the
+// same sample as the bundle.
+template <class T>
+inline uintptr_t CallCodeAt(const UnifiedVectorFormat &f, idx_t di, idx_t variant_idx, idx_t sample_idx) {
+	if (!f.validity.RowIsValid(di)) {
+		return 3;
+	}
+	const T v = UnifiedVectorFormat::GetData<T>(f)[di];
+	const uintptr_t nyp = CallCode<T>(v);
+	if (nyp > 3) {
+		ThrowCallOutOfRange(Value::CreateValue<T>(v).ToString(), variant_idx, sample_idx);
+	}
+	return nyp;
+}
+
+inline void SetNyp(uintptr_t *genovec, idx_t out, uintptr_t nyp) {
+	genovec[out / plink2::kBitsPerWordD2] |= nyp << (2 * (out % plink2::kBitsPerWordD2));
+}
+
+// Pack samples [lo, hi) of one LIST/ARRAY row, whose calls sit at child positions base + s.
+template <class T>
+void PackCallRun(const UnifiedVectorFormat &child, idx_t base, idx_t lo, idx_t hi, uintptr_t *genovec,
+                 idx_t variant_idx) {
+	for (idx_t s = lo; s < hi; s++) {
+		SetNyp(genovec, s - lo, CallCodeAt<T>(child, child.sel->get_index(base + s), variant_idx, s));
+	}
+}
+
+// Run `fn<T>()` for the C++ type of an integer element's physical type. The bind accepts
+// integer element types only (ValidateHardcallElem), so any other type is a bug.
+template <class FN>
+auto DispatchCallType(PhysicalType ptype, FN &&fn) -> decltype(fn(int8_t())) {
+	switch (ptype) {
+	case PhysicalType::INT8:
+		return fn(int8_t());
+	case PhysicalType::INT16:
+		return fn(int16_t());
+	case PhysicalType::INT32:
+		return fn(int32_t());
+	case PhysicalType::INT64:
+		return fn(int64_t());
+	case PhysicalType::INT128:
+		return fn(hugeint_t());
+	case PhysicalType::UINT8:
+		return fn(uint8_t());
+	case PhysicalType::UINT16:
+		return fn(uint16_t());
+	case PhysicalType::UINT32:
+		return fn(uint32_t());
+	case PhysicalType::UINT64:
+		return fn(uint64_t());
+	case PhysicalType::UINT128:
+		return fn(uhugeint_t());
+	default:
+		throw InternalException("write pgen: genotype element has physical type %s, which the bind rejects",
+		                        TypeIdToString(ptype));
+	}
+}
+
+class GenotypeColumnReader {
+public:
+	// Reads the genotypes column (and ALT, for the multiallelic guard) of `input`.
+	// Call input.Flatten() first: STRUCT fields are then indexed by row.
+	GenotypeColumnReader(const PgenWriteBindData &bind, DataChunk &input)
+	    : bind(bind), input(input), geno(input.data[bind.geno_input_idx]) {
+		CompatToUnifiedFormat(geno, input.size(), top);
+		const LogicalTypeId tid = geno.GetType().id();
+		if (tid == LogicalTypeId::STRUCT) {
+			shape = Shape::STRUCT;
+			auto &entries = StructVector::GetEntries(geno);
+			fields.resize(entries.size());
+			field_ptypes.resize(entries.size());
+			for (idx_t s = 0; s < entries.size(); s++) {
+				auto &field_vec = CompatStructEntry(entries[s]);
+				CompatToUnifiedFormat(field_vec, input.size(), fields[s]);
+				field_ptypes[s] = field_vec.GetType().InternalType();
+			}
+		} else if (tid == LogicalTypeId::ARRAY) {
+			shape = Shape::ARRAY;
+			array_size = ArrayType::GetSize(geno.GetType());
+			auto &child_vec = ArrayVector::GetEntry(geno);
+			CompatToUnifiedFormat(child_vec, ArrayVector::GetTotalSize(geno), child);
+			child_ptype = child_vec.GetType().InternalType();
+		} else {
+			shape = Shape::LIST;
+			auto &child_vec = ListVector::GetEntry(geno);
+			CompatToUnifiedFormat(child_vec, ListVector::GetListSize(geno), child);
+			child_ptype = child_vec.GetType().InternalType();
 		}
 	}
 
-	// --- fetch the per-variant genotype list ---
-	auto geno_val = input.GetValue(bind.geno_input_idx, row);
-	if (geno_val.IsNull()) {
-		throw InvalidInputException(
-		    "write pgen: the genotypes cell is NULL for a variant — every variant needs a list of per-sample "
-		    "calls (use -9 or NULL *inside* the list for a missing call)");
+	// The row-level guards (best-effort multiallelic ALT; a NULL cell). Returns the
+	// number of calls in the row. Shared by every sink, so a row is checked ONCE
+	// however many shard writers it feeds.
+	idx_t PrepareRow(idx_t row) const {
+		// A genotypes-only input carries NO multiallelic signal (PgrGet collapses a
+		// multiallelic site to biallelic 0/1/2/missing). When the natural round-trip
+		// query carries ALT, a comma reveals it; reject those.
+		if (bind.has_alt) {
+			auto alt_val = input.GetValue(bind.alt_input_idx, row);
+			if (!alt_val.IsNull() && alt_val.ToString().find(',') != string::npos) {
+				throw InvalidInputException(
+				    "write pgen: variant has a multiallelic ALT ('%s') — multiallelic .pgen writing is not "
+				    "supported in this increment (biallelic hardcalls only)",
+				    alt_val.ToString());
+			}
+		}
+		const idx_t ti = top.sel->get_index(row);
+		if (!top.validity.RowIsValid(ti)) {
+			throw InvalidInputException(
+			    "write pgen: the genotypes cell is NULL for a variant — every variant needs a list of per-sample "
+			    "calls (use -9 or NULL *inside* the list for a missing call)");
+		}
+		switch (shape) {
+		case Shape::LIST:
+			return UnifiedVectorFormat::GetData<list_entry_t>(top)[ti].length;
+		case Shape::ARRAY:
+			return array_size;
+		default:
+			return fields.size();
+		}
 	}
-	return geno_val;
-}
 
-// The per-sample calls of a genotype cell: LIST/ARRAY children, or STRUCT field values
-// in field order (same positional per-sample semantics — the struct's field NAMES
-// carried the IIDs to the .psam at bind, the VALUES are the per-sample calls here).
-const vector<Value> &GenotypeCalls(const Value &geno_val) {
-	LogicalTypeId gtid = geno_val.type().id();
-	return (gtid == LogicalTypeId::ARRAY)    ? ArrayValue::GetChildren(geno_val)
-	       : (gtid == LogicalTypeId::STRUCT) ? StructValue::GetChildren(geno_val)
-	                                         : ListValue::GetChildren(geno_val);
-}
+	// OR the 2-bit codes of samples [lo, hi) of `row` into a zeroed `genovec`, sample lo
+	// in the low bits. `variant_idx` names the variant in an out-of-range error.
+	void Pack(idx_t row, idx_t lo, idx_t hi, uintptr_t *genovec, idx_t variant_idx) const {
+		const idx_t ti = top.sel->get_index(row);
+		if (shape == Shape::STRUCT) {
+			for (idx_t s = lo; s < hi; s++) {
+				const auto &f = fields[s];
+				const idx_t di = f.sel->get_index(row);
+				SetNyp(genovec, s - lo, DispatchCallType(field_ptypes[s], [&](auto tag) {
+					       return CallCodeAt<decltype(tag)>(f, di, variant_idx, s);
+				       }));
+			}
+			return;
+		}
+		const idx_t base =
+		    shape == Shape::ARRAY ? ti * array_size : UnifiedVectorFormat::GetData<list_entry_t>(top)[ti].offset;
+		DispatchCallType(child_ptype, [&](auto tag) {
+			PackCallRun<decltype(tag)>(child, base, lo, hi, genovec, variant_idx);
+			return 0;
+		});
+	}
 
-// Pack calls[lo, hi) into a 2-bit genovec and append it as ONE variant to `g` (whose
-// writer must be inited with sample_ct == hi - lo). Guards the variant-count bound
-// (pgenlib does not) and the 0/1/2/-9 value range. A sample index in an error is the
-// INPUT position (lo + offset), so a shard writer names the same sample as the bundle.
-void PgenAppendCallRange(PgenWriteGlobalState &g, const vector<Value> &calls, idx_t lo, idx_t hi) {
+private:
+	enum class Shape { LIST, ARRAY, STRUCT };
+	const PgenWriteBindData &bind;
+	DataChunk &input;
+	Vector &geno;
+	Shape shape = Shape::LIST;
+	UnifiedVectorFormat top;
+	UnifiedVectorFormat child; //! LIST/ARRAY: the calls of every row
+	PhysicalType child_ptype = PhysicalType::INT8;
+	idx_t array_size = 0;
+	vector<UnifiedVectorFormat> fields; //! STRUCT: one per sample
+	vector<PhysicalType> field_ptypes;
+};
+
+// Pack samples [lo, hi) of `row` into a 2-bit genovec and append it as ONE variant to `g`
+// (whose writer must be inited with sample_ct == hi - lo). Guards the variant-count bound
+// (pgenlib does not) and the 0/1/2/-9 value range.
+void PgenAppendCallRange(PgenWriteGlobalState &g, const GenotypeColumnReader &calls, idx_t row, idx_t lo, idx_t hi) {
 	// --- guard against exceeding the variant-count bound ---
 	// pgenlib does NOT bounds-check the append; overrunning corrupts the heap.
 	if (g.appended >= g.variant_ct_limit) {
@@ -1042,43 +1217,11 @@ void PgenAppendCallRange(PgenWriteGlobalState &g, const vector<Value> &calls, id
 		    g.variant_ct_limit);
 	}
 
-	// --- pack the int8 calls into a 2-bit genovec (sample 0 in low bits) ---
+	// --- pack the calls into a 2-bit genovec (sample 0 in low bits) ---
 	//   0 -> 0b00, 1 -> 0b01, 2 -> 0b10, (-9 | NULL) -> 0b11 (missing).
 	auto *genovec = g.genovec.As<uintptr_t>();
 	std::memset(genovec, 0, g.genovec_bytes);
-	for (idx_t s = lo; s < hi; s++) {
-		uintptr_t nyp;
-		const Value &c = calls[s];
-		if (c.IsNull()) {
-			nyp = 3; // missing
-		} else {
-			int64_t code = c.GetValue<int64_t>();
-			switch (code) {
-			case 0:
-				nyp = 0;
-				break;
-			case 1:
-				nyp = 1;
-				break;
-			case 2:
-				nyp = 2;
-				break;
-			case -9:
-				nyp = 3;
-				break;
-			default:
-				throw InvalidInputException(
-				    "write pgen: genotype value %lld (variant %llu, sample %llu) is out of range — a biallelic "
-				    "hardcall must be 0, 1, 2, or -9/NULL (missing)",
-				    static_cast<long long>(code), static_cast<unsigned long long>(g.appended),
-				    static_cast<unsigned long long>(s));
-			}
-		}
-		uint32_t out = static_cast<uint32_t>(s - lo);
-		uint32_t widx = out / plink2::kBitsPerWordD2;
-		uint32_t shift = 2 * (out % plink2::kBitsPerWordD2);
-		genovec[widx] |= nyp << shift;
-	}
+	calls.Pack(row, lo, hi, genovec, g.appended);
 	plink2::ZeroTrailingBits(g.sample_ct * 2, genovec);
 
 	plink2::PglErr e = plink2::SpgwAppendBiallelicGenovec(genovec, &g.spgw);
@@ -1095,10 +1238,9 @@ void PgenAppendCallRange(PgenWriteGlobalState &g, const vector<Value> &calls, id
 void PgenWriteChunk(const PgenWriteBindData &bind, PgenWriteGlobalState &g, DataChunk &input, idx_t row_begin,
                     idx_t row_end) {
 	input.Flatten();
+	GenotypeColumnReader calls(bind, input);
 	for (idx_t row = row_begin; row < row_end; row++) {
-		Value geno_val = PgenRowGenotypes(bind, input, row);
-		const vector<Value> &calls = GenotypeCalls(geno_val);
-		idx_t n = calls.size();
+		idx_t n = calls.PrepareRow(row);
 
 		// --- establish / validate the sample count ---
 		// Use the bind-known sample_ct (fixed ARRAY width) when we have it, else
@@ -1113,7 +1255,7 @@ void PgenWriteChunk(const PgenWriteBindData &bind, PgenWriteGlobalState &g, Data
 			    "the same number of samples",
 			    static_cast<unsigned long long>(g.appended), static_cast<unsigned long long>(n), g.sample_ct);
 		}
-		PgenAppendCallRange(g, calls, 0, n);
+		PgenAppendCallRange(g, calls, row, 0, n);
 	}
 }
 
@@ -2671,21 +2813,21 @@ void PfileSampleShardedSink(ExecutionContext &context, const PfileWriteBindData 
 		// The shared .pvar first: its (CHROM, POS) monotonicity check fires before any .pgen append.
 		PvarWriteChunk(*bind.pvar_bind, g.pvar_g, input, 0, input.size());
 		const uint32_t total = static_cast<uint32_t>(bind.iids.size());
+		GenotypeColumnReader calls(*bind.pgen_bind, input);
 		for (idx_t row = 0; row < input.size(); row++) {
-			Value geno_val = PgenRowGenotypes(*bind.pgen_bind, input, row);
-			const vector<Value> &calls = GenotypeCalls(geno_val);
-			if (calls.size() != total) {
+			const idx_t n = calls.PrepareRow(row);
+			if (n != total) {
 				throw InvalidInputException(
 				    "write pgen: variant %llu has %llu genotypes but the sample count is %u — every variant must list "
 				    "the same number of samples",
-				    static_cast<unsigned long long>(g.shards[0].pgen->appended),
-				    static_cast<unsigned long long>(calls.size()), total);
+				    static_cast<unsigned long long>(g.shards[0].pgen->appended), static_cast<unsigned long long>(n),
+				    total);
 			}
 			for (auto &sh : g.shards) {
 				if (!sh.pgen->writer_inited) {
 					PgenEnsureWriterInited(*sh.pgen, sh.pgen->sample_ct);
 				}
-				PgenAppendCallRange(*sh.pgen, calls, sh.lo, sh.hi);
+				PgenAppendCallRange(*sh.pgen, calls, row, sh.lo, sh.hi);
 			}
 		}
 	} catch (...) {
@@ -3007,6 +3149,7 @@ void PfileMatrixSink(ExecutionContext &context, const PfileWriteBindData &bind, 
 		input.Flatten();
 		const idx_t n = input.size();
 		const uint32_t total = static_cast<uint32_t>(bind.iids.size());
+		GenotypeColumnReader calls(*bind.pgen_bind, input);
 		idx_t row = 0;
 		while (row < n) {
 			auto kv = input.GetValue(bind.shard_key_input_idx, row);
@@ -3034,21 +3177,20 @@ void PfileMatrixSink(ExecutionContext &context, const PfileWriteBindData &bind, 
 			// The block's .pvar first: its (CHROM, POS) monotonicity check fires before any .pgen append.
 			PvarWriteChunk(*bind.pvar_bind, *g.cur_pvar, input, row, run_end);
 			for (idx_t r = row; r < run_end; r++) {
-				Value geno_val = PgenRowGenotypes(*bind.pgen_bind, input, r);
-				const vector<Value> &calls = GenotypeCalls(geno_val);
-				if (calls.size() != total) {
+				const idx_t n_calls = calls.PrepareRow(r);
+				if (n_calls != total) {
 					throw InvalidInputException(
 					    "write pgen: variant %llu has %llu genotypes but the sample count is %u — every variant must "
 					    "list the same number of samples",
 					    static_cast<unsigned long long>(g.running_start + g.cur_pgens[0]->appended),
-					    static_cast<unsigned long long>(calls.size()), total);
+					    static_cast<unsigned long long>(n_calls), total);
 				}
 				for (idx_t i = 0; i < g.cur_pgens.size(); i++) {
 					auto &pg = *g.cur_pgens[i];
 					if (!pg.writer_inited) {
 						PgenEnsureWriterInited(pg, pg.sample_ct);
 					}
-					PgenAppendCallRange(pg, calls, g.sblocks[i].lo, g.sblocks[i].hi);
+					PgenAppendCallRange(pg, calls, r, g.sblocks[i].lo, g.sblocks[i].hi);
 				}
 			}
 			row = run_end;
