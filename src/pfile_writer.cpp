@@ -1322,11 +1322,13 @@ CopyFunctionExecutionMode PgenCopyExecMode(bool /*preserve_insertion_order*/, bo
 // ===========================================================================
 // FORMAT psam — text `.psam` writer + THE SAMPLE-IDENTITY CONTRACT (P9 Phase C)
 //
-// Writes a MINIMAL `#IID`-only `.psam` (one IID per sample), re-readable by
-// `read_psam`/`read_pfile`. Per-sample metadata beyond IID (SEX/phenotype/
-// covariates) is DEFERRED — a variant-oriented stream has no per-sample axis to
-// carry it. See docs/planning/P9-001-writers-design (Decision 2) + the task's
-// SAMPLE-IDENTITY CONTRACT.
+// Writes a `.psam` re-readable by `read_psam`/`read_pfile`. The OUT-OF-BAND modes
+// (1, 2 below) and the FORMAT pfile bundle / sharded / matrix writers write a
+// MINIMAL `#IID`-only `.psam`: a variant-oriented stream has no per-sample axis
+// to carry SEX/phenotype/covariates. The standalone ROW-STREAM mode (3) has that
+// axis, so it PASSES THROUGH every input column ([FID,] IID first, SEX in PLINK
+// coding, the rest in input order). See docs/planning/P9-001-writers-design
+// (Decision 2) + the task's SAMPLE-IDENTITY CONTRACT.
 //
 // IID source, in priority order (NEVER fabricate IIDs):
 //   1. a STRUCT genotypes column — its field NAMES are the sample IIDs
@@ -1338,8 +1340,9 @@ CopyFunctionExecutionMode PgenCopyExecMode(bool /*preserve_insertion_order*/, bo
 //      (a sample-oriented input, e.g. `SELECT IID FROM read_psam('x')`).
 // If NONE is present for the bundle, a clean BinderException (no files written).
 //
-// `sample_fields {sex: …, …}` (metadata beyond IID) → explicit "not yet
-// supported (follow-on)" error; we NEVER silently drop requested metadata.
+// `sample_fields {sex: …, …}` (roles beyond IID) → explicit error; we NEVER
+// silently drop requested metadata. (The standalone row-stream writer carries
+// such columns by name instead: rename them in the query.)
 // ===========================================================================
 
 // Reject an IID that cannot be represented in a tab-delimited `.psam` (or that
@@ -1389,28 +1392,103 @@ void WritePsamFromIids(FileSystem &fs, const string &path, const vector<string> 
 // private Connection inherits the DB's `preserve_insertion_order`, and with it off a parallel COPY of
 // more than one row group could otherwise reorder rows silently (a small test never shows it). `__sidx`
 // is dropped from the output, so the companion stays IID-only. Mirrors PvarParquetFlush's __vidx guard.
-void WritePsamParquetFromIids(DatabaseInstance &db, const string &psam_path, const vector<string> &iids) {
+// The standalone row-stream writer passes every input column through, so the companion holds those
+// columns (`headers`/`types`, one Value per column per row in `rows`); `ord_name` is the internal
+// ordinal column, chosen at bind so it cannot equal any written column name.
+string QuotePsamIdent(const string &name) {
+	return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+}
+
+void WritePsamParquet(DatabaseInstance &db, const string &psam_path, const vector<string> &headers,
+                      const vector<LogicalType> &types, const vector<vector<Value>> &rows, const string &ord_name) {
 	Connection con(db);
-	auto r = con.Query("CREATE TEMP TABLE __psam_pq(IID VARCHAR, __sidx BIGINT)");
+	string cols;
+	string ddl;
+	for (idx_t c = 0; c < headers.size(); c++) {
+		cols += (c ? ", " : "") + QuotePsamIdent(headers[c]);
+		ddl += QuotePsamIdent(headers[c]) + " " + types[c].ToString() + ", ";
+	}
+	auto r = con.Query("CREATE TEMP TABLE __psam_pq(" + ddl + QuotePsamIdent(ord_name) + " BIGINT)");
 	if (r->HasError()) {
 		throw IOException("write psam: cannot buffer the parquet companion: %s", r->GetError());
 	}
 	{
 		Appender app(con, "temp", "main", "__psam_pq");
-		for (idx_t i = 0; i < iids.size(); i++) {
+		for (idx_t i = 0; i < rows.size(); i++) {
 			app.BeginRow();
-			app.Append(Value(iids[i]));
+			for (auto &v : rows[i]) {
+				app.Append(v);
+			}
 			app.Append(Value::BIGINT(static_cast<int64_t>(i)));
 			app.EndRow();
 		}
 		app.Close();
 	}
 	string target = psam_path + ".parquet";
-	auto c = con.Query("COPY (SELECT IID FROM __psam_pq ORDER BY __sidx) TO '" +
+	auto c = con.Query("COPY (SELECT " + cols + " FROM __psam_pq ORDER BY " + QuotePsamIdent(ord_name) + ") TO '" +
 	                   StringUtil::Replace(target, "'", "''") + "' (FORMAT parquet, COMPRESSION zstd)");
 	if (c->HasError()) {
 		throw IOException("write psam: cannot write the parquet companion '%s': %s", target, c->GetError());
 	}
+}
+
+void WritePsamParquetFromIids(DatabaseInstance &db, const string &psam_path, const vector<string> &iids) {
+	vector<vector<Value>> rows;
+	rows.reserve(iids.size());
+	for (auto &iid : iids) {
+		rows.push_back({Value(iid)});
+	}
+	WritePsamParquet(db, psam_path, {"IID"}, {LogicalType::VARCHAR}, rows, "__sidx");
+}
+
+// ---- row-stream passthrough cells ---------------------------------------------------------------
+// read_psam reads these field texts as NULL, so the writer treats a value with this text as missing:
+// "NA" in the text .psam and NULL in the companion (companions on and off then read the same).
+bool IsPsamMissingText(const string &s) {
+	return s.empty() || s == "." || s == "NA" || s == "na";
+}
+
+void CheckPsamFieldText(const string &s, const string &col_name) {
+	if (s.find('\t') != string::npos || s.find('\n') != string::npos || s.find('\r') != string::npos) {
+		throw InvalidInputException("write psam: column '%s' value contains a tab, newline, or carriage return, which "
+		                            "cannot be written to a tab-delimited .psam",
+		                            col_name);
+	}
+}
+
+// SEX in PLINK coding: 1 = male, 2 = female, NULL = unknown (written "NA"). Accepts a number (1/2/0)
+// or the PLINK 2 text codes 1/M/m, 2/F/f, 0/N/NA/na/./empty. Anything else is an error, never a silent
+// 'unknown'. Returns an INTEGER Value (NULL for unknown), the type read_psam gives SEX.
+Value PsamSexCode(const Value &v) {
+	if (v.IsNull()) {
+		return Value(LogicalType::INTEGER);
+	}
+	if (v.type().IsNumeric()) {
+		double d = v.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
+		if (d == 1) {
+			return Value::INTEGER(1);
+		}
+		if (d == 2) {
+			return Value::INTEGER(2);
+		}
+		if (d == 0) {
+			return Value(LogicalType::INTEGER);
+		}
+	} else {
+		auto s = StringUtil::Lower(v.ToString());
+		if (s == "1" || s == "m") {
+			return Value::INTEGER(1);
+		}
+		if (s == "2" || s == "f") {
+			return Value::INTEGER(2);
+		}
+		if (s == "0" || s == "n" || IsPsamMissingText(s)) {
+			return Value(LogicalType::INTEGER);
+		}
+	}
+	throw InvalidInputException("write psam: SEX value '%s' is not a PLINK sex code (1/M = male, 2/F = female, "
+	                            "0/NA/NULL = unknown)",
+	                            v.ToString());
 }
 
 // Parse the `samples ['a','b', …]` option. Returns true iff the option is present
@@ -1450,7 +1528,9 @@ bool TryParseSamplesOption(CopyFunctionBindInput &input, vector<string> &out, bo
 // Inspect a `sample_fields {iid: '<col>', …}` option. Sets `iid_col`/`has_iid` when
 // an `iid` mapping is present; THROWS on any other key (metadata beyond IID is
 // deferred — never silently dropped). No option present leaves outputs untouched.
-void CheckSampleFieldsIid(CopyFunctionBindInput &input, string &iid_col, bool &has_iid) {
+// `standalone_psam` only changes the error text: the standalone row-stream psam writer passes every
+// column through, so its hint is "rename the column", not "IID-only".
+void CheckSampleFieldsIid(CopyFunctionBindInput &input, string &iid_col, bool &has_iid, bool standalone_psam = false) {
 	for (auto &opt : input.info.options) {
 		if (StringUtil::Lower(CompatNameStr(opt.first)) != "sample_fields") {
 			continue;
@@ -1472,6 +1552,11 @@ void CheckSampleFieldsIid(CopyFunctionBindInput &input, string &iid_col, bool &h
 				}
 				iid_col = children[c].ToString();
 				has_iid = true;
+			} else if (standalone_psam) {
+				throw BinderException("write psam: sample_fields supports only the 'iid' role, not '%s'. The "
+				                      "standalone psam writer passes every input column through by name: rename "
+				                      "the column in the query instead (e.g. gender AS SEX).",
+				                      CompatNameStr(child_types[c].first));
 			} else {
 				throw BinderException("write: sample metadata beyond IID is not yet supported (follow-on): "
 				                      "sample_fields role '%s'. For now .psam is IID-only.",
@@ -1547,12 +1632,20 @@ vector<string> ResolveIdentity(CopyFunctionBindInput &input, const vector<string
 // --- standalone FORMAT psam ------------------------------------------------
 
 enum class PsamWriteMode { OUT_OF_BAND, ROW_STREAM };
+//! ROW_STREAM output column role: IID / FID / SEX get canonical headers and special coding.
+enum class PsamColRole : uint8_t { OTHER, IID, FID, SEX };
 
 struct PsamWriteBindData : public FunctionData {
 	PsamWriteMode mode = PsamWriteMode::ROW_STREAM;
 	vector<string> iids;     //! OUT_OF_BAND: the full IID list (written once at init)
 	idx_t iid_input_idx = 0; //! ROW_STREAM: input column index of the per-row IID
-	string path_override;    //! `psam` option; empty -> use the COPY target
+	//! ROW_STREAM passthrough: the output columns, in write order ([FID,] IID, then input order).
+	vector<string> out_headers;
+	vector<idx_t> out_source_idx;
+	vector<PsamColRole> out_roles;
+	vector<LogicalType> out_pq_types; //! companion column types (IID/FID VARCHAR, SEX INTEGER, rest as input)
+	string pq_ord_name = "__sidx";    //! companion row-order column; never equals an output header
+	string path_override;             //! `psam` option; empty -> use the COPY target
 	//! The user's final `.psam` target. DuckDB may hand InitGlobal a `tmp_` name on overwrite, so the
 	//! companion reconciliation (the InitGlobal stale-drop and the Finalize move) needs this, not g.path.
 	string target_path;
@@ -1567,6 +1660,11 @@ struct PsamWriteBindData : public FunctionData {
 		r->mode = mode;
 		r->iids = iids;
 		r->iid_input_idx = iid_input_idx;
+		r->out_headers = out_headers;
+		r->out_source_idx = out_source_idx;
+		r->out_roles = out_roles;
+		r->out_pq_types = out_pq_types;
+		r->pq_ord_name = pq_ord_name;
 		r->path_override = path_override;
 		r->target_path = target_path;
 		r->psam_parquet = psam_parquet;
@@ -1575,17 +1673,19 @@ struct PsamWriteBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<PsamWriteBindData>();
-		return mode == o.mode && iids == o.iids && iid_input_idx == o.iid_input_idx &&
-		       path_override == o.path_override && target_path == o.target_path && psam_parquet == o.psam_parquet;
+		return mode == o.mode && iids == o.iids && iid_input_idx == o.iid_input_idx && out_headers == o.out_headers &&
+		       out_source_idx == o.out_source_idx && out_roles == o.out_roles && out_pq_types == o.out_pq_types &&
+		       pq_ord_name == o.pq_ord_name && path_override == o.path_override && target_path == o.target_path &&
+		       psam_parquet == o.psam_parquet;
 	}
 };
 
 struct PsamWriteGlobalState : public GlobalFunctionData {
 	unique_ptr<FileHandle> handle;
 	string path;
-	std::set<string> seen_iids;   //! ROW_STREAM dup-IID guard (read_psam rejects dups)
-	vector<string> streamed_iids; //! ROW_STREAM: IIDs in write (= row) order, for the parquet companion
-	bool pq_on = false;           //! a parquet companion was started for this state (gates cleanup)
+	std::set<string> seen_iids;          //! ROW_STREAM dup-IID guard (read_psam rejects dups)
+	vector<vector<Value>> streamed_rows; //! ROW_STREAM: companion rows in write (= row) order
+	bool pq_on = false;                  //! a parquet companion was started for this state (gates cleanup)
 
 	void CleanupPartial(FileSystem &fs) {
 		if (handle) {
@@ -1626,7 +1726,7 @@ unique_ptr<FunctionData> PsamCopyBind(ClientContext &context, CopyFunctionBindIn
 	// IID column remap (standalone row-stream) + reject metadata-beyond-IID.
 	string iid_col = "IID";
 	bool has_iid_map = false;
-	CheckSampleFieldsIid(input, iid_col, has_iid_map);
+	CheckSampleFieldsIid(input, iid_col, has_iid_map, /*standalone_psam=*/true);
 
 	// Priority: STRUCT genotypes field names > `samples` list > per-row IID column.
 	vector<string> struct_iids;
@@ -1656,6 +1756,76 @@ unique_ptr<FunctionData> PsamCopyBind(ClientContext &context, CopyFunctionBindIn
 			                      iid_col, StringUtil::Join(names, ", "));
 		}
 		bind->iid_input_idx = idx;
+
+		// Passthrough: every input column reaches the .psam. FID (if present) and IID lead, as PLINK 2
+		// requires (#FID IID ...); the rest follow in input order. FID/IID/SEX get the canonical
+		// upper-case header read_psam keys on (it types SEX INTEGER only for the exact name).
+		idx_t fid_idx = names.size();
+		idx_t sex_idx = names.size();
+		for (idx_t i = 0; i < names.size(); i++) {
+			if (i == idx) {
+				continue;
+			}
+			if (fid_idx == names.size() && StringUtil::CIEquals(names[i], "FID")) {
+				fid_idx = i;
+			} else if (sex_idx == names.size() && StringUtil::CIEquals(names[i], "SEX")) {
+				sex_idx = i;
+			}
+		}
+		auto add = [&](idx_t i, PsamColRole role, const string &header, const LogicalType &pq_type) {
+			bind->out_source_idx.push_back(i);
+			bind->out_roles.push_back(role);
+			bind->out_headers.push_back(header);
+			bind->out_pq_types.push_back(pq_type);
+		};
+		if (fid_idx != names.size()) {
+			add(fid_idx, PsamColRole::FID, "FID", LogicalType::VARCHAR);
+		}
+		add(idx, PsamColRole::IID, "IID", LogicalType::VARCHAR);
+		for (idx_t i = 0; i < names.size(); i++) {
+			if (i == idx || i == fid_idx) {
+				continue;
+			}
+			if (i == sex_idx) {
+				add(i, PsamColRole::SEX, "SEX", LogicalType::INTEGER);
+				continue;
+			}
+			if (sql_types[i].IsNested()) {
+				throw BinderException("write psam: column '%s' has the nested type %s, which has no .psam text form. "
+				                      "Drop it, or cast it to VARCHAR in the query.",
+				                      names[i], sql_types[i].ToString());
+			}
+			add(i, PsamColRole::OTHER, names[i], sql_types[i]);
+		}
+		for (idx_t a = 0; a < bind->out_headers.size(); a++) {
+			auto &h = bind->out_headers[a];
+			if (h.empty() || h.find('\t') != string::npos || h.find('\n') != string::npos ||
+			    h.find('\r') != string::npos) {
+				throw BinderException("write psam: column name '%s' is empty or contains a tab, newline, or carriage "
+				                      "return, which cannot be written to a tab-delimited .psam header",
+				                      h);
+			}
+			for (idx_t b = a + 1; b < bind->out_headers.size(); b++) {
+				if (StringUtil::CIEquals(h, bind->out_headers[b])) {
+					throw BinderException("write psam: output column '%s' appears twice in the .psam header — the "
+					                      "sample_fields iid remap leaves another column of that name. Drop or rename "
+					                      "the duplicate input column.",
+					                      bind->out_headers[b]);
+				}
+			}
+		}
+		// The companion's internal row-order column must not collide with a written column.
+		auto ord_taken = [&]() {
+			for (auto &h : bind->out_headers) {
+				if (StringUtil::CIEquals(h, bind->pq_ord_name)) {
+					return true;
+				}
+			}
+			return false;
+		};
+		while (ord_taken()) {
+			bind->pq_ord_name = "_" + bind->pq_ord_name;
+		}
 	}
 	bind->target_path = bind->path_override.empty() ? input.info.file_path : bind->path_override;
 	bind->db = &DatabaseInstance::GetDatabase(context);
@@ -1690,8 +1860,8 @@ unique_ptr<GlobalFunctionData> PsamCopyInitGlobal(ClientContext &context, Functi
 	} else {
 		// ROW_STREAM: open + header now; one line per input row in the sink.
 		g->handle = fs.OpenFile(g->path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
-		const char *hdr = "#IID\n";
-		g->handle->Write(const_cast<char *>(hdr), 5);
+		string hdr = "#" + StringUtil::Join(bind.out_headers, "\t") + "\n";
+		g->handle->Write(const_cast<char *>(hdr.data()), hdr.size());
 	}
 	return std::move(g);
 }
@@ -1712,20 +1882,56 @@ void PsamCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 		input.Flatten();
 		string buffer;
 		for (idx_t row = 0; row < input.size(); row++) {
-			auto v = input.GetValue(bind.iid_input_idx, row);
-			if (v.IsNull()) {
-				throw InvalidInputException("write psam: the IID column is NULL for a row — every sample needs an IID");
+			vector<Value> pq_row; // companion row (only filled when needed)
+			for (idx_t c = 0; c < bind.out_headers.size(); c++) {
+				auto v = input.GetValue(bind.out_source_idx[c], row);
+				string field;
+				Value pq_val;
+				switch (bind.out_roles[c]) {
+				case PsamColRole::IID: {
+					if (v.IsNull()) {
+						throw InvalidInputException(
+						    "write psam: the IID column is NULL for a row — every sample needs an IID");
+					}
+					field = v.ToString();
+					ValidatePsamIid(field);
+					if (!g.seen_iids.insert(field).second) {
+						throw InvalidInputException("write psam: duplicate IID '%s' — .psam IIDs must be unique",
+						                            field);
+					}
+					pq_val = Value(field);
+					break;
+				}
+				case PsamColRole::SEX:
+					pq_val = PsamSexCode(v);
+					field = pq_val.IsNull() ? "NA" : pq_val.ToString();
+					break;
+				case PsamColRole::FID:
+				case PsamColRole::OTHER: {
+					string s = v.IsNull() ? string() : v.ToString();
+					if (v.IsNull() || IsPsamMissingText(s)) {
+						field = "NA";
+						pq_val = Value(bind.out_pq_types[c]);
+					} else {
+						CheckPsamFieldText(s, bind.out_headers[c]);
+						field = s;
+						pq_val = bind.out_roles[c] == PsamColRole::FID ? Value(s) : v;
+					}
+					break;
+				}
+				}
+				if (c) {
+					buffer += '\t';
+				}
+				buffer += field;
+				if (bind.psam_parquet) {
+					pq_row.push_back(std::move(pq_val));
+				}
 			}
-			auto iid = v.ToString();
-			ValidatePsamIid(iid);
-			if (!g.seen_iids.insert(iid).second) {
-				throw InvalidInputException("write psam: duplicate IID '%s' — .psam IIDs must be unique", iid);
-			}
-			if (bind.psam_parquet) {
-				g.streamed_iids.push_back(iid); // write-order IIDs for the parquet companion (only when needed)
-			}
-			buffer += iid;
 			buffer += '\n';
+			if (bind.psam_parquet) {
+				g.streamed_rows.push_back(std::move(pq_row));
+			}
 		}
 		if (!buffer.empty()) {
 			g.handle->Write(const_cast<char *>(buffer.data()), buffer.size());
@@ -1752,8 +1958,11 @@ void PsamCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFun
 	auto &fs = FileSystem::GetFileSystem(context);
 	try {
 		g.pq_on = true;
-		const vector<string> &iids = bind.mode == PsamWriteMode::OUT_OF_BAND ? bind.iids : g.streamed_iids;
-		WritePsamParquetFromIids(*bind.db, g.path, iids);
+		if (bind.mode == PsamWriteMode::OUT_OF_BAND) {
+			WritePsamParquetFromIids(*bind.db, g.path, bind.iids);
+		} else {
+			WritePsamParquet(*bind.db, g.path, bind.out_headers, bind.out_pq_types, g.streamed_rows, bind.pq_ord_name);
+		}
 		// Move only when g.path is a DIFFERENT file from the final target — i.e. DuckDB wrote via a
 		// `tmp_` name. Compare EXPANDED paths: DuckDB runs the COPY target through fs.ExpandPath before
 		// InitGlobal (so g.path is expanded), while target_path is captured raw at bind. A raw compare
