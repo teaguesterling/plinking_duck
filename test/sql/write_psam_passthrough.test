@@ -268,12 +268,23 @@ WHERE r.CHROM = 'X';
 ----
 1	0
 
+# Proof of which file each read uses: pheno is VARCHAR in the text .psam, DECIMAL in the companion.
+query T
+SELECT typeof(pheno) FROM read_pfile('{TEST_DIR}/sxb', orient := 'sample') LIMIT 1;
+----
+VARCHAR
+
 statement ok
 CREATE TEMP TABLE meta_off AS
 SELECT IID, SEX, ancestry, pheno::VARCHAR AS pheno FROM read_pfile('{TEST_DIR}/sxb', orient := 'sample');
 
 statement ok
 SET plinking_use_parquet_companions = true;
+
+query T
+SELECT typeof(pheno) LIKE 'DECIMAL%' FROM read_pfile('{TEST_DIR}/sxb', orient := 'sample') LIMIT 1;
+----
+true
 
 query II
 SELECT count(*),
