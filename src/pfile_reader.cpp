@@ -869,7 +869,12 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 //! Views PR 2b: the virtual column CPRA = CHROM:POS:REF:ALT (VARCHAR), in variant and genotype orient.
 //! A virtual column (get_virtual_columns) is not in SELECT * and is computed only when a query names
 //! it. Its id is above every schema column, so each scan handles it before any lookup by column index.
-static const column_t CPRA_COLUMN_ID = VIRTUAL_COLUMN_START + 1;
+//! A function, not a global: VIRTUAL_COLUMN_START is an extern const in another translation unit,
+//! so a global initialized from it depends on static-initialization order (clang-tidy
+//! cppcoreguidelines-interfaces-global-init).
+static column_t CpraColumnId() {
+	return VIRTUAL_COLUMN_START + 1;
+}
 
 //! The CPRA value of variant `vidx` (a multiallelic ALT stays one string).
 static string CpraOf(const VariantMetadataIndex &v, uint32_t vidx) {
@@ -902,7 +907,7 @@ static virtual_column_map_t PfileGetVirtualColumns(ClientContext &context, optio
 	if (bind_data_p && bind_data_p->Cast<PfileBindData>().orient_mode == OrientMode::SAMPLE) {
 		return result; // sample orient has no per-variant row
 	}
-	result.insert(make_pair(CPRA_COLUMN_ID, TableColumn("CPRA", LogicalType::VARCHAR)));
+	result.insert(make_pair(CpraColumnId(), TableColumn("CPRA", LogicalType::VARCHAR)));
 	return result;
 }
 
@@ -4622,7 +4627,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
 				continue;
 			}
-			if (file_col == CPRA_COLUMN_ID) {
+			if (file_col == CpraColumnId()) {
 				auto &cvec = output.data[out_col];
 				CompatFlatDataMutable<string_t>(cvec)[rows_emitted] =
 				    StringVector::AddString(cvec, CpraOf(source.variants, vidx));
@@ -5335,7 +5340,7 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
 				continue;
 			}
-			if (file_col == CPRA_COLUMN_ID) {
+			if (file_col == CpraColumnId()) {
 				auto &cvec = output.data[out_col];
 				CompatFlatDataMutable<string_t>(cvec)[rows_emitted] =
 				    StringVector::AddString(cvec, CpraOf(source.variants, vidx));
@@ -6337,7 +6342,7 @@ static idx_t CellPruneColumnOf(const LogicalGet &get, const Expression &e) {
 		return DConstants::INVALID_INDEX;
 	}
 	// Of the virtual columns, only CPRA (views PR 2b) is a constraint source.
-	if (ids[i].IsVirtualColumn() && ids[i].GetPrimaryIndex() != CPRA_COLUMN_ID) {
+	if (ids[i].IsVirtualColumn() && ids[i].GetPrimaryIndex() != CpraColumnId()) {
 		return DConstants::INVALID_INDEX;
 	}
 	return ids[i].GetPrimaryIndex();
@@ -6457,7 +6462,7 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
 		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
 		const idx_t in_col = kids.size() < 2 ? DConstants::INVALID_INDEX : CellPruneColumnOf(get, *kids[0]);
-		if (in_col == CPRA_COLUMN_ID && c.chrom_col != DConstants::INVALID_INDEX) {
+		if (in_col == CpraColumnId() && c.chrom_col != DConstants::INVALID_INDEX) {
 			// CPRA IN (...): the contigs, and the POS span, of the members. A member that does not parse as
 			// four parts may still equal a row whose REF, ALT or contig contains ':' (a symbolic SV allele
 			// such as <DUP:TANDEM>), so it stops the narrowing, as an unfoldable member does.
@@ -6537,7 +6542,7 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (col == DConstants::INVALID_INDEX || !CellPruneConstant(context, *other, v)) {
 		return;
 	}
-	if (col == CPRA_COLUMN_ID && c.chrom_col != DConstants::INVALID_INDEX && cmp == ExpressionType::COMPARE_EQUAL &&
+	if (col == CpraColumnId() && c.chrom_col != DConstants::INVALID_INDEX && cmp == ExpressionType::COMPARE_EQUAL &&
 	    v.type().id() == LogicalTypeId::VARCHAR) {
 		string chrom;
 		int64_t pos;
