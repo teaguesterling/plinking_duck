@@ -71,8 +71,9 @@ uses.
   IID**. **(Teague: wide columns, after the STRUCT measurement.)**
 - G3. `c.genotypes_by_sample` is one row per sample with **one column per variant, named by
   ID**. **(Teague)**
-- G4. `WHERE ID = '…'` and `WHERE ID IN (…)` open only the variant blocks that hold those IDs,
-  through an **ID index file** written next to the catalog. **(Teague)**
+- G4. `WHERE ID = '…'` / `ID IN (…)` open only the variant blocks that hold those IDs, and
+  `WHERE IID` uses the same kind of index, through optional **index files** beside the file set
+  or the catalog (§4). **(Teague)**
 - G4b. A `WHERE` on `genotype` in the tall view (`= 2`, `> 0`, `IN (1, 2)`, `<> 0`, `IS NULL`)
   becomes the `include_genotypes` filter inside the scan, not a filter on decoded rows. Measured
   at 1M samples: Q2-shape 2.17 s with `WHERE genotype > 0` vs 1.05 s with
@@ -193,7 +194,12 @@ Freq columns (§2) and `af_range`/`ac_range` must keep counting every call, as t
   matching `ResolveCpraString`)**. An unparsable constant gives zero rows, not an error, because
   it is a `WHERE` value and not a parameter. The pushed filter still runs on the output rows, so
   a wrong parse can only lose rows. The tests must cover that case.
-- **Clash:** a `.pvar` with an extra column named `CPRA` is an error at bind that names the file.
+- **A `.pvar` that has its own `CPRA` column (Teague):** the view uses that column as is, in the
+  same position. Each row that is read must have a `CPRA` equal to `CHROM:POS:REF:ALT`; a row
+  that does not is an error that names the file and the row. "Parses as a CPRA" is not enough: a
+  `chr1:…` value over a `CHROM` of `1`, or another allele normalization, would make the `POS`
+  pushdown drop the wrong rows. Only the rows read are checked; a block that the pushdown drops
+  is never checked. **(Claude's definition of "invalid".)**
 - **No index:** `CPRA` lookups need no ID index; the `POS` bounds do the block drop. The ID index
   (§4) holds `ID` only.
 - **Timing to measure in its PR:** `WHERE CPRA = …` on the 20 × 2 matrix against
@@ -218,44 +224,67 @@ Freq columns (§2) and `af_range`/`ac_range` must keep counting every call, as t
   100M variants that is very slow, or out of memory (inferred, not measured). The docs say so and
   point to `c.genotypes` with a region filter for large cohorts.
 
-### 4. The ID index file
+### 4. The index files (`.pvar.index.parquet`, `.psam.index.parquet`)
 
-**Format.** `<prefix>.ids.parquet`, beside `<prefix>.pfile.json`. Columns:
-`ID VARCHAR, variant_block INTEGER, ordinal BIGINT` (the variant's cohort-wide ordinal, the same
-numbering as `variant_range`). Rows are sorted by `ID`. Row groups are small enough that one
-`ID =` lookup reads one row group (the builder picks the size and measures it). Parquet min/max
-statistics on the sorted `ID` let DuckDB skip the other row groups.
+`CHROM`/`POS` and `CPRA` need no index: the `.pvar` is in position order, and a `CPRA` constant
+becomes `POS` bounds (§2c). An index is needed only for the names that are not sorted: `ID` and
+`IID`. **(Teague, 2026-11-19.)**
 
-**The catalog names it.** A new optional top-level field in the catalog JSON:
-`"id_index": "<relative path>"`. Valid in v1 and v2. A reader that does not know the field ignores
-it (the builder checks that today's parser ignores unknown fields; if not, the field needs a
-version note).
+**Format (Teague).** One format, for a single file set and for a catalog:
 
-**The writer emits it.** A sharded or matrix `COPY … (FORMAT pfile)` writes the index when a new
-option `id_index true` is set. **(Claude's call: off by default, because it costs a sort of every
-ID. The builder measures that cost at 400k variants, and Teague may make it the default.)**
+| File | Columns | Sorted by |
+|---|---|---|
+| `<p>.pvar.index.parquet` | `ID VARCHAR, [_variant_block INTEGER,] _pvar_ordinal BIGINT` | `ID` |
+| `<p>.psam.index.parquet` | `IID VARCHAR, [_sample_block INTEGER,] _psam_ordinal BIGINT` | `IID` |
 
-**Old catalogs.** The docs give a `COPY` that builds the index from `c.variants`, plus one line
-of JSON to add. The builder decides whether `c.variants` can carry `variant_block` and the ordinal
-(it is a `read_pvar` list read today).
+- The block column is present only when more than one file is involved (a catalog). It is the
+  block's position in the catalog's variant (or sample) block list. **(Teague: "a block/group
+  column if relevant".)**
+- `_pvar_ordinal` / `_psam_ordinal` is the row in that block's `.pvar` / `.psam` (0-based), so the
+  column has one meaning in both forms. **(Claude's call.)**
+- Row groups are small enough that one `ID =` lookup reads one row group (the builder picks the
+  size and measures it). Parquet min/max statistics on the sorted key let DuckDB skip the other
+  row groups.
+- A `.` or empty `ID` is not indexed **(Claude's call: it is not a lookup key)**. A duplicate `ID`
+  gets one index row per occurrence.
 
-**The read side.** In `read_pfile(catalog := …)` (so every view gets it), a pushed-down
-`ID = const` or `ID IN (consts)` filter, on a catalog with an `id_index`, does this:
+**Discovery (Claude's call).** By name, as the other companions are found: beside
+`<p>.pfile.json` for a catalog, or beside `<p>.pgen` for a single file set. The catalog JSON gets
+no new field. A catalog reader uses only the catalog-level index; an index beside one cell is not
+read when that cell is read through its catalog. `plinking_use_parquet_companions = false` also
+turns index discovery off **(Claude's call)**.
 
-1. Query the index for the IDs, which returns the set of `(variant_block, ordinal)` pairs.
-2. Keep only those variant blocks, through the same mechanism as the `CHROM`/`POS` block drop.
-3. Narrow the `.pgen` read to the ordinals, where the read path allows it. The `WHERE ID`
-   narrowing from #120 is the model to follow.
+**Optional (Teague).** The writer writes an index only when a new option `index true` is set
+**(Claude's call: off by default, because it costs a sort of every ID; the builder measures that
+cost at 400k variants, and Teague may make it the default)**. It writes one index pair at the
+output prefix: the two-column form for a single file set, the block-column form for a catalog. It
+writes no index per block. A reader uses an index only when it finds one; without one, every
+query gives the same rows, only slower.
 
-An ID that is not in the index gives zero rows and opens no block. The filter still runs on the
-rows that are read, so a stale index cannot add wrong rows. A stale index can lose rows, and the
-docs must say that the writer owns the index. **(Claude's call: no index verification at read
-time, to match the catalog's "verified bounds" rule. The builder decides whether a cheap check,
-such as total row count = total variants, is enough.)**
+**Old file sets and catalogs.** The docs give the `COPY` that builds each index from `read_pvar` /
+`read_psam` (with the block number, for a catalog).
 
-The index must be found and read through the VFS, so it works for a remote catalog. A remote
-cold lookup should cost the JSON, one parquet footer, one row group, and the one block's header
-and records.
+**The read side.** In `read_pfile` (so every view gets it), with an index present:
+
+1. A pushed `ID = const` / `ID IN (consts)` queries `.pvar.index.parquet`, which returns the
+   `(block, ordinal)` pairs. Only those variant blocks are kept, through the `CHROM`/`POS` block
+   drop's mechanism, and the `.pgen` read narrows to the ordinals where the read path allows it
+   (the #120 `WHERE ID` narrowing is the model).
+2. A pushed `IID = const` / `IID IN (consts)` queries `.psam.index.parquet`, and keeps only those
+   sample blocks (where `WHERE IID` already drops sample blocks today: genotype orient, and sample
+   orient without a filter parameter). For a single file set it gives the sample ordinals, so the
+   `.psam` need not be parsed for the lookup when the read path allows it (the builder states
+   whether it does).
+3. A name that is not in the index gives zero rows and opens no block.
+
+The pushed filter still runs on the rows that are read, so a stale index cannot add rows. It can
+lose rows; the docs say that the writer owns the index. **(Claude's call: no index verification
+at read time, as the catalog's bounds rule. The builder decides whether a cheap check, such as
+the index's row count, is enough.)**
+
+The index is read through the VFS, so it works for a remote file set or catalog. A remote cold
+`ID =` lookup should cost: the JSON, one index footer and row group, and the one block's header
+and records. The PR measures this over the range server (`LAT_MS=40`) on the 20 x 2 matrix.
 
 ### 5. Pushdown of the three target reads
 
@@ -280,6 +309,10 @@ Each read below must be one query on a view, and must open only the blocks named
   named by ID, with the schema-size risk stated.
 - **ID lookup:** an ID index file (picked), a per-session ID → block map built on the first query
   (no format change, but the first query stays slow, and costly when remote), or both.
+- **Index layout:** a catalog-level `ids.parquet` named in the JSON (first draft), one index per
+  file (an `ID` lookup over N blocks opens N files: about N serial round trips remote, inferred),
+  or one format with an optional block column. Teague picked the last, which also adds the IID
+  index and covers a single file set.
 
 ## Delivery (Claude's call: four PRs, in this order)
 
@@ -289,8 +322,9 @@ Each read below must be one query on a view, and must open only the blocks named
    the scan (an `EXPLAIN` or a decode counter), plus the row oracle.
 3. The five views (§1, §3), docs, and the breaking-change note. RED test first: the new
    schemas and a row oracle against `read_pfile` on the un-sharded source.
-4. The ID index: writer option, JSON field, read-side drop, and docs. RED test first: a
-   block-open count (the cell-skip tests' method) for `ID =` with and without an index.
+4. The index files: writer option, discovery, the `ID` and `IID` read-side drops, and docs. RED
+   test first: a block-open count (the cell-skip tests' method) for `ID =` and `IID =`, with and
+   without an index.
 
 ## Tests (each PR)
 
@@ -303,7 +337,8 @@ Each read below must be one query on a view, and must open only the blocks named
   timed at 1M samples in the PR body (local, and Q1 also over the range server).
 - `CPRA`: equals `CHROM || ':' || POS || ':' || REF || ':' || ALT` on every row; `WHERE CPRA`
   gives the same rows as the matching `CHROM`/`POS`/`REF`/`ALT` filter; a bad constant gives zero
-  rows; a `.pvar` with a `CPRA` column is an error.
+  rows; a `.pvar` with a valid `CPRA` column is used as is, and one with a wrong value is an
+  error on a read of that row.
 - Names: an ID of `.`, a duplicate ID, and an IID that equals `POS`; and `read_pfile` without
   the naming option still raises the duplicate-ID error.
 - Holes: each of the four wide and list views raises the "not supported" error on a holed matrix
