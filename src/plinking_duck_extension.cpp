@@ -61,6 +61,12 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 	                          "0 = default (hardcoded cap of 16), >0 = cap at this value.",
 	                          LogicalType::BIGINT, Value::BIGINT(0), SetPlinkingMaxThreads);
 
+	config.AddExtensionOption("plinking_pgen_header_cache",
+	                          "Cache each decoded .pgen header (its per-variant index, 9 bytes per variant) once "
+	                          "per process, shared by every thread and query of read_pfile. Bounded by DuckDB's "
+	                          "object cache, which counts against memory_limit. false = decode per thread.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	config.AddExtensionOption("plinking_use_parquet_companions",
 	                          "Auto-discover .pvar.parquet and .psam.parquet companion files. "
 	                          "When true, parquet companions are preferred over text formats.",
