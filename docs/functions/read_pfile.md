@@ -92,10 +92,11 @@ position, not by ID. An optional index file fixes this. It holds one row per var
 |--------|------|-------------|
 | `ID` | `VARCHAR` | The variant ID. `.` and empty IDs are left out. |
 | `_variant_block` | `INTEGER` | A catalog only: the variant block, counted from 0 in the catalog's order |
-| `_pvar_ordinal` | `BIGINT` | The row in that block's `.pvar`, counted from 0 |
+| `_pvar_ordinal` | `BIGINT` | The variant's record index in that block's `.pgen`, counted from 0: `__ordinal` of `with_ordinal := true`, and `__vidx` of a `.pvar.parquet` |
 
 `read_pfile` looks for it by name: `<p>.pvar.index.parquet` beside `<p>.pgen` (a file set, or each file
-of a list), or beside `<p>.pfile.json` (a catalog). With the index:
+of a list), or beside `<p>.pfile.json` (a catalog). A read made only from `pgen :=`, `pvar :=` and
+`psam :=` has no prefix, so it uses no index. With the index:
 
 - A catalog opens only the variant blocks that hold the IDs.
 - With a `.pvar.parquet`, only the index's rows are loaded. With a text `.pvar`, the whole file is

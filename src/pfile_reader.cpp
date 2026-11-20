@@ -6933,6 +6933,9 @@ static void ApplyIdIndex(ClientContext &context, PfileBindData &bind_data, const
 	}
 	for (idx_t i = 0; i < n; i++) {
 		string prefix = bind_data.source_prefixes[i];
+		if (prefix.empty()) {
+			continue; // a read made only from overrides has no prefix, so no index
+		}
 		if (StringUtil::EndsWith(prefix, ".pgen")) {
 			prefix = prefix.substr(0, prefix.size() - 5);
 		}
