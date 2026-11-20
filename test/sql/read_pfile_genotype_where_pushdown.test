@@ -1,0 +1,299 @@
+# name: test/sql/read_pfile_genotype_where_pushdown.test
+# description: in genotype orient, a WHERE on genotype compiles into the scan's genotype filter (as include_genotypes); the rows equal the unpushed answer
+# group: [sql]
+
+require plinking_duck
+
+# Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 2b. Oracle: a table
+# copy of the read, filtered by the same WHERE (no pushdown). large_example has missing calls
+# (SAMP2: 750), so the NULL semantics are exercised. The counter shows that the compile happened.
+
+statement ok
+CREATE TABLE t AS SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype');
+
+query I
+SELECT count(*) FILTER (genotype IS NULL) > 0 AND count(DISTINCT genotype) = 3 FROM t;
+----
+true
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+# WHERE genotype = 0
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 0) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype = 0) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype = 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 0)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype = 1
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 1) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype = 1) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype = 1) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 1)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype = 2
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 2) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype = 2) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype = 2) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 2)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype > 0
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype > 0) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype > 0)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype >= 1
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype >= 1) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype >= 1) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype >= 1) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype >= 1)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype < 2
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype < 2) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype < 2) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype < 2) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype < 2)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype <= 1
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype <= 1) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype <= 1) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype <= 1) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype <= 1)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype <> 0
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype <> 0) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype <> 0) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype <> 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype <> 0)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype IN (1, 2)
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IN (1, 2)) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype IN (1, 2)) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype IN (1, 2)) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IN (1, 2))));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype IN (0, 2)
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IN (0, 2)) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype IN (0, 2)) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype IN (0, 2)) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IN (0, 2))));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype BETWEEN 1 AND 2
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype BETWEEN 1 AND 2) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype BETWEEN 1 AND 2) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype BETWEEN 1 AND 2) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype BETWEEN 1 AND 2)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype IS NULL
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IS NULL) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype IS NULL) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype IS NULL) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IS NULL)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype IS NOT NULL
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IS NOT NULL) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype IS NOT NULL) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype IS NOT NULL) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype IS NOT NULL)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype > 0 AND genotype < 2
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype > 0 AND genotype < 2) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype > 0 AND genotype < 2) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype > 0 AND genotype < 2) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype > 0 AND genotype < 2)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+1
+
+# WHERE genotype = 0 OR genotype = 2
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 0 OR genotype = 2) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype = 0 OR genotype = 2) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype = 0 OR genotype = 2) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype = 0 OR genotype = 2)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+0
+
+# WHERE NOT (genotype = 0)
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE NOT (genotype = 0)) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE NOT (genotype = 0)) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE NOT (genotype = 0)) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE NOT (genotype = 0))));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+0
+
+# WHERE genotype > 0.5
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype > 0.5) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype > 0.5) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype > 0.5) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype > 0.5)));
+----
+0
+
+# WHERE genotype + 0 > 0
+statement ok
+SELECT plinking_debug_genotype_where_pushed_reset();
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype + 0 > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype + 0 > 0) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype + 0 > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype + 0 > 0)));
+----
+0
+
+# With include_genotypes := as well, the two intersect (here: nothing).
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het']) WHERE genotype = 2;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het', 'hom_alt']) WHERE genotype = 2) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype = 2) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype = 2) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['het', 'hom_alt']) WHERE genotype = 2)));
+----
+0
+
+# With samples :=.
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', samples := ['SAMP1', 'SAMP2', 'SAMP5']) WHERE genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype > 0 AND IID IN ('SAMP1', 'SAMP2', 'SAMP5')) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype > 0 AND IID IN ('SAMP1', 'SAMP2', 'SAMP5')) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', samples := ['SAMP1', 'SAMP2', 'SAMP5']) WHERE genotype > 0)));
+----
+0
+
+# A sample-sharded matrix with WHERE IID (count_filter_subset must be built and rebuilt).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype') WHERE genotype = 2 AND IID IN ('SAMP2', 'SAMP6')) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype = 2 AND IID IN ('SAMP2', 'SAMP6')) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype = 2 AND IID IN ('SAMP2', 'SAMP6')) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype') WHERE genotype = 2 AND IID IN ('SAMP2', 'SAMP6'))));
+----
+0
+
+# freq stays the unfiltered counts.
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true) WHERE genotype = 2) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', freq := true) WHERE ID IN (SELECT ID FROM t WHERE genotype = 2)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', freq := true) WHERE ID IN (SELECT ID FROM t WHERE genotype = 2)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true) WHERE genotype = 2)));
+----
+0
+
+endloop
