@@ -877,7 +877,8 @@ static string CpraOf(const VariantMetadataIndex &v, uint32_t vidx) {
 }
 
 //! The parsed form of a CPRA constant: exactly four ':'-separated parts with an integer POS. Any other
-//! string is no CPRA value, so it can equal no row; it narrows nothing (the WHERE then gives no row).
+//! string narrows nothing: it may still equal a row whose REF, ALT or contig contains ':' (a symbolic
+//! SV allele such as <DUP:TANDEM>, a breakend ALT), and the WHERE then decides.
 static bool ParseCpraConstant(const string &s, string &chrom, int64_t &pos) {
 	auto parts = StringUtil::Split(s, ':');
 	if (parts.size() != 4 || parts[0].empty() || parts[1].empty()) {
@@ -6457,8 +6458,9 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
 		const idx_t in_col = kids.size() < 2 ? DConstants::INVALID_INDEX : CellPruneColumnOf(get, *kids[0]);
 		if (in_col == CPRA_COLUMN_ID && c.chrom_col != DConstants::INVALID_INDEX) {
-			// CPRA IN (...): the contigs, and the POS span, of the parsable members. A member that is
-			// no CPRA value matches no row, so it adds nothing; an unfoldable member stops the narrowing.
+			// CPRA IN (...): the contigs, and the POS span, of the members. A member that does not parse as
+			// four parts may still equal a row whose REF, ALT or contig contains ':' (a symbolic SV allele
+			// such as <DUP:TANDEM>), so it stops the narrowing, as an unfoldable member does.
 			std::set<string> chroms;
 			int64_t lo = std::numeric_limits<int64_t>::max(), hi = std::numeric_limits<int64_t>::lowest();
 			for (idx_t i = 1; i < kids.size(); i++) {
@@ -6468,17 +6470,16 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 				}
 				string chrom;
 				int64_t pos;
-				if (ParseCpraConstant(v.GetValue<string>(), chrom, pos)) {
-					chroms.insert(chrom);
-					lo = std::min(lo, pos);
-					hi = std::max(hi, pos);
+				if (!ParseCpraConstant(v.GetValue<string>(), chrom, pos)) {
+					return;
 				}
+				chroms.insert(chrom);
+				lo = std::min(lo, pos);
+				hi = std::max(hi, pos);
 			}
 			c.AllowChroms(chroms);
-			if (!chroms.empty()) {
-				c.NarrowPos(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo);
-				c.NarrowPos(ExpressionType::COMPARE_LESSTHANOREQUALTO, hi);
-			}
+			c.NarrowPos(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo);
+			c.NarrowPos(ExpressionType::COMPARE_LESSTHANOREQUALTO, hi);
 			return;
 		}
 		if (in_col == DConstants::INVALID_INDEX || (in_col != c.chrom_col && in_col != c.iid_col)) {

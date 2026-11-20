@@ -755,7 +755,7 @@ of a holed grid is not defined yet. There, `count(*) FROM c.genotypes` is varian
 blocks, the `genotypes` column is a fixed `ARRAY` only when every sample block has the same
 width (else a `LIST`), and a `WHERE` drops no cell.
 
-**`c.genotypes` has the `CPRA` column** ([`CHROM:POS:REF:ALT`](../functions/read_pfile.md#the-cpra-column)), so `SELECT * FROM c.genotypes WHERE CPRA = '1:10000:T:C'` works and reads only that region. `COPY (SELECT * FROM c.genotypes) …` writes it as an extra `.pvar` column, as it does the freq columns.
+**`c.genotypes` has the `CPRA` column** ([`CHROM:POS:REF:ALT`](../functions/read_pfile.md#the-cpra-column)), so `SELECT * FROM c.genotypes WHERE CPRA = '1:10000:T:C'` works and reads only that region. `COPY (SELECT * FROM c.genotypes) …` writes it as an extra column of the text `.pvar`, as it does the freq columns (a `.pvar.parquet` companion keeps only CHROM to ALT and `__vidx`).
 
 **`c.genotypes` has the `plink_freq` columns.** Every kind passes
 [`freq := true`](../functions/read_pfile.md#frequency-columns-freq), so the view adds `ALT_FREQ`,
@@ -766,7 +766,7 @@ only its own sample block. `c.genotypes_by_sample` does not have these columns.
 
 `COPY (SELECT * FROM c.genotypes) TO … (FORMAT pfile)` writes the six columns into the output
 `.pvar` as extra columns, because the writer keeps every extra input column. Name the columns to
-write, or use `SELECT * EXCLUDE (ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT)`.
+write, or use `SELECT * EXCLUDE (CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT)`.
 
 ### Inspecting a matrix without reading it
 

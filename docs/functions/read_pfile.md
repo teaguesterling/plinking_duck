@@ -75,8 +75,11 @@ SELECT CPRA, ID FROM read_pfile('cohort') WHERE CPRA IN ('1:10000:T:C', '2:10000
 
 A `WHERE CPRA = '…'` or `CPRA IN (…)` narrows the read like the same `CHROM` and `POS` filter: one
 contig loads only that region of the `.pvar.parquet`, and a catalog drops the other variant blocks.
-A value that is not four `:`-separated parts with an integer `POS` (`'1:10000'`, `'rs123'`) equals no
-`CPRA`, so it gives no row and no error. The `ID` column is unchanged: it is what the `.pvar` holds.
+A value that is not four `:`-separated parts with an integer `POS` narrows nothing, and the `WHERE`
+decides. For example, `'1:10000'` and `'rs123'` give no row and no error. A symbolic SV allele
+(`'2:10000:T:<DUP:TANDEM>'`) finds its row, but it does not narrow the load, and neither does an `IN`
+list that holds one. `CPRA = '1:10000'` gives no row, while `variants := ['1:10000']` selects that
+site: `CPRA` is a string, compared exactly. The `ID` column is unchanged: it is what the `.pvar` holds.
 Sample orient has no `CPRA`.
 
 ### Frequency Columns (`freq`)
