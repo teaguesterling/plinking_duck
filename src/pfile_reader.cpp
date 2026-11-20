@@ -85,6 +85,9 @@ static std::atomic<int64_t> g_sparse_concat_altmajor_shards {0};
 //! Test-only: optimizer hook calls in which a WHERE on genotype compiled into the scan's genotype filter
 //! (views PR 2a). EXPLAIN and each rebind count too.
 static std::atomic<int64_t> g_genotype_where_pushed {0};
+//! Test-only: reads whose WHERE on IID narrowed the sample set (PruneSamplesByIid), applied now or
+//! deferred to InitGlobal (freq := true).
+static std::atomic<int64_t> g_iid_where_pushed {0};
 
 // ---------------------------------------------------------------------------
 // Region parsing
@@ -6718,6 +6721,7 @@ static void PruneSamplesByIid(ClientContext &context, PfileBindData &bind_data, 
 	if (keep.size() == bind_data.OutputSampleCt()) {
 		return;
 	}
+	g_iid_where_pushed.fetch_add(1, std::memory_order_relaxed);
 	if (bind_data.include_freq) {
 		// A freq column, if read, needs every sample: InitGlobal decides (ApplyPendingSampleKeep).
 		bind_data.pending_sample_keep = std::move(keep);
@@ -7177,6 +7181,15 @@ static void DebugPgenHeaderDecodesResetFunc(DataChunk &args, ExpressionState &, 
 	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
 }
 
+static void DebugIidWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(g_iid_where_pushed.load(std::memory_order_relaxed)), args.size());
+}
+
+static void DebugIidWherePushedResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	g_iid_where_pushed.store(0, std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
+}
+
 static void DebugGenotypeWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	CompatReferenceConstant(result, Value::BIGINT(g_genotype_where_pushed.load(std::memory_order_relaxed)),
 	                        args.size());
@@ -7296,6 +7309,16 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	RegisterScalarWithDesc(loader, dbg_sparse_reset, {},
 	                       "Test-only: reset the sparse-difflist proof-ran counter to 0, returns 0 (P13-011).",
 	                       {"SELECT plinking_debug_sparse_variants_reset()"});
+	ScalarFunction dbg_iw("plinking_debug_iid_where_pushed", {}, LogicalType::BIGINT, DebugIidWherePushedFunc);
+	dbg_iw.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_iw, {},
+	                       "Test-only: reads whose WHERE on IID narrowed the sample set since the last reset.",
+	                       {"SELECT plinking_debug_iid_where_pushed()"});
+	ScalarFunction dbg_iw_reset("plinking_debug_iid_where_pushed_reset", {}, LogicalType::BIGINT,
+	                            DebugIidWherePushedResetFunc);
+	dbg_iw_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_iw_reset, {}, "Test-only: reset plinking_debug_iid_where_pushed to 0.",
+	                       {"SELECT plinking_debug_iid_where_pushed_reset()"});
 	ScalarFunction dbg_gw("plinking_debug_genotype_where_pushed", {}, LogicalType::BIGINT,
 	                      DebugGenotypeWherePushedFunc);
 	dbg_gw.SetVolatile();
