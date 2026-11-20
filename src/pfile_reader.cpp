@@ -13,6 +13,7 @@
 #include "psam_reader.hpp"
 #include "pfile_sample_metadata.hpp"
 #include "pfile_attach_cache.hpp"
+#include "pgen_header_cache.hpp"
 
 #include <unordered_map>
 
@@ -938,8 +939,8 @@ struct PfileLocalState : public LocalTableFunctionState {
 	//! freq := true, genotype orient: the current variant's values, computed once in load_variant
 	//! and repeated on each of its sample rows.
 	FreqValues tall_freq;
-	plink2::PgenFileInfo pgfi;
-	AlignedBuffer pgfi_alloc_buf;
+	//! The decoded header of the open source's .pgen (cache tier 1); pgr points into it.
+	shared_ptr<PgenHeader> header;
 
 	plink2::PgenReader pgr;
 	AlignedBuffer pgr_alloc_buf;
@@ -1008,8 +1009,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 	~PfileLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
-			plink2::CleanupPgr(&pgr, &reterr);
-			plink2::CleanupPgfi(&pgfi, &reterr);
+			plink2::CleanupPgr(&pgr, &reterr); // before `header` (pgr points into it) is released
 		}
 	}
 };
@@ -1772,46 +1772,16 @@ static void FillSampleMatrix(ClientContext &context, PfileBindData &bind_data_re
 		plink2::PreinitPgfi(&tmp_pgfi);
 		plink2::PgenReader tmp_pgr;
 		plink2::PreinitPgr(&tmp_pgr);
-		AlignedBuffer pgfi_alloc2;
+		shared_ptr<PgenHeader> tmp_header; // tmp_pgr points into it; CleanupPgr(tmp_pgr) runs before this block ends
 		AlignedBuffer pgr_alloc2;
 		plink2::PgrSampleSubsetIndex pssi2;
 		plink2::PgrClearSampleSubsetIndex(nullptr, &pssi2);
 		if (!pr_cat) {
-			char errstr_buf2[plink2::kPglErrstrBufBlen];
-			plink2::PgenHeaderCtrl header_ctrl2;
-			uintptr_t pgfi_alloc_ct2 = 0;
-			err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data->raw_sample_ct,
-			                             &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read: %s", errstr_buf2);
-			}
-			if (pgfi_alloc_ct2 > 0) {
-				pgfi_alloc2.Allocate(pgfi_alloc_ct2 * plink2::kCacheline);
-			}
-			uint32_t max_vrec2 = 0;
-			uintptr_t pgr_alloc_ct2 = 0;
-			err = plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
-			                             pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
-				                  errstr_buf2);
-			}
-			if (pgr_alloc_ct2 > 0) {
-				pgr_alloc2.Allocate(pgr_alloc_ct2 * plink2::kCacheline);
-			}
-			err =
-			    plink2::PgrInit(src.pgen_path.c_str(), max_vrec2, &tmp_pgfi, &tmp_pgr, pgr_alloc2.As<unsigned char>());
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgr(&tmp_pgr, &ce);
-				ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: PgrInit failed for sample-orient pre-read");
-			}
+			// tmp_pgfi stays preinit'd (its Cleanup calls are no-ops); the decoded header is cache tier 1's.
+			tmp_header = AcquirePgenHeader(context, bind_data->use_vfs, src.pgen_path, src.raw_variant_ct,
+			                               bind_data->raw_sample_ct,
+			                               "read_pfile: failed to init PgenReader for sample-orient pre-read");
+			InitPgenReaderOn(*tmp_header, src.pgen_path, tmp_pgr, pgr_alloc2, "read_pfile: sample-orient pre-read");
 			if (bind_data->has_sample_subset) {
 				plink2::PgrSetSampleSubsetIndex(preread_subset.CumulativePopcounts(), &tmp_pgr, &pssi2);
 			} else {
@@ -2871,51 +2841,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				plink2::PreinitPgfi(&cf_pgfi);
 				plink2::PgenReader cf_pgr;
 				plink2::PreinitPgr(&cf_pgr);
-				AlignedBuffer cf_pgfi_alloc;
+				shared_ptr<PgenHeader>
+				    cf_header; // cf_pgr points into it; CleanupPgr(cf_pgr) runs before this block ends
 				AlignedBuffer cf_pgr_alloc;
 				plink2::PgrSampleSubsetIndex cf_pssi;
 				plink2::PgrClearSampleSubsetIndex(nullptr, &cf_pssi);
 				if (!cf_cat) {
-					char cf_errstr[plink2::kPglErrstrBufBlen];
-					plink2::PgenHeaderCtrl cf_hdr;
-					uintptr_t cf_pgfi_alloc_ct = 0;
-
-					err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct,
-					                             bind_data->raw_sample_ct, &cf_hdr, &cf_pgfi, &cf_pgfi_alloc_ct,
-					                             cf_errstr);
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&cf_pgfi, &ce);
-						throw IOException("read_pfile: failed to init PgenReader for count filter: %s", cf_errstr);
-					}
-
-					if (cf_pgfi_alloc_ct > 0) {
-						cf_pgfi_alloc.Allocate(cf_pgfi_alloc_ct * plink2::kCacheline);
-					}
-
-					uint32_t cf_max_vrec = 0;
-					uintptr_t cf_pgr_alloc_ct = 0;
-					err = plink2::PgfiInitPhase2(cf_hdr, 0, 0, 0, 0, cf_pgfi.raw_variant_ct, &cf_max_vrec, &cf_pgfi,
-					                             cf_pgfi_alloc.As<unsigned char>(), &cf_pgr_alloc_ct, cf_errstr);
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&cf_pgfi, &ce);
-						throw IOException("read_pfile: count filter PgenReader init failed (phase 2): %s", cf_errstr);
-					}
-
-					if (cf_pgr_alloc_ct > 0) {
-						cf_pgr_alloc.Allocate(cf_pgr_alloc_ct * plink2::kCacheline);
-					}
-
-					err = plink2::PgrInit(src.pgen_path.c_str(), cf_max_vrec, &cf_pgfi, &cf_pgr,
-					                      cf_pgr_alloc.As<unsigned char>());
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgr(&cf_pgr, &ce);
-						ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&cf_pgfi, &ce);
-						throw IOException("read_pfile: PgrInit failed for count filter");
-					}
+					// cf_pgfi stays preinit'd (its Cleanup calls are no-ops); the decoded header is cache tier 1's.
+					cf_header = AcquirePgenHeader(context, bind_data->use_vfs, src.pgen_path, src.raw_variant_ct,
+					                              bind_data->raw_sample_ct,
+					                              "read_pfile: failed to init PgenReader for count filter");
+					InitPgenReaderOn(*cf_header, src.pgen_path, cf_pgr, cf_pgr_alloc, "read_pfile: count filter");
 
 					// Set up sample subsetting for PgrGetCounts
 					if (bind_data->has_sample_subset && bind_data->count_filter_subset) {
@@ -4297,8 +4233,7 @@ static void OpenSourceReader(ClientContext &context, PfileLocalState &state, con
 	if (bind_data.IsConcat()) {
 		// One source per variant block; the reader spans every sample shard of THIS block
 		// (a fresh ConcatPgenReader replaces the previous block's, which closes its files).
-		// pgfi/pgr are preinit'd only, so the destructor's Cleanup* calls are no-ops.
-		plink2::PreinitPgfi(&state.pgfi);
+		// pgr is preinit'd only, so the destructor's CleanupPgr is a no-op.
 		plink2::PreinitPgr(&state.pgr);
 		plink2::PgrClearSampleSubsetIndex(nullptr, &state.pssi);
 		state.concat = make_uniq<ConcatPgenReader>();
@@ -4310,10 +4245,10 @@ static void OpenSourceReader(ClientContext &context, PfileLocalState &state, con
 		return;
 	}
 	if (state.initialized) {
-		// Tear down the reader currently open on another source (pgr before pgfi).
+		// Tear down the reader currently open on another source (pgr before its header).
 		plink2::PglErr ce = plink2::kPglRetSuccess;
 		plink2::CleanupPgr(&state.pgr, &ce);
-		plink2::CleanupPgfi(&state.pgfi, &ce);
+		state.header.reset();
 		state.initialized = false;
 	}
 
@@ -4321,54 +4256,9 @@ static void OpenSourceReader(ClientContext &context, PfileLocalState &state, con
 	PgenVfsScope pgen_vfs_scope(context, bind_data.use_vfs);
 
 	const PfileSource &src = bind_data.sources[source_idx];
-
-	plink2::PreinitPgfi(&state.pgfi);
-	plink2::PreinitPgr(&state.pgr);
-
-	char errstr_buf[plink2::kPglErrstrBufBlen];
-	plink2::PgenHeaderCtrl header_ctrl;
-	uintptr_t pgfi_alloc_cacheline_ct = 0;
-
-	plink2::PglErr err =
-	    plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data.raw_sample_ct,
-	                           &header_ctrl, &state.pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state.pgfi, &cleanup_err);
-		throw IOException("read_pfile: thread init failed (phase 1) for '%s': %s", src.pgen_path, errstr_buf);
-	}
-
-	if (pgfi_alloc_cacheline_ct > 0) {
-		state.pgfi_alloc_buf.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-	} else {
-		state.pgfi_alloc_buf.Reset();
-	}
-
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state.pgfi.raw_variant_ct, &max_vrec_width, &state.pgfi,
-	                             state.pgfi_alloc_buf.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state.pgfi, &cleanup_err);
-		throw IOException("read_pfile: thread init failed (phase 2) for '%s': %s", src.pgen_path, errstr_buf);
-	}
-
-	if (pgr_alloc_cacheline_ct > 0) {
-		state.pgr_alloc_buf.Allocate(pgr_alloc_cacheline_ct * plink2::kCacheline);
-	} else {
-		state.pgr_alloc_buf.Reset();
-	}
-
-	err = plink2::PgrInit(src.pgen_path.c_str(), max_vrec_width, &state.pgfi, &state.pgr,
-	                      state.pgr_alloc_buf.As<unsigned char>());
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgr(&state.pgr, &cleanup_err);
-		cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state.pgfi, &cleanup_err);
-		throw IOException("read_pfile: PgrInit failed for '%s'", src.pgen_path);
-	}
+	state.header = AcquirePgenHeader(context, bind_data.use_vfs, src.pgen_path, src.raw_variant_ct,
+	                                 bind_data.raw_sample_ct, "read_pfile: thread init failed");
+	InitPgenReaderOn(*state.header, src.pgen_path, state.pgr, state.pgr_alloc_buf, "read_pfile");
 
 	// Re-bind the sample-subset index to the (new) pgr. cumulative_popcounts_buf was
 	// filled once in PfileInitLocal and is identical across sources.
@@ -7106,6 +6996,15 @@ static void DebugSparseVariantsResetFunc(DataChunk &args, ExpressionState &, Vec
 	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
 }
 
+static void DebugPgenHeaderDecodesFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(g_pgen_header_decodes.load(std::memory_order_relaxed)), args.size());
+}
+
+static void DebugPgenHeaderDecodesResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	g_pgen_header_decodes.store(0, std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
+}
+
 static void DebugGenotypeWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	CompatReferenceConstant(result, Value::BIGINT(g_genotype_where_pushed.load(std::memory_order_relaxed)),
 	                        args.size());
@@ -7237,6 +7136,17 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	dbg_gw_reset.SetVolatile();
 	RegisterScalarWithDesc(loader, dbg_gw_reset, {}, "Test-only: reset plinking_debug_genotype_where_pushed to 0.",
 	                       {"SELECT plinking_debug_genotype_where_pushed_reset()"});
+	ScalarFunction dbg_hdr("plinking_debug_pgen_header_decodes", {}, LogicalType::BIGINT, DebugPgenHeaderDecodesFunc);
+	dbg_hdr.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_hdr, {},
+	                       "Test-only: .pgen header decodes (PgfiInitPhase2 runs) by read_pfile since the last reset "
+	                       "(cache tier 1).",
+	                       {"SELECT plinking_debug_pgen_header_decodes()"});
+	ScalarFunction dbg_hdr_reset("plinking_debug_pgen_header_decodes_reset", {}, LogicalType::BIGINT,
+	                             DebugPgenHeaderDecodesResetFunc);
+	dbg_hdr_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_hdr_reset, {}, "Test-only: reset plinking_debug_pgen_header_decodes to 0.",
+	                       {"SELECT plinking_debug_pgen_header_decodes_reset()"});
 	ScalarFunction dbg_concat_dense("plinking_debug_sparse_concat_dense", {}, LogicalType::BIGINT,
 	                                DebugSparseConcatDenseFunc);
 	dbg_concat_dense.SetVolatile();
