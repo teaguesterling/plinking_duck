@@ -367,7 +367,12 @@ unique_ptr<FunctionData> PvarCopyBind(ClientContext &context, CopyFunctionBindIn
 	auto bind = BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
 	bind->db = &DatabaseInstance::GetDatabase(context);
 	bind->target_path = bind->path_override.empty() ? input.info.file_path : bind->path_override;
-	RefuseExistingOutput(context, ParseForceOption(input), {bind->target_path}, "write pvar");
+	// '<p>.pvar.index.parquet' indexes this .pvar's IDs: a rewrite must not keep it (views PR 4b).
+	vector<string> outputs {bind->target_path};
+	if (StringUtil::EndsWith(bind->target_path, ".pvar")) {
+		outputs.push_back(bind->target_path + ".index.parquet");
+	}
+	RefuseExistingOutput(context, ParseForceOption(input), outputs, "write pvar");
 	return std::move(bind);
 }
 
@@ -578,6 +583,11 @@ void PvarCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFun
 		return;
 	}
 	auto &fs = FileSystem::GetFileSystem(context);
+	// The ID index of the old .pvar (bind refused it without force): its IDs are not this file's.
+	const string old_index = bind.target_path + ".index.parquet";
+	if (StringUtil::EndsWith(bind.target_path, ".pvar") && fs.FileExists(old_index)) {
+		fs.RemoveFile(old_index);
+	}
 	const string final_pq = bind.target_path + ".parquet";
 	if (!g.pq_on) {
 		// A rewrite without pvar_parquet must not leave a stale companion (its __vidx would mis-seek).
@@ -2019,6 +2029,13 @@ struct PfileWriteBindData : public FunctionData {
 	//! the reader (plinking_use_parquet_companions / a catalog that declares the `.psam.parquet` path).
 	//! Mirrors `pvar_parquet` (which lives on pvar_bind). db is read from `pvar_bind->db`.
 	bool psam_parquet = false;
+	//! `index` option (views PR 4b): after a successful COPY, also write '<prefix>.pvar.index.parquet'
+	//! (ID, [_variant_block,] _pvar_ordinal, sorted by ID), read back from the written .pvar files.
+	bool write_index = false;
+	string prefix; //! the COPY target's prefix, where the index (and a catalog) sits
+	//! `force`: an index at '<prefix>.pvar.index.parquet' is removed before the new files are promoted,
+	//! since an index of other output loses rows.
+	bool force = false;
 
 	//! `shard_by '<col>'` — empty means the plain (single-fileset) bundle. When set, the one
 	//! ordered COPY fans out one pfile per contiguous key value under a hive layout, a single
@@ -2051,6 +2068,10 @@ struct PfileWriteBindData : public FunctionData {
 		r->pgen_override = pgen_override;
 		r->psam_override = psam_override;
 		r->psam_parquet = psam_parquet;
+		r->write_index = write_index;
+		r->prefix = prefix;
+		r->force = force;
+		r->stale_catalog_path = stale_catalog_path;
 		r->shard_by = shard_by;
 		r->shard_key_input_idx = shard_key_input_idx;
 		r->shard_key_header = shard_key_header;
@@ -2066,7 +2087,8 @@ struct PfileWriteBindData : public FunctionData {
 		auto &o = other_p.Cast<PfileWriteBindData>();
 		return pvar_bind->Equals(*o.pvar_bind) && pgen_bind->Equals(*o.pgen_bind) && iids == o.iids &&
 		       pvar_override == o.pvar_override && pgen_override == o.pgen_override &&
-		       psam_override == o.psam_override && psam_parquet == o.psam_parquet && shard_by == o.shard_by &&
+		       psam_override == o.psam_override && psam_parquet == o.psam_parquet && write_index == o.write_index &&
+		       prefix == o.prefix && force == o.force && shard_by == o.shard_by &&
 		       shard_key_input_idx == o.shard_key_input_idx && shard_key_header == o.shard_key_header &&
 		       sample_shard_mode == o.sample_shard_mode && shard_labels == o.shard_labels && shard_lo == o.shard_lo &&
 		       shard_hi == o.shard_hi && matrix_mode == o.matrix_mode && matrix_over_chrom == o.matrix_over_chrom;
@@ -3525,7 +3547,17 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 			bind->psam_parquet =
 			    opt.second.empty() ||
 			    (!opt.second[0].IsNull() && opt.second[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
+		} else if (key == "index") {
+			// bare `index` or `index true` enables; NULL/false disables (as psam_parquet).
+			bind->write_index =
+			    opt.second.empty() ||
+			    (!opt.second[0].IsNull() && opt.second[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
 		}
+	}
+	if (bind->write_index &&
+	    (!bind->pvar_override.empty() || !bind->pgen_override.empty() || !bind->psam_override.empty())) {
+		throw BinderException("write pfile: index cannot be combined with pvar/pgen/psam path overrides — the index "
+		                      "is '<prefix>.pvar.index.parquet', found by read_pfile beside '<prefix>.pgen'");
 	}
 
 	// shard_by (variant axis) and shard_samples (sample axis) at once is the V2 grid (P13-010).
@@ -3677,13 +3709,18 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	// files and a catalog at the prefix (which read_pfile would prefer over the new fileset).
 	// Sharded (any mode): the catalog, the root companions, a fileset at the prefix, and the shard tree.
 	const bool force = ParseForceOption(input);
+	bind->force = force;
+	bind->prefix = prefix;
 	const bool sharded = bind->matrix_mode || bind->sample_shard_mode || !bind->shard_by.empty();
+	const string index_path = prefix + ".pvar.index.parquet";
 	if (sharded) {
-		RefuseExistingOutput(context, force,
-		                     {prefix + ".pfile.json", prefix + ".pgen", prefix + ".pvar", prefix + ".psam", prefix},
-		                     "write pfile");
+		RefuseExistingOutput(
+		    context, force,
+		    {prefix + ".pfile.json", prefix + ".pgen", prefix + ".pvar", prefix + ".psam", prefix, index_path},
+		    "write pfile");
 	} else {
-		RefuseExistingOutput(context, force, {eff_pgen, eff_pvar, eff_psam, prefix + ".pfile.json"}, "write pfile");
+		RefuseExistingOutput(context, force, {eff_pgen, eff_pvar, eff_psam, prefix + ".pfile.json", index_path},
+		                     "write pfile");
 		if (force) {
 			bind->stale_catalog_path = prefix + ".pfile.json";
 		}
@@ -3788,7 +3825,72 @@ void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFun
 void PfileCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
 }
 
+//! Views PR 4b: write '<prefix>.pvar.index.parquet' from the .pvar files the COPY has just promoted.
+//! A catalog's index has the variant block (its position in the catalog's variant-block list); a file
+//! set's has none. The ordinal is read_pvar's per-file __ordinal, which for a file this writer wrote is
+//! the variant's .pgen record index. Written to a staging name, then moved.
+void WritePvarIndex(ClientContext &context, const PfileWriteBindData &bind, bool sharded) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto quote = [](const string &v) {
+		return "'" + StringUtil::Replace(v, "'", "''") + "'";
+	};
+	auto text_pvar = [](const string &p) {
+		const string pq = ".parquet";
+		return StringUtil::EndsWith(p, ".pvar" + pq) ? p.substr(0, p.size() - pq.size()) : p;
+	};
+	string body;
+	if (sharded) {
+		auto grid = LoadCatalogGrid(context, fs, bind.prefix + ".pfile.json", "write pfile");
+		std::set<idx_t> seen;
+		for (auto &cell : grid.cells) {
+			if (!seen.insert(cell.variant_block).second) {
+				continue;
+			}
+			body += string(body.empty() ? "" : " UNION ALL ") + "SELECT ID, CAST(" +
+			        std::to_string(cell.variant_block) + " AS INTEGER) AS _variant_block, __ordinal AS _pvar_ordinal " +
+			        "FROM read_pvar(" +
+			        // A v1 catalog under pvar_parquet leaves "pvar" out (discovery): the block's text .pvar
+			        // is then '<cell prefix>.pvar', which this writer always writes.
+			        quote(cell.pvar.empty() ? cell.prefix + ".pvar" : text_pvar(cell.pvar)) + ", with_ordinal := true)";
+		}
+	} else {
+		body = "SELECT ID, __ordinal AS _pvar_ordinal FROM read_pvar(" + quote(bind.prefix + ".pvar") +
+		       ", with_ordinal := true)";
+	}
+	const string final_path = bind.prefix + ".pvar.index.parquet";
+	const string staging = final_path + ".staging";
+	Connection con(DatabaseInstance::GetDatabase(context));
+	auto res =
+	    con.Query("COPY (SELECT * FROM (" + body + ") WHERE ID IS NOT NULL AND ID <> '' ORDER BY ID) TO " +
+	              quote(staging) + " (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192)");
+	if (res->HasError()) {
+		if (fs.FileExists(staging)) {
+			fs.RemoveFile(staging);
+		}
+		throw IOException("write pfile: writing the ID index '%s' failed: %s", final_path, res->GetError());
+	}
+	fs.MoveFile(staging, final_path);
+}
+
+void PfileCopyFinalizeFiles(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate);
+
 void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+	auto &bind = bind_data.Cast<PfileWriteBindData>();
+	auto &fs = FileSystem::GetFileSystem(context);
+	// An index of other output loses rows: under force it goes before any new file is promoted (the
+	// bind refused an existing one without force). A failed COPY then leaves no index, which only
+	// costs speed.
+	const string index_path = bind.prefix + ".pvar.index.parquet";
+	if (bind.force && !bind.prefix.empty() && fs.FileExists(index_path)) {
+		fs.RemoveFile(index_path);
+	}
+	PfileCopyFinalizeFiles(context, bind_data, gstate);
+	if (bind.write_index) {
+		WritePvarIndex(context, bind, bind.matrix_mode || bind.sample_shard_mode || !bind.shard_by.empty());
+	}
+}
+
+void PfileCopyFinalizeFiles(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (bind.matrix_mode) {

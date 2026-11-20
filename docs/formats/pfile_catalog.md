@@ -713,8 +713,9 @@ SELECT DISTINCT IID FROM c.genotypes WHERE ID IN ('rs1', 'rs2', 'rs3') AND genot
 - **`WHERE ID` and the ID index.** A `WHERE ID` reads every `.pvar` unless the catalog has an ID index,
   `<p>.pvar.index.parquet` beside `<p>.pfile.json` (see
   [`read_pfile`](../functions/read_pfile.md#the-id-index-ppvarindexparquet)). With it, only the
-  variant blocks that hold the IDs open. Build it from each block's files, in the catalog's block
-  order (here, a v1 catalog with three blocks and a shared `.psam`):
+  variant blocks that hold the IDs open. `COPY … (FORMAT pfile, shard_by …, index)` writes it. For a
+  catalog from another tool, build it from each block's files, in the catalog's block order (here, a
+  v1 catalog with three blocks and a shared `.psam`):
 
   ```sql
   COPY (SELECT * FROM (
