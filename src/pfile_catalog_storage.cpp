@@ -147,7 +147,8 @@ static string BuildV1BlockSql(const string &path_sql, const string &concat_dim, 
 //! each cell/shard already carries its own co-located .pvar.
 static string GenotypesSql(const vector<string> &prefixes, const string &shared_psam, bool sample_concat,
                            const string &shared_pvar, bool by_sample, const string &cache_arg) {
-	string sql = "SELECT * FROM read_pfile(" + SqlPathList(prefixes);
+	// CPRA is a virtual column (views PR 2b): SELECT * leaves it out, so the variant-row view names it.
+	string sql = string(by_sample ? "SELECT *" : "SELECT *, CPRA") + " FROM read_pfile(" + SqlPathList(prefixes);
 	if (sample_concat) {
 		// Also for ONE cell: its shard may have no .pvar of its own, and pvar := is valid
 		// single-file too (combine_samples on a one-element list reads the fileset normally).
@@ -189,7 +190,7 @@ static string MatrixGenotypesSql(const vector<MatrixCell> &cells, const string &
 	string sql;
 	for (idx_t i = 0; i < cells.size(); i++) {
 		sql += (i ? " UNION ALL " : "");
-		sql += "SELECT * FROM read_pfile(" + SQLString::ToString(cells[i].prefix) +
+		sql += "SELECT *, CPRA FROM read_pfile(" + SQLString::ToString(cells[i].prefix) +
 		       ", pvar := " + SQLString::ToString(cells[i].pvar) + ", psam := " + SQLString::ToString(cells[i].psam);
 		if (!uniform) {
 			sql += ", genotypes := 'list'";
@@ -357,7 +358,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	if (is_matrix && matrix_has_holes) {
 		views.emplace_back(Identifier("genotypes"), MatrixGenotypesSql(matrix_cells, cache_arg));
 	} else if (!catalog_path_sql.empty()) {
-		views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(catalog := " + catalog_path_sql +
+		views.emplace_back(Identifier("genotypes"), "SELECT *, CPRA FROM read_pfile(catalog := " + catalog_path_sql +
 		                                                ", freq := true" + cache_arg + ")");
 	} else {
 		views.emplace_back(Identifier("genotypes"),
