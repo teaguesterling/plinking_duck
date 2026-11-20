@@ -315,6 +315,64 @@ static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &
 	}
 }
 
+//! freq := true in genotype orient: the coded SEX (SampleInfo::sexes) of a .psam that
+//! LoadPfileSampleMetadata / ...FromSource already loaded. A text .psam has its rows here; a parquet
+//! one is read for its SEX column only, so a wide companion stays cheap. Empty when there is no SEX
+//! column or the count disagrees, which NULLs the chrX/Y freq values, as in plink_freq.
+static vector<uint8_t> CodedSexesFromMetadata(ClientContext &context, const PfileSampleMetadata &meta,
+                                              idx_t sample_ct) {
+	vector<uint8_t> sexes;
+	if (meta.sex_col_idx == DConstants::INVALID_INDEX) {
+		return sexes;
+	}
+	sexes.reserve(sample_ct);
+	if (!meta.from_parquet) {
+		// The common text values without a Value per row (1M samples: ~0.9 s with one, measured).
+		// Anything else goes through CodeSampleSex, so the meaning matches LoadSampleMetadata.
+		for (auto &row : meta.rows) {
+			if (meta.sex_col_idx >= row.size()) {
+				sexes.push_back(0);
+				continue;
+			}
+			const string &v = row[meta.sex_col_idx];
+			if (v == "1") {
+				sexes.push_back(1);
+			} else if (v == "2") {
+				sexes.push_back(2);
+			} else if (v.empty() || v == "0" || v == "NA" || v == "na" || v == ".") {
+				sexes.push_back(0);
+			} else {
+				sexes.push_back(CodeSampleSex(Value(v)));
+			}
+		}
+	} else {
+		// TRY_CAST is CodeSampleSex's cast (a failed cast is NULL, so 0), done in one vector pass.
+		auto &db = DatabaseInstance::GetDatabase(context);
+		Connection conn(db);
+		const string col = "\"" + StringUtil::Replace(meta.header.column_names[meta.sex_col_idx], "\"", "\"\"") + "\"";
+		auto result = conn.Query(PsamSelectSql(meta, "TRY_CAST(" + col + " AS BIGINT)"));
+		if (result->HasError()) {
+			throw IOException("read_pfile: failed to load SEX from '%s': %s", meta.source_path, result->GetError());
+		}
+		unique_ptr<DataChunk> chunk;
+		while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+			const idx_t n = chunk->size();
+			UnifiedVectorFormat uvf;
+			CompatToUnifiedFormat(chunk->data[0], n, uvf);
+			auto data = UnifiedVectorFormat::GetData<int64_t>(uvf);
+			for (idx_t i = 0; i < n; i++) {
+				const idx_t di = uvf.sel->get_index(i);
+				const int64_t code = uvf.validity.RowIsValid(di) ? data[di] : 0;
+				sexes.push_back(code == 1 ? 1 : (code == 2 ? 2 : 0));
+			}
+		}
+	}
+	if (sexes.size() != sample_ct) {
+		sexes.clear();
+	}
+	return sexes;
+}
+
 //! Load full sample metadata including all columns for genotype orient mode output.
 //! Also populates sample_info to avoid a separate file read for LoadSampleInfo.
 static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const string &path,
@@ -1287,6 +1345,11 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 					}
 				}
 			}
+			// freq := true in genotype orient: the freq columns need the coded SEX on chrX/Y, which the
+			// full .psam load does not fill. Read it before `meta` moves into the bind data.
+			if (bind_data.include_freq) {
+				part.sexes = CodedSexesFromMetadata(context, meta, part.sample_ct);
+			}
 			if (k == 0) {
 				bind_data.sample_metadata = std::move(meta);
 			} else {
@@ -1304,11 +1367,6 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 			}
 			if (parquet_full) {
 				bind_data.sample_metadata.source_paths.push_back(path);
-			}
-			// freq := true in genotype orient: the freq columns need the coded SEX on chrX/Y, which the
-			// full .psam load does not fill. Take it from variant orient's loader, so the coding matches.
-			if (bind_data.include_freq) {
-				part.sexes = LoadSampleMetadata(context, path).sexes;
 			}
 		} else if (needs_iids) {
 			part = LoadSampleMetadata(context, path);
@@ -2407,13 +2465,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		                         needs_iids, bind_data->combine_samples == CombineSamplesMode::DISJOINT);
 	} else if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		bind_data->sample_metadata = LoadPfileSampleMetadata(context, psam_path, bind_data->sample_info);
-		// freq := true (genotype orient): the coded SEX for chrX/Y, from variant orient's loader (see
-		// LoadConcatSampleMetadata). Kept only when it covers every sample, as BuildAlignedSex expects.
+		// freq := true (genotype orient): the coded SEX for chrX/Y, from the .psam just loaded.
 		if (bind_data->include_freq) {
-			auto sexes = LoadSampleMetadata(context, psam_path).sexes;
-			if (sexes.size() == bind_data->sample_info.sample_ct) {
-				bind_data->sample_info.sexes = std::move(sexes);
-			}
+			bind_data->sample_info.sexes =
+			    CodedSexesFromMetadata(context, bind_data->sample_metadata, bind_data->sample_info.sample_ct);
 		}
 	} else if (needs_iids) {
 		bind_data->sample_info = LoadSampleMetadata(context, psam_path);

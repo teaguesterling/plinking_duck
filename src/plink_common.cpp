@@ -1309,6 +1309,18 @@ idx_t GetParquetRowCount(ClientContext &context, const string &path) {
 	return static_cast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
 }
 
+uint8_t CodeSampleSex(const Value &v) {
+	if (v.IsNull()) {
+		return 0;
+	}
+	try {
+		int64_t s = v.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		return s == 1 ? 1 : (s == 2 ? 2 : 0);
+	} catch (...) {
+		return 0;
+	}
+}
+
 //! Columnar ingest helper for psam query results.
 static void IngestSampleResult(QueryResult &result, const string &source_label, SampleInfo &info, bool load_iids,
                                bool load_fids) {
@@ -1345,21 +1357,7 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 		// Only paid when a sex column exists.
 		if (has_sex_col) {
 			for (idx_t i = 0; i < n; i++) {
-				Value v = chunk->GetValue(sex_col, i);
-				uint8_t sex_code = 0;
-				if (!v.IsNull()) {
-					try {
-						int64_t s = v.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-						if (s == 1) {
-							sex_code = 1;
-						} else if (s == 2) {
-							sex_code = 2;
-						}
-					} catch (...) {
-						sex_code = 0;
-					}
-				}
-				info.sexes.push_back(sex_code);
+				info.sexes.push_back(CodeSampleSex(chunk->GetValue(sex_col, i)));
 			}
 		}
 
