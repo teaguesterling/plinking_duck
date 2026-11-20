@@ -44,19 +44,17 @@ static shared_ptr<PgenHeader> DecodePgenHeader(ClientContext &context, bool use_
 
 //! The cache key: the path, the file's identity, and the counts the caller expects (phase 1 checks
 //! them, so a caller expecting other counts decodes afresh and gets pgenlib's error). A stale header
-//! gives WRONG records, not lost rows, so the identity is as strict as the route allows:
-//! - a native path: stat() device, inode, size and mtime in nanoseconds. A rewrite that promotes by
-//!   rename (our writer) gets a new inode, even within the same second at the same size;
-//! - a VFS path: DuckDB's size and last-modified time (for httpfs, from the HEAD response).
+//! gives WRONG records, not lost rows, so the identity is as strict as the file allows:
+//! - a path stat() can see (a local file, on any route, including plinking_pgen_io = 'vfs'): device,
+//!   inode, size and mtime in nanoseconds. A rewrite that promotes by rename (our writer) gets a new
+//!   inode, even within the same second at the same size;
+//! - otherwise (a remote path): DuckDB's size, last-modified time and version tag (the ETag, for
+//!   httpfs). A file with neither a version tag nor a modification time is not cached.
 //! Returns "" when the identity cannot be read: that open is then not cached.
-static string PgenHeaderKey(ClientContext &context, bool use_vfs, const string &pgen_path, uint32_t variant_ct,
-                            uint32_t sample_ct) {
+static string PgenHeaderKey(ClientContext &context, const string &pgen_path, uint32_t variant_ct, uint32_t sample_ct) {
 	string identity;
-	if (!use_vfs) {
-		struct stat st;
-		if (stat(pgen_path.c_str(), &st) != 0) {
-			return "";
-		}
+	struct stat st;
+	if (stat(pgen_path.c_str(), &st) == 0) {
 		identity = StringUtil::Format("dev=%llu ino=%llu size=%lld mtime=%lld.%09ld", (unsigned long long)st.st_dev,
 		                              (unsigned long long)st.st_ino, (long long)st.st_size,
 		                              (long long)st.st_mtim.tv_sec, (long)st.st_mtim.tv_nsec);
@@ -64,8 +62,13 @@ static string PgenHeaderKey(ClientContext &context, bool use_vfs, const string &
 		try {
 			auto &fs = FileSystem::GetFileSystem(context);
 			auto handle = fs.OpenFile(pgen_path, FileFlags::FILE_FLAGS_READ);
-			identity = StringUtil::Format("size=%lld mtime=%lld", (long long)handle->GetFileSize(),
-			                              (long long)fs.GetLastModifiedTime(*handle).value);
+			const string tag = fs.GetVersionTag(*handle);
+			const int64_t mtime = fs.GetLastModifiedTime(*handle).value;
+			if (tag.empty() && mtime == 0) {
+				return "";
+			}
+			identity = StringUtil::Format("size=%lld mtime=%lld tag=%s", (long long)handle->GetFileSize(),
+			                              (long long)mtime, tag);
 		} catch (std::exception &) {
 			return "";
 		}
@@ -83,7 +86,10 @@ shared_ptr<PgenHeader> AcquirePgenHeader(ClientContext &context, bool use_vfs, c
 	if (!PgenHeaderCacheEnabled(context)) {
 		return DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
 	}
-	const string key = PgenHeaderKey(context, use_vfs, pgen_path, variant_ct, sample_ct);
+	if (IsLocalizedPgenTemp(pgen_path)) {
+		return DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
+	}
+	const string key = PgenHeaderKey(context, pgen_path, variant_ct, sample_ct);
 	if (key.empty()) {
 		return DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
 	}

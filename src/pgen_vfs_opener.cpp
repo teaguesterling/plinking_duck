@@ -10,6 +10,9 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb_compat.hpp" // CompatRegisteredState
 
+#include <mutex>
+#include <unordered_set>
+
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -221,8 +224,26 @@ bool PgenPathNeedsVfs(const string &pgen_path) {
 
 // --- PgenLocalizeGuard: RAII cleanup of downloaded temp .pgen copies ------------
 
+//! Every live localize temp, across guards (IsLocalizedPgenTemp).
+static std::mutex g_localized_mutex;
+static std::unordered_set<string> g_localized_paths;
+
+static void ForgetLocalized(const string &path) {
+	std::lock_guard<std::mutex> g(g_localized_mutex);
+	g_localized_paths.erase(path);
+}
+
+bool IsLocalizedPgenTemp(const string &path) {
+	std::lock_guard<std::mutex> g(g_localized_mutex);
+	return g_localized_paths.count(path) > 0;
+}
+
 void PgenLocalizeGuard::Track(FileSystem &fs, string temp_path) {
 	fs_ = &fs;
+	{
+		std::lock_guard<std::mutex> g(g_localized_mutex);
+		g_localized_paths.insert(temp_path);
+	}
 	temp_paths_.push_back(std::move(temp_path));
 }
 
@@ -242,6 +263,7 @@ void PgenLocalizeGuard::Discard(const string &path) noexcept {
 	} catch (...) {
 		// best-effort, as in Cleanup.
 	}
+	ForgetLocalized(path);
 	temp_paths_.erase(it);
 }
 
@@ -257,6 +279,7 @@ void PgenLocalizeGuard::Cleanup() noexcept {
 		} catch (...) {
 			// best-effort: a leftover temp is not worth aborting teardown over.
 		}
+		ForgetLocalized(p);
 	}
 	temp_paths_.clear();
 	fs_ = nullptr;

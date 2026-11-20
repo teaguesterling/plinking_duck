@@ -63,7 +63,7 @@ void PlinkingDuckExtension::Load(ExtensionLoader &loader) {
 
 	config.AddExtensionOption("plinking_pgen_header_cache",
 	                          "Cache each decoded .pgen header (its per-variant index, 9 bytes per variant) once "
-	                          "per process, shared by every thread and query of read_pfile. Bounded by DuckDB's "
+	                          "per database, shared by every thread and query of read_pfile. Bounded by DuckDB's "
 	                          "object cache, which counts against memory_limit. false = decode per thread.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 

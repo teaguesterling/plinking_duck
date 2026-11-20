@@ -63,6 +63,10 @@ private:
 //! for a deferred catalog cell (see PfileBindData::localize_deferred).
 void LocalizePgenIfRequested(ClientContext &context, string &pgen_path, PgenLocalizeGuard &guard);
 
+//! Whether `path` is a live localize temp (tracked by some PgenLocalizeGuard). Each query copies to a
+//! new name, so the .pgen header cache does not keep a header for one: it could never be hit again.
+bool IsLocalizedPgenTemp(const string &path);
+
 //! Directory for localized temps: plinking_localize_dir if set, else DuckDB's temporary_directory,
 //! else the current directory. Read from the current settings.
 string LocalizeDir(ClientContext &context);
