@@ -1284,6 +1284,51 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	return idx;
 }
 
+VariantMetadataIndex LoadVariantMetadataFromParquetOrdinals(ClientContext &context, const string &path,
+                                                            const vector<uint32_t> &ordinals, idx_t variant_ct_hint,
+                                                            const string &func_name) {
+	BindPhaseTimer timer("LoadVariantMetadataFromParquetOrdinals");
+	VariantMetadataIndex idx;
+	idx.is_bim = false;
+	idx.is_subset = true; // see LoadVariantMetadataFromParquetRegion
+	idx.variant_ct = variant_ct_hint;
+	idx.has_ids = true;
+	idx.has_alleles = true;
+	if (ordinals.empty()) {
+		return idx;
+	}
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	bool has_vidx = false;
+	auto chrom_col_name = DetectChromColumn(conn, path, func_name, has_vidx);
+	// The ordinals are integers, so the IN list is built as text; the path is quote-doubled.
+	string in_list;
+	for (auto o : ordinals) {
+		in_list += (in_list.empty() ? "" : ", ") + std::to_string(o);
+	}
+	auto escaped_path = StringUtil::Replace(path, "'", "''");
+	const string ordinal_col = has_vidx ? "CAST(__vidx AS BIGINT)" : "file_row_number";
+	string sql = "SELECT \"" + chrom_col_name + "\" AS \"#CHROM\", POS, ID, REF, ALT, " + ordinal_col +
+	             " AS file_row_number FROM read_parquet('" + escaped_path + "'" +
+	             (has_vidx ? "" : ", file_row_number=true") + ") WHERE " + (has_vidx ? "__vidx" : "file_row_number") +
+	             " IN (" + in_list + ") ORDER BY 6";
+	auto result = conn.Query(sql);
+	if (result->HasError()) {
+		throw IOException("%s: ordinal query failed on '%s': %s", func_name, path, result->GetError());
+	}
+	string label = "parquet companion '" + path + "' (ID index)";
+	IngestVariantResult(*result, label, func_name, idx, /*expect_ordinal=*/true, /*vidx_bound=*/variant_ct_hint);
+	BuildChromOffsets(idx, label);
+	if (!idx.local_to_vidx.empty() &&
+	    idx.local_to_vidx.back() - idx.local_to_vidx.front() + 1 == idx.local_to_vidx.size()) {
+		idx.has_contiguous_vidx_range = true;
+		idx.contiguous_start_vidx = idx.local_to_vidx.front();
+	}
+	timer.Note("ingested %llu of %llu requested ordinals", (unsigned long long)idx.chroms.size(),
+	           (unsigned long long)ordinals.size());
+	return idx;
+}
+
 //! Get total row count from a parquet file.
 //!
 //! Uses `SELECT COUNT(*) FROM read_parquet(...)`, which DuckDB optimizes to

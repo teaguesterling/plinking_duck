@@ -83,6 +83,41 @@ list that holds one. `CPRA = '1:10000'` gives no row, while `variants := ['1:100
 site: `CPRA` is a string, compared exactly. The `ID` column is unchanged: it is what the `.pvar` holds.
 Sample orient has no `CPRA`.
 
+### The ID index (`<p>.pvar.index.parquet`)
+
+A `WHERE ID = '…'` or `ID IN (…)` reads every `.pvar` row to find the IDs, because a `.pvar` is sorted by
+position, not by ID. An optional index file fixes this. It holds one row per variant, sorted by `ID`:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `ID` | `VARCHAR` | The variant ID. `.` and empty IDs are left out. |
+| `_variant_block` | `INTEGER` | A catalog only: the variant block, counted from 0 in the catalog's order |
+| `_pvar_ordinal` | `BIGINT` | The variant's record index in that block's `.pgen`, counted from 0: `__ordinal` of `with_ordinal := true`, and `__vidx` of a `.pvar.parquet` |
+
+`read_pfile` looks for it by name: `<p>.pvar.index.parquet` beside `<p>.pgen` (a file set, or each file
+of a list), or beside `<p>.pfile.json` (a catalog). A read made only from `pgen :=`, `pvar :=` and
+`psam :=` has no prefix, so it uses no index. With the index:
+
+- A catalog opens only the variant blocks that hold the IDs.
+- With a `.pvar.parquet`, only the index's rows are loaded. With a text `.pvar`, the whole file is
+  parsed, but only the index's rows are read from the `.pgen`.
+- With a region (`region :=`, or a `WHERE` on `CHROM`/`POS`), the region load is used, and the index's
+  rows still limit the read.
+
+The `WHERE` still runs on every row, so a stale index can lose rows, but it never adds one. A `WHERE`
+that names `.` or `''` does not use the index. `SET plinking_use_parquet_companions = false` turns
+the lookup off. Build an index for a file set with this recipe:
+
+```sql
+COPY (SELECT ID, __ordinal AS _pvar_ordinal FROM read_pfile('cohort', with_ordinal := true)
+      WHERE ID IS NOT NULL AND ID NOT IN ('.', '') ORDER BY ID)
+TO 'cohort.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
+```
+
+For a catalog, take the same rows from each variant block's files, add the block number as
+`_variant_block`, and write one file beside the `.pfile.json`. See
+[the catalog format](../formats/pfile_catalog.md).
+
 ### Frequency Columns (`freq`)
 
 With `freq := true`, six columns follow the genotype columns (and come before `__ordinal`). They are the value columns of [`plink_freq(counts := true)`](plink_freq.md), and each one holds the value `plink_freq` gives for the same variant and the same samples:

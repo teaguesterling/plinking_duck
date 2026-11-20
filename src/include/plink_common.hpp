@@ -436,6 +436,13 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
                                                           const string &chrom, int64_t pos_start, int64_t pos_end,
                                                           idx_t variant_ct_hint, const string &func_name);
 
+//! Ordinal loader (views PR 4a, the ID index): materializes only the rows whose pgen record index
+//! (__vidx, or file_row_number for a legacy companion) is in `ordinals`. Returns a sparse index like
+//! the region loader's; `variant_ct_hint` sets idx.variant_ct. An empty `ordinals` reads nothing.
+VariantMetadataIndex LoadVariantMetadataFromParquetOrdinals(ClientContext &context, const string &path,
+                                                            const vector<uint32_t> &ordinals, idx_t variant_ct_hint,
+                                                            const string &func_name);
+
 //! Region-pushdown text loader for native .pvar/.bim companions. Scans only
 //! until the sorted target interval has been passed and materializes only
 //! matching rows. Returns a sparse VariantMetadataIndex keyed by global

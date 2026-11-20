@@ -710,6 +710,23 @@ SELECT * FROM c.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND ge
 SELECT DISTINCT IID FROM c.genotypes WHERE ID IN ('rs1', 'rs2', 'rs3') AND genotype = 2;
 ```
 
+- **`WHERE ID` and the ID index.** A `WHERE ID` reads every `.pvar` unless the catalog has an ID index,
+  `<p>.pvar.index.parquet` beside `<p>.pfile.json` (see
+  [`read_pfile`](../functions/read_pfile.md#the-id-index-ppvarindexparquet)). With it, only the
+  variant blocks that hold the IDs open. Build it from each block's files, in the catalog's block
+  order (here, a v1 catalog with three blocks and a shared `.psam`):
+
+  ```sql
+  COPY (SELECT * FROM (
+          SELECT ID, 0 AS _variant_block, __ordinal AS _pvar_ordinal
+          FROM read_pfile('c/CHROM=1/data', psam := 'c.psam', with_ordinal := true)
+          UNION ALL SELECT ID, 1, __ordinal FROM read_pfile('c/CHROM=2/data', psam := 'c.psam', with_ordinal := true)
+          UNION ALL SELECT ID, 2, __ordinal FROM read_pfile('c/CHROM=3/data', psam := 'c.psam', with_ordinal := true))
+        WHERE ID IS NOT NULL AND ID NOT IN ('.', '') ORDER BY ID)
+  TO 'c.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
+  ```
+
+  An index with no `_variant_block` column is an error on a catalog with more than one variant block.
 - **Column names in the wide views.** `c.genotypes_by_sample` names each column by its variant ID.
   A `.`, empty or duplicate ID is named by its `CPRA`, then `<CPRA>_<n>` if that is also taken.
 - **The width of a wide view.** Its schema has one column per sample, or per variant, so every query

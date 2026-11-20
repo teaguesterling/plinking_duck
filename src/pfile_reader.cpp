@@ -613,6 +613,19 @@ struct PfileBindData : public TableFunctionData {
 	//! lazy_variants only: each source's declared genomic range (parallel to `sources`), for the
 	//! stage-4 pushdown_complex_filter hook, which drops sources a WHERE on CHROM/POS cannot reach.
 	vector<ShardEntry> source_ranges;
+	//! Views PR 4a (the ID index), lazy_variants only, parallel to `sources`: a catalog's variant block
+	//! per source (source_blocks), or a non-catalog source's prefix (source_prefixes), where the
+	//! <p>.pvar.index.parquet lookup starts.
+	vector<idx_t> source_blocks;
+	vector<string> source_prefixes;
+	//! The index rows that a WHERE ID = / IN found, per source (parallel to `sources`; empty when no
+	//! index was used). An active entry is the source's variant set; with a parquet .pvar and no region,
+	//! EnsureLazyVariants loads only those rows.
+	struct IdOrdinals {
+		bool active = false;
+		vector<uint32_t> ordinals; //! sorted, unique
+	};
+	vector<IdOrdinals> id_ordinals;
 	//! P13-006 §10.5 / stage 5: a lazy_variants read whose catalog declares the cells' counts also
 	//! leaves their .pgen headers unopened at bind. Bind takes each cell's counts from the catalog;
 	//! EnsureLazyVariants opens the header of each source that survives pruning and checks it against
@@ -1016,8 +1029,13 @@ struct PfileLocalState : public LocalTableFunctionState {
 //! Load one source's .pvar (src.pvar_path) into src.variants, and check its count against the
 //! .pgen header. A parquet .pvar is region-pushed. Called at bind, or at InitGlobal for a
 //! deferred (lazy_variants) read.
-static void LoadSourceVariants(ClientContext &context, PfileSource &src, const RegionFilter &region) {
-	if (region.active && IsParquetFile(src.pvar_path)) {
+static void LoadSourceVariants(ClientContext &context, PfileSource &src, const RegionFilter &region,
+                               const vector<uint32_t> *id_ordinals = nullptr) {
+	if (id_ordinals && !region.active && IsParquetFile(src.pvar_path)) {
+		// Views PR 4a: only the rows the ID index found (with a region, the region load is used).
+		src.variants = LoadVariantMetadataFromParquetOrdinals(context, src.pvar_path, *id_ordinals,
+		                                                      static_cast<idx_t>(src.raw_variant_ct), "read_pfile");
+	} else if (region.active && IsParquetFile(src.pvar_path)) {
 		src.variants =
 		    LoadVariantMetadataFromParquetRegion(context, src.pvar_path, region.chrom, region.start, region.end,
 		                                         static_cast<idx_t>(src.raw_variant_ct), "read_pfile");
@@ -2499,6 +2517,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			// list has none, and source_ranges stays empty, which turns that drop off.
 			if (from_catalog) {
 				bind_data->source_ranges.push_back(grid.variant_ranges[grid.cells[si].variant_block]);
+				bind_data->source_blocks.push_back(grid.cells[si].variant_block);
+			} else {
+				bind_data->source_prefixes.push_back(prefixes[si]);
 			}
 			bind_data->sources.push_back(std::move(src)); // region / variant_range apply at InitGlobal
 			continue;
@@ -3954,8 +3975,16 @@ static void EnsureLazyVariants(ClientContext &context, const PfileBindData &bind
 		}
 		src.has_effective_variant_list = false;
 		src.effective_variant_indices.clear();
-		LoadSourceVariants(context, src, bind_data.region);
-		BuildEffectiveVariantList(src, bind_data.region, {}, false);
+		const bool by_id = src_idx < bind_data.id_ordinals.size() && bind_data.id_ordinals[src_idx].active;
+		const vector<uint32_t> *ordinals = by_id ? &bind_data.id_ordinals[src_idx].ordinals : nullptr;
+		LoadSourceVariants(context, src, bind_data.region, ordinals);
+		if (by_id) {
+			// The index rows are the source's variant set, whatever .pvar load ran.
+			std::unordered_set<uint32_t> id_set(ordinals->begin(), ordinals->end());
+			BuildEffectiveVariantList(src, bind_data.region, id_set, true);
+		} else {
+			BuildEffectiveVariantList(src, bind_data.region, {}, false);
+		}
 		if (bind_data.has_variant_range) {
 			ApplyVariantRange(src, bind_data.variant_range_lo, bind_data.variant_range_hi);
 		}
@@ -6391,6 +6420,10 @@ struct CellPruneConstraints {
 	idx_t iid_col = DConstants::INVALID_INDEX;
 	bool has_iid = false;
 	std::set<string> iids;
+	//! The ID column (variant and genotype orient), and the ID values a row may have (views PR 4a).
+	idx_t id_col = PfileBindData::ID_COL;
+	bool has_id = false;
+	std::set<string> ids;
 
 	static void Intersect(bool &has, std::set<string> &current, const std::set<string> &values) {
 		if (!has) {
@@ -6411,6 +6444,9 @@ struct CellPruneConstraints {
 	}
 	void AllowIids(const std::set<string> &values) {
 		Intersect(has_iid, iids, values);
+	}
+	void AllowIds(const std::set<string> &values) {
+		Intersect(has_id, ids, values);
 	}
 	//! POS <type> v, for one comparison type with the column on the left.
 	void NarrowPos(ExpressionType type, int64_t v) {
@@ -6506,7 +6542,8 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 			c.NarrowPos(ExpressionType::COMPARE_LESSTHANOREQUALTO, hi);
 			return;
 		}
-		if (in_col == DConstants::INVALID_INDEX || (in_col != c.chrom_col && in_col != c.iid_col)) {
+		if (in_col == DConstants::INVALID_INDEX ||
+		    (in_col != c.chrom_col && in_col != c.iid_col && in_col != c.id_col)) {
 			return;
 		}
 		std::set<string> values;
@@ -6519,6 +6556,8 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 		}
 		if (in_col == c.chrom_col) {
 			c.AllowChroms(values);
+		} else if (in_col == c.id_col) {
+			c.AllowIds(values);
 		} else {
 			c.AllowIids(values);
 		}
@@ -6573,6 +6612,8 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 		c.AllowChroms({v.GetValue<string>()});
 	} else if (col == c.iid_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowIids({v.GetValue<string>()});
+	} else if (col == c.id_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
+		c.AllowIds({v.GetValue<string>()});
 	} else if (col == c.pos_col && v.DefaultTryCastAs(LogicalType::BIGINT)) {
 		c.NarrowPos(cmp, v.GetValue<int64_t>());
 	}
@@ -6788,6 +6829,139 @@ static bool CollectGenotypeAllowed(ClientContext &context, const LogicalGet &get
 	return narrow(keep);
 }
 
+//! Views PR 4a: the rows of the ID index at `index_path` whose ID is in `ids`, as (variant block,
+//! ordinal) pairs. An index with no _variant_block column gives block 0. A negative ordinal, or one
+//! past uint32, is skipped (it indexes no .pgen record).
+static vector<std::pair<idx_t, uint32_t>> QueryIdIndex(ClientContext &context, const string &index_path,
+                                                       const std::set<string> &ids, bool &has_block_out) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto escaped_path = StringUtil::Replace(index_path, "'", "''");
+	auto schema = conn.Query("SELECT * FROM read_parquet('" + escaped_path + "') LIMIT 0");
+	if (schema->HasError()) {
+		throw IOException("read_pfile: failed to read the ID index '%s': %s", index_path, schema->GetError());
+	}
+	bool has_id = false, has_ordinal = false;
+	has_block_out = false;
+	for (auto &name : CompatResultNames(*schema)) {
+		has_id = has_id || name == "ID";
+		has_ordinal = has_ordinal || name == "_pvar_ordinal";
+		has_block_out = has_block_out || name == "_variant_block";
+	}
+	if (!has_id || !has_ordinal) {
+		throw InvalidInputException("read_pfile: the ID index '%s' needs the columns ID and _pvar_ordinal", index_path);
+	}
+	string in_list;
+	for (auto &id : ids) {
+		in_list += (in_list.empty() ? "'" : ", '") + StringUtil::Replace(id, "'", "''") + "'";
+	}
+	auto result = conn.Query(string("SELECT ") + (has_block_out ? "CAST(_variant_block AS BIGINT)" : "0") +
+	                         ", CAST(_pvar_ordinal AS BIGINT) FROM read_parquet('" + escaped_path + "') WHERE ID IN (" +
+	                         in_list + ")");
+	if (result->HasError()) {
+		throw IOException("read_pfile: the ID index query failed on '%s': %s", index_path, result->GetError());
+	}
+	vector<std::pair<idx_t, uint32_t>> rows;
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			auto block = chunk->GetValue(0, r);
+			auto ordinal = chunk->GetValue(1, r);
+			if (block.IsNull() || ordinal.IsNull()) {
+				continue;
+			}
+			const int64_t b = block.GetValue<int64_t>();
+			const int64_t o = ordinal.GetValue<int64_t>();
+			if (b < 0 || o < 0 || o > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+				continue;
+			}
+			rows.emplace_back(static_cast<idx_t>(b), static_cast<uint32_t>(o));
+		}
+	}
+	return rows;
+}
+
+//! Views PR 4a: look up a WHERE ID's values in the ID index. A catalog has one index, beside its
+//! .pfile.json; `keep` then marks the sources (variant blocks) that hold a match. A file set or a list
+//! has one index per source, beside its .pgen, and drops nothing (`keep` stays empty). Each source
+//! that an index covers gets its ordinals as its variant set (bind_data.id_ordinals).
+static void ApplyIdIndex(ClientContext &context, PfileBindData &bind_data, const std::set<string> &ids,
+                         vector<bool> &keep) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	const idx_t n = bind_data.sources.size();
+	auto finish = [](PfileBindData::IdOrdinals &o) {
+		std::sort(o.ordinals.begin(), o.ordinals.end());
+		o.ordinals.erase(std::unique(o.ordinals.begin(), o.ordinals.end()), o.ordinals.end());
+	};
+	if (bind_data.source_blocks.size() == n) {
+		const string &cat = bind_data.lazy_pgen_catalog_path;
+		const string suffix = ".pfile.json";
+		if (!StringUtil::EndsWith(cat, suffix)) {
+			return;
+		}
+		const string index_path = cat.substr(0, cat.size() - suffix.size()) + ".pvar.index.parquet";
+		if (!fs.FileExists(index_path)) {
+			return;
+		}
+		bool has_block = false;
+		auto rows = QueryIdIndex(context, index_path, ids, has_block);
+		if (!has_block) {
+			for (auto b : bind_data.source_blocks) {
+				if (b != 0) {
+					throw InvalidInputException(
+					    "read_pfile: the ID index '%s' has no _variant_block column, but the catalog has more "
+					    "than one variant block",
+					    index_path);
+				}
+			}
+		}
+		std::unordered_map<idx_t, vector<uint32_t>> by_block;
+		for (auto &r : rows) {
+			by_block[r.first].push_back(r.second);
+		}
+		bind_data.id_ordinals.assign(n, PfileBindData::IdOrdinals());
+		keep.assign(n, false);
+		for (idx_t i = 0; i < n; i++) {
+			auto &o = bind_data.id_ordinals[i];
+			o.active = true; // a block with no match reads no row, even when it is the one kept
+			auto it = by_block.find(bind_data.source_blocks[i]);
+			if (it != by_block.end()) {
+				keep[i] = true;
+				o.ordinals = it->second;
+				finish(o);
+			}
+		}
+		return;
+	}
+	if (bind_data.source_prefixes.size() != n) {
+		return;
+	}
+	for (idx_t i = 0; i < n; i++) {
+		string prefix = bind_data.source_prefixes[i];
+		if (prefix.empty()) {
+			continue; // a read made only from overrides has no prefix, so no index
+		}
+		if (StringUtil::EndsWith(prefix, ".pgen")) {
+			prefix = prefix.substr(0, prefix.size() - 5);
+		}
+		const string index_path = ResolveExistingPath(context, fs, prefix + ".pvar.index.parquet");
+		if (index_path.empty()) {
+			continue;
+		}
+		bool has_block = false;
+		auto rows = QueryIdIndex(context, index_path, ids, has_block);
+		if (bind_data.id_ordinals.size() != n) {
+			bind_data.id_ordinals.assign(n, PfileBindData::IdOrdinals());
+		}
+		auto &o = bind_data.id_ordinals[i];
+		o.active = true;
+		for (auto &r : rows) {
+			o.ordinals.push_back(r.second);
+		}
+		finish(o);
+	}
+}
+
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
@@ -6838,6 +7012,7 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 		if (bind_data.orient_mode == OrientMode::SAMPLE) {
 			c.chrom_col = DConstants::INVALID_INDEX;
 			c.pos_col = DConstants::INVALID_INDEX;
+			c.id_col = DConstants::INVALID_INDEX;
 			for (idx_t j = 0; j < bind_data.sample_orient_col_to_psam_col.size(); j++) {
 				if (psam_cols[bind_data.sample_orient_col_to_psam_col[j]] == "IID") {
 					c.iid_col = j;
@@ -6861,23 +7036,56 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	if (push_region && PushedRegion(c, bind_data.region, pushed)) {
 		bind_data.region = pushed;
 	}
-	if (!prune_variants || (!c.has_chrom && !c.has_pos)) {
+	// Views PR 4a: a WHERE ID = / IN looks up the ID index. '.' and '' are never indexed, so a WHERE that
+	// names one cannot use it. The WHERE still runs on every row.
+	vector<bool> id_keep;
+	if (push_region && bind_data.id_ordinals.empty() && c.has_id && !c.ids.empty() && !c.ids.count(".") &&
+	    !c.ids.count("") && GetUseParquetCompanions(context)) {
+		ApplyIdIndex(context, bind_data, c.ids, id_keep);
+	}
+	const bool range_drop = prune_variants && (c.has_chrom || c.has_pos);
+	if (!range_drop && id_keep.empty()) {
 		return;
+	}
+	const idx_t n = bind_data.sources.size();
+	const bool carry_ranges = bind_data.source_ranges.size() == n;
+	const bool carry_blocks = bind_data.source_blocks.size() == n;
+	const bool carry_ids = bind_data.id_ordinals.size() == n;
+	vector<idx_t> kept_idx;
+	for (idx_t i = 0; i < n; i++) {
+		if ((!range_drop || c.MayOverlap(bind_data.source_ranges[i])) && (id_keep.empty() || id_keep[i])) {
+			kept_idx.push_back(i);
+		}
+	}
+	if (kept_idx.empty()) {
+		kept_idx.push_back(0);
 	}
 	vector<PfileSource> kept;
 	vector<ShardEntry> kept_ranges;
-	for (idx_t i = 0; i < bind_data.sources.size(); i++) {
-		if (c.MayOverlap(bind_data.source_ranges[i])) {
-			kept.push_back(std::move(bind_data.sources[i]));
+	vector<idx_t> kept_blocks;
+	vector<PfileBindData::IdOrdinals> kept_ids;
+	for (auto i : kept_idx) {
+		kept.push_back(std::move(bind_data.sources[i]));
+		if (carry_ranges) {
 			kept_ranges.push_back(bind_data.source_ranges[i]);
 		}
-	}
-	if (kept.empty()) {
-		kept.push_back(std::move(bind_data.sources[0]));
-		kept_ranges.push_back(bind_data.source_ranges[0]);
+		if (carry_blocks) {
+			kept_blocks.push_back(bind_data.source_blocks[i]);
+		}
+		if (carry_ids) {
+			kept_ids.push_back(std::move(bind_data.id_ordinals[i]));
+		}
 	}
 	bind_data.sources = std::move(kept);
-	bind_data.source_ranges = std::move(kept_ranges);
+	if (carry_ranges) {
+		bind_data.source_ranges = std::move(kept_ranges);
+	}
+	if (carry_blocks) {
+		bind_data.source_blocks = std::move(kept_blocks);
+	}
+	if (carry_ids) {
+		bind_data.id_ordinals = std::move(kept_ids);
+	}
 }
 
 // ---------------------------------------------------------------------------
