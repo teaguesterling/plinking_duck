@@ -207,3 +207,86 @@ query I
 SELECT plinking_debug_pgen_header_decodes() >= 1;
 ----
 true
+
+statement ok
+RESET plinking_pgen_header_cache;
+
+# ---------------------------------------------------------------------------
+# Review finding: on the VFS route the key was size + mtime in seconds. A same-size rewrite in the
+# same second kept the old key (a stale header gives wrong records). A local file is now keyed by
+# stat() on every route; this rewrite (each variant's genotypes reversed) keeps the size, 10520 B
+# (measured), and is promoted by rename (a new inode).
+# ---------------------------------------------------------------------------
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+statement ok
+COPY src TO '{TEST_DIR}/R' (FORMAT pfile);
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/R');
+----
+3000
+
+statement ok
+COPY (SELECT * REPLACE (list_reverse(genotypes) AS genotypes) FROM read_pfile('{TEST_DIR}/R') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/R' (FORMAT pfile, force, samples ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']);
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/R');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+2
+
+query I
+SELECT count(*) FROM (
+  SELECT genotypes FROM read_pfile('{TEST_DIR}/R') ORDER BY CHROM, POS
+  EXCEPT ALL
+  SELECT list_reverse(genotypes)::TINYINT[8] FROM read_pfile('test/data/large_example'));
+----
+0
+
+statement ok
+RESET plinking_pgen_io;
+
+# ---------------------------------------------------------------------------
+# Review finding: under 'localize' each query reads a new temp copy, so a cached header could never
+# be hit again and only held memory. A localize temp is not cached: the object cache does not grow.
+# ---------------------------------------------------------------------------
+statement ok
+SET plinking_pgen_io = 'localize';
+
+statement ok
+CREATE TABLE oc0 AS SELECT coalesce(sum(memory_usage_bytes), 0) AS b FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT (SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE') - (SELECT b FROM oc0);
+----
+0
+
+statement ok
+RESET plinking_pgen_io;
