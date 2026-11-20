@@ -73,9 +73,9 @@ public:
 	//! `kind` names the loader ("full", "source", "info", "count"), so one path can hold several
 	//! loads. `meta` is null for the loaders that produce only a SampleInfo.
 	//! Cache tier 2, step A (docs/superpowers/specs/2026-11-20-metadata-cache-tiers-design.md; Teague,
-	//! 2026-11-20): an entry keeps the IIDs, FIDs and SEX codes in a compact form, and a parquet
-	//! source's column header. It never keeps a text .psam's rows: a load that needs them (a text
-	//! "full" / "source" metadata load) is not cached, and the query re-parses the file. A Get rebuilds
+	//! 2026-11-20): an entry keeps the IIDs, FIDs and SEX codes in a compact form, and the column
+	//! header. It never keeps a text .psam's rows: its metadata comes as rows_deferred (with the SEX
+	//! values), and a query that projects another column parses the file at InitGlobal. A Get rebuilds
 	//! the SampleInfo (iid_to_idx is left for EnsureIidMap to build when a caller needs it).
 	bool GetSamples(const string &kind, const string &path, SampleInfo &info, PfileSampleMetadata *meta) const {
 		std::lock_guard<std::mutex> guard(lock);
@@ -98,8 +98,8 @@ public:
 		return true;
 	}
 	void PutSamples(const string &kind, const string &path, const SampleInfo &info, const PfileSampleMetadata *meta) {
-		if (meta && (!meta->from_parquet || !meta->rows.empty())) {
-			return; // a text .psam's rows are never cached (re-parsed per query)
+		if (meta && !meta->rows.empty()) {
+			return; // rows are never cached: a text .psam comes as rows_deferred metadata (IDs + SEX only)
 		}
 		CachedSamples entry;
 		if (!entry.iids.Assign(info.iids) || !entry.fids.Assign(info.fids)) {
@@ -117,6 +117,8 @@ public:
 			for (auto &p : entry.meta.source_paths) {
 				sz += p.size() + 32;
 			}
+			sz += entry.meta.text_path.size() + entry.meta.sex_values.size() * sizeof(int32_t) +
+			      entry.meta.coded_sexes.size();
 		}
 		std::lock_guard<std::mutex> guard(lock);
 		if (samples.emplace(kind + '\n' + path, std::move(entry)).second) {
@@ -182,7 +184,7 @@ private:
 		vector<uint8_t> sexes;
 		idx_t sample_ct = 0;
 		bool has_meta = false;
-		PfileSampleMetadata meta; //! parquet sources only (no rows)
+		PfileSampleMetadata meta; //! never with rows (a text source is rows_deferred)
 	};
 	mutable std::mutex lock;
 	idx_t bytes = 0;
