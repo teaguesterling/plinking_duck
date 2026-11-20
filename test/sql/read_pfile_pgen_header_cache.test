@@ -249,7 +249,7 @@ SELECT plinking_debug_pgen_header_decodes();
 
 query I
 SELECT count(*) FROM (
-  SELECT genotypes FROM read_pfile('{TEST_DIR}/R') ORDER BY CHROM, POS
+  SELECT genotypes FROM read_pfile('{TEST_DIR}/R')
   EXCEPT ALL
   SELECT list_reverse(genotypes)::TINYINT[8] FROM read_pfile('test/data/large_example'));
 ----
