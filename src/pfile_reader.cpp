@@ -11,6 +11,8 @@
 #include "pfile_catalog.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
+#include "pfile_sample_metadata.hpp"
+#include "pfile_attach_cache.hpp"
 
 #include <unordered_map>
 
@@ -148,34 +150,7 @@ static RegionFilter ParseRegion(const string &region_str) {
 // Sample metadata for genotype orient mode output
 // ---------------------------------------------------------------------------
 
-//! Extended sample info for genotype orient mode: includes all psam columns.
-struct PfileSampleMetadata {
-	PsamHeaderInfo header;
-	//! All data rows from the .psam/.fam, in file order (TEXT path only).
-	//! Each inner vector has one field per column. Empty for the parquet path, whose
-	//! column values are loaded projection-aware at InitGlobal (PfileGlobalState).
-	vector<vector<string>> rows;
-
-	//! Source path for the parquet/non-native path — the projected column data is
-	//! (re-)queried from here at InitGlobal, not materialized at bind. Empty for text.
-	string source_path;
-	//! Sample-sharded cohort over parquet companions: every shard's .psam.parquet, in shard
-	//! order (source_paths[0] == source_path). Empty for a single source. See PsamSelectSql.
-	vector<string> source_paths;
-
-	//! IID / FID column positions in the header (for the parquet path).
-	idx_t iid_col_idx = DConstants::INVALID_INDEX;
-	idx_t fid_col_idx = DConstants::INVALID_INDEX;
-
-	//! Index of SEX column in the header (DConstants::INVALID_INDEX if absent)
-	idx_t sex_col_idx = DConstants::INVALID_INDEX;
-	//! Indices of PAT/MAT columns for special missing-value handling
-	vector<idx_t> parent_col_indices;
-
-	//! True when the psam came from a parquet/non-native source: column data is not
-	//! in `rows`; the scan reads it from the projection-aware CDC in the global state.
-	bool from_parquet = false;
-};
+// PfileSampleMetadata: src/include/pfile_sample_metadata.hpp (shared with the ATTACH cache).
 
 //! The query that reads `cols` from a parquet/non-native psam, in sample order. One source:
 //! `SELECT cols FROM '<path>'`. A sample-sharded cohort (source_paths): the shards' parquet files
@@ -620,6 +595,10 @@ struct PfileBindData : public TableFunctionData {
 	bool lazy_variants = false;
 	mutable std::mutex lazy_variants_lock;
 	mutable bool lazy_variants_loaded = false;
+	//! attach_cache := '<key>' (passed by the ATTACH views, design Part 2): that ATTACH's metadata cache,
+	//! or null (no key, or the entry was evicted). Never set for a direct read_pfile call.
+	shared_ptr<PfileAttachCache> attach_cache;
+	string attach_cache_key; //! its ObjectCache key (for RefreshAttachCacheWeight)
 	//! freq := true in genotype orient: the sample set a WHERE IID would narrow to (PruneSamplesByIid).
 	//! The freq values cover the read's full sample set, and the projection is final only at InitGlobal
 	//! (UNUSED_COLUMNS runs after filter pushdown), so ApplyPendingSampleKeep applies it there, under
@@ -1040,7 +1019,8 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
                                    const string &override_psam, bool need_psam, bool need_pvar,
                                    const RegionFilter &region, uint32_t &raw_sample_ct_out,
                                    PgenLocalizeGuard &localize_guard, bool load_pvar = true, bool read_header = true,
-                                   bool resolve_overrides = true, bool defer_copy = false) {
+                                   bool resolve_overrides = true, bool defer_copy = false,
+                                   PfileAttachCache *attach_cache = nullptr) {
 	// need_pvar discovers the .pvar path; load_pvar also parses it now (false: a lazy_variants
 	// read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
 	// .pgen header open too (a lazy_pgen catalog cell; see PfileBindData::lazy_pgen).
@@ -1067,7 +1047,31 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	// never search-resolve each companion independently (that could mix files
 	// from different search dirs).
 	string eff_prefix = prefix;
-	if (src.pgen_path.empty() && !prefix.empty()) {
+	// ATTACH cache (design Part 2): what discovery resolved for this prefix on an earlier query of the
+	// same ATTACH, so no HEAD request is repeated. Only a pure discovery (no override) is cached.
+	const bool cache_companions =
+	    attach_cache && !prefix.empty() && override_pgen.empty() && override_pvar.empty() && override_psam.empty();
+	// The settings that change what discovery finds are part of the key: a SET after the first query
+	// (or another connection's setting) must not reuse a lookup made under different rules.
+	string companions_key = prefix + "\n" + (need_pvar ? "v" : "") + (need_psam ? "s" : "");
+	if (cache_companions) {
+		for (auto *setting : {"plinking_use_parquet_companions", "file_search_path"}) {
+			Value v;
+			companions_key += "\n";
+			if (context.TryGetCurrentSetting(setting, v) && !v.IsNull()) {
+				companions_key += v.ToString();
+			}
+		}
+	}
+	PfileAttachCache::CachedCompanions cached_companions;
+	const bool companions_hit = cache_companions && attach_cache->GetCompanions(companions_key, cached_companions);
+	if (companions_hit) {
+		src.pgen_path = cached_companions.pgen;
+		src.pvar_path = cached_companions.pvar;
+		src.psam_path = cached_companions.psam;
+		eff_prefix = cached_companions.eff_prefix;
+	}
+	if (!companions_hit && src.pgen_path.empty() && !prefix.empty()) {
 		string resolved = ResolveExistingPath(context, fs, prefix + ".pgen");
 		if (!resolved.empty()) {
 			src.pgen_path = resolved;
@@ -1088,7 +1092,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	}
 
 	// Discover .pvar/.bim
-	if (need_pvar && src.pvar_path.empty()) {
+	if (!companions_hit && need_pvar && src.pvar_path.empty()) {
 		if (!eff_prefix.empty()) {
 			src.pvar_path = FindCompanionFileWithParquet(context, fs, eff_prefix + ".pgen", {".pvar", ".bim"});
 			if (src.pvar_path.empty()) {
@@ -1112,7 +1116,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	}
 
 	// Discover .psam/.fam (only the first source needs it — shared sample metadata)
-	if (need_psam && src.psam_path.empty()) {
+	if (!companions_hit && need_psam && src.psam_path.empty()) {
 		if (!eff_prefix.empty()) {
 			src.psam_path = FindCompanionFileWithParquet(context, fs, eff_prefix + ".pgen", {".psam", ".fam"});
 		}
@@ -1128,6 +1132,9 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 			                            "(use psam := 'path' to specify explicitly)",
 			                            prefix.empty() ? src.pgen_path : prefix);
 		}
+	}
+	if (cache_companions && !companions_hit) {
+		attach_cache->PutCompanions(companions_key, {src.pgen_path, src.pvar_path, src.psam_path, eff_prefix});
 	}
 
 	if (!read_header) {
@@ -1284,6 +1291,39 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 	}
 }
 
+//! ATTACH cache (design Part 2) wrappers for the .psam loaders: a query of an ATTACH reuses the
+//! sample metadata an earlier query parsed. `kind` keeps the loaders apart, since one path can be
+//! loaded several ways. With no cache they are the plain loaders.
+static PfileSampleMetadata LoadPfileSampleMetadataCached(ClientContext &context, const string &path,
+                                                         SampleInfo &sample_info_out, PfileAttachCache *cache,
+                                                         bool from_source) {
+	const string kind = from_source ? "source" : "full";
+	PfileSampleMetadata meta;
+	if (cache && cache->GetSamples(kind, path, sample_info_out, &meta)) {
+		return meta;
+	}
+	meta = from_source ? LoadPfileSampleMetadataFromSource(context, path, sample_info_out)
+	                   : LoadPfileSampleMetadata(context, path, sample_info_out);
+	if (cache) {
+		cache->PutSamples(kind, path, sample_info_out, &meta);
+	}
+	return meta;
+}
+
+static SampleInfo LoadSampleInfoCached(ClientContext &context, const string &path, PfileAttachCache *cache,
+                                       bool count_only) {
+	const string kind = count_only ? "count" : "info";
+	SampleInfo info;
+	if (cache && cache->GetSamples(kind, path, info, nullptr)) {
+		return info;
+	}
+	info = count_only ? LoadSampleCount(context, path) : LoadSampleMetadata(context, path);
+	if (cache) {
+		cache->PutSamples(kind, path, info, nullptr);
+	}
+	return info;
+}
+
 //! Sample metadata of a sample-sharded cohort: every shard's .psam, concatenated in
 //! shard order (the same order as the combined genotype columns). `full_metadata`
 //! loads all psam columns (genotype/sample orient); otherwise IIDs only when
@@ -1345,8 +1385,8 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 		const auto &shard = bind_data.sample_shards[k];
 		SampleInfo part;
 		if (full_metadata) {
-			PfileSampleMetadata meta = parquet_full ? LoadPfileSampleMetadataFromSource(context, path, part)
-			                                        : LoadPfileSampleMetadata(context, path, part);
+			PfileSampleMetadata meta =
+			    LoadPfileSampleMetadataCached(context, path, part, bind_data.attach_cache.get(), parquet_full);
 			if (parquet_full && k == 0 && paths.size() > 1) {
 				// PsamSelectSql adds these two columns to read the shards in order.
 				for (auto &name : meta.header.column_names) {
@@ -1384,9 +1424,9 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 				bind_data.sample_metadata.source_paths.push_back(path);
 			}
 		} else if (needs_iids) {
-			part = LoadSampleMetadata(context, path);
+			part = LoadSampleInfoCached(context, path, bind_data.attach_cache.get(), false);
 		} else {
-			part = LoadSampleCount(context, path);
+			part = LoadSampleInfoCached(context, path, bind_data.attach_cache.get(), true);
 		}
 		if (part.sample_ct != shard.raw_sample_ct) {
 			throw InvalidInputException("read_pfile: sample count mismatch: .pgen '%s' has %u samples, "
@@ -1881,6 +1921,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
                                           vector<LogicalType> &return_types, vector<CompatName> &names) {
 	BindPhaseTimer bind_timer("PfileBind(total)");
 	auto bind_data = make_uniq<PfileBindData>();
+	{
+		auto ac_it = input.named_parameters.find("attach_cache");
+		if (ac_it != input.named_parameters.end() && !ac_it->second.IsNull()) {
+			bind_data->attach_cache_key = StringValue::Get(ac_it->second);
+			bind_data->attach_cache =
+			    ObjectCache::GetObjectCache(context).Get<PfileAttachCache>(bind_data->attach_cache_key);
+		}
+	}
 
 	// --- Parse the composable axis selection (samples/region/variants/variant_range) ---
 	// ParseSelection captures `samples` + `region` symbolically, applying most-specific-wins
@@ -1953,7 +2001,13 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 					    catalog_path, key);
 				}
 			}
-			grid = LoadCatalogGrid(context, fs, catalog_path, "read_pfile");
+			// ATTACH cache (design Part 2): the grid parsed by an earlier query of the same ATTACH.
+			if (!(bind_data->attach_cache && bind_data->attach_cache->GetGrid(catalog_path, grid))) {
+				grid = LoadCatalogGrid(context, fs, catalog_path, "read_pfile");
+				if (bind_data->attach_cache) {
+					bind_data->attach_cache->PutGrid(catalog_path, grid);
+				}
+			}
 			PruneCatalogGrid(input, sel, grid);
 		}
 	}
@@ -2294,10 +2348,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// header without a copy, and waits for InitGlobal like the other cells, so a pruned cell 0 is never
 		// copied. (A v1 sample concat with no declared sample extents still copies its cells here.)
 		const bool defer_copy = bind_data->localize_deferred && !defer_header && !concat;
-		PfileSource src =
-		    LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam, need_pvar,
-		                    bind_data->region, src_sample_ct, bind_data->localize_guard,
-		                    !bind_data->lazy_variants && !defer_header, !defer_header, !from_catalog, defer_copy);
+		PfileSource src = LoadPfileSource(context, fs, prefixes[si], elem_pgen, elem_pvar, elem_psam, need_psam,
+		                                  need_pvar, bind_data->region, src_sample_ct, bind_data->localize_guard,
+		                                  !bind_data->lazy_variants && !defer_header, !defer_header, !from_catalog,
+		                                  defer_copy, from_catalog ? nullptr : bind_data->attach_cache.get());
 		if (defer_copy) {
 			src.pgen_header_deferred = true; // CheckDeferredPgenHeaders copies it, then re-checks the copy
 		}
@@ -2487,16 +2541,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		                             bind_data->orient_mode == OrientMode::SAMPLE,
 		                         needs_iids, bind_data->combine_samples == CombineSamplesMode::DISJOINT);
 	} else if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
-		bind_data->sample_metadata = LoadPfileSampleMetadata(context, psam_path, bind_data->sample_info);
+		bind_data->sample_metadata = LoadPfileSampleMetadataCached(context, psam_path, bind_data->sample_info,
+		                                                           bind_data->attach_cache.get(), false);
 		// freq := true (genotype orient): the coded SEX for chrX/Y, from the .psam just loaded.
 		if (bind_data->include_freq) {
 			bind_data->sample_info.sexes =
 			    CodedSexesFromMetadata(context, bind_data->sample_metadata, bind_data->sample_info.sample_ct);
 		}
 	} else if (needs_iids) {
-		bind_data->sample_info = LoadSampleMetadata(context, psam_path);
+		bind_data->sample_info = LoadSampleInfoCached(context, psam_path, bind_data->attach_cache.get(), false);
 	} else {
-		bind_data->sample_info = LoadSampleCount(context, psam_path);
+		bind_data->sample_info = LoadSampleInfoCached(context, psam_path, bind_data->attach_cache.get(), true);
 	}
 	bind_timer.Note("sample metadata loaded (%llu samples, iids=%llu)",
 	                (unsigned long long)bind_data->sample_info.sample_ct,
@@ -3098,6 +3153,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		return_types.push_back(LogicalType::BIGINT);
 	}
 
+	// ATTACH cache: re-Put a grown entry so ObjectCache counts its new size (it reads the size only
+	// at Put). Only while the key still maps to this entry: after DETACH's Delete it must not return.
+	if (bind_data->attach_cache && bind_data->attach_cache->TakeGrown()) {
+		auto &object_cache = ObjectCache::GetObjectCache(context);
+		if (object_cache.Get<PfileAttachCache>(bind_data->attach_cache_key) == bind_data->attach_cache) {
+			object_cache.Put(bind_data->attach_cache_key, bind_data->attach_cache);
+		}
+	}
 	return std::move(bind_data);
 }
 
@@ -6599,6 +6662,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		                            {"dosages", LogicalType::BOOLEAN},
 		                            {"phased", LogicalType::BOOLEAN},
 		                            {"region", LogicalType::VARCHAR},
+		                            {"attach_cache", LogicalType::VARCHAR},
 		                            {"samples", LogicalType::ANY},
 		                            {"variants", LogicalType::ANY},
 		                            {"selection", LogicalType::ANY},
