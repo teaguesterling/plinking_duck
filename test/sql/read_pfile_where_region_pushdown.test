@@ -1,0 +1,190 @@
+# name: test/sql/read_pfile_where_region_pushdown.test
+# description: a WHERE on one CHROM (+ POS) loads only that region's variants, as region := does; the rows are the same
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-19-where-region-pushdown-and-attach-cache-design.md, Part 1.
+# Proof without timing: drop3.pvar.parquet is A's companion minus the last chr3 row. A full load
+# checks the row count against the .pgen header and fails ("variant count mismatch"); the parquet
+# region loader trusts the header count, so a chr1 region reads cleanly. Oracle: region := on the
+# same files, and the plain WHERE on large_example (3000 variants x 8 samples, CHROM 1/2/3,
+# POS 100..100000 step 100).
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/A' (FORMAT pfile, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/A.pvar.parquet') WHERE NOT (CHROM = '3' AND POS = 100000) ORDER BY __vidx)
+TO '{TEST_DIR}/drop3.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 500);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM IN ('1', '2') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/s1' (FORMAT pfile);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '3' ORDER BY CHROM, POS)
+TO '{TEST_DIR}/s2' (FORMAT pfile);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+# ---------------------------------------------------------------------------
+# The fixture works: a full read fails, region := reads the region
+# ---------------------------------------------------------------------------
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet');
+----
+variant count mismatch
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', region := '1:10000-20000');
+----
+101
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+# ---------------------------------------------------------------------------
+# RED on 6f78387: the WHERE loads every variant, so it fails like the full read
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE CHROM = '1' AND POS BETWEEN 10000 AND 20000;
+----
+101
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 10000 AND 20000;
+----
+808
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE CHROM = '1' AND POS >= 10000 AND POS <= 20000;
+----
+101
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE CHROM = '1';
+----
+1000
+
+# ---------------------------------------------------------------------------
+# Guards (pass before and after): the WHERE gives region :='s rows, on every source kind and orient
+# ---------------------------------------------------------------------------
+
+# text .pvar
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example', region := '2:5000-7000')) UNION ALL ((SELECT ID, genotypes FROM read_pfile('test/data/large_example', region := '2:5000-7000')) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# text .pvar, orient := 'genotype'
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', region := '2:5000-7000')) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype', region := '2:5000-7000')) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# parquet .pvar
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A', region := '2:5000-7000')) UNION ALL ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A', region := '2:5000-7000')) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# parquet .pvar, orient := 'genotype'
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/A', orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/A', orient := 'genotype', region := '2:5000-7000')) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/A', orient := 'genotype', region := '2:5000-7000')) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/A', orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# v1 list
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2']) WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2'], region := '2:5000-7000')) UNION ALL ((SELECT ID, genotypes FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2'], region := '2:5000-7000')) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2']) WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# v1 list, orient := 'genotype'
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2'], orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2'], orient := 'genotype', region := '2:5000-7000')) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2'], orient := 'genotype', region := '2:5000-7000')) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile(['{TEST_DIR}/s1', '{TEST_DIR}/s2'], orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# matrix catalog
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '2:5000-7000')) UNION ALL ((SELECT ID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', region := '2:5000-7000')) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# matrix catalog, orient := 'genotype'
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', region := '2:5000-7000')) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', region := '2:5000-7000')) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype') WHERE CHROM = '2' AND POS BETWEEN 5000 AND 7000)));
+----
+0
+
+# pushes nothing: CHROM IN ('1', '2') AND POS < 500
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM IN ('1', '2') AND POS < 500) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM IN ('1', '2') AND POS < 500) UNION ALL ((SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM IN ('1', '2') AND POS < 500) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM IN ('1', '2') AND POS < 500)));
+----
+0
+
+# pushes nothing: POS BETWEEN 100 AND 300
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE POS BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE POS BETWEEN 100 AND 300) UNION ALL ((SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE POS BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE POS BETWEEN 100 AND 300)));
+----
+0
+
+# pushes nothing: CHROM = '1' OR POS = 100
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' OR POS = 100) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' OR POS = 100) UNION ALL ((SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' OR POS = 100) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' OR POS = 100)));
+----
+0
+
+# pushes no POS bound (a function of POS; DuckDB folds POS + 0 away, so that form is not one): CHROM = '1' AND abs(POS) BETWEEN 100 AND 300
+query I
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300) UNION ALL ((SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300)));
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A') WHERE CHROM IN ('1', '2') AND POS < 500;
+----
+8
+
+# An explicit region and a WHERE on another contig: zero rows, no error (Review Focus 2).
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', region := '1:100-5000') WHERE CHROM = '2';
+----
+0
+
+# An explicit region and a narrower WHERE: their intersection.
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', region := '1:100-5000') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 9000;
+----
+21
+
+# A contig name the file does not use: zero rows (Review Focus 3).
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = 'chr1';
+----
+0
+
+endloop
+
+# A prepared statement run twice (Review Focus 5). RED on 6f78387, like the queries above.
+statement ok
+PREPARE q AS SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE CHROM = '1' AND POS BETWEEN 10000 AND 20000;
+
+query I
+EXECUTE q;
+----
+101
+
+query I
+EXECUTE q;
+----
+101

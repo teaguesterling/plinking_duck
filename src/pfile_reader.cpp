@@ -987,7 +987,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 //! `raw_sample_ct_out` for the caller's cross-source equality check.
 //! Load one source's .pvar (src.pvar_path) into src.variants, and check its count against the
 //! .pgen header. A parquet .pvar is region-pushed. Called at bind, or at InitGlobal for a
-//! deferred (lazy_variants) catalog read.
+//! deferred (lazy_variants) read.
 static void LoadSourceVariants(ClientContext &context, PfileSource &src, const RegionFilter &region) {
 	if (region.active && IsParquetFile(src.pvar_path)) {
 		src.variants =
@@ -1042,7 +1042,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
                                    PgenLocalizeGuard &localize_guard, bool load_pvar = true, bool read_header = true,
                                    bool resolve_overrides = true, bool defer_copy = false) {
 	// need_pvar discovers the .pvar path; load_pvar also parses it now (false: a lazy_variants
-	// catalog read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
+	// read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
 	// .pgen header open too (a lazy_pgen catalog cell; see PfileBindData::lazy_pgen).
 	// resolve_overrides = false takes the given paths as written, with no existence check (a catalog
 	// cell: the catalog names absolute paths, and each check is a HEAD request on a remote store).
@@ -1220,6 +1220,21 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 			idx_t lo_local = it->second.first;
 			idx_t hi_local = it->second.second;
 			auto &positions = src.variants.positions;
+			// The binary search needs POS sorted within the contig. BuildChromOffsets checks only that
+			// the contig is one run, so a file from another tool can break this: then scan the run.
+			if (!std::is_sorted(positions.begin() + lo_local, positions.begin() + hi_local)) {
+				for (idx_t vidx = lo_local; vidx < hi_local; vidx++) {
+					const int64_t pos = positions[vidx];
+					if (pos < region.start || pos > region.end) {
+						continue;
+					}
+					if (use_variant_set && variant_set.find(static_cast<uint32_t>(vidx)) == variant_set.end()) {
+						continue;
+					}
+					src.effective_variant_indices.push_back(static_cast<uint32_t>(vidx));
+				}
+				return;
+			}
 			idx_t lo = lo_local, hi = hi_local;
 			while (lo < hi) {
 				idx_t mid = lo + (hi - lo) / 2;
@@ -2208,12 +2223,13 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_data->variant_range_lo = sel.variant_range_lo;
 	bind_data->variant_range_hi = sel.variant_range_hi;
 
-	// A catalog read in variant or genotype orient defers each source's .pvar to InitGlobal: their
-	// schema needs only the sample axis. variants := resolves IDs against the .pvar at bind, and
-	// sample orient's schema needs the variant count, so both keep the bind-time load.
-	bind_data->lazy_variants =
-	    from_catalog && !bind_data->has_variant_filter &&
-	    (bind_data->orient_mode == OrientMode::VARIANT || bind_data->orient_mode == OrientMode::GENOTYPE);
+	// A read in variant or genotype orient (a catalog, a single file set or a list) defers each
+	// source's .pvar to InitGlobal: their schema needs only the sample axis, and a WHERE on CHROM/POS
+	// pushed in between narrows the load (PfilePushdownComplexFilter). variants := resolves IDs
+	// against the .pvar at bind, and sample orient's schema needs the variant count, so both keep the
+	// bind-time load.
+	bind_data->lazy_variants = !bind_data->has_variant_filter && (bind_data->orient_mode == OrientMode::VARIANT ||
+	                                                              bind_data->orient_mode == OrientMode::GENOTYPE);
 	// Stage 5: a cell's .pgen header waits for InitGlobal too, when the catalog declares the cell's
 	// variant count and its sample count is known without the header: declared (a v2 matrix), or
 	// shared with cell 0 (a v1 variant concat, whose cell 0 still opens here).
@@ -2231,7 +2247,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		bind_data->smp_headers_at_init = !has_param("af_range") && !has_param("ac_range") &&
 		                                 !has_param("include_genotypes") && !has_param("genotype_range");
 	}
-	bind_data->lazy_pgen = (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent;
+	// Catalog reads only: the declared counts come from the grid (a non-catalog read's default grid
+	// has no cells, though its has_variant_extent defaults to true).
+	bind_data->lazy_pgen =
+	    from_catalog && (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent;
 	bind_data->localize_deferred = bind_data->lazy_pgen && PgenIoLocalizes(context);
 	if (bind_data->localize_deferred) {
 		bind_data->localize_dir = LocalizeDir(context);
@@ -2373,7 +2392,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// read_pfile still owns the region ∩ set (BuildEffectiveVariantList) and the
 		// variant_range post-filter below, since their type + timing differ from the handler.
 		if (bind_data->lazy_variants) {
-			bind_data->source_ranges.push_back(grid.variant_ranges[grid.cells[si].variant_block]);
+			// Only a catalog declares each source's range (for the cell drop); a single file or a
+			// list has none, and source_ranges stays empty, which turns that drop off.
+			if (from_catalog) {
+				bind_data->source_ranges.push_back(grid.variant_ranges[grid.cells[si].variant_block]);
+			}
 			bind_data->sources.push_back(std::move(src)); // region / variant_range apply at InitGlobal
 			continue;
 		}
@@ -6421,6 +6444,37 @@ static void PruneSamplesByIid(ClientContext &context, PfileBindData &bind_data, 
 	ApplySampleKeep(bind_data, std::move(keep));
 }
 
+//! A WHERE's CHROM/POS constraints as the one-contig region that EnsureLazyVariants loads (the
+//! parquet .pvar is region-read; BuildEffectiveVariantList keeps the matching variants). False when
+//! nothing can be pushed: no CHROM, or more than one (RegionFilter holds one contig). With an active
+//! explicit region := the two intersect; a different contig or an empty interval returns false,
+//! because the explicit region and the WHERE then select no row anyway. The WHERE still runs on every
+//! row, so a pushed region only drops rows that the WHERE drops.
+static bool PushedRegion(const CellPruneConstraints &c, const RegionFilter &explicit_region, RegionFilter &out) {
+	if (!c.has_chrom || c.chroms.size() != 1) {
+		return false;
+	}
+	RegionFilter r;
+	r.active = true;
+	r.chrom = *c.chroms.begin();
+	// The WHERE's own bounds, unclamped: a POS of 0 (an unplaced variant) or below is a real value,
+	// and NarrowPos leaves pos_lo at its lowest for POS <= x, POS < x and POS <> x.
+	r.start = c.pos_lo;
+	r.end = c.pos_hi;
+	if (explicit_region.active) {
+		if (explicit_region.chrom != r.chrom) {
+			return false;
+		}
+		r.start = std::max(r.start, explicit_region.start);
+		r.end = std::min(r.end, explicit_region.end);
+	}
+	if (r.start > r.end) {
+		return false;
+	}
+	out = r;
+	return true;
+}
+
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
@@ -6432,7 +6486,12 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	const bool prune_variants = bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
 	                            bind_data.sources.size() > 1 &&
 	                            bind_data.source_ranges.size() == bind_data.sources.size();
-	if (!prune_samples && !prune_variants) {
+	// Part 1 of the WHERE -> region design: a one-contig CHROM (+ POS) constraint narrows every
+	// source's .pvar load (lazy_variants defers it to InitGlobal), single file, list or catalog.
+	const bool push_region =
+	    bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
+	    (bind_data.orient_mode == OrientMode::VARIANT || bind_data.orient_mode == OrientMode::GENOTYPE);
+	if (!prune_samples && !prune_variants && !push_region) {
 		return;
 	}
 	CellPruneConstraints c;
@@ -6459,6 +6518,10 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	}
 	if (prune_samples) {
 		PruneSamplesByIid(context, bind_data, c);
+	}
+	RegionFilter pushed;
+	if (push_region && PushedRegion(c, bind_data.region, pushed)) {
+		bind_data.region = pushed;
 	}
 	if (!prune_variants || (!c.has_chrom && !c.has_pos)) {
 		return;

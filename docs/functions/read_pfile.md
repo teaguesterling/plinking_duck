@@ -314,6 +314,16 @@ only the matching slice. Pushed predicates compose (intersect) with the `region`
 applied as a normal residual filter on the output, so results are always correct
 regardless of what the optimizer pushes.
 
+A `WHERE` on one `CHROM` (with or without `POS` bounds) also narrows the **variant load**, in
+variant and genotype orient, as `region :=` does. With a `.pvar.parquet` companion, only the
+row groups of that region are read. On 10M variants, `WHERE CHROM = '3' AND POS BETWEEN …` loads
+like `region := '3:…'`, instead of parsing all 10M variants first. A `.pvar` is therefore parsed
+when the query starts, not at bind, so `DESCRIBE` no longer reports a bad `.pvar`; the query does.
+These push no region and load every variant, with the same rows: more than one contig
+(`CHROM IN ('1', '2')`), `POS` with no `CHROM`, an `OR`, or a function of `POS`. With
+`region :=` as well, the two intersect. Sample orient, and `variants := [...]`, still load
+the whole `.pvar` at bind.
+
 In `orient := 'genotype'` over sample shards (a catalog with more than one sample block, or a
 `combine_samples := 'concatenate'` / `'disjoint'` list), a `WHERE IID = '…'` or
 `WHERE IID IN (…)` narrows the sample set, as `samples := [...]` does. A shard that holds none of
