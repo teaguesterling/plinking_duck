@@ -122,6 +122,11 @@ with its own `__vidx` range. Bounds are checked on read: a `__vidx` outside
 
 A rewrite with `force` and without `pvar_parquet` removes a stale companion,
 because its `__vidx` would no longer match the new `.pgen`.
+
+Both parquet companions are written with `PARQUET_VERSION V2, COMPRESSION zstd`.
+V2 pages use delta encodings, so the sorted `POS` and `__vidx` columns take almost
+no space. On a 400,000-variant `.pvar`, the companion is 0.28 MB with V2 and
+1.79 MB with V1. A reader must support parquet format version 2. DuckDB does.
 The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#reading-parquet-companions).
 
 ### Parquet `.psam` companion (`psam_parquet`)
