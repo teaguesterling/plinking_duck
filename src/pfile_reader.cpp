@@ -2208,12 +2208,13 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	bind_data->variant_range_lo = sel.variant_range_lo;
 	bind_data->variant_range_hi = sel.variant_range_hi;
 
-	// A catalog read in variant or genotype orient defers each source's .pvar to InitGlobal: their
-	// schema needs only the sample axis. variants := resolves IDs against the .pvar at bind, and
-	// sample orient's schema needs the variant count, so both keep the bind-time load.
-	bind_data->lazy_variants =
-	    from_catalog && !bind_data->has_variant_filter &&
-	    (bind_data->orient_mode == OrientMode::VARIANT || bind_data->orient_mode == OrientMode::GENOTYPE);
+	// A read in variant or genotype orient (a catalog, a single file set or a list) defers each
+	// source's .pvar to InitGlobal: their schema needs only the sample axis, and a WHERE on CHROM/POS
+	// pushed in between narrows the load (PfilePushdownComplexFilter). variants := resolves IDs
+	// against the .pvar at bind, and sample orient's schema needs the variant count, so both keep the
+	// bind-time load.
+	bind_data->lazy_variants = !bind_data->has_variant_filter && (bind_data->orient_mode == OrientMode::VARIANT ||
+	                                                              bind_data->orient_mode == OrientMode::GENOTYPE);
 	// Stage 5: a cell's .pgen header waits for InitGlobal too, when the catalog declares the cell's
 	// variant count and its sample count is known without the header: declared (a v2 matrix), or
 	// shared with cell 0 (a v1 variant concat, whose cell 0 still opens here).
@@ -2231,7 +2232,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		bind_data->smp_headers_at_init = !has_param("af_range") && !has_param("ac_range") &&
 		                                 !has_param("include_genotypes") && !has_param("genotype_range");
 	}
-	bind_data->lazy_pgen = (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent;
+	// Catalog reads only: the declared counts come from the grid (a non-catalog read's default grid
+	// has no cells, though its has_variant_extent defaults to true).
+	bind_data->lazy_pgen =
+	    from_catalog && (bind_data->lazy_variants || bind_data->smp_headers_at_init) && grid.has_variant_extent;
 	bind_data->localize_deferred = bind_data->lazy_pgen && PgenIoLocalizes(context);
 	if (bind_data->localize_deferred) {
 		bind_data->localize_dir = LocalizeDir(context);
@@ -2373,7 +2377,11 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		// read_pfile still owns the region ∩ set (BuildEffectiveVariantList) and the
 		// variant_range post-filter below, since their type + timing differ from the handler.
 		if (bind_data->lazy_variants) {
-			bind_data->source_ranges.push_back(grid.variant_ranges[grid.cells[si].variant_block]);
+			// Only a catalog declares each source's range (for the cell drop); a single file or a
+			// list has none, and source_ranges stays empty, which turns that drop off.
+			if (from_catalog) {
+				bind_data->source_ranges.push_back(grid.variant_ranges[grid.cells[si].variant_block]);
+			}
 			bind_data->sources.push_back(std::move(src)); // region / variant_range apply at InitGlobal
 			continue;
 		}

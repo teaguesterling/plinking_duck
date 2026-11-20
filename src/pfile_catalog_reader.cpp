@@ -631,7 +631,9 @@ void VerifyCounts(ClientContext &context, FileSystem &fs, const ShardEntry &e) {
 	if (!e.psam.empty()) {
 		probe += ", psam := " + SqlStr(e.psam);
 	}
-	probe += ") LIMIT 0";
+	// LIMIT 1, not 0: read_pfile parses the .pvar (and checks its count against the .pgen header) at
+	// InitGlobal, and a LIMIT 0 plan never initializes the scan. SELECT 1 decodes no genotype.
+	probe += ") LIMIT 1";
 	auto res = conn.Query(probe);
 	if (res->HasError()) {
 		// Discriminate the two failure classes the probe can surface, so the caller is not sent down
