@@ -153,17 +153,18 @@ SELECT round((SELECT sum(ALT_FREQ) FROM read_pfile('test/data/large_example', or
 ----
 true
 
-# --- A WHERE on a freq column keeps whole variants' rows.
+# --- A WHERE on a freq column keeps whole variants' rows. sexchr_example, because every variant of
+# large_example has ALT_FREQ 0.5. 0.6 keeps a1 (0.5), par1 (0.33) and x1 (0.44), with 6 samples each.
 query I
-SELECT (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true) WHERE ALT_FREQ < 0.2)
-     = 8 * (SELECT count(*) FROM read_pfile('test/data/large_example', freq := true) WHERE ALT_FREQ < 0.2);
+SELECT (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true) WHERE ALT_FREQ < 0.6)
+     = 6 * (SELECT count(*) FROM read_pfile('test/data/sexchr_example', freq := true) WHERE ALT_FREQ < 0.6);
 ----
 true
 
 query I
-SELECT count(*) > 0 FROM read_pfile('test/data/large_example', freq := true) WHERE ALT_FREQ < 0.2;
+SELECT count(*) FROM read_pfile('test/data/sexchr_example', freq := true) WHERE ALT_FREQ < 0.6;
 ----
-true
+3
 
 endloop
 
