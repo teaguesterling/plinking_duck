@@ -6,7 +6,8 @@ require plinking_duck
 
 # Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 2b. Oracle: a table
 # copy of the read, filtered by the same WHERE (no pushdown). large_example has missing calls
-# (SAMP2: 750), so the NULL semantics are exercised. The counter shows that the compile happened.
+# (SAMP2: 750), so the NULL semantics are exercised. The counter shows that the compile happened:
+# each oracle query scans read_pfile twice (both EXCEPT ALL directions), so a pushed form counts 2.
 
 statement ok
 CREATE TABLE t AS SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype');
@@ -37,7 +38,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype = 1
 statement ok
@@ -51,7 +52,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype = 2
 statement ok
@@ -65,7 +66,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype > 0
 statement ok
@@ -79,7 +80,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype >= 1
 statement ok
@@ -93,7 +94,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype < 2
 statement ok
@@ -107,7 +108,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype <= 1
 statement ok
@@ -121,7 +122,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype <> 0
 statement ok
@@ -135,7 +136,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype IN (1, 2)
 statement ok
@@ -149,7 +150,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype IN (0, 2)
 statement ok
@@ -163,7 +164,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype BETWEEN 1 AND 2
 statement ok
@@ -177,7 +178,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype IS NULL
 statement ok
@@ -191,7 +192,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype IS NOT NULL
 statement ok
@@ -205,7 +206,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype > 0 AND genotype < 2
 statement ok
@@ -219,7 +220,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-1
+2
 
 # WHERE genotype = 0 OR genotype = 2
 statement ok
@@ -235,7 +236,8 @@ SELECT plinking_debug_genotype_where_pushed();
 ----
 0
 
-# WHERE NOT (genotype = 0)
+# WHERE NOT (genotype = 0): DuckDB rewrites it to genotype <> 0 before the hook (both exclude NULL),
+# so it is pushed
 statement ok
 SELECT plinking_debug_genotype_where_pushed_reset();
 
@@ -247,7 +249,7 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 query I
 SELECT plinking_debug_genotype_where_pushed();
 ----
-0
+2
 
 # WHERE genotype > 0.5
 statement ok
