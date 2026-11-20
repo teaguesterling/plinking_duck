@@ -243,7 +243,7 @@ SELECT count(*),
        count(*) FILTER (WHERE r.ALT_FREQ IS DISTINCT FROM f.ALT_FREQ OR r.OBS_CT IS DISTINCT FROM f.OBS_CT
                           OR r.HOM_REF_CT IS DISTINCT FROM f.HOM_REF_CT OR r.HET_CT IS DISTINCT FROM f.HET_CT
                           OR r.HOM_ALT_CT IS DISTINCT FROM f.HOM_ALT_CT OR r.MISSING_CT IS DISTINCT FROM f.MISSING_CT)
-FROM sx.genotypes r
+FROM sx.genotypes_by_variant_list r
 JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
 ----
 5	0
@@ -253,13 +253,13 @@ ATTACH '{TEST_DIR}/mx.pfile.json' AS mx (TYPE pfile_catalog);
 
 query I
 SELECT count(*) = (SELECT count(*) FROM plink_freq('test/data/large_example.pgen', counts := true) WHERE HET_CT >= 2 AND CHROM = '2')
-FROM (SELECT ID FROM mx.genotypes WHERE HET_CT >= 2 AND CHROM = '2');
+FROM (SELECT ID FROM mx.genotypes_by_variant_list WHERE HET_CT >= 2 AND CHROM = '2');
 ----
 true
 
 # large_example has HET_CT = 2 on every variant, so this filter keeps none.
 query I
-SELECT count(*) FROM mx.genotypes WHERE HET_CT > 2 AND CHROM = '2';
+SELECT count(*) FROM mx.genotypes_by_variant_list WHERE HET_CT > 2 AND CHROM = '2';
 ----
 0
 
@@ -269,14 +269,14 @@ ATTACH 'test/data/sexchr_example' AS bare (TYPE pfile_catalog);
 
 query II
 SELECT count(*), count(*) FILTER (WHERE r.HET_CT IS DISTINCT FROM f.HET_CT OR r.OBS_CT IS DISTINCT FROM f.OBS_CT)
-FROM bare.genotypes r
+FROM bare.genotypes_by_variant_list r
 JOIN plink_freq('test/data/sexchr_example.pgen', counts := true) f USING (ID);
 ----
 5	0
 
 # The sample-oriented view is unchanged: no count columns there.
 query I
-SELECT count(*) FROM (DESCRIBE SELECT * FROM sx.genotypes_by_sample) WHERE column_name IN ('HET_CT', 'ALT_FREQ');
+SELECT count(*) FROM (DESCRIBE SELECT * FROM sx.genotypes_by_sample_list) WHERE column_name IN ('HET_CT', 'ALT_FREQ');
 ----
 0
 
@@ -284,7 +284,7 @@ SELECT count(*) FROM (DESCRIBE SELECT * FROM sx.genotypes_by_sample) WHERE colum
 # pfile_catalog.md). Reading the output back with freq := true still works: read_pfile does not
 # emit .pvar extra columns, so the names do not clash.
 statement ok
-COPY (SELECT * FROM sx.genotypes) TO '{TEST_DIR}/leak' (FORMAT pfile, samples ['M1', 'M2', 'M3', 'F1', 'F2', 'F3']);
+COPY (SELECT * FROM sx.genotypes_by_variant_list) TO '{TEST_DIR}/leak' (FORMAT pfile, samples ['M1', 'M2', 'M3', 'F1', 'F2', 'F3']);
 
 query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pvar('{TEST_DIR}/leak.pvar')) WHERE column_name IN ('ALT_FREQ', 'OBS_CT', 'HOM_REF_CT', 'HET_CT', 'HOM_ALT_CT', 'MISSING_CT');

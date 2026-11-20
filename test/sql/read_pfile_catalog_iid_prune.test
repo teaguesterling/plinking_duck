@@ -402,15 +402,15 @@ ATTACH '{TEST_DIR}/badhi.pfile.json' AS bh (TYPE pfile_catalog);
 
 query II
 SELECT (SELECT count(*) FROM (
-          SELECT IID, genotypes FROM bh.genotypes_by_sample WHERE IID = 'SAMP2'
+          SELECT IID, genotypes FROM bh.genotypes_by_sample_list WHERE IID = 'SAMP2'
           EXCEPT ALL
           SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample') WHERE IID = 'SAMP2')),
-       (SELECT count(*) FROM bh.genotypes_by_sample WHERE IID = 'SAMP2');
+       (SELECT count(*) FROM bh.genotypes_by_sample_list WHERE IID = 'SAMP2');
 ----
 0	1
 
 statement error
-SELECT IID FROM bh.genotypes_by_sample WHERE IID = 'SAMP7';
+SELECT IID FROM bh.genotypes_by_sample_list WHERE IID = 'SAMP7';
 ----
 data.pgen
 

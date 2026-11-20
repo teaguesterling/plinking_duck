@@ -53,6 +53,6 @@ statement ok
 ATTACH 'file://{WORKING_DIR}/{TEST_DIR}/mx.pfile.json' AS c (TYPE pfile_catalog);
 
 query I
-SELECT count(*) FROM c.genotypes WHERE CHROM = '3';
+SELECT count(*) FROM c.genotypes_by_variant_list WHERE CHROM = '3';
 ----
 1000

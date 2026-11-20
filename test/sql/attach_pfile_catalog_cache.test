@@ -29,9 +29,9 @@ CACHE
 # The same rows with and without the cache.
 query I
 SELECT count(*) FROM (
-  (SELECT ID, genotypes FROM nc.genotypes EXCEPT ALL SELECT ID, genotypes FROM yc.genotypes)
+  (SELECT ID, genotypes FROM nc.genotypes_by_variant_list EXCEPT ALL SELECT ID, genotypes FROM yc.genotypes_by_variant_list)
   UNION ALL
-  (SELECT ID, genotypes FROM yc.genotypes EXCEPT ALL SELECT ID, genotypes FROM nc.genotypes));
+  (SELECT ID, genotypes FROM yc.genotypes_by_variant_list EXCEPT ALL SELECT ID, genotypes FROM nc.genotypes_by_variant_list));
 ----
 0
 
@@ -79,10 +79,10 @@ statement ok
 ATTACH '{TEST_DIR}/g' AS g0 (TYPE pfile_catalog, CACHE false);
 
 statement ok
-CREATE TABLE g_first AS SELECT ID, genotypes FROM g1.genotypes;
+CREATE TABLE g_first AS SELECT ID, genotypes FROM g1.genotypes_by_variant_list;
 
 query I
-SELECT count(*) FROM g0.genotypes;
+SELECT count(*) FROM g0.genotypes_by_variant_list;
 ----
 3000
 
@@ -96,15 +96,15 @@ SET threads = ${threads};
 
 query I
 SELECT count(*) FROM (
-  (SELECT ID, genotypes FROM g1.genotypes EXCEPT ALL SELECT * FROM g_first)
-  UNION ALL (SELECT * FROM g_first EXCEPT ALL SELECT ID, genotypes FROM g1.genotypes));
+  (SELECT ID, genotypes FROM g1.genotypes_by_variant_list EXCEPT ALL SELECT * FROM g_first)
+  UNION ALL (SELECT * FROM g_first EXCEPT ALL SELECT ID, genotypes FROM g1.genotypes_by_variant_list));
 ----
 0
 
 endloop
 
 statement error
-SELECT count(*) FROM g0.genotypes;
+SELECT count(*) FROM g0.genotypes_by_variant_list;
 ----
 
 statement ok
@@ -127,20 +127,20 @@ statement ok
 ATTACH '{TEST_DIR}/p' AS p0 (TYPE pfile_catalog, CACHE false);
 
 statement ok
-CREATE TABLE p_first AS SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes;
+CREATE TABLE p_first AS SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes_by_variant_list;
 
 statement ok
 COPY (SELECT 'garbage') TO '{TEST_DIR}/p/GROUP=hi/samples.psam' (FORMAT csv, header false);
 
 query I
 SELECT count(*) FROM (
-  (SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes EXCEPT ALL SELECT * FROM p_first)
-  UNION ALL (SELECT * FROM p_first EXCEPT ALL SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes));
+  (SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes_by_variant_list EXCEPT ALL SELECT * FROM p_first)
+  UNION ALL (SELECT * FROM p_first EXCEPT ALL SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes_by_variant_list));
 ----
 0
 
 statement error
-SELECT count(*) FROM p0.genotypes;
+SELECT count(*) FROM p0.genotypes_by_variant_list;
 ----
 
 statement ok
@@ -150,7 +150,7 @@ statement ok
 ATTACH '{TEST_DIR}/p' AS p1 (TYPE pfile_catalog);
 
 statement error
-SELECT count(*) FROM p1.genotypes;
+SELECT count(*) FROM p1.genotypes_by_variant_list;
 ----
 
 # --- the companion paths discovery chose (a bare file set with a text .pvar) ---
@@ -165,7 +165,7 @@ statement ok
 ATTACH '{TEST_DIR}/t' AS t0 (TYPE pfile_catalog, CACHE false);
 
 statement ok
-CREATE TABLE t_first AS SELECT ID, genotypes FROM t1.genotypes;
+CREATE TABLE t_first AS SELECT ID, genotypes FROM t1.genotypes_by_variant_list;
 
 # A .pvar.parquet appears after the first query; discovery prefers it, and it is garbage.
 statement ok
@@ -173,13 +173,13 @@ COPY (SELECT 'garbage') TO '{TEST_DIR}/t.pvar.parquet' (FORMAT csv, header false
 
 query I
 SELECT count(*) FROM (
-  (SELECT ID, genotypes FROM t1.genotypes EXCEPT ALL SELECT * FROM t_first)
-  UNION ALL (SELECT * FROM t_first EXCEPT ALL SELECT ID, genotypes FROM t1.genotypes));
+  (SELECT ID, genotypes FROM t1.genotypes_by_variant_list EXCEPT ALL SELECT * FROM t_first)
+  UNION ALL (SELECT * FROM t_first EXCEPT ALL SELECT ID, genotypes FROM t1.genotypes_by_variant_list));
 ----
 0
 
 statement error
-SELECT count(*) FROM t0.genotypes;
+SELECT count(*) FROM t0.genotypes_by_variant_list;
 ----
 
 statement ok
@@ -189,7 +189,7 @@ statement ok
 ATTACH '{TEST_DIR}/t' AS t1 (TYPE pfile_catalog);
 
 statement error
-SELECT count(*) FROM t1.genotypes;
+SELECT count(*) FROM t1.genotypes_by_variant_list;
 ----
 
 # ---------------------------------------------------------------------------
@@ -209,7 +209,7 @@ statement ok
 ATTACH '{TEST_DIR}/f' AS fa (TYPE pfile_catalog);
 
 query T
-SELECT min(IID) FROM fa.genotypes_by_sample;
+SELECT min(IID) FROM fa.genotypes_by_sample_list;
 ----
 PQ_SAMP1
 
@@ -218,7 +218,7 @@ statement ok
 SET plinking_use_parquet_companions = false;
 
 query T
-SELECT min(IID) FROM fa.genotypes_by_sample;
+SELECT min(IID) FROM fa.genotypes_by_sample_list;
 ----
 SAMP1
 
@@ -226,7 +226,7 @@ statement ok
 RESET plinking_use_parquet_companions;
 
 query T
-SELECT min(IID) FROM fa.genotypes_by_sample;
+SELECT min(IID) FROM fa.genotypes_by_sample_list;
 ----
 PQ_SAMP1
 
@@ -242,7 +242,7 @@ statement ok
 ATTACH 'test/data/large_example' AS ma (TYPE pfile_catalog);
 
 statement ok
-SELECT count(*) FROM ma.genotypes_by_sample;
+SELECT count(*) FROM ma.genotypes_by_sample_list;
 
 query I
 SELECT memory_usage_bytes > (SELECT b FROM oc_before) FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';

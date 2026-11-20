@@ -290,26 +290,26 @@ SELECT string_agg(IID, ',' ORDER BY IID) FROM m.samples;
 ----
 SAMP1,SAMP2,SAMP3,SAMP4,SAMP5,SAMP6,SAMP7,SAMP8
 
-# ATTACH m.genotypes reads all 6 cells, each through its templated .pvar/.psam, and joins the
+# ATTACH m.genotypes_by_variant_list reads all 6 cells, each through its templated .pvar/.psam, and joins the
 # 2 sample-blocks into one 8-sample row per variant. Positional array equality means the sample
 # order (a then b) and the variant order (CHROM 1, 2, 3) must both match the source.
 query III
-SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM m.genotypes
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM m.genotypes_by_variant_list
         EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM read_pfile('test/data/large_example'))),
        (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM read_pfile('test/data/large_example')
-        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM m.genotypes)),
-       (SELECT count(*) FROM m.genotypes);
+        EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes::TINYINT[] FROM m.genotypes_by_variant_list)),
+       (SELECT count(*) FROM m.genotypes_by_variant_list);
 ----
 0	0	3000
 
-# ATTACH m.genotypes_by_sample: one row per sample, each with all 3000 variants in source order.
+# ATTACH m.genotypes_by_sample_list: one row per sample, each with all 3000 variants in source order.
 # Samples from both sample-blocks appear, and no block is stacked onto another.
 query III
-SELECT (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM m.genotypes_by_sample
+SELECT (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM m.genotypes_by_sample_list
         EXCEPT ALL SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample'))),
        (SELECT count(*) FROM (SELECT IID, genotypes::TINYINT[] FROM read_pfile('test/data/large_example', orient := 'sample')
-        EXCEPT ALL SELECT IID, genotypes::TINYINT[] FROM m.genotypes_by_sample)),
-       (SELECT count(*) FROM m.genotypes_by_sample);
+        EXCEPT ALL SELECT IID, genotypes::TINYINT[] FROM m.genotypes_by_sample_list)),
+       (SELECT count(*) FROM m.genotypes_by_sample_list);
 ----
 0	0	8
 

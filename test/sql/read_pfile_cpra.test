@@ -135,7 +135,7 @@ statement ok
 ATTACH 'test/data/large_example' AS c (TYPE pfile_catalog);
 
 query TT
-SELECT CPRA, ID FROM c.genotypes WHERE CPRA = '1:10000:T:C';
+SELECT CPRA, ID FROM c.genotypes_by_variant_list WHERE CPRA = '1:10000:T:C';
 ----
 1:10000:T:C	var100
 
