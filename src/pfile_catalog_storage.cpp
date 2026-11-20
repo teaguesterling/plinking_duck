@@ -145,10 +145,12 @@ static string BuildV1BlockSql(const string &path_sql, const string &concat_dim, 
 //! pvar := when the catalog names a single distinct one (the shards may carry no .pvar of their own).
 //! Otherwise a pvar override is never passed — read_pfile rejects it on a variant-sharded list, and
 //! each cell/shard already carries its own co-located .pvar.
+//! `select` is the view's select list (variant-row views name the virtual CPRA, views PR 2b), and
+//! `args` the shape's extra named arguments (orient / genotypes / freq; see ViewShape).
 static string GenotypesSql(const vector<string> &prefixes, const string &shared_psam, bool sample_concat,
-                           const string &shared_pvar, bool by_sample, const string &cache_arg) {
-	// CPRA is a virtual column (views PR 2b): SELECT * leaves it out, so the variant-row view names it.
-	string sql = string(by_sample ? "SELECT *" : "SELECT *, CPRA") + " FROM read_pfile(" + SqlPathList(prefixes);
+                           const string &shared_pvar, const string &select, const string &args,
+                           const string &cache_arg) {
+	string sql = "SELECT " + select + " FROM read_pfile(" + SqlPathList(prefixes);
 	if (sample_concat) {
 		// Also for ONE cell: its shard may have no .pvar of its own, and pvar := is valid
 		// single-file too (combine_samples on a one-element list reads the fileset normally).
@@ -161,12 +163,7 @@ static string GenotypesSql(const vector<string> &prefixes, const string &shared_
 	} else if (prefixes.size() > 1 && !shared_psam.empty()) {
 		sql += ", psam := " + SQLString::ToString(shared_psam);
 	}
-	if (by_sample) {
-		sql += ", orient := 'sample'";
-	} else {
-		// P13-006 §5: plink_freq's per-variant columns, computed only when a query names them.
-		sql += ", freq := true";
-	}
+	sql += args;
 	sql += cache_arg;
 	sql += ")";
 	return sql;
@@ -179,7 +176,8 @@ static string GenotypesSql(const vector<string> &prefixes, const string &shared_
 //! with read_pfile's own genotype mode ('auto' = a fixed ARRAY for the cell's sample count). When
 //! the sample blocks differ in width, those ARRAYs differ in size and cannot union, so every cell is
 //! read with genotypes := 'list' — read_pfile's ARRAY-or-LIST rule, lifted to the grid.
-static string MatrixGenotypesSql(const vector<MatrixCell> &cells, const string &cache_arg) {
+static string MatrixGenotypesSql(const vector<MatrixCell> &cells, const string &select, const string &args,
+                                 bool list_if_uneven, const string &cache_arg) {
 	bool uniform = true;
 	for (auto &c : cells) {
 		if (c.sample_stop - c.sample_start != cells[0].sample_stop - cells[0].sample_start) {
@@ -190,13 +188,13 @@ static string MatrixGenotypesSql(const vector<MatrixCell> &cells, const string &
 	string sql;
 	for (idx_t i = 0; i < cells.size(); i++) {
 		sql += (i ? " UNION ALL " : "");
-		sql += "SELECT *, CPRA FROM read_pfile(" + SQLString::ToString(cells[i].prefix) +
+		sql += "SELECT " + select + " FROM read_pfile(" + SQLString::ToString(cells[i].prefix) +
 		       ", pvar := " + SQLString::ToString(cells[i].pvar) + ", psam := " + SQLString::ToString(cells[i].psam);
-		if (!uniform) {
+		if (list_if_uneven && !uniform) {
 			sql += ", genotypes := 'list'";
 		}
-		// The same columns as every other c.genotypes; here each row counts its own sample block.
-		sql += ", freq := true" + cache_arg + ")";
+		// The same columns as the catalog read; here each row's freq counts its own sample block.
+		sql += args + cache_arg + ")";
 	}
 	return sql;
 }
@@ -350,34 +348,52 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// beside shared.pvar), so pvar_paths holds exactly that path.
 	string shared_pvar = (sample_concat && pvar_paths.size() == 1) ? pvar_paths[0] : "";
 	vector<std::pair<Identifier, string>> views;
-	// c.genotypes is the catalog read itself, read_pfile(catalog := ...): one row per variant with
-	// every sample, and a WHERE on CHROM/POS drops variant blocks before they are read (P13-006
-	// stage 4). Teague approved the change on 2026-11-09; before it, a matrix fanned out one row per
-	// variant x sample block. A matrix with holes keeps that fan-out: read_pfile(catalog := ...)
-	// rejects holes, and their 2-D meaning is not defined. A bare fileset has no catalog to name.
-	if (is_matrix && matrix_has_holes) {
-		views.emplace_back(Identifier("genotypes"), MatrixGenotypesSql(matrix_cells, cache_arg));
-	} else if (!catalog_path_sql.empty()) {
-		views.emplace_back(Identifier("genotypes"), "SELECT *, CPRA FROM read_pfile(catalog := " + catalog_path_sql +
-		                                                ", freq := true" + cache_arg + ")");
-	} else {
-		views.emplace_back(Identifier("genotypes"),
-		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false, cache_arg));
-	}
-	// A matrix's SAMPLE-oriented view is the 2-D read: read_pfile(catalog := …) concatenates the
-	// sample blocks within each variant block and row-concatenates the variant blocks, with every
-	// cell's template-resolved companions. (A list read of the cells combines one axis only: it
-	// filed other sample blocks' calls under the first block's IIDs — measured before this view.)
-	// A matrix with holes errors at bind inside read_pfile, so every query on the view (count(*),
-	// a filter that matches no row, DESCRIBE) gets that message — EXCEPT with one sample block:
-	// there a hole removes a whole variant block, and the variant-sharded list read of the
-	// present cells is correct (it was the view before the 2-D read; kept so it does not regress).
-	if (is_matrix && !(matrix_has_holes && psam_paths.size() == 1)) {
-		views.emplace_back(Identifier("genotypes_by_sample"), "SELECT * FROM read_pfile(catalog := " + matrix_path_sql +
-		                                                          ", orient := 'sample'" + cache_arg + ")");
-	} else {
-		views.emplace_back(Identifier("genotypes_by_sample"),
-		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, true, cache_arg));
+	// The five genotype views (views PR 3; design §1, §1b). Each is one shape over the shipped
+	// readers: a catalog kind reads through read_pfile(catalog := ...), whose WHERE on CHROM/POS drops
+	// variant blocks; a bare fileset through a list read that discovers its own companions.
+	// Variant-row shapes name the virtual CPRA (SELECT * leaves it out) and carry the freq columns.
+	struct ViewShape {
+		const char *name;
+		bool by_sample;
+		const char *select;
+		const char *args;
+		bool list_if_uneven; //! a holed matrix's per-cell reads: LIST when sample blocks differ in width
+	};
+	static const ViewShape shapes[] = {
+	    {"genotypes", false, "*, CPRA", ", orient := 'genotype', freq := true", false},
+	    {"genotypes_by_variant", false, "*, CPRA", ", genotypes := 'columns', freq := true", false},
+	    {"genotypes_by_variant_list", false, "*, CPRA", ", freq := true", true},
+	    {"genotypes_by_sample", true, "*", ", orient := 'sample', genotypes := 'columns', unique_column_names := true",
+	     false},
+	    {"genotypes_by_sample_list", true, "*", ", orient := 'sample'", false},
+	};
+	const bool one_sample_block = psam_paths.size() == 1;
+	for (auto &shape : shapes) {
+		string sql;
+		if (!shape.by_sample) {
+			// A matrix with holes has no 2-D read (read_pfile(catalog := ...) rejects it at bind). The
+			// tall view, and any view of a one-sample-block grid (a hole removes a whole variant block),
+			// is the UNION ALL of the present cells; the other variant-row views keep the bind error.
+			if (is_matrix && matrix_has_holes && (string(shape.name) == "genotypes" || one_sample_block)) {
+				sql = MatrixGenotypesSql(matrix_cells, shape.select, shape.args, shape.list_if_uneven, cache_arg);
+			} else if (!catalog_path_sql.empty()) {
+				sql = string("SELECT ") + shape.select + " FROM read_pfile(catalog := " + catalog_path_sql +
+				      shape.args + cache_arg + ")";
+			} else {
+				sql = GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, shape.select, shape.args,
+				                   cache_arg);
+			}
+		} else if (is_matrix && !(matrix_has_holes && one_sample_block)) {
+			// A matrix's sample-row views are the 2-D read; with holes and more than one sample block it
+			// errors at bind, so count(*), an empty filter and DESCRIBE all get the message.
+			sql = string("SELECT ") + shape.select + " FROM read_pfile(catalog := " + matrix_path_sql + shape.args +
+			      cache_arg + ")";
+		} else {
+			// One sample block (or none of the grid's): the variant-sharded list read of the present cells.
+			sql = GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, shape.select, shape.args,
+			                   cache_arg);
+		}
+		views.emplace_back(Identifier(shape.name), std::move(sql));
 	}
 	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
 	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));

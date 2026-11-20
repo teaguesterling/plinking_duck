@@ -25,6 +25,7 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | `orient` | `VARCHAR` | `'variant'` | Output orientation: `'variant'`, `'genotype'`, or `'sample'` |
 | `combine_samples` | `VARCHAR` | `'implicit'` | Multi-file only: how shards' samples combine — `'implicit'` (positional trust), `'identical'` (verify IIDs), `'concatenate'` (sample-sharded: same variants, different samples), or `'disjoint'` (`'concatenate'` + verify IIDs are unique across shards). See [Multi-File Input](#multi-file-input) |
 | `genotypes` | `VARCHAR` | `'array'` | Genotype output: `'array'`, `'list'`, `'columns'`, `'struct'`, or the aggregate modes `'counts'` / `'stats'` (per-sample summaries in sample orient) |
+| `unique_column_names` | `BOOLEAN` | `false` | With `orient := 'sample'` and `genotypes := 'columns'`: a `.`, empty or duplicate variant ID column is named by its `CPRA` (then `<CPRA>_<n>`), not an error. The ATTACH `c.genotypes_by_sample` view passes it. Without it, a duplicate ID is an error |
 | `phased` | `BOOLEAN` | `false` | Output phased haplotype pairs instead of dosage counts |
 | `dosages` | `BOOLEAN` | `false` | Output dosage values instead of hard calls |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific samples |

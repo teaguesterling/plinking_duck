@@ -3007,12 +3007,31 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 			// Check for duplicate variant IDs (variant IDs can duplicate unlike sample
 			// IIDs) — across ALL sources, in global (shard) order.
+			// unique_column_names := true (views PR 3, the ATTACH by-sample view): a '.', empty or
+			// duplicate ID is named by its CPRA, then CPRA_<n>, in variant order, instead of an error.
+			bool unique_names = false;
+			{
+				auto un_it = input.named_parameters.find("unique_column_names");
+				if (un_it != input.named_parameters.end() && !un_it->second.IsNull()) {
+					unique_names = BooleanValue::Get(un_it->second.DefaultCastAs(LogicalType::BOOLEAN));
+				}
+			}
 			std::unordered_set<string> seen_names;
 			for (auto &src : bind_data->sources) {
 				uint32_t src_ct = src.EffectiveVariantCt();
 				for (uint32_t ev = 0; ev < src_ct; ev++) {
 					uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[ev] : ev;
 					string col_name = variant_col_name(src, vidx);
+					if (unique_names) {
+						const auto id = src.variants.GetId(vidx);
+						if (id.empty() || id == "." || seen_names.count(col_name)) {
+							const string cpra = CpraOf(src.variants, vidx);
+							col_name = cpra;
+							for (idx_t n = 1; seen_names.count(col_name); n++) {
+								col_name = cpra + "_" + std::to_string(n);
+							}
+						}
+					}
 					if (!seen_names.insert(col_name).second) {
 						throw InvalidInputException(
 						    "read_pfile: genotypes := 'columns' with orient := 'sample' requires unique variant "
@@ -6926,6 +6945,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		                            {"phased", LogicalType::BOOLEAN},
 		                            {"region", LogicalType::VARCHAR},
 		                            {"attach_cache", LogicalType::VARCHAR},
+		                            {"unique_column_names", LogicalType::BOOLEAN},
 		                            {"samples", LogicalType::ANY},
 		                            {"variants", LogicalType::ANY},
 		                            {"selection", LogicalType::ANY},
