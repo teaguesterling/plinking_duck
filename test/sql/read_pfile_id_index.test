@@ -247,3 +247,24 @@ statement error
 SELECT count(*) FROM read_pfile('{TEST_DIR}/bad') WHERE ID = 'var100';
 ----
 CHROM=3/data.pvar
+
+statement ok
+RESET plinking_use_parquet_companions;
+
+# ---------------------------------------------------------------------------
+# Review finding: a read made only from overrides has no prefix, so it has no index. A stray
+# '.pvar.index.parquet' (here found through file_search_path) must not narrow the read.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM (VALUES ('var100', 0::BIGINT)) t(ID, _pvar_ordinal)) TO '{TEST_DIR}/.pvar.index.parquet' (FORMAT parquet);
+
+statement ok
+SET file_search_path = '{TEST_DIR}';
+
+query I
+SELECT count(*) FROM read_pfile(pgen := '{TEST_DIR}/A.pgen', pvar := '{TEST_DIR}/A.pvar.parquet', psam := '{TEST_DIR}/A.psam') WHERE ID = 'var100';
+----
+1
+
+statement ok
+RESET file_search_path;
