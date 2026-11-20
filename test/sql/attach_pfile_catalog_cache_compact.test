@@ -50,9 +50,16 @@ SELECT count(IID) FROM b.genotypes WHERE ID = 'var100';
 statement ok
 CREATE TABLE oc2 AS SELECT coalesce(sum(memory_usage_bytes), 0) AS b FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
 
-# B's 20 wide columns (8 x 20 x 100 B = 16,000 B of text) add nothing to the cache over A.
+# Both ATTACHes store a samples entry (the IDs and SEX), and B's 20 wide columns (8 x 20 x 100 B =
+# 16,000 B of row text) stay out of it. B's entry is larger only by its column header: 21 names
+# against A's 1, at 64 B + the name each (about 1,300 B), so the bound sits between that and 16,000 B.
+query II
+SELECT (SELECT b FROM oc1) > (SELECT b FROM oc0), (SELECT b FROM oc2) > (SELECT b FROM oc1);
+----
+true	true
+
 query I
-SELECT ((SELECT b FROM oc2) - (SELECT b FROM oc1)) - ((SELECT b FROM oc1) - (SELECT b FROM oc0)) < 1000;
+SELECT ((SELECT b FROM oc2) - (SELECT b FROM oc1)) - ((SELECT b FROM oc1) - (SELECT b FROM oc0)) < 3000;
 ----
 true
 
