@@ -340,3 +340,46 @@ query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM d.genotypes_by_sample);
 ----
 6
+
+# ---------------------------------------------------------------------------
+# Review finding (Critical): a holed matrix's tall view is the UNION ALL of the present cells' reads.
+# Sample blocks whose .psam headers differ (#FID IID vs #IID SEX) must still put each value under its
+# own column name, not by position. hm: the 3 x 2 matrix, lo = SAMP1-3, hi = SAMP4-8; hole: CHROM 3 x hi.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/hm' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3'], hi: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#FID', 'IID'), ('F1', 'SAMP1'), ('F2', 'SAMP2'), ('F3', 'SAMP3')))
+TO '{TEST_DIR}/hm/GROUP=lo/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('SAMP4', '1'), ('SAMP5', '2'), ('SAMP6', '1'), ('SAMP7', '2'), ('SAMP8', '1')))
+TO '{TEST_DIR}/hm/GROUP=hi/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT regexp_replace(content, '}\s*$', ', "holes": [{"CHROM": "3", "GROUP": "hi"}]}') FROM read_text('{TEST_DIR}/hm.pfile.json'))
+TO '{TEST_DIR}/hmh.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement ok
+ATTACH '{TEST_DIR}/hmh.pfile.json' AS hh (TYPE pfile_catalog);
+
+# Every IID is a real IID, and SAMP5 has its two present variant blocks (CHROM 1 and 2).
+query I
+SELECT list(DISTINCT IID ORDER BY IID) FROM hh.genotypes;
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+query I
+SELECT count(*) FROM hh.genotypes WHERE IID = 'SAMP5';
+----
+2000
+
+# Each block's own columns carry its values; the other block's are NULL.
+query IIII
+SELECT count(*) FILTER (IID = 'SAMP1' AND FID = 'F1'), count(*) FILTER (IID = 'SAMP5' AND SEX = 2),
+       count(*) FILTER (IID = 'SAMP5' AND FID IS NOT NULL), count(*) FILTER (IID = 'SAMP1' AND SEX IS NOT NULL)
+FROM hh.genotypes;
+----
+3000	2000	0	0
