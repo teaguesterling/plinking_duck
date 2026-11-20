@@ -324,6 +324,20 @@ These push no region and load every variant, with the same rows: more than one c
 `region :=` as well, the two intersect. Sample orient, and `variants := [...]`, still load
 the whole `.pvar` at bind.
 
+In `orient := 'genotype'`, a `WHERE` on `genotype` becomes the scan's genotype filter, the one
+behind `include_genotypes`. The scan then skips a variant with no matching call before it decodes
+it, and does not build the rows the filter drops. It applies to `=`, `<>`, `<`, `<=`, `>`, `>=`,
+`BETWEEN`, `IN (…)`, `IS NULL` and `IS NOT NULL`, joined with `AND`. A missing call is `NULL`, so
+`genotype > 0` and `genotype <> 0` select het and hom-alt, and only `IS NULL` selects missing. With
+`include_genotypes :=` as well, the two intersect. The freq columns and `af_range` / `ac_range`
+still count every call. `OR`, a function of `genotype`, and phased or dosage output push nothing;
+the rows are the same either way.
+```sql
+-- the hom-alt carriers of a list of variants
+SELECT DISTINCT IID FROM read_pfile('cohort', orient := 'genotype')
+WHERE ID IN ('rs1', 'rs2', 'rs3') AND genotype = 2;
+```
+
 In `orient := 'genotype'` over sample shards (a catalog with more than one sample block, or a
 `combine_samples := 'concatenate'` / `'disjoint'` list), a `WHERE IID = '…'` or
 `WHERE IID IN (…)` narrows the sample set, as `samples := [...]` does. A shard that holds none of

@@ -79,6 +79,8 @@ static std::atomic<int64_t> g_sparse_variants_decoded {0};
 // on-disk record encoding (not just the data distribution), so only a read through
 // the concat reader itself can prove it. Reset together with the variant counter.
 static std::atomic<int64_t> g_sparse_concat_dense_shards {0};
+//! Test-only: reads whose WHERE on genotype compiled into the scan's genotype filter (views PR 2a).
+static std::atomic<int64_t> g_genotype_where_pushed {0};
 static std::atomic<int64_t> g_sparse_concat_altmajor_shards {0};
 
 // ---------------------------------------------------------------------------
@@ -6538,6 +6540,139 @@ static bool PushedRegion(const CellPruneConstraints &c, const RegionFilter &expl
 	return true;
 }
 
+//! Whether `g` (a hardcall 0, 1 or 2) satisfies `g <cmp> c`. False in `known` for any other comparison.
+static bool GenotypeCmpHolds(ExpressionType cmp, double g, double c, bool &known) {
+	known = true;
+	switch (cmp) {
+	case ExpressionType::COMPARE_EQUAL:
+		return g == c;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return g != c;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return g < c;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return g <= c;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return g > c;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return g >= c;
+	default:
+		known = false;
+		return true;
+	}
+}
+
+//! Views PR 2a: narrow `allowed` (index 0-2: the hardcall 0/1/2; index 3: missing, which genotype
+//! orient emits as NULL) by what a WHERE conjunct says about the `genotype` column (`gcol`).
+//! Returns true when something narrowed it. A comparison excludes missing (NULL never compares
+//! true); IS NULL keeps only missing. Any other form (OR, NOT, a function or cast on the column,
+//! IS DISTINCT FROM) narrows nothing, so the pushed filter only ever keeps more calls.
+static bool CollectGenotypeAllowed(ClientContext &context, const LogicalGet &get, const Expression &e, idx_t gcol,
+                                   bool allowed[4]) {
+	const auto type = e.GetExpressionType();
+	if (type == ExpressionType::CONJUNCTION_AND) {
+		bool any = false;
+		for (auto &child : e.Cast<BoundConjunctionExpression>().GetChildren()) {
+			any |= CollectGenotypeAllowed(context, get, *child, gcol, allowed);
+		}
+		return any;
+	}
+	auto narrow = [&](const bool keep[4]) {
+		for (idx_t i = 0; i < 4; i++) {
+			allowed[i] = allowed[i] && keep[i];
+		}
+		return true;
+	};
+	auto as_double = [&](const Expression &x, double &out) {
+		Value v;
+		if (!CellPruneConstant(context, x, v) || !v.DefaultTryCastAs(LogicalType::DOUBLE)) {
+			return false;
+		}
+		out = v.GetValue<double>();
+		return true;
+	};
+	if ((type == ExpressionType::OPERATOR_IS_NULL || type == ExpressionType::OPERATOR_IS_NOT_NULL) &&
+	    e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
+		if (kids.size() != 1 || CellPruneColumnOf(get, *kids[0]) != gcol) {
+			return false;
+		}
+		const bool is_null = type == ExpressionType::OPERATOR_IS_NULL;
+		const bool keep[4] = {!is_null, !is_null, !is_null, is_null};
+		return narrow(keep);
+	}
+	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
+		if (kids.size() < 2 || CellPruneColumnOf(get, *kids[0]) != gcol) {
+			return false;
+		}
+		bool keep[4] = {false, false, false, false};
+		for (idx_t i = 1; i < kids.size(); i++) {
+			double c;
+			if (!as_double(*kids[i], c)) {
+				return false; // one unknown member: the set could be anything
+			}
+			for (idx_t g = 0; g < 3; g++) {
+				keep[g] = keep[g] || static_cast<double>(g) == c;
+			}
+		}
+		return narrow(keep);
+	}
+	if (e.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &fn = e.Cast<BoundFunctionExpression>();
+	if (type == ExpressionType::COMPARE_BETWEEN) {
+		if (!BoundBetweenExpression::HasValidBindData(fn) ||
+		    CellPruneColumnOf(get, BoundBetweenExpression::Input(fn)) != gcol) {
+			return false;
+		}
+		double lo, hi;
+		if (!as_double(BoundBetweenExpression::LowerBound(fn), lo) ||
+		    !as_double(BoundBetweenExpression::UpperBound(fn), hi)) {
+			return false;
+		}
+		bool keep[4] = {false, false, false, false};
+		for (idx_t g = 0; g < 3; g++) {
+			bool k1, k2;
+			const bool a = GenotypeCmpHolds(BoundBetweenExpression::LowerComparisonType(fn), double(g), lo, k1);
+			const bool b = GenotypeCmpHolds(BoundBetweenExpression::UpperComparisonType(fn), double(g), hi, k2);
+			if (!k1 || !k2) {
+				return false;
+			}
+			keep[g] = a && b;
+		}
+		return narrow(keep);
+	}
+	if (!BoundComparisonExpression::IsComparison(e)) {
+		return false;
+	}
+	auto &left = BoundComparisonExpression::Left(fn);
+	auto &right = BoundComparisonExpression::Right(fn);
+	const Expression *other = &right;
+	ExpressionType cmp = type;
+	if (CellPruneColumnOf(get, left) != gcol) {
+		if (CellPruneColumnOf(get, right) != gcol) {
+			return false;
+		}
+		other = &left;
+		cmp = FlipComparisonExpression(type);
+	}
+	double c;
+	if (!as_double(*other, c)) {
+		return false;
+	}
+	bool keep[4] = {false, false, false, false};
+	for (idx_t g = 0; g < 3; g++) {
+		bool known;
+		keep[g] = GenotypeCmpHolds(cmp, double(g), c, known);
+		if (!known) {
+			return false;
+		}
+	}
+	return narrow(keep);
+}
+
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
@@ -6554,8 +6689,33 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	const bool push_region =
 	    bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
 	    (bind_data.orient_mode == OrientMode::VARIANT || bind_data.orient_mode == OrientMode::GENOTYPE);
-	if (!prune_samples && !prune_variants && !push_region) {
+	// Views PR 2a: a WHERE on the scalar genotype column becomes the scan's genotype filter.
+	const bool push_genotype = bind_data.orient_mode == OrientMode::GENOTYPE && !bind_data.include_phased &&
+	                           !bind_data.include_dosages && !bind_data.lazy_variants_loaded;
+	if (!prune_samples && !prune_variants && !push_region && !push_genotype) {
 		return;
+	}
+	if (push_genotype) {
+		bool allowed[4] = {true, true, true, true};
+		bool any = false;
+		for (auto &f : filters) {
+			any |= CollectGenotypeAllowed(context, get, *f, bind_data.geno_genotype_col, allowed);
+		}
+		if (any) {
+			// Intersect with include_genotypes / genotype_range (if given); the WHERE still runs on
+			// every row. Set before PruneSamplesByIid, which rebuilds count_filter_subset when active.
+			auto &gf = bind_data.genotype_filter;
+			for (idx_t g = 0; g < 3; g++) {
+				gf.allowed[g] = gf.active ? (gf.allowed[g] && allowed[g]) : allowed[g];
+			}
+			gf.include_missing = gf.active ? (gf.include_missing && allowed[3]) : allowed[3];
+			gf.active = true;
+			if (bind_data.has_sample_subset && !bind_data.count_filter_subset) {
+				bind_data.count_filter_subset =
+				    make_uniq<SampleSubset>(BuildSampleSubset(bind_data.raw_sample_ct, bind_data.sample_indices));
+			}
+			g_genotype_where_pushed.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 	CellPruneConstraints c;
 	if (prune_samples) {
@@ -6624,6 +6784,16 @@ static void DebugSparseVariantsResetFunc(DataChunk &args, ExpressionState &, Vec
 }
 
 // P13-011 Task 2: per-shard concat fallback read-backs (dense genovec / ALT-major).
+static void DebugGenotypeWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(g_genotype_where_pushed.load(std::memory_order_relaxed)),
+	                        args.size());
+}
+
+static void DebugGenotypeWherePushedResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	g_genotype_where_pushed.store(0, std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
+}
+
 static void DebugSparseConcatDenseFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	int64_t v = g_sparse_concat_dense_shards.load(std::memory_order_relaxed);
 	CompatReferenceConstant(result, Value::BIGINT(v), args.size());
@@ -6729,6 +6899,18 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	RegisterScalarWithDesc(loader, dbg_sparse_reset, {},
 	                       "Test-only: reset the sparse-difflist proof-ran counter to 0, returns 0 (P13-011).",
 	                       {"SELECT plinking_debug_sparse_variants_reset()"});
+	ScalarFunction dbg_gw("plinking_debug_genotype_where_pushed", {}, LogicalType::BIGINT,
+	                      DebugGenotypeWherePushedFunc);
+	dbg_gw.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_gw, {},
+	                       "Test-only: reads whose WHERE on genotype compiled into the scan's genotype filter since "
+	                       "the last reset (views PR 2a).",
+	                       {"SELECT plinking_debug_genotype_where_pushed()"});
+	ScalarFunction dbg_gw_reset("plinking_debug_genotype_where_pushed_reset", {}, LogicalType::BIGINT,
+	                            DebugGenotypeWherePushedResetFunc);
+	dbg_gw_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_gw_reset, {}, "Test-only: reset plinking_debug_genotype_where_pushed to 0.",
+	                       {"SELECT plinking_debug_genotype_where_pushed_reset()"});
 	ScalarFunction dbg_concat_dense("plinking_debug_sparse_concat_dense", {}, LogicalType::BIGINT,
 	                                DebugSparseConcatDenseFunc);
 	dbg_concat_dense.SetVolatile();
