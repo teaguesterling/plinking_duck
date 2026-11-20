@@ -106,7 +106,8 @@ of a list), or beside `<p>.pfile.json` (a catalog). A read made only from `pgen 
 
 The `WHERE` still runs on every row, so a stale index can lose rows, but it never adds one. A `WHERE`
 that names `.` or `''` does not use the index. `SET plinking_use_parquet_companions = false` turns
-the lookup off. Build an index for a file set with this recipe:
+the lookup off. `COPY … (FORMAT pfile, index)` writes the index (see [`write_pfile`](write_pfile.md#id-index-index)).
+For files written by another tool, build it for a file set with this recipe:
 
 ```sql
 COPY (SELECT ID, __ordinal AS _pvar_ordinal FROM read_pfile('cohort', with_ordinal := true)

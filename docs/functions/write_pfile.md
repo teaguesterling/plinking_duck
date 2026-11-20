@@ -67,6 +67,7 @@ target is stripped to the prefix, so `TO 'out'` and `TO 'out.pfile'` both write
 | `pvar` / `pgen` / `psam` | `VARCHAR` | `prefix.{pvar,pgen,psam}` | Per-file path overrides (symmetric with the reader's path overrides). |
 | `pvar_parquet` | flag | off | Also write a region-prunable parquet `.pvar` companion. See [Parquet `.pvar` companion](#parquet-pvar-companion-pvar_parquet). |
 | `psam_parquet` | flag | off | Also write a parquet `.psam` companion (a single `IID` column for the bundle). See [Parquet `.psam` companion](#parquet-psam-companion-psam_parquet). |
+| `index` | flag | off | Also write the ID index `<prefix>.pvar.index.parquet`, so a `WHERE ID` reads only the matching variants. See [ID index](#id-index-index). |
 | `shard_by` | `VARCHAR` | *(none)* | Shard along the **variant** axis by a key column. See [Sharded output](#sharded-output-shard_by). |
 | `shard_samples` | `STRUCT` | *(none)* | Shard along the **sample** axis into named IID groups. See [Sample-sharded output](#sample-sharded-output-shard_samples). |
 | `force` | `BOOLEAN` | `false` | Replace existing output. Without it, a `COPY` onto an existing target is an error. See [Existing output](#existing-output-force). |
@@ -143,6 +144,20 @@ matrix write emits one `.psam.parquet` per sample axis, and the catalog declares
 each. As with `pvar_parquet`, a rewrite with `force` and without `psam_parquet`
 removes a stale companion.
 The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#reading-parquet-companions).
+
+### ID index (`index`)
+
+`COPY … TO 'out' (FORMAT pfile, index)` also writes `out.pvar.index.parquet`, after the other files.
+It has one row per variant with an ID, sorted by `ID`: `ID`, `_pvar_ordinal` (the `.pgen` record
+index), and, for a sharded or matrix write, `_variant_block` (the variant block's position in the
+catalog). It is written with `PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192`. A `NULL`
+(`.`) or empty ID is left out.
+
+- `read_pfile` finds it by name. See [The ID index](read_pfile.md#the-id-index-ppvarindexparquet).
+- A rewrite with `force` removes an old index first, with or without `index`: an index of other
+  output loses rows. Without `force`, an existing index refuses the COPY, as the other files do.
+- `index` cannot be combined with a `pvar`, `pgen` or `psam` path override.
+- If the COPY fails, no index is left. That costs speed only.
 
 ### Local-only
 
