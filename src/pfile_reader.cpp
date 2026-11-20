@@ -987,7 +987,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 //! `raw_sample_ct_out` for the caller's cross-source equality check.
 //! Load one source's .pvar (src.pvar_path) into src.variants, and check its count against the
 //! .pgen header. A parquet .pvar is region-pushed. Called at bind, or at InitGlobal for a
-//! deferred (lazy_variants) catalog read.
+//! deferred (lazy_variants) read.
 static void LoadSourceVariants(ClientContext &context, PfileSource &src, const RegionFilter &region) {
 	if (region.active && IsParquetFile(src.pvar_path)) {
 		src.variants =
@@ -1042,7 +1042,7 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
                                    PgenLocalizeGuard &localize_guard, bool load_pvar = true, bool read_header = true,
                                    bool resolve_overrides = true, bool defer_copy = false) {
 	// need_pvar discovers the .pvar path; load_pvar also parses it now (false: a lazy_variants
-	// catalog read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
+	// read, whose EnsureLazyVariants parses it at InitGlobal). read_header = false skips the
 	// .pgen header open too (a lazy_pgen catalog cell; see PfileBindData::lazy_pgen).
 	// resolve_overrides = false takes the given paths as written, with no existence check (a catalog
 	// cell: the catalog names absolute paths, and each check is a HEAD request on a remote store).
@@ -1220,6 +1220,21 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 			idx_t lo_local = it->second.first;
 			idx_t hi_local = it->second.second;
 			auto &positions = src.variants.positions;
+			// The binary search needs POS sorted within the contig. BuildChromOffsets checks only that
+			// the contig is one run, so a file from another tool can break this: then scan the run.
+			if (!std::is_sorted(positions.begin() + lo_local, positions.begin() + hi_local)) {
+				for (idx_t vidx = lo_local; vidx < hi_local; vidx++) {
+					const int64_t pos = positions[vidx];
+					if (pos < region.start || pos > region.end) {
+						continue;
+					}
+					if (use_variant_set && variant_set.find(static_cast<uint32_t>(vidx)) == variant_set.end()) {
+						continue;
+					}
+					src.effective_variant_indices.push_back(static_cast<uint32_t>(vidx));
+				}
+				return;
+			}
 			idx_t lo = lo_local, hi = hi_local;
 			while (lo < hi) {
 				idx_t mid = lo + (hi - lo) / 2;
@@ -6442,8 +6457,10 @@ static bool PushedRegion(const CellPruneConstraints &c, const RegionFilter &expl
 	RegionFilter r;
 	r.active = true;
 	r.chrom = *c.chroms.begin();
-	r.start = c.has_pos ? std::max<int64_t>(1, c.pos_lo) : 0;
-	r.end = c.has_pos ? c.pos_hi : INT64_MAX;
+	// The WHERE's own bounds, unclamped: a POS of 0 (an unplaced variant) or below is a real value,
+	// and NarrowPos leaves pos_lo at its lowest for POS <= x, POS < x and POS <> x.
+	r.start = c.pos_lo;
+	r.end = c.pos_hi;
 	if (explicit_region.active) {
 		if (explicit_region.chrom != r.chrom) {
 			return false;

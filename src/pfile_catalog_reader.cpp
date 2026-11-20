@@ -596,8 +596,8 @@ string ResolveExistingCompanion(ClientContext &context, FileSystem &fs, const st
 	return FindCompanionFileWithParquet(context, fs, prefix + ".pgen", exts);
 }
 
-//! Count verify: force read_pfile's bind-time `.pgen`-header-vs-companion check with a zero-row
-//! probe and re-raise as a count-mismatch (same discipline as howard's `_verify_header`). Existence
+//! Count verify: force read_pfile's `.pgen`-header-vs-companion check (now at InitGlobal) with a
+//! one-row probe and re-raise as a count-mismatch (same discipline as howard's `_verify_header`). Existence
 //! is checked first so a surviving error is unambiguously a count lie, not a missing file.
 void VerifyCounts(ClientContext &context, FileSystem &fs, const ShardEntry &e) {
 	string pgen = e.prefix + ".pgen";
