@@ -1,0 +1,59 @@
+# name: test/sql/attach_pfile_catalog_cache.test
+# description: ATTACH ... (TYPE pfile_catalog, CACHE <bool>): queries on one ATTACH reuse its catalog grid, companion paths and parsed .psam; CACHE false reads them every query
+# group: [sql]
+
+require plinking_duck
+
+# Spec: docs/superpowers/specs/2026-11-19-where-region-pushdown-and-attach-cache-design.md, Part 2.
+# The ATTACH is a snapshot: the cache is never re-validated against the files.
+
+# ---------------------------------------------------------------------------
+# Part 1: the option and the view key
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH 'test/data/large_example' AS nc (TYPE pfile_catalog, CACHE false);
+
+statement ok
+ATTACH 'test/data/large_example' AS yc (TYPE pfile_catalog, CACHE true);
+
+statement ok
+ATTACH 'test/data/large_example' AS dc (TYPE pfile_catalog);
+
+statement error
+ATTACH 'test/data/large_example' AS bad (TYPE pfile_catalog, CACHE 'x');
+----
+CACHE
+
+# The same rows with and without the cache.
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes FROM nc.genotypes EXCEPT ALL SELECT ID, genotypes FROM yc.genotypes)
+  UNION ALL
+  (SELECT ID, genotypes FROM yc.genotypes EXCEPT ALL SELECT ID, genotypes FROM nc.genotypes));
+----
+0
+
+# Only a cached ATTACH names a cache in its views (the default is CACHE true).
+query II
+SELECT database_name, contains(sql, 'attach_cache :=') FROM duckdb_views()
+WHERE database_name IN ('nc', 'yc', 'dc') AND view_name = 'genotypes' ORDER BY ALL;
+----
+dc	true
+nc	false
+yc	true
+
+# Two ATTACHes of one file set do not share a key.
+query I
+SELECT count(DISTINCT regexp_extract(sql, 'attach_cache := ''([^'']+)''', 1)) FROM duckdb_views()
+WHERE database_name IN ('yc', 'dc') AND view_name = 'genotypes';
+----
+2
+
+statement ok
+DETACH nc;
+
+statement ok
+DETACH yc;
+
+statement ok
+DETACH dc;
