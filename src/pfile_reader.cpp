@@ -7031,13 +7031,12 @@ static void ApplyIdIndex(ClientContext &context, PfileBindData &bind_data, const
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
-	// Sample orient: only a read with no filter, whose bind reads no genotype (smp_headers_at_init). A
-	// read with a filter pre-reads its matrix at bind, before this hook.
 	// A WHERE on IID narrows the sample set (PruneSamplesByIid): over sample shards in genotype orient
 	// and in a sample-orient read with no filter (smp_headers_at_init), and on a single cohort (one
 	// sample set) in genotype orient, where it saves the scan from emitting and comparing every
 	// sample's row (8M samples: WHERE ID AND IID 1.14 s against 0.60 s for WHERE ID, measured
-	// 2026-11-20). A single cohort's sample orient pre-reads its matrix at bind, before this hook.
+	// 2026-11-20). A sample-orient read with a filter, and a single cohort's sample orient, pre-read
+	// the matrix at bind, before this hook.
 	const bool prune_samples = !bind_data.lazy_variants_loaded &&
 	                           (((bind_data.orient_mode == OrientMode::GENOTYPE || bind_data.smp_headers_at_init) &&
 	                             bind_data.IsConcat() && bind_data.sample_shards.size() > 1) ||
