@@ -676,7 +676,8 @@ struct PfileBindData : public TableFunctionData {
 	// freq := true (P13-006 §5): plink_freq(counts := true)'s value columns, after the genotype
 	// columns and before __ordinal, in FREQ_COL_NAMES order. Each holds the value plink_freq emits
 	// for the same variant and samples: PgrGetCounts on autosomes and PAR, ComputeSexAwareCounts on
-	// chrX non-PAR / chrY / chrMT (sex from the .psam, PAR bounds from build :=). Variant orient only.
+	// chrX non-PAR / chrY / chrMT (sex from the .psam, PAR bounds from build :=). Variant orient, and genotype orient
+	// (each sample row repeats its variant's values).
 	bool include_freq = false;
 	idx_t freq_first_col = 0;
 	ParBounds par_bounds;
@@ -817,7 +818,20 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 // Local state (per-thread)
 // ---------------------------------------------------------------------------
 
+// freq := true: one variant's plink_freq(counts := true) values (see plink_freq.cpp's scan — the
+// same two paths, the same NULL rules). On autosomes and PAR, PgrGetCounts over the output samples;
+// on chrX non-PAR / chrY / chrMT, the decoded hardcalls through ComputeSexAwareCounts.
+struct FreqValues {
+	double alt_freq = 0.0;
+	int32_t counts[PfileBindData::FREQ_COL_CT] = {0, 0, 0, 0, 0, 0};
+	bool alt_null = false;    //!< ALT_FREQ is NULL
+	bool counts_null = false; //!< every count but OBS_CT is NULL (no SEX on chrX/Y)
+};
+
 struct PfileLocalState : public LocalTableFunctionState {
+	//! freq := true, genotype orient: the current variant's values, computed once in load_variant
+	//! and repeated on each of its sample rows.
+	FreqValues tall_freq;
 	plink2::PgenFileInfo pgfi;
 	AlignedBuffer pgfi_alloc_buf;
 
@@ -1283,6 +1297,11 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 			}
 			if (parquet_full) {
 				bind_data.sample_metadata.source_paths.push_back(path);
+			}
+			// freq := true in genotype orient: the freq columns need the coded SEX on chrX/Y, which the
+			// full .psam load does not fill. Take it from variant orient's loader, so the coding matches.
+			if (bind_data.include_freq) {
+				part.sexes = LoadSampleMetadata(context, path).sexes;
 			}
 		} else if (needs_iids) {
 			part = LoadSampleMetadata(context, path);
@@ -1753,6 +1772,31 @@ static void FillSampleMatrix(ClientContext &context, PfileBindData &bind_data_re
 	}
 }
 
+//! freq := true: append the six plink_freq columns (FREQ_COL_NAMES order) to the schema, and set
+//! freq_first_col. A name that is already in the schema (a genotypes := 'columns' sample IID, or a
+//! .psam column in genotype orient) is an error rather than a second column with that name.
+static void AppendFreqColumns(PfileBindData &bind_data, vector<CompatName> &names, vector<LogicalType> &return_types) {
+	static const char *const FREQ_COL_NAMES[] = {"ALT_FREQ", "OBS_CT",     "HOM_REF_CT",
+	                                             "HET_CT",   "HOM_ALT_CT", "MISSING_CT"};
+	for (auto *freq_name : FREQ_COL_NAMES) {
+		for (auto &existing : names) {
+			if (StringUtil::CIEquals(CompatNameStr(existing), freq_name)) {
+				throw InvalidInputException("read_pfile: freq := true adds a column '%s', but the output "
+				                            "already has a column with that name (a sample IID in "
+				                            "genotypes := 'columns', or a .psam column?)",
+				                            freq_name);
+			}
+		}
+	}
+	bind_data.freq_first_col = names.size();
+	names.push_back("ALT_FREQ");
+	return_types.push_back(LogicalType::DOUBLE);
+	for (idx_t c = 1; c < PfileBindData::FREQ_COL_CT; c++) {
+		names.push_back(FREQ_COL_NAMES[c]);
+		return_types.push_back(LogicalType::INTEGER);
+	}
+}
+
 static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<CompatName> &names) {
 	BindPhaseTimer bind_timer("PfileBind(total)");
@@ -1900,8 +1944,8 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		    "read_pfile: with_ordinal := true is only supported with orient := 'variant' (the default)");
 	}
 
-	// freq := true adds one row's worth of per-variant counts; only variant orient has one row per
-	// variant. plink_freq's own dosage mode weights by dosage, so a hardcall count beside
+	// freq := true adds one variant's counts: one row per variant, or each of its sample rows in
+	// genotype orient. plink_freq's own dosage mode weights by dosage, so a hardcall count beside
 	// dosages := true would read as the dosage answer: refuse it.
 	{
 		auto build_it = input.named_parameters.find("build");
@@ -1911,9 +1955,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			                            "freq columns use on chrX)");
 		}
 		if (bind_data->include_freq) {
-			if (bind_data->orient_mode != OrientMode::VARIANT) {
-				throw InvalidInputException("read_pfile: freq := true needs orient := 'variant' (the default): its "
-				                            "columns hold one value per variant");
+			// Genotype orient repeats each variant's values on its sample rows (PfileTidyScan).
+			if (bind_data->orient_mode == OrientMode::SAMPLE) {
+				throw InvalidInputException("read_pfile: freq := true needs orient := 'variant' or 'genotype': "
+				                            "sample orient has no per-variant row");
 			}
 			if (bind_data->include_dosages) {
 				throw InvalidInputException("read_pfile: freq := true is incompatible with dosages := true (the freq "
@@ -2355,6 +2400,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		                         needs_iids, bind_data->combine_samples == CombineSamplesMode::DISJOINT);
 	} else if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		bind_data->sample_metadata = LoadPfileSampleMetadata(context, psam_path, bind_data->sample_info);
+		// freq := true (genotype orient): the coded SEX for chrX/Y, from variant orient's loader (see
+		// LoadConcatSampleMetadata). Kept only when it covers every sample, as BuildAlignedSex expects.
+		if (bind_data->include_freq) {
+			auto sexes = LoadSampleMetadata(context, psam_path).sexes;
+			if (sexes.size() == bind_data->sample_info.sample_ct) {
+				bind_data->sample_info.sexes = std::move(sexes);
+			}
+		}
 	} else if (needs_iids) {
 		bind_data->sample_info = LoadSampleMetadata(context, psam_path);
 	} else {
@@ -2570,6 +2623,10 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		                       : bind_data->include_dosages ? LogicalType::DOUBLE
 		                                                    : LogicalType::TINYINT);
 		bind_data->geno_genotype_col = names.size() - 1;
+		// freq := true: the six columns follow `genotype`; each sample row repeats its variant's values.
+		if (bind_data->include_freq) {
+			AppendFreqColumns(*bind_data, names, return_types);
+		}
 		bind_data->geno_total_cols = names.size();
 	} else if (bind_data->orient_mode == OrientMode::SAMPLE) {
 		// Sample orient across one OR MORE sources: pre-read every source's
@@ -2942,27 +2999,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 
 		if (bind_data->include_freq) {
-			static const char *const FREQ_COL_NAMES[] = {"ALT_FREQ", "OBS_CT",     "HOM_REF_CT",
-			                                             "HET_CT",   "HOM_ALT_CT", "MISSING_CT"};
-			// genotypes := 'columns' names one column per sample IID: refuse a clash rather than
-			// emit two columns with one name.
-			for (auto *freq_name : FREQ_COL_NAMES) {
-				for (auto &existing : names) {
-					if (StringUtil::CIEquals(CompatNameStr(existing), freq_name)) {
-						throw InvalidInputException("read_pfile: freq := true adds a column '%s', but the output "
-						                            "already has a column with that name (a sample IID in "
-						                            "genotypes := 'columns'?)",
-						                            freq_name);
-					}
-				}
-			}
-			bind_data->freq_first_col = names.size();
-			names.push_back("ALT_FREQ");
-			return_types.push_back(LogicalType::DOUBLE);
-			for (idx_t c = 1; c < PfileBindData::FREQ_COL_CT; c++) {
-				names.push_back(FREQ_COL_NAMES[c]);
-				return_types.push_back(LogicalType::INTEGER);
-			}
+			AppendFreqColumns(*bind_data, names, return_types);
 		}
 	}
 
@@ -4152,16 +4189,6 @@ static unique_ptr<LocalTableFunctionState> PfileInitLocal(ExecutionContext &cont
 static constexpr uint32_t PFILE_BATCH_SIZE = 128;
 static constexpr uint32_t PFILE_GENOTYPE_BATCH_SIZE = 64;
 
-// freq := true: one variant's plink_freq(counts := true) values (see plink_freq.cpp's scan — the
-// same two paths, the same NULL rules). On autosomes and PAR, PgrGetCounts over the output samples;
-// on chrX non-PAR / chrY / chrMT, the decoded hardcalls through ComputeSexAwareCounts.
-struct FreqValues {
-	double alt_freq = 0.0;
-	int32_t counts[PfileBindData::FREQ_COL_CT] = {0, 0, 0, 0, 0, 0};
-	bool alt_null = false;    //!< ALT_FREQ is NULL
-	bool counts_null = false; //!< every count but OBS_CT is NULL (no SEX on chrX/Y)
-};
-
 //! Fill `out` for variant `vidx` of `source`. `hardcalls_in_buffer`: lstate.genotype_bytes already
 //! holds this variant's hardcalls for every output sample. dosages := true is refused at bind, so a
 //! read genotype buffer always holds hardcalls; when it is false, a non-autosomal variant is decoded here.
@@ -5015,6 +5042,12 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 				                             lstate.genotype_bytes.data());
 			}
 		}
+		// freq := true: once per variant, after the count-filter skip. Every path that bind allows with
+		// freq (dosages := true is refused) leaves the hardcalls in genotype_bytes when it decoded.
+		if (gstate.need_freq) {
+			ComputeFreqValues(bind_data, lstate, source, vidx, output_sample_ct,
+			                  gstate.need_genotypes && lstate.initialized, lstate.tall_freq);
+		}
 		return true;
 	};
 
@@ -5064,6 +5097,11 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 			}
 
 			auto &vec = output.data[out_col];
+
+			if (bind_data.IsFreqCol(file_col)) {
+				WriteFreqColumn(bind_data, lstate.tall_freq, file_col, vec, rows_emitted);
+				continue;
+			}
 
 			if (file_col < 5) {
 				// Variant metadata columns

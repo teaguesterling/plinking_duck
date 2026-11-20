@@ -82,7 +82,8 @@ With `freq := true`, six columns follow the genotype columns (and come before `_
 - `samples :=` changes the counts to the selected samples. A catalog read counts over every sample block.
 - `include_genotypes` and `genotype_range` do not change the counts: a kept variant reports its true counts.
 - A column is computed only when the query names it, in the `SELECT` list or in a `WHERE`.
-- `freq := true` is an error with `orient := 'genotype'`, `orient := 'sample'` or `dosages := true`, and when a `genotypes := 'columns'` sample IID has the name of a `freq` column.
+- In `orient := 'genotype'`, the six columns follow `genotype`, and each variant × sample row repeats its variant's values. The values are over the read's sample set (`samples :=`), not over the rows that a `WHERE IID` keeps. For example, `SELECT IID, ID, genotype FROM read_pfile('data/cohort', orient := 'genotype', freq := true) WHERE ALT_FREQ < 0.01 AND genotype > 0` finds the carriers of rare variants.
+- `freq := true` is an error with `orient := 'sample'` or `dosages := true`, and when a `genotypes := 'columns'` sample IID, or a `.psam` column in genotype orient, has the name of a `freq` column.
 
 ```sql
 -- Rare variants with at least one het, without a genotype decode.
