@@ -471,6 +471,10 @@ VariantMetadataIndex LoadVariantMetadata(ClientContext &context, const string &p
 //! Load sample info, auto-dispatching between parquet, native text, and arbitrary sources.
 SampleInfo LoadSampleMetadata(ClientContext &context, const string &path);
 
+//! A .psam SEX value as SampleInfo::sexes codes it: 1 = male, 2 = female, 0 = unknown (NULL, NA,
+//! or any value that is not the integer 1 or 2).
+uint8_t CodeSampleSex(const Value &v);
+
 //! Cheap count-only psam loader: returns SampleInfo with `sample_ct` set but
 //! `iids`/`fids`/`iid_to_idx` empty. For parquet, uses footer metadata (O(1)).
 //! For text/source, falls back to full load and discards strings to keep memory low.

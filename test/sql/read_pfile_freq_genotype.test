@@ -1,0 +1,196 @@
+# name: test/sql/read_pfile_freq_genotype.test
+# description: freq := true in genotype orient: each variant x sample row repeats its variant's six plink_freq values, over the read's sample set. Oracle: variant orient's freq columns, which read_pfile_freq.test ties to plink_freq(counts := true).
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 2. The tall c.genotypes
+# view (PR 3) passes freq := true, so "rare variants in these samples" stays one query.
+
+# ---------------------------------------------------------------------------
+# Schema: the six columns follow `genotype`, with variant orient's types
+# ---------------------------------------------------------------------------
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true))
+WHERE column_name IN ('genotype', 'ALT_FREQ', 'OBS_CT', 'HOM_REF_CT', 'HET_CT', 'HOM_ALT_CT', 'MISSING_CT');
+----
+genotype	TINYINT
+ALT_FREQ	DOUBLE
+OBS_CT	INTEGER
+HOM_REF_CT	INTEGER
+HET_CT	INTEGER
+HOM_ALT_CT	INTEGER
+MISSING_CT	INTEGER
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+# --- sexchr_example: autosome, PAR, chrX/chrY/chrMT with SEX
+# The tall rows carry exactly variant orient's values (both directions; EXCEPT treats NULLs as equal).
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true))));
+----
+0
+
+# One value set per variant: no variant has two different freq rows.
+query I
+SELECT count(*) FROM (SELECT ID FROM (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true)) GROUP BY ID HAVING count(*) > 1);
+----
+0
+
+# Every variant x sample row is there.
+query I
+SELECT (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true))
+     = (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype'));
+----
+true
+
+# --- sexchr_example, samples := ['M1', 'F1', 'F2']: samples := narrows the freq values, as in variant orient
+# The tall rows carry exactly variant orient's values (both directions; EXCEPT treats NULLs as equal).
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, samples := ['M1', 'F1', 'F2'])) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true, samples := ['M1', 'F1', 'F2'])) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true, samples := ['M1', 'F1', 'F2'])) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, samples := ['M1', 'F1', 'F2']))));
+----
+0
+
+# One value set per variant: no variant has two different freq rows.
+query I
+SELECT count(*) FROM (SELECT ID FROM (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, samples := ['M1', 'F1', 'F2'])) GROUP BY ID HAVING count(*) > 1);
+----
+0
+
+# Every variant x sample row is there.
+query I
+SELECT (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, samples := ['M1', 'F1', 'F2']))
+     = (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', samples := ['M1', 'F1', 'F2']));
+----
+true
+
+# --- sexchr_example, psam := 'test/data/sexchr_nosex.psam': no SEX: chrX/Y counts NULL, OBS_CT 0, as plink_freq (Review Focus 4)
+# The tall rows carry exactly variant orient's values (both directions; EXCEPT treats NULLs as equal).
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := 'test/data/sexchr_nosex.psam')) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true, psam := 'test/data/sexchr_nosex.psam')) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true, psam := 'test/data/sexchr_nosex.psam')) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := 'test/data/sexchr_nosex.psam'))));
+----
+0
+
+# One value set per variant: no variant has two different freq rows.
+query I
+SELECT count(*) FROM (SELECT ID FROM (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := 'test/data/sexchr_nosex.psam')) GROUP BY ID HAVING count(*) > 1);
+----
+0
+
+# Every variant x sample row is there.
+query I
+SELECT (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := 'test/data/sexchr_nosex.psam'))
+     = (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', psam := 'test/data/sexchr_nosex.psam'));
+----
+true
+
+# --- sexchr_example, phased := true: phased output: the freq values do not change (Review Focus 5)
+# The tall rows carry exactly variant orient's values (both directions; EXCEPT treats NULLs as equal).
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, phased := true)) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true, phased := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', freq := true, phased := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, phased := true))));
+----
+0
+
+# One value set per variant: no variant has two different freq rows.
+query I
+SELECT count(*) FROM (SELECT ID FROM (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, phased := true)) GROUP BY ID HAVING count(*) > 1);
+----
+0
+
+# Every variant x sample row is there.
+query I
+SELECT (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, phased := true))
+     = (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', phased := true));
+----
+true
+
+# --- large_example: a multi-batch autosomal file: the PgrGetCounts path
+# The tall rows carry exactly variant orient's values (both directions; EXCEPT treats NULLs as equal).
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', freq := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', freq := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true))));
+----
+0
+
+# One value set per variant: no variant has two different freq rows.
+query I
+SELECT count(*) FROM (SELECT ID FROM (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) GROUP BY ID HAVING count(*) > 1);
+----
+0
+
+# Every variant x sample row is there.
+query I
+SELECT (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true))
+     = (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype'));
+----
+true
+
+# --- include_genotypes := ['hom_alt']: freq stays the TRUE counts (Review Focus 5). The rows that
+# survive carry the unfiltered values of their variants.
+query I
+SELECT count(*) FROM (
+  (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT
+     FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true, include_genotypes := ['hom_alt']))
+  EXCEPT ALL
+  (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', freq := true)
+    WHERE ID IN (SELECT ID FROM read_pfile('test/data/large_example', orient := 'genotype', include_genotypes := ['hom_alt']))));
+----
+0
+
+query I
+SELECT bool_and(HOM_REF_CT + HET_CT + HOM_ALT_CT + MISSING_CT = 8)
+FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true, include_genotypes := ['hom_alt']);
+----
+true
+
+# --- Only a freq column projected (no genotype column): the counts still come. round(): the sums run
+# in a thread-dependent order, so compare at 1e-6.
+query I
+SELECT round((SELECT sum(ALT_FREQ) FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)), 6)
+     = round(8 * (SELECT sum(ALT_FREQ) FROM read_pfile('test/data/large_example', freq := true)), 6);
+----
+true
+
+# --- A WHERE on a freq column keeps whole variants' rows. sexchr_example, because every variant of
+# large_example has ALT_FREQ 0.5. 0.6 keeps a1 (0.5), par1 (0.33) and x1 (0.44), with 6 samples each.
+query I
+SELECT (SELECT count(*) FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true) WHERE ALT_FREQ < 0.6)
+     = 6 * (SELECT count(*) FROM read_pfile('test/data/sexchr_example', freq := true) WHERE ALT_FREQ < 0.6);
+----
+true
+
+query I
+SELECT count(*) FROM read_pfile('test/data/sexchr_example', freq := true) WHERE ALT_FREQ < 0.6;
+----
+3
+
+endloop
+
+# ---------------------------------------------------------------------------
+# Still an error
+# ---------------------------------------------------------------------------
+statement error
+SELECT * FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, dosages := true);
+----
+incompatible with dosages := true
+
+# ---------------------------------------------------------------------------
+# A parquet .psam (review finding): the coded SEX comes from its SEX column alone, not from a
+# second full load. chrX/chrY must still match plink_freq.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_psam('test/data/sexchr_example.psam')) TO '{TEST_DIR}/sx.psam.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := '{TEST_DIR}/sx.psam.parquet')) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := '{TEST_DIR}/sx.psam.parquet'))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := '{TEST_DIR}/sx.psam.parquet')) WHERE ID IN ('x1', 'y1') AND HET_CT IS NOT NULL;
+----
+2
