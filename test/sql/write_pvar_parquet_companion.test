@@ -350,3 +350,42 @@ query I
 SELECT count(*) FROM read_pfile('{TEST_DIR}/rwb', pvar := '{TEST_DIR}/rwb.pvar.parquet', orient := 'genotype', region := '1:15000-35000');
 ----
 8
+
+# ===========================================================================
+# Row-group size (Teague, 2026-11-19): the companion is written in 20,480-row groups, so a region
+# read skips the row groups outside it. Measured on 10M variants (median of 5, remote at 40 ms):
+# region read 1.46 s at 20,480 rows vs 3.36 s at DuckDB's default 122,880; local 0.10 s vs 0.09 s.
+# streaming_example has 50,000 variants: 20,480 + 20,480 + 9,040 rows.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/streaming_example', genotypes := 'struct'))
+TO '{TEST_DIR}/rgs' (FORMAT pfile, pvar_parquet);
+
+query II
+SELECT num_row_groups, num_rows FROM parquet_file_metadata('{TEST_DIR}/rgs.pvar.parquet');
+----
+3	50000
+
+query I
+SELECT max(row_group_num_rows) FROM parquet_metadata('{TEST_DIR}/rgs.pvar.parquet');
+----
+20480
+
+# A region that spans a row-group boundary reads the same rows through the companion as from the source.
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/rgs', pvar := '{TEST_DIR}/rgs.pvar.parquet', orient := 'genotype', region := '1:1-100000000')
+   EXCEPT ALL
+   SELECT ID, IID, genotype FROM read_pfile('test/data/streaming_example', orient := 'genotype', region := '1:1-100000000'))
+  UNION ALL
+  (SELECT ID, IID, genotype FROM read_pfile('test/data/streaming_example', orient := 'genotype', region := '1:1-100000000')
+   EXCEPT ALL
+   SELECT ID, IID, genotype FROM read_pfile('{TEST_DIR}/rgs', pvar := '{TEST_DIR}/rgs.pvar.parquet', orient := 'genotype', region := '1:1-100000000')));
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/rgs', pvar := '{TEST_DIR}/rgs.pvar.parquet', region := '1:1-100000000');
+----
+20000
