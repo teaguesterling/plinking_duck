@@ -1,0 +1,73 @@
+# name: test/sql/read_pfile_lazy_pvar_single.test
+# description: a single-file or list read_pfile in variant or genotype orient parses its .pvar when the scan starts, not at bind (as a catalog read does since P13-006 stage 3)
+# group: [sql]
+
+require plinking_duck
+
+# Spec: docs/superpowers/specs/2026-11-19-where-region-pushdown-and-attach-cache-design.md, Part 1, step 1.
+# The .pvar parse waits for InitGlobal, so a WHERE on CHROM/POS (pushed at optimize time) can narrow
+# it. Proof: a file set with a garbage .pvar binds (DESCRIBE succeeds) and still errors when the scan
+# runs. Sample orient, and variants := [...], still parse at bind (their bind needs the variants).
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct')) TO '{TEST_DIR}/g' (FORMAT pfile);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/g.pvar' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct')) TO '{TEST_DIR}/ok' (FORMAT pfile);
+
+# ---------------------------------------------------------------------------
+# Bind does not parse the .pvar (variant and genotype orient, single file and list)
+# ---------------------------------------------------------------------------
+statement ok
+DESCRIBE SELECT * FROM read_pfile('{TEST_DIR}/g');
+
+statement ok
+DESCRIBE SELECT * FROM read_pfile('{TEST_DIR}/g', orient := 'genotype');
+
+statement ok
+DESCRIBE SELECT * FROM read_pfile(['{TEST_DIR}/ok', '{TEST_DIR}/g']);
+
+# ---------------------------------------------------------------------------
+# The scan still parses it, and reports the same error (Review Focus 1)
+# ---------------------------------------------------------------------------
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/g');
+----
+has a line missing required fields
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/g', orient := 'genotype');
+----
+has a line missing required fields
+
+statement error
+SELECT count(*) FROM read_pfile(['{TEST_DIR}/ok', '{TEST_DIR}/g']);
+----
+has a line missing required fields
+
+# ---------------------------------------------------------------------------
+# These still parse at bind
+# ---------------------------------------------------------------------------
+statement error
+DESCRIBE SELECT * FROM read_pfile('{TEST_DIR}/g', orient := 'sample');
+----
+has a line missing required fields
+
+statement error
+DESCRIBE SELECT * FROM read_pfile('{TEST_DIR}/g', variants := ['1:100']);
+----
+has a line missing required fields
+
+# ---------------------------------------------------------------------------
+# A good file set reads the same rows as before
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/ok') EXCEPT ALL SELECT ID, genotypes FROM read_pfile('test/data/large_example'))
+  UNION ALL
+  (SELECT ID, genotypes FROM read_pfile('test/data/large_example') EXCEPT ALL SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/ok')));
+----
+0
