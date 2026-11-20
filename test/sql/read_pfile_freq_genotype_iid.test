@@ -80,3 +80,64 @@ query I
 EXECUTE p;
 ----
 3000
+
+# ===========================================================================
+# chrX / chrY / chrMT over sample shards (review finding, 2026-11-19): the coded SEX of each sample
+# block's .psam reaches the freq columns. The writer's shard .psam files are IID-only, so the SEX
+# files are written by hand, as in plink_freq_catalog.test. Oracle: plink_freq over the source.
+# ===========================================================================
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['M1', 'M2'], b: ['M3', 'F1', 'F2', 'F3']});
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M1', '1'), ('M2', '1')))
+TO '{TEST_DIR}/ss/a/data.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M3', '1'), ('F1', '2'), ('F2', '2'), ('F3', '2')))
+TO '{TEST_DIR}/ss/b/data.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/sexchr_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sm' (FORMAT pfile, shard_by 'CHROM', shard_samples {a: ['M1', 'M2', 'M3'], b: ['F1', 'F2', 'F3']});
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('M1', '1'), ('M2', '1'), ('M3', '1')))
+TO '{TEST_DIR}/sm/GROUP=a/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('F1', '2'), ('F2', '2'), ('F3', '2')))
+TO '{TEST_DIR}/sm/GROUP=b/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+# The fixture makes SEX matter: x1 and y1 have non-NULL sex-aware counts in the source.
+query I
+SELECT count(*) FROM plink_freq('test/data/sexchr_example.pgen', counts := true) WHERE ID IN ('x1', 'y1') AND HET_CT IS NOT NULL;
+----
+2
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+# a 1 x 2 sample-sharded cohort: every variant, chrX/chrY included
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('{TEST_DIR}/ss', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('{TEST_DIR}/ss', orient := 'genotype', freq := true))));
+----
+0
+
+# a 5 x 2 matrix
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('{TEST_DIR}/sm', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('{TEST_DIR}/sm', orient := 'genotype', freq := true))));
+----
+0
+
+# a WHERE IID with freq read: the values stay full-cohort
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('{TEST_DIR}/sm', orient := 'genotype', freq := true) WHERE IID = 'M1') EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('{TEST_DIR}/sm', orient := 'genotype', freq := true) WHERE IID = 'M1')));
+----
+0
+
+endloop
