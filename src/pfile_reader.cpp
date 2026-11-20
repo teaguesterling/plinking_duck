@@ -4152,6 +4152,98 @@ static unique_ptr<LocalTableFunctionState> PfileInitLocal(ExecutionContext &cont
 static constexpr uint32_t PFILE_BATCH_SIZE = 128;
 static constexpr uint32_t PFILE_GENOTYPE_BATCH_SIZE = 64;
 
+// freq := true: one variant's plink_freq(counts := true) values (see plink_freq.cpp's scan — the
+// same two paths, the same NULL rules). On autosomes and PAR, PgrGetCounts over the output samples;
+// on chrX non-PAR / chrY / chrMT, the decoded hardcalls through ComputeSexAwareCounts.
+struct FreqValues {
+	double alt_freq = 0.0;
+	int32_t counts[PfileBindData::FREQ_COL_CT] = {0, 0, 0, 0, 0, 0};
+	bool alt_null = false;    //!< ALT_FREQ is NULL
+	bool counts_null = false; //!< every count but OBS_CT is NULL (no SEX on chrX/Y)
+};
+
+//! Fill `out` for variant `vidx` of `source`. `hardcalls_in_buffer`: lstate.genotype_bytes already
+//! holds this variant's hardcalls for every output sample. dosages := true is refused at bind, so a
+//! read genotype buffer always holds hardcalls; when it is false, a non-autosomal variant is decoded here.
+static void ComputeFreqValues(const PfileBindData &bind_data, PfileLocalState &lstate, const PfileSource &source,
+                              uint32_t vidx, uint32_t output_sample_ct, bool hardcalls_in_buffer, FreqValues &out) {
+	out = FreqValues();
+	if (!lstate.initialized) {
+		throw InternalException("read_pfile: freq columns projected but no .pgen reader is open");
+	}
+	ChromPloidy ploidy =
+	    ClassifyChromPloidy(source.variants.GetChrom(vidx), source.variants.GetPos(vidx), bind_data.par_bounds);
+	if (ploidy != ChromPloidy::AUTOSOMAL) {
+		if (!hardcalls_in_buffer) {
+			const uintptr_t *sample_include =
+			    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
+			plink2::PglErr err = lstate.concat ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
+			                                   : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx,
+			                                                    &lstate.pgr, lstate.genovec_buf.As<uintptr_t>());
+			if (err != plink2::kPglRetSuccess) {
+				throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
+			}
+			plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
+			                             lstate.genotype_bytes.data());
+		}
+		const bool have_sex = !bind_data.aligned_sex.empty();
+		SexAwareCounts sac = ComputeSexAwareCounts(lstate.genotype_bytes.data(), output_sample_ct, ploidy,
+		                                           have_sex ? bind_data.aligned_sex.data() : nullptr, have_sex);
+		if (sac.sex_unavailable || sac.obs_allele_ct == 0) {
+			out.alt_null = true;
+			out.counts_null = sac.sex_unavailable;
+		} else {
+			out.alt_freq = static_cast<double>(sac.alt_allele_ct) / static_cast<double>(sac.obs_allele_ct);
+			out.counts[PfileBindData::FREQ_OBS_CT] = static_cast<int32_t>(sac.obs_allele_ct);
+		}
+		out.counts[PfileBindData::FREQ_HOM_REF_CT] = static_cast<int32_t>(sac.geno_hom_ref);
+		out.counts[PfileBindData::FREQ_HET_CT] = static_cast<int32_t>(sac.geno_het);
+		out.counts[PfileBindData::FREQ_HOM_ALT_CT] = static_cast<int32_t>(sac.geno_hom_alt);
+		out.counts[PfileBindData::FREQ_MISSING_CT] = static_cast<int32_t>(sac.geno_missing);
+		return;
+	}
+	STD_ARRAY_DECL(uint32_t, 4, gc);
+	const bool sub = bind_data.has_sample_subset && bind_data.count_filter_subset;
+	plink2::PglErr err = lstate.concat
+	                         ? lstate.concat->GetCounts(vidx, gc)
+	                         : plink2::PgrGetCounts(sub ? bind_data.count_filter_subset->SampleInclude() : nullptr,
+	                                                sub ? bind_data.count_filter_subset->InterleavedVec() : nullptr,
+	                                                lstate.pssi, output_sample_ct, vidx, &lstate.pgr, gc);
+	if (err != plink2::kPglRetSuccess) {
+		throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
+	}
+	uint32_t obs_samples = gc[0] + gc[1] + gc[2];
+	if (obs_samples == 0) {
+		out.alt_null = true;
+	} else {
+		out.counts[PfileBindData::FREQ_OBS_CT] = static_cast<int32_t>(2 * obs_samples);
+		out.alt_freq =
+		    (static_cast<double>(gc[1]) + 2.0 * static_cast<double>(gc[2])) / (2.0 * static_cast<double>(obs_samples));
+	}
+	out.counts[PfileBindData::FREQ_HOM_REF_CT] = static_cast<int32_t>(gc[0]);
+	out.counts[PfileBindData::FREQ_HET_CT] = static_cast<int32_t>(gc[1]);
+	out.counts[PfileBindData::FREQ_HOM_ALT_CT] = static_cast<int32_t>(gc[2]);
+	out.counts[PfileBindData::FREQ_MISSING_CT] = static_cast<int32_t>(gc[3]);
+}
+
+//! Write freq column `file_col` (bind_data.IsFreqCol(file_col)) of row `row` from `f`.
+static void WriteFreqColumn(const PfileBindData &bind_data, const FreqValues &f, idx_t file_col, Vector &vec,
+                            idx_t row) {
+	idx_t which = file_col - bind_data.freq_first_col;
+	if (which == PfileBindData::FREQ_ALT_FREQ) {
+		if (f.alt_null) {
+			FlatVector::SetNull(vec, row, true);
+		} else {
+			CompatFlatDataMutable<double>(vec)[row] = f.alt_freq;
+		}
+	} else if (f.counts_null && which != PfileBindData::FREQ_OBS_CT) {
+		// As plink_freq: no SEX on chrX/Y NULLs the genotype counts; OBS_CT stays 0.
+		FlatVector::SetNull(vec, row, true);
+	} else {
+		CompatFlatDataMutable<int32_t>(vec)[row] = f.counts[which];
+	}
+}
+
 static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->Cast<PfileBindData>();
 	auto &gstate = data_p.global_state->Cast<PfileGlobalState>();
@@ -4257,75 +4349,10 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			genotypes_read = true;
 		}
 
-		// freq := true: plink_freq(counts := true)'s values for this variant (see plink_freq.cpp's
-		// scan — the same two paths, the same NULL rules). On autosomes and PAR, PgrGetCounts over
-		// the output samples; on chrX non-PAR / chrY / chrMT, the decoded hardcalls through
-		// ComputeSexAwareCounts. dosages := true is refused at bind, so genotype_bytes, when read,
-		// holds the hardcalls of exactly the output samples.
-		int32_t freq_vals[PfileBindData::FREQ_COL_CT] = {0, 0, 0, 0, 0, 0};
-		double freq_alt = 0.0;
-		bool freq_alt_null = false, freq_counts_null = false;
+		// freq := true: plink_freq(counts := true)'s values for this variant (ComputeFreqValues).
+		FreqValues freq;
 		if (gstate.need_freq) {
-			if (!lstate.initialized) {
-				throw InternalException("read_pfile: freq columns projected but no .pgen reader is open");
-			} else {
-				ChromPloidy ploidy = ClassifyChromPloidy(source.variants.GetChrom(vidx), source.variants.GetPos(vidx),
-				                                         bind_data.par_bounds);
-				if (ploidy != ChromPloidy::AUTOSOMAL) {
-					if (!genotypes_read) {
-						const uintptr_t *sample_include =
-						    bind_data.has_sample_subset ? lstate.sample_include_buf.As<uintptr_t>() : nullptr;
-						plink2::PglErr err = lstate.concat
-						                         ? lstate.concat->Get(vidx, lstate.genovec_buf.As<uintptr_t>())
-						                         : plink2::PgrGet(sample_include, lstate.pssi, output_sample_ct, vidx,
-						                                          &lstate.pgr, lstate.genovec_buf.As<uintptr_t>());
-						if (err != plink2::kPglRetSuccess) {
-							throw IOException("read_pfile: PgrGet failed for variant %u", vidx);
-						}
-						plink2::GenoarrToBytesMinus9(lstate.genovec_buf.As<uintptr_t>(), output_sample_ct,
-						                             lstate.genotype_bytes.data());
-					}
-					const bool have_sex = !bind_data.aligned_sex.empty();
-					SexAwareCounts sac =
-					    ComputeSexAwareCounts(lstate.genotype_bytes.data(), output_sample_ct, ploidy,
-					                          have_sex ? bind_data.aligned_sex.data() : nullptr, have_sex);
-					if (sac.sex_unavailable || sac.obs_allele_ct == 0) {
-						freq_alt_null = true;
-						freq_counts_null = sac.sex_unavailable;
-					} else {
-						freq_alt = static_cast<double>(sac.alt_allele_ct) / static_cast<double>(sac.obs_allele_ct);
-						freq_vals[PfileBindData::FREQ_OBS_CT] = static_cast<int32_t>(sac.obs_allele_ct);
-					}
-					freq_vals[PfileBindData::FREQ_HOM_REF_CT] = static_cast<int32_t>(sac.geno_hom_ref);
-					freq_vals[PfileBindData::FREQ_HET_CT] = static_cast<int32_t>(sac.geno_het);
-					freq_vals[PfileBindData::FREQ_HOM_ALT_CT] = static_cast<int32_t>(sac.geno_hom_alt);
-					freq_vals[PfileBindData::FREQ_MISSING_CT] = static_cast<int32_t>(sac.geno_missing);
-				} else {
-					STD_ARRAY_DECL(uint32_t, 4, gc);
-					const bool sub = bind_data.has_sample_subset && bind_data.count_filter_subset;
-					plink2::PglErr err =
-					    lstate.concat
-					        ? lstate.concat->GetCounts(vidx, gc)
-					        : plink2::PgrGetCounts(sub ? bind_data.count_filter_subset->SampleInclude() : nullptr,
-					                               sub ? bind_data.count_filter_subset->InterleavedVec() : nullptr,
-					                               lstate.pssi, output_sample_ct, vidx, &lstate.pgr, gc);
-					if (err != plink2::kPglRetSuccess) {
-						throw IOException("read_pfile: PgrGetCounts failed for variant %u", vidx);
-					}
-					uint32_t obs_samples = gc[0] + gc[1] + gc[2];
-					if (obs_samples == 0) {
-						freq_alt_null = true;
-					} else {
-						freq_vals[PfileBindData::FREQ_OBS_CT] = static_cast<int32_t>(2 * obs_samples);
-						freq_alt = (static_cast<double>(gc[1]) + 2.0 * static_cast<double>(gc[2])) /
-						           (2.0 * static_cast<double>(obs_samples));
-					}
-					freq_vals[PfileBindData::FREQ_HOM_REF_CT] = static_cast<int32_t>(gc[0]);
-					freq_vals[PfileBindData::FREQ_HET_CT] = static_cast<int32_t>(gc[1]);
-					freq_vals[PfileBindData::FREQ_HOM_ALT_CT] = static_cast<int32_t>(gc[2]);
-					freq_vals[PfileBindData::FREQ_MISSING_CT] = static_cast<int32_t>(gc[3]);
-				}
-			}
+			ComputeFreqValues(bind_data, lstate, source, vidx, output_sample_ct, genotypes_read, freq);
 		}
 
 		// Fill projected columns
@@ -4338,20 +4365,7 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			// freq := true columns (before the switch: their indices follow the genotype columns,
 			// which the columns-mode default case would otherwise claim).
 			if (bind_data.IsFreqCol(file_col)) {
-				auto &fvec = output.data[out_col];
-				idx_t which = file_col - bind_data.freq_first_col;
-				if (which == PfileBindData::FREQ_ALT_FREQ) {
-					if (freq_alt_null) {
-						FlatVector::SetNull(fvec, rows_emitted, true);
-					} else {
-						CompatFlatDataMutable<double>(fvec)[rows_emitted] = freq_alt;
-					}
-				} else if (freq_counts_null && which != PfileBindData::FREQ_OBS_CT) {
-					// As plink_freq: no SEX on chrX/Y NULLs the genotype counts; OBS_CT stays 0.
-					FlatVector::SetNull(fvec, rows_emitted, true);
-				} else {
-					CompatFlatDataMutable<int32_t>(fvec)[rows_emitted] = freq_vals[which];
-				}
+				WriteFreqColumn(bind_data, freq, file_col, output.data[out_col], rows_emitted);
 				continue;
 			}
 
