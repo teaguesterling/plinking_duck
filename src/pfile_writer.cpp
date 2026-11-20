@@ -391,6 +391,12 @@ void PvarParquetBegin(PvarWriteGlobalState &g, const PvarWriteBindData &bind) {
 	g.pq_on = true;
 }
 
+// Rows per row group of the .pvar.parquet companion. A region read skips the row groups outside
+// it, so smaller groups read less; much smaller groups make the footer large. Measured on 10M
+// variants (median of 5, remote at 40 ms): region read 1.46 s at 20,480 vs 3.36 s at DuckDB's
+// default 122,880, and 1.73 s at 2,048 (a 2.5 MB footer).
+static constexpr idx_t PVAR_PARQUET_ROW_GROUP_SIZE = 20480;
+
 // Write the buffered rows to `<g.path>.parquet`, in write order. Called once, after the last row.
 void PvarParquetFlush(PvarWriteGlobalState &g) {
 	if (!g.pq_app) {
@@ -400,7 +406,8 @@ void PvarParquetFlush(PvarWriteGlobalState &g) {
 	string target = g.path + ".parquet";
 	auto r = g.pq_con->Query("COPY (SELECT CHROM, POS, ID, REF, ALT, __vidx FROM __pvar_pq ORDER BY __vidx) TO '" +
 	                         StringUtil::Replace(target, "'", "''") +
-	                         "' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd)");
+	                         "' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE " +
+	                         std::to_string(PVAR_PARQUET_ROW_GROUP_SIZE) + ")");
 	if (r->HasError()) {
 		throw IOException("write pvar: cannot write the parquet companion '%s': %s", target, r->GetError());
 	}

@@ -127,6 +127,11 @@ Both parquet companions are written with `PARQUET_VERSION V2, COMPRESSION zstd`.
 V2 pages use delta encodings, so the sorted `POS` and `__vidx` columns take almost
 no space. On a 400,000-variant `.pvar`, the companion is 0.28 MB with V2 and
 1.79 MB with V1. A reader must support parquet format version 2. DuckDB does.
+
+The `.pvar.parquet` companion is written in row groups of 20,480 rows, so a region read
+skips the row groups outside the region. On 10M variants, a remote region read took 1.46 s
+with 20,480-row groups and 3.36 s with DuckDB's default of 122,880. The `.psam.parquet`
+companion keeps the default, because a read takes the whole sample list.
 The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#reading-parquet-companions).
 
 ### Parquet `.psam` companion (`psam_parquet`)
