@@ -598,6 +598,7 @@ struct PfileBindData : public TableFunctionData {
 	//! attach_cache := '<key>' (passed by the ATTACH views, design Part 2): that ATTACH's metadata cache,
 	//! or null (no key, or the entry was evicted). Never set for a direct read_pfile call.
 	shared_ptr<PfileAttachCache> attach_cache;
+	string attach_cache_key; //! its ObjectCache key (for RefreshAttachCacheWeight)
 	//! freq := true in genotype orient: the sample set a WHERE IID would narrow to (PruneSamplesByIid).
 	//! The freq values cover the read's full sample set, and the projection is final only at InitGlobal
 	//! (UNUSED_COLUMNS runs after filter pushdown), so ApplyPendingSampleKeep applies it there, under
@@ -1050,7 +1051,18 @@ static PfileSource LoadPfileSource(ClientContext &context, FileSystem &fs, const
 	// same ATTACH, so no HEAD request is repeated. Only a pure discovery (no override) is cached.
 	const bool cache_companions =
 	    attach_cache && !prefix.empty() && override_pgen.empty() && override_pvar.empty() && override_psam.empty();
-	const string companions_key = prefix + "\n" + (need_pvar ? "v" : "") + (need_psam ? "s" : "");
+	// The settings that change what discovery finds are part of the key: a SET after the first query
+	// (or another connection's setting) must not reuse a lookup made under different rules.
+	string companions_key = prefix + "\n" + (need_pvar ? "v" : "") + (need_psam ? "s" : "");
+	if (cache_companions) {
+		for (auto *setting : {"plinking_use_parquet_companions", "file_search_path"}) {
+			Value v;
+			companions_key += "\n";
+			if (context.TryGetCurrentSetting(setting, v) && !v.IsNull()) {
+				companions_key += v.ToString();
+			}
+		}
+	}
 	PfileAttachCache::CachedCompanions cached_companions;
 	const bool companions_hit = cache_companions && attach_cache->GetCompanions(companions_key, cached_companions);
 	if (companions_hit) {
@@ -1912,8 +1924,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	{
 		auto ac_it = input.named_parameters.find("attach_cache");
 		if (ac_it != input.named_parameters.end() && !ac_it->second.IsNull()) {
+			bind_data->attach_cache_key = StringValue::Get(ac_it->second);
 			bind_data->attach_cache =
-			    ObjectCache::GetObjectCache(context).Get<PfileAttachCache>(StringValue::Get(ac_it->second));
+			    ObjectCache::GetObjectCache(context).Get<PfileAttachCache>(bind_data->attach_cache_key);
 		}
 	}
 
@@ -3140,6 +3153,14 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		return_types.push_back(LogicalType::BIGINT);
 	}
 
+	// ATTACH cache: re-Put a grown entry so ObjectCache counts its new size (it reads the size only
+	// at Put). Only while the key still maps to this entry: after DETACH's Delete it must not return.
+	if (bind_data->attach_cache && bind_data->attach_cache->TakeGrown()) {
+		auto &object_cache = ObjectCache::GetObjectCache(context);
+		if (object_cache.Get<PfileAttachCache>(bind_data->attach_cache_key) == bind_data->attach_cache) {
+			object_cache.Put(bind_data->attach_cache_key, bind_data->attach_cache);
+		}
+	}
 	return std::move(bind_data);
 }
 

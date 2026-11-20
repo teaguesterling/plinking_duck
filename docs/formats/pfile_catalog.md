@@ -716,9 +716,16 @@ ATTACH 's3://bucket/cohort' AS c (TYPE pfile_catalog);               -- cached
 ATTACH 's3://bucket/cohort' AS c (TYPE pfile_catalog, CACHE false);  -- reads metadata every query
 ```
 
-`DETACH` frees the cache. DuckDB can also drop it under memory pressure; the next query then reads
-the files again. The variant metadata (`.pvar`) is not cached. A direct `read_pfile` call is never
-cached.
+The cache serves `c.genotypes` and `c.genotypes_by_sample`. `c.samples` and `c.variants` read
+their files every query, so after a file changes they can disagree with the cached views until a new
+`ATTACH`. A setting that changes which companion is found (`plinking_use_parquet_companions`,
+`file_search_path`) takes effect at once: it is part of the cache key. The variant metadata
+(`.pvar`) is not cached.
+
+The cache counts against DuckDB's memory limit (it shows as `OBJECT_CACHE` in `duckdb_memory()`),
+and DuckDB can drop it under memory pressure; the next query then reads the files again. `DETACH`
+frees it. The views name the cache with `read_pfile`'s internal `attach_cache` parameter; a
+`read_pfile` call without it is not cached.
 
 For a remote catalog, also set DuckDB's own caches. They are session-wide, so the extension does not
 set them:

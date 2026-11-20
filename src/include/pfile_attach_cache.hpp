@@ -48,6 +48,7 @@ public:
 		std::lock_guard<std::mutex> guard(lock);
 		if (grids.emplace(catalog_path, g).second) {
 			bytes += 256 * (g.cells.size() + 1);
+			grown = true;
 		}
 	}
 
@@ -64,6 +65,7 @@ public:
 		std::lock_guard<std::mutex> guard(lock);
 		if (companions.emplace(prefix, c).second) {
 			bytes += prefix.size() + c.pgen.size() + c.pvar.size() + c.psam.size() + c.eff_prefix.size();
+			grown = true;
 		}
 	}
 
@@ -96,7 +98,17 @@ public:
 		}
 		if (samples.emplace(kind + '\n' + path, std::move(entry)).second) {
 			bytes += sz;
+			grown = true;
 		}
+	}
+
+	//! True once after an insert: ObjectCache reads GetEstimatedCacheMemory only at Put, so the
+	//! owner re-Puts the entry (RefreshAttachCacheWeight) to have the new size counted.
+	bool TakeGrown() {
+		std::lock_guard<std::mutex> guard(lock);
+		bool g = grown;
+		grown = false;
+		return g;
 	}
 
 private:
@@ -106,6 +118,7 @@ private:
 	};
 	mutable std::mutex lock;
 	idx_t bytes = 0;
+	bool grown = false;
 	unordered_map<string, CatalogGrid> grids;
 	unordered_map<string, CachedCompanions> companions;
 	unordered_map<string, CachedSamples> samples;
