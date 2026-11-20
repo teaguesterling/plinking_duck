@@ -330,8 +330,9 @@ it, and does not build the rows the filter drops. It applies to `=`, `<>`, `<`, 
 `BETWEEN`, `IN (…)`, `IS NULL` and `IS NOT NULL`, joined with `AND`. A missing call is `NULL`, so
 `genotype > 0` and `genotype <> 0` select het and hom-alt, and only `IS NULL` selects missing. With
 `include_genotypes :=` as well, the two intersect. The freq columns and `af_range` / `ac_range`
-still count every call. `OR`, a function of `genotype`, and phased or dosage output push nothing;
-the rows are the same either way.
+still count every call. `OR`, a predicate that DuckDB cannot reduce to the bare column against
+an integer constant (`abs(genotype) > 0`; `genotype > 0.5`, where the binder casts the column),
+and phased or dosage output push nothing; the rows are the same either way.
 ```sql
 -- the hom-alt carriers of a list of variants
 SELECT DISTINCT IID FROM read_pfile('cohort', orient := 'genotype')

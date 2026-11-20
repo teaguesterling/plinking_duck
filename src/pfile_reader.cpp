@@ -79,9 +79,11 @@ static std::atomic<int64_t> g_sparse_variants_decoded {0};
 // on-disk record encoding (not just the data distribution), so only a read through
 // the concat reader itself can prove it. Reset together with the variant counter.
 static std::atomic<int64_t> g_sparse_concat_dense_shards {0};
-//! Test-only: reads whose WHERE on genotype compiled into the scan's genotype filter (views PR 2a).
-static std::atomic<int64_t> g_genotype_where_pushed {0};
 static std::atomic<int64_t> g_sparse_concat_altmajor_shards {0};
+
+//! Test-only: optimizer hook calls in which a WHERE on genotype compiled into the scan's genotype filter
+//! (views PR 2a). EXPLAIN and each rebind count too.
+static std::atomic<int64_t> g_genotype_where_pushed {0};
 
 // ---------------------------------------------------------------------------
 // Region parsing
@@ -6783,7 +6785,6 @@ static void DebugSparseVariantsResetFunc(DataChunk &args, ExpressionState &, Vec
 	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
 }
 
-// P13-011 Task 2: per-shard concat fallback read-backs (dense genovec / ALT-major).
 static void DebugGenotypeWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	CompatReferenceConstant(result, Value::BIGINT(g_genotype_where_pushed.load(std::memory_order_relaxed)),
 	                        args.size());
@@ -6794,6 +6795,7 @@ static void DebugGenotypeWherePushedResetFunc(DataChunk &args, ExpressionState &
 	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
 }
 
+// P13-011 Task 2: per-shard concat fallback read-backs (dense genovec / ALT-major).
 static void DebugSparseConcatDenseFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	int64_t v = g_sparse_concat_dense_shards.load(std::memory_order_relaxed);
 	CompatReferenceConstant(result, Value::BIGINT(v), args.size());
