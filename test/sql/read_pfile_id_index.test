@@ -8,7 +8,8 @@ require parquet
 
 # Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 4. large_example:
 # 3000 variants x 8 samples, CHROM 1/2/3 (1000 each), POS 100..100000 step 100; ID var<POS/100>, so
-# var100 = 1:10000 (ordinal 99), var1100 = 2:10000, var2100 = 3:10000.
+# var100 = 1:10000 (ordinal 99), var1100 = 2:10000, var2100 = 3:10000. var100 + var1100 have 12
+# non-missing genotypes, over 6 IIDs (measured on the source).
 
 # ---------------------------------------------------------------------------
 # A file set. drop3.pvar.parquet lacks one chr3 row, so a full .pvar load fails its count check.
@@ -61,13 +62,13 @@ SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.p
 # The rows equal the same WHERE on a full read.
 query I
 SELECT count(*) FROM (
-  (SELECT * FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE ID IN ('var100', 'var2100')
+  (SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE ID IN ('var100', 'var2100')
    EXCEPT ALL
-   SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var2100'))
+   SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var2100'))
   UNION ALL
-  (SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var2100')
+  (SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var2100')
    EXCEPT ALL
-   SELECT * FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE ID IN ('var100', 'var2100')));
+   SELECT CHROM, POS, ID, REF, ALT, IID, genotype FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE ID IN ('var100', 'var2100')));
 ----
 0
 
@@ -171,11 +172,11 @@ TO '{TEST_DIR}/noidx' (FORMAT pfile, shard_by 'CHROM');
 # The index is built from the clean blocks, one per block, before the corruption.
 statement ok
 COPY (SELECT ID, _variant_block, _pvar_ordinal FROM (
-        SELECT ID, 0 AS _variant_block, __ordinal AS _pvar_ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=1/data', with_ordinal := true)
+        SELECT ID, 0 AS _variant_block, __ordinal AS _pvar_ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=1/data', psam := '{TEST_DIR}/bad.psam', with_ordinal := true)
         UNION ALL
-        SELECT ID, 1, __ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=2/data', with_ordinal := true)
+        SELECT ID, 1, __ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=2/data', psam := '{TEST_DIR}/bad.psam', with_ordinal := true)
         UNION ALL
-        SELECT ID, 2, __ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=3/data', with_ordinal := true))
+        SELECT ID, 2, __ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=3/data', psam := '{TEST_DIR}/bad.psam', with_ordinal := true))
       ORDER BY ID)
 TO '{TEST_DIR}/bad.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
 
@@ -189,6 +190,7 @@ COPY (SELECT 'garbage') TO '{TEST_DIR}/noidx/CHROM=3/data.pvar' (FORMAT csv, hea
 statement error
 SELECT count(*) FROM read_pfile('{TEST_DIR}/noidx') WHERE ID = 'var100';
 ----
+CHROM=3/data.pvar
 
 foreach threads 1 4
 
@@ -208,7 +210,7 @@ SELECT list(ID ORDER BY ID) FROM read_pfile('{TEST_DIR}/bad') WHERE ID IN ('var1
 query I
 SELECT count(*) FROM read_pfile('{TEST_DIR}/bad', orient := 'genotype') WHERE ID IN ('var100', 'var1100') AND genotype >= 0;
 ----
-16
+12
 
 endloop
 
@@ -216,6 +218,7 @@ endloop
 statement error
 SELECT count(*) FROM read_pfile('{TEST_DIR}/bad') WHERE ID IN ('var100', 'var2100');
 ----
+CHROM=3/data.pvar
 
 query I
 SELECT count(*) FROM read_pfile('{TEST_DIR}/bad') WHERE ID = 'nope';
@@ -234,7 +237,7 @@ SELECT count(*) FROM c.genotypes WHERE ID = 'var100';
 query I
 SELECT count(DISTINCT IID) FROM c.genotypes WHERE ID IN ('var100', 'var1100') AND genotype >= 0;
 ----
-8
+6
 
 # Companions off: the catalog's index is not used.
 statement ok
@@ -243,3 +246,4 @@ SET plinking_use_parquet_companions = false;
 statement error
 SELECT count(*) FROM read_pfile('{TEST_DIR}/bad') WHERE ID = 'var100';
 ----
+CHROM=3/data.pvar
