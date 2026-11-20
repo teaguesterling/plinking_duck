@@ -562,6 +562,13 @@ struct PfileBindData : public TableFunctionData {
 	bool lazy_variants = false;
 	mutable std::mutex lazy_variants_lock;
 	mutable bool lazy_variants_loaded = false;
+	//! freq := true in genotype orient: the sample set a WHERE IID would narrow to (PruneSamplesByIid).
+	//! The freq values cover the read's full sample set, and the projection is final only at InitGlobal
+	//! (UNUSED_COLUMNS runs after filter pushdown), so ApplyPendingSampleKeep applies it there, under
+	//! lazy_variants_lock and once per bind, only when no freq column is read.
+	vector<uint32_t> pending_sample_keep;
+	bool has_pending_sample_keep = false;
+	bool pending_sample_keep_applied = false;
 	//! lazy_variants only: each source's declared genomic range (parallel to `sources`), for the
 	//! stage-4 pushdown_complex_filter hook, which drops sources a WHERE on CHROM/POS cannot reach.
 	vector<ShardEntry> source_ranges;
@@ -3753,8 +3760,50 @@ static void EnsureLazyVariants(ClientContext &context, const PfileBindData &bind
 	bind_data.lazy_variants_loaded = true;
 }
 
+//! Narrow the read's sample set to `keep` (ascending sample indices; an empty `keep` keeps one
+//! sample, so the scan still runs and the WHERE yields no rows). The tail of PruneSamplesByIid.
+static void ApplySampleKeep(PfileBindData &bind_data, vector<uint32_t> keep) {
+	if (keep.empty()) {
+		keep.push_back(bind_data.has_sample_subset ? bind_data.sample_indices[0] : 0);
+	}
+	bind_data.sample_indices = std::move(keep);
+	bind_data.has_sample_subset = true;
+	bind_data.subset_sample_ct = static_cast<uint32_t>(bind_data.sample_indices.size());
+	if (bind_data.genotype_filter.active) {
+		bind_data.count_filter_subset =
+		    make_uniq<SampleSubset>(BuildSampleSubset(bind_data.raw_sample_ct, bind_data.sample_indices));
+	}
+}
+
+//! freq := true: apply a WHERE IID's deferred sample narrowing unless the query reads a freq column
+//! (input.column_ids holds the projected and the filter-only columns). Runs before EnsureLazyVariants,
+//! so a dropped sample block's .pgen is never opened. The first InitGlobal of a bind decides: a
+//! prepared statement keeps its plan, so a re-execution has the same column_ids.
+static void ApplyPendingSampleKeep(const PfileBindData &bind_data_c, const TableFunctionInitInput &input) {
+	if (!bind_data_c.has_pending_sample_keep) {
+		return;
+	}
+	std::lock_guard<std::mutex> guard(bind_data_c.lazy_variants_lock);
+	auto &bind_data = const_cast<PfileBindData &>(bind_data_c);
+	if (bind_data.pending_sample_keep_applied) {
+		return;
+	}
+	bool freq_needed = false;
+	for (auto col_id : input.column_ids) {
+		if (bind_data.IsFreqCol(col_id)) {
+			freq_needed = true;
+			break;
+		}
+	}
+	if (!freq_needed) {
+		ApplySampleKeep(bind_data, std::move(bind_data.pending_sample_keep));
+	}
+	bind_data.pending_sample_keep_applied = true;
+}
+
 static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<PfileBindData>();
+	ApplyPendingSampleKeep(bind_data, input);
 	EnsureLazyVariants(context, bind_data);
 	auto state = make_uniq<PfileGlobalState>();
 
@@ -6308,16 +6357,13 @@ static void PruneSamplesByIid(ClientContext &context, PfileBindData &bind_data, 
 	if (keep.size() == bind_data.OutputSampleCt()) {
 		return;
 	}
-	if (keep.empty()) {
-		keep.push_back(bind_data.has_sample_subset ? bind_data.sample_indices[0] : 0);
+	if (bind_data.include_freq) {
+		// A freq column, if read, needs every sample: InitGlobal decides (ApplyPendingSampleKeep).
+		bind_data.pending_sample_keep = std::move(keep);
+		bind_data.has_pending_sample_keep = true;
+		return;
 	}
-	bind_data.sample_indices = std::move(keep);
-	bind_data.has_sample_subset = true;
-	bind_data.subset_sample_ct = static_cast<uint32_t>(bind_data.sample_indices.size());
-	if (bind_data.genotype_filter.active) {
-		bind_data.count_filter_subset =
-		    make_uniq<SampleSubset>(BuildSampleSubset(bind_data.raw_sample_ct, bind_data.sample_indices));
-	}
+	ApplySampleKeep(bind_data, std::move(keep));
 }
 
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
