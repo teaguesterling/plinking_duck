@@ -1,0 +1,87 @@
+# name: test/sql/attach_pfile_catalog_cache_compact.test
+# description: cache tier 2 step A — the ATTACH cache keeps a .psam's IIDs and SEX only: a wide text .psam costs the cache no more than an IID-only one, and its other columns are re-read per query
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-20-metadata-cache-tiers-design.md, tier 2, with Teague's
+# decision (2026-11-20): cache only IIDs + SEX; a text .psam is re-parsed when a query projects
+# another column. OBJECT_CACHE here is the ATTACH cache's own size estimate (what DuckDB counts); the
+# real memory is measured separately (8M samples: a text .psam's rows cost ~1 GB, 2026-11-20).
+# A: the writer's IID-only .psam. B: the same file set with a 21-column text .psam (20 x 100 chars).
+
+statement ok
+CREATE TABLE src AS SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS;
+
+statement ok
+COPY src TO '{TEST_DIR}/A' (FORMAT pfile);
+
+statement ok
+COPY src TO '{TEST_DIR}/B' (FORMAT pfile);
+
+statement ok
+COPY (SELECT IID AS "#IID", repeat(chr(97 + 0), 100) AS c0, repeat(chr(97 + 1), 100) AS c1, repeat(chr(97 + 2), 100) AS c2, repeat(chr(97 + 3), 100) AS c3, repeat(chr(97 + 4), 100) AS c4, repeat(chr(97 + 5), 100) AS c5, repeat(chr(97 + 6), 100) AS c6, repeat(chr(97 + 7), 100) AS c7, repeat(chr(97 + 8), 100) AS c8, repeat(chr(97 + 9), 100) AS c9, repeat(chr(97 + 10), 100) AS c10, repeat(chr(97 + 11), 100) AS c11, repeat(chr(97 + 12), 100) AS c12, repeat(chr(97 + 13), 100) AS c13, repeat(chr(97 + 14), 100) AS c14, repeat(chr(97 + 15), 100) AS c15, repeat(chr(97 + 16), 100) AS c16, repeat(chr(97 + 17), 100) AS c17, repeat(chr(97 + 18), 100) AS c18, repeat(chr(97 + 19), 100) AS c19 FROM read_psam('{TEST_DIR}/A.psam'))
+TO '{TEST_DIR}/B.psam' (FORMAT csv, delim '\t', header true, quote '');
+
+statement ok
+CREATE TABLE oc0 AS SELECT coalesce(sum(memory_usage_bytes), 0) AS b FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+
+statement ok
+ATTACH '{TEST_DIR}/A' AS a (TYPE pfile_catalog);
+
+query I
+SELECT count(IID) FROM a.genotypes WHERE ID = 'var100';
+----
+8
+
+statement ok
+CREATE TABLE oc1 AS SELECT coalesce(sum(memory_usage_bytes), 0) AS b FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+
+statement ok
+ATTACH '{TEST_DIR}/B' AS b (TYPE pfile_catalog);
+
+query I
+SELECT count(IID) FROM b.genotypes WHERE ID = 'var100';
+----
+8
+
+statement ok
+CREATE TABLE oc2 AS SELECT coalesce(sum(memory_usage_bytes), 0) AS b FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+
+# B's 20 wide columns (8 x 20 x 100 B = 16,000 B of text) add nothing to the cache over A.
+query I
+SELECT ((SELECT b FROM oc2) - (SELECT b FROM oc1)) - ((SELECT b FROM oc1) - (SELECT b FROM oc0)) < 1000;
+----
+true
+
+# B's other columns are still read, query after query (re-parsed, not cached).
+query II
+SELECT count(*), count(*) FILTER (WHERE c7 = repeat('h', 100)) FROM b.genotypes WHERE ID = 'var100';
+----
+8	8
+
+query II
+SELECT count(*), count(*) FILTER (WHERE c19 = repeat('t', 100)) FROM b.genotypes WHERE ID IN ('var100', 'var200');
+----
+16	16
+
+# The IIDs and SEX served from the cache equal the source's, in every orient.
+query I
+SELECT count(*) FROM (
+  SELECT IID, genotype FROM b.genotypes WHERE ID = 'var100'
+  EXCEPT ALL
+  SELECT IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100');
+----
+0
+
+query T
+SELECT list(IID ORDER BY IID) FROM a.genotypes_by_sample_list;
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+query I
+SELECT count(*) FROM a.genotypes WHERE IID = 'SAMP3' AND ID = 'var100';
+----
+1
