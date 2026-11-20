@@ -174,3 +174,45 @@ query I
 SELECT count(*) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype') WHERE ID = 'var2100';
 ----
 8
+
+# ---------------------------------------------------------------------------
+# Review finding: shard_by + pvar_parquet leaves "pvar" out of the catalog (found by discovery). The
+# index must still be written.
+# ---------------------------------------------------------------------------
+statement ok
+COPY src TO '{TEST_DIR}/VP' (FORMAT pfile, shard_by 'CHROM', pvar_parquet, index);
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/VP.pvar.index.parquet');
+----
+2999
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/VP', orient := 'genotype') WHERE ID IN ('var100', 'var1100', 'var2100');
+----
+24
+
+# ---------------------------------------------------------------------------
+# Review finding: a standalone FORMAT pvar rewrite with force must remove the old index of that
+# .pvar (<p>.pvar.index.parquet): new IDs with an old index lose rows. Without force it refuses.
+# ---------------------------------------------------------------------------
+statement ok
+COPY src TO '{TEST_DIR}/T1' (FORMAT pfile, index);
+
+statement error
+COPY (SELECT CHROM, POS, 'rs_' || ID AS ID, REF, ALT FROM src ORDER BY CHROM, POS) TO '{TEST_DIR}/T1.pvar' (FORMAT pvar);
+----
+force
+
+statement ok
+COPY (SELECT CHROM, POS, 'rs_' || ID AS ID, REF, ALT FROM src ORDER BY CHROM, POS) TO '{TEST_DIR}/T1.pvar' (FORMAT pvar, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/T1.pvar.index.parquet');
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/T1') WHERE ID = 'rs_var2100';
+----
+1
