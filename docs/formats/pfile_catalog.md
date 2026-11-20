@@ -705,6 +705,32 @@ The catalog is **read-only**: a write to `c.*` raises. Do not pass `READ_ONLY` t
 `ATTACH`; the catalog is always read-only, and the storage is in-memory. An all-holes
 catalog has no cell to read, so its `ATTACH` raises.
 
+**The ATTACH cache (`CACHE`, default `true`).** Queries on one `ATTACH` reuse the metadata that
+an earlier query on it read: the parsed `.pfile.json`, the companion paths that discovery chose,
+and each parsed `.psam`. So a second query does not fetch or parse them again. The ATTACH is a
+snapshot: the cache is never checked against the files. A file that changes after the first
+query is seen after `DETACH` and a new `ATTACH`, or with `CACHE false`:
+
+```sql
+ATTACH 's3://bucket/cohort' AS c (TYPE pfile_catalog);               -- cached
+ATTACH 's3://bucket/cohort' AS c (TYPE pfile_catalog, CACHE false);  -- reads metadata every query
+```
+
+`DETACH` frees the cache. DuckDB can also drop it under memory pressure; the next query then reads
+the files again. The variant metadata (`.pvar`) is not cached. A direct `read_pfile` call is never
+cached.
+
+For a remote catalog, also set DuckDB's own caches. They are session-wide, so the extension does not
+set them:
+
+```sql
+SET enable_http_metadata_cache = true;  -- no repeated HEAD request per file
+SET parquet_metadata_cache = true;      -- parquet companion footers read once
+```
+
+Measured on 2026-11-19, a warm query on an attached 20 × 2 matrix over a range server with 40 ms
+latency: 0.426 s without `enable_http_metadata_cache`, 0.183 s with it.
+
 **`c.genotypes` is one row per variant.** It is
 [`read_pfile(catalog := …)`](../functions/read_pfile.md#catalog-input-catalog): within each
 variant block the sample blocks are concatenated, so each row's `genotypes` holds every sample
