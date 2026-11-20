@@ -11,6 +11,8 @@
 #include "pfile_catalog.hpp"
 #include "pvar_reader.hpp"
 #include "psam_reader.hpp"
+#include "pfile_sample_metadata.hpp"
+#include "pfile_attach_cache.hpp"
 
 #include <unordered_map>
 
@@ -148,34 +150,7 @@ static RegionFilter ParseRegion(const string &region_str) {
 // Sample metadata for genotype orient mode output
 // ---------------------------------------------------------------------------
 
-//! Extended sample info for genotype orient mode: includes all psam columns.
-struct PfileSampleMetadata {
-	PsamHeaderInfo header;
-	//! All data rows from the .psam/.fam, in file order (TEXT path only).
-	//! Each inner vector has one field per column. Empty for the parquet path, whose
-	//! column values are loaded projection-aware at InitGlobal (PfileGlobalState).
-	vector<vector<string>> rows;
-
-	//! Source path for the parquet/non-native path — the projected column data is
-	//! (re-)queried from here at InitGlobal, not materialized at bind. Empty for text.
-	string source_path;
-	//! Sample-sharded cohort over parquet companions: every shard's .psam.parquet, in shard
-	//! order (source_paths[0] == source_path). Empty for a single source. See PsamSelectSql.
-	vector<string> source_paths;
-
-	//! IID / FID column positions in the header (for the parquet path).
-	idx_t iid_col_idx = DConstants::INVALID_INDEX;
-	idx_t fid_col_idx = DConstants::INVALID_INDEX;
-
-	//! Index of SEX column in the header (DConstants::INVALID_INDEX if absent)
-	idx_t sex_col_idx = DConstants::INVALID_INDEX;
-	//! Indices of PAT/MAT columns for special missing-value handling
-	vector<idx_t> parent_col_indices;
-
-	//! True when the psam came from a parquet/non-native source: column data is not
-	//! in `rows`; the scan reads it from the projection-aware CDC in the global state.
-	bool from_parquet = false;
-};
+// PfileSampleMetadata: src/include/pfile_sample_metadata.hpp (shared with the ATTACH cache).
 
 //! The query that reads `cols` from a parquet/non-native psam, in sample order. One source:
 //! `SELECT cols FROM '<path>'`. A sample-sharded cohort (source_paths): the shards' parquet files
@@ -620,6 +595,9 @@ struct PfileBindData : public TableFunctionData {
 	bool lazy_variants = false;
 	mutable std::mutex lazy_variants_lock;
 	mutable bool lazy_variants_loaded = false;
+	//! attach_cache := '<key>' (passed by the ATTACH views, design Part 2): that ATTACH's metadata cache,
+	//! or null (no key, or the entry was evicted). Never set for a direct read_pfile call.
+	shared_ptr<PfileAttachCache> attach_cache;
 	//! freq := true in genotype orient: the sample set a WHERE IID would narrow to (PruneSamplesByIid).
 	//! The freq values cover the read's full sample set, and the projection is final only at InitGlobal
 	//! (UNUSED_COLUMNS runs after filter pushdown), so ApplyPendingSampleKeep applies it there, under
@@ -1881,6 +1859,13 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
                                           vector<LogicalType> &return_types, vector<CompatName> &names) {
 	BindPhaseTimer bind_timer("PfileBind(total)");
 	auto bind_data = make_uniq<PfileBindData>();
+	{
+		auto ac_it = input.named_parameters.find("attach_cache");
+		if (ac_it != input.named_parameters.end() && !ac_it->second.IsNull()) {
+			bind_data->attach_cache =
+			    ObjectCache::GetObjectCache(context).Get<PfileAttachCache>(StringValue::Get(ac_it->second));
+		}
+	}
 
 	// --- Parse the composable axis selection (samples/region/variants/variant_range) ---
 	// ParseSelection captures `samples` + `region` symbolically, applying most-specific-wins
@@ -6599,6 +6584,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		                            {"dosages", LogicalType::BOOLEAN},
 		                            {"phased", LogicalType::BOOLEAN},
 		                            {"region", LogicalType::VARCHAR},
+		                            {"attach_cache", LogicalType::VARCHAR},
 		                            {"samples", LogicalType::ANY},
 		                            {"variants", LogicalType::ANY},
 		                            {"selection", LogicalType::ANY},

@@ -2,6 +2,8 @@
 #include "pfile_catalog_matrix.hpp"
 #include "pfile_catalog.hpp"
 #include "pfile_catalog_util.hpp"
+#include "pfile_attach_cache.hpp"
+#include "duckdb/common/types/uuid.hpp"
 
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -27,10 +29,17 @@ namespace duckdb {
 class PfileCatalogViewGenerator : public DefaultGenerator {
 public:
 	PfileCatalogViewGenerator(Catalog &catalog, SchemaCatalogEntry &schema,
-	                          vector<std::pair<Identifier, string>> views_p)
-	    : DefaultGenerator(catalog), schema(schema), views(std::move(views_p)) {
+	                          vector<std::pair<Identifier, string>> views_p, DatabaseInstance &db_p, string cache_key_p)
+	    : DefaultGenerator(catalog), schema(schema), views(std::move(views_p)), db(db_p),
+	      cache_key(std::move(cache_key_p)) {
 		for (auto &v : views) {
 			view_names.push_back(v.first);
+		}
+	}
+	//! The attached catalog owns this generator, so DETACH destroys it: drop the ATTACH's cache entry.
+	~PfileCatalogViewGenerator() override {
+		if (!cache_key.empty()) {
+			db.GetObjectCache().Delete(cache_key);
 		}
 	}
 
@@ -56,6 +65,8 @@ private:
 	SchemaCatalogEntry &schema;
 	vector<std::pair<Identifier, string>> views;
 	vector<Identifier> view_names;
+	DatabaseInstance &db;
+	string cache_key; //! the PfileAttachCache's ObjectCache key; empty under CACHE false
 };
 
 //! A SQL list literal of single-quoted, escaped paths: ['a', 'b', ...].
@@ -135,7 +146,7 @@ static string BuildV1BlockSql(const string &path_sql, const string &concat_dim, 
 //! Otherwise a pvar override is never passed — read_pfile rejects it on a variant-sharded list, and
 //! each cell/shard already carries its own co-located .pvar.
 static string GenotypesSql(const vector<string> &prefixes, const string &shared_psam, bool sample_concat,
-                           const string &shared_pvar, bool by_sample) {
+                           const string &shared_pvar, bool by_sample, const string &cache_arg) {
 	string sql = "SELECT * FROM read_pfile(" + SqlPathList(prefixes);
 	if (sample_concat) {
 		// Also for ONE cell: its shard may have no .pvar of its own, and pvar := is valid
@@ -155,6 +166,7 @@ static string GenotypesSql(const vector<string> &prefixes, const string &shared_
 		// P13-006 §5: plink_freq's per-variant columns, computed only when a query names them.
 		sql += ", freq := true";
 	}
+	sql += cache_arg;
 	sql += ")";
 	return sql;
 }
@@ -166,7 +178,7 @@ static string GenotypesSql(const vector<string> &prefixes, const string &shared_
 //! with read_pfile's own genotype mode ('auto' = a fixed ARRAY for the cell's sample count). When
 //! the sample blocks differ in width, those ARRAYs differ in size and cannot union, so every cell is
 //! read with genotypes := 'list' — read_pfile's ARRAY-or-LIST rule, lifted to the grid.
-static string MatrixGenotypesSql(const vector<MatrixCell> &cells) {
+static string MatrixGenotypesSql(const vector<MatrixCell> &cells, const string &cache_arg) {
 	bool uniform = true;
 	for (auto &c : cells) {
 		if (c.sample_stop - c.sample_start != cells[0].sample_stop - cells[0].sample_start) {
@@ -183,7 +195,7 @@ static string MatrixGenotypesSql(const vector<MatrixCell> &cells) {
 			sql += ", genotypes := 'list'";
 		}
 		// The same columns as every other c.genotypes; here each row counts its own sample block.
-		sql += ", freq := true)";
+		sql += ", freq := true" + cache_arg + ")";
 	}
 	return sql;
 }
@@ -205,6 +217,34 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// The catalog is a read-only view over the shipped readers. access_mode is already
 	// fixed before attach() runs, so force the read-only type here (rejects CREATE/INSERT/etc).
 	db.SetReadOnlyDatabase();
+
+	// CACHE <bool> (default true, design Part 2): a per-ATTACH metadata cache that the views name. The
+	// backing DuckCatalog's storage manager rejects unknown options, so take it out of the map.
+	bool use_cache = true;
+	for (auto it = options.options.begin(); it != options.options.end();) {
+		if (StringUtil::Lower(it->first) == "cache") {
+			const Value v = it->second;
+			try {
+				Value b = v.DefaultCastAs(LogicalType::BOOLEAN);
+				if (b.IsNull()) {
+					throw InvalidInputException("NULL");
+				}
+				use_cache = BooleanValue::Get(b);
+			} catch (std::exception &) {
+				throw InvalidInputException("ATTACH pfile_catalog: CACHE must be true or false (got '%s')",
+				                            v.ToString());
+			}
+			it = options.options.erase(it);
+		} else {
+			++it;
+		}
+	}
+	string cache_key;
+	string cache_arg;
+	if (use_cache) {
+		cache_key = "plinking_attach:" + BaseUUID::ToString(UUID::GenerateRandomUUID());
+		cache_arg = ", attach_cache := " + SQLString::ToString(cache_key);
+	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	string raw_path = info.path;
@@ -315,13 +355,13 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// variant x sample block. A matrix with holes keeps that fan-out: read_pfile(catalog := ...)
 	// rejects holes, and their 2-D meaning is not defined. A bare fileset has no catalog to name.
 	if (is_matrix && matrix_has_holes) {
-		views.emplace_back(Identifier("genotypes"), MatrixGenotypesSql(matrix_cells));
+		views.emplace_back(Identifier("genotypes"), MatrixGenotypesSql(matrix_cells, cache_arg));
 	} else if (!catalog_path_sql.empty()) {
-		views.emplace_back(Identifier("genotypes"),
-		                   "SELECT * FROM read_pfile(catalog := " + catalog_path_sql + ", freq := true)");
+		views.emplace_back(Identifier("genotypes"), "SELECT * FROM read_pfile(catalog := " + catalog_path_sql +
+		                                                ", freq := true" + cache_arg + ")");
 	} else {
 		views.emplace_back(Identifier("genotypes"),
-		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false));
+		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, false, cache_arg));
 	}
 	// A matrix's SAMPLE-oriented view is the 2-D read: read_pfile(catalog := …) concatenates the
 	// sample blocks within each variant block and row-concatenates the variant blocks, with every
@@ -332,11 +372,11 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	// there a hole removes a whole variant block, and the variant-sharded list read of the
 	// present cells is correct (it was the view before the 2-D read; kept so it does not regress).
 	if (is_matrix && !(matrix_has_holes && psam_paths.size() == 1)) {
-		views.emplace_back(Identifier("genotypes_by_sample"),
-		                   "SELECT * FROM read_pfile(catalog := " + matrix_path_sql + ", orient := 'sample')");
+		views.emplace_back(Identifier("genotypes_by_sample"), "SELECT * FROM read_pfile(catalog := " + matrix_path_sql +
+		                                                          ", orient := 'sample'" + cache_arg + ")");
 	} else {
 		views.emplace_back(Identifier("genotypes_by_sample"),
-		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, true));
+		                   GenotypesSql(cell_prefixes, shared_psam, sample_concat, shared_pvar, true, cache_arg));
 	}
 	views.emplace_back(Identifier("variants"), "SELECT * FROM read_pvar(" + SqlPathList(pvar_paths) + ")");
 	views.emplace_back(Identifier("samples"), BuildPsamUnionSql(psam_paths));
@@ -356,7 +396,12 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	auto &schema = catalog->GetSchema(system_transaction, Identifier::DefaultSchema());
 	auto &duck_schema = schema.Cast<DuckSchemaEntry>();
 	auto &view_set = duck_schema.GetCatalogSet(CatalogType::VIEW_ENTRY);
-	view_set.SetDefaultGenerator(make_uniq<PfileCatalogViewGenerator>(*catalog, schema, std::move(views)));
+	if (!cache_key.empty()) {
+		// Last, so an ATTACH that fails above leaves no entry; the generator deletes it at DETACH.
+		db.GetDatabase().GetObjectCache().Put(cache_key, make_shared_ptr<PfileAttachCache>());
+	}
+	view_set.SetDefaultGenerator(
+	    make_uniq<PfileCatalogViewGenerator>(*catalog, schema, std::move(views), db.GetDatabase(), cache_key));
 
 	return std::move(catalog);
 }
