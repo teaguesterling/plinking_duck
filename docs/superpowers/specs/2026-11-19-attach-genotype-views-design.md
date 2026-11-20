@@ -80,6 +80,10 @@ uses.
   non-ref; on real, mostly hom-ref data the gain is expected to be larger (inferred, not measured).
 - G4c. List versions of the two wide views: `c.genotypes_by_variant_list` and
   `c.genotypes_by_sample_list`. **(Teague)**
+- G4d. `ID` stays exactly what the `.pvar` holds, in every row view. A new virtual column
+  `CPRA` (`CHROM:POS:REF:ALT`, VARCHAR) is built only when a query projects it, and a
+  `WHERE CPRA = '…'` / `IN (…)` is parsed into `CHROM`/`POS` bounds plus an allele check.
+  **(Teague, 2026-11-19.)** See §2c.
 - G5. All views keep today's block drops: `CHROM`/`POS` drop variant blocks, `IID` drops
   sample blocks (where the read shape allows it).
 
@@ -174,6 +178,27 @@ intersects the two. **(Claude's call.)**
 Freq columns (§2) and `af_range`/`ac_range` must keep counting every call, as they do today with
 `include_genotypes` (CLAUDE.md: counts report TRUE counts).
 
+### 2c. The virtual `CPRA` column
+
+- **Where:** `read_pfile` variant and genotype orient, so `c.genotypes`, `c.genotypes_by_variant`
+  and `c.genotypes_by_variant_list` all have it, after `ALT` and before the extra `.pvar` columns
+  **(Claude's call on position)**. It is projection-aware, like the freq columns: a query that
+  does not name it pays nothing.
+- **Format:** `CHROM:POS:REF:ALT`, the format that `ResolveCpraString`
+  (`src/plink_common.cpp:2045`) already parses for `variants := [...]`. A multiallelic ALT
+  stays one string (`1:3000:G:A,C`), because the parser splits only on `:`.
+- **Pushdown:** a pushed `CPRA = const` or `CPRA IN (consts)` becomes `CHROM` + `POS` bounds,
+  which reuse the existing variant-block drop and the #120 `.pgen` narrowing, plus a REF/ALT
+  match. A `CHROM:POS` constant (two parts) matches the site with any alleles **(Claude's call,
+  matching `ResolveCpraString`)**. An unparsable constant gives zero rows, not an error, because
+  it is a `WHERE` value and not a parameter. The pushed filter still runs on the output rows, so
+  a wrong parse can only lose rows. The tests must cover that case.
+- **Clash:** a `.pvar` with an extra column named `CPRA` is an error at bind that names the file.
+- **No index:** `CPRA` lookups need no ID index; the `POS` bounds do the block drop. The ID index
+  (§4) holds `ID` only.
+- **Timing to measure in its PR:** `WHERE CPRA = …` on the 20 × 2 matrix against
+  `WHERE POS = …` (8 ms measured). The two are expected to match (inferred).
+
 ### 3. Wide-column names and their limits
 
 - `genotypes_by_variant`: column name = IID. This is `genotypes := 'columns'` today. A name that
@@ -183,9 +208,9 @@ Freq columns (§2) and `af_range`/`ac_range` must keep counting every call, as t
 - `genotypes_by_sample`: column name = variant ID. Today `read_pfile(orient := 'sample',
   genotypes := 'columns')` raises an error on a duplicate ID (`src/pfile_reader.cpp:2774`) and
   names an empty ID `CHROM:POS` (`:2741`). Real `.pvar` files often have many `.` IDs, so the
-  view would raise that error on most cohorts. **(Teague: a view-only naming option.)** A new
-  `read_pfile` option, which only the view passes, gives an ID of `.`, an empty ID, or a
-  duplicate ID the name `CHROM:POS:REF:ALT`. If that is also a duplicate, it adds a suffix `_<n>`
+  view would raise that error on most cohorts. **(Teague: a view-only naming option, with the
+  `CPRA` value as the fallback.)** A new `read_pfile` option, which only the view passes, gives
+  an ID of `.`, an empty ID, or a duplicate ID the variant's `CPRA` value as its column name. If that is also a duplicate, it adds a suffix `_<n>`
   in variant order. Without the option, `read_pfile` keeps today's behaviour, and its tests do
   not change. The builder names the option, and documents it in `docs/functions/read_pfile.md`.
 - **Risk, accepted by Teague:** the by-sample schema holds one column per variant in the
@@ -259,7 +284,8 @@ Each read below must be one query on a view, and must open only the blocks named
 ## Delivery (Claude's call: four PRs, in this order)
 
 1. `freq := true` in genotype orient, with the freq-correctness rule of §2. RED test first.
-2. `WHERE genotype` pushdown (§2b). RED test first: a timing-free check that the filter reached
+2. `WHERE genotype` pushdown (§2b), and the `CPRA` column with its pushdown (§2c). Two
+   separate commits in one PR, or two PRs if the diff is large (builder's call). RED test first: a timing-free check that the filter reached
    the scan (an `EXPLAIN` or a decode counter), plus the row oracle.
 3. The five views (§1, §3), docs, and the breaking-change note. RED test first: the new
    schemas and a row oracle against `read_pfile` on the un-sharded source.
@@ -275,6 +301,9 @@ Each read below must be one query on a view, and must open only the blocks named
 - Freq: a tall row's freq equals `plink_freq` on the source, with and without `WHERE IID`.
 - Q1, Q2 and Q3 verbatim, on every catalog kind, each against the source oracle, and each
   timed at 1M samples in the PR body (local, and Q1 also over the range server).
+- `CPRA`: equals `CHROM || ':' || POS || ':' || REF || ':' || ALT` on every row; `WHERE CPRA`
+  gives the same rows as the matching `CHROM`/`POS`/`REF`/`ALT` filter; a bad constant gives zero
+  rows; a `.pvar` with a `CPRA` column is an error.
 - Names: an ID of `.`, a duplicate ID, and an IID that equals `POS`; and `read_pfile` without
   the naming option still raises the duplicate-ID error.
 - Holes: each of the four wide and list views raises the "not supported" error on a holed matrix
