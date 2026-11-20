@@ -157,7 +157,10 @@ catalog). It is written with `PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SI
 - A rewrite with `force` removes an old index first, with or without `index`: an index of other
   output loses rows. Without `force`, an existing index refuses the COPY, as the other files do.
 - `index` cannot be combined with a `pvar`, `pgen` or `psam` path override.
-- If the COPY fails, no index is left. That costs speed only.
+- The index is written last, after the other files are in place. If that step fails, the COPY
+  reports an error, the new files stay, and no index is left (a read is then only slower).
+- A standalone `COPY … (FORMAT pvar)` to `<p>.pvar` also removes `<p>.pvar.index.parquet` under
+  `force` (and refuses without it), since the index holds the old IDs.
 
 ### Local-only
 

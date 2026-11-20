@@ -367,7 +367,12 @@ unique_ptr<FunctionData> PvarCopyBind(ClientContext &context, CopyFunctionBindIn
 	auto bind = BuildPvarBind(input, names, sql_types, /*exclude=*/ {});
 	bind->db = &DatabaseInstance::GetDatabase(context);
 	bind->target_path = bind->path_override.empty() ? input.info.file_path : bind->path_override;
-	RefuseExistingOutput(context, ParseForceOption(input), {bind->target_path}, "write pvar");
+	// '<p>.pvar.index.parquet' indexes this .pvar's IDs: a rewrite must not keep it (views PR 4b).
+	vector<string> outputs {bind->target_path};
+	if (StringUtil::EndsWith(bind->target_path, ".pvar")) {
+		outputs.push_back(bind->target_path + ".index.parquet");
+	}
+	RefuseExistingOutput(context, ParseForceOption(input), outputs, "write pvar");
 	return std::move(bind);
 }
 
@@ -578,6 +583,11 @@ void PvarCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFun
 		return;
 	}
 	auto &fs = FileSystem::GetFileSystem(context);
+	// The ID index of the old .pvar (bind refused it without force): its IDs are not this file's.
+	const string old_index = bind.target_path + ".index.parquet";
+	if (StringUtil::EndsWith(bind.target_path, ".pvar") && fs.FileExists(old_index)) {
+		fs.RemoveFile(old_index);
+	}
 	const string final_pq = bind.target_path + ".parquet";
 	if (!g.pq_on) {
 		// A rewrite without pvar_parquet must not leave a stale companion (its __vidx would mis-seek).
@@ -3838,7 +3848,10 @@ void WritePvarIndex(ClientContext &context, const PfileWriteBindData &bind, bool
 			}
 			body += string(body.empty() ? "" : " UNION ALL ") + "SELECT ID, CAST(" +
 			        std::to_string(cell.variant_block) + " AS INTEGER) AS _variant_block, __ordinal AS _pvar_ordinal " +
-			        "FROM read_pvar(" + quote(text_pvar(cell.pvar)) + ", with_ordinal := true)";
+			        "FROM read_pvar(" +
+			        // A v1 catalog under pvar_parquet leaves "pvar" out (discovery): the block's text .pvar
+			        // is then '<cell prefix>.pvar', which this writer always writes.
+			        quote(cell.pvar.empty() ? cell.prefix + ".pvar" : text_pvar(cell.pvar)) + ", with_ordinal := true)";
 		}
 	} else {
 		body = "SELECT ID, __ordinal AS _pvar_ordinal FROM read_pvar(" + quote(bind.prefix + ".pvar") +
