@@ -156,7 +156,7 @@ that a hole's rows are absent.)**
 
 `read_pfile` rejects `freq := true` with `orient := 'genotype'` today ("its columns hold one value
 per variant"). Change: allow it, and repeat the variant's six values on each of its sample rows.
-The values are over the cohort's full sample set, not over the rows a `WHERE IID` keeps.
+The values are over the read's sample set: `samples :=` narrows them, as in variant orient, but the rows that a `WHERE IID` keeps do not. **(Teague, 2026-11-19: keep the `samples :=` narrowing.)** The ATTACH views pass no `samples :=`, so for them this is the full cohort.
 **(Claude's call.)** This keeps "rare variants in these samples" one query:
 `SELECT * FROM c.genotypes WHERE ALT_FREQ < 0.01 AND IID IN (…)`.
 
