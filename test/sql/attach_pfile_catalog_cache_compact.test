@@ -67,7 +67,7 @@ SELECT count(*), count(*) FILTER (WHERE c19 = repeat('t', 100)) FROM b.genotypes
 ----
 16	16
 
-# The IIDs and SEX served from the cache equal the source's, in every orient.
+# The IIDs equal the source's, in every orient.
 query I
 SELECT count(*) FROM (
   SELECT IID, genotype FROM b.genotypes WHERE ID = 'var100'
@@ -85,3 +85,65 @@ query I
 SELECT count(*) FROM a.genotypes WHERE IID = 'SAMP3' AND ID = 'var100';
 ----
 1
+
+# ---------------------------------------------------------------------------
+# Review finding: a text .psam's genotype/sample-orient load was not cached at all, so every query
+# re-parsed it, even for IID only, and one ATTACH could show two sample sets. Teague's rule: the
+# cache keeps the IDs (IID, FID) and SEX; only a query that projects another column re-reads the
+# file. Here B.psam is replaced after the ATTACH (new IIDs X1..X8, new c7): the IDs stay the
+# ATTACH's snapshot, and c7 is the file's.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT 'X' || IID[5:] AS "#IID", repeat(chr(97 + 0), 100) AS c0, repeat(chr(97 + 1), 100) AS c1, repeat(chr(97 + 2), 100) AS c2, repeat(chr(97 + 3), 100) AS c3, repeat(chr(97 + 4), 100) AS c4, repeat(chr(97 + 5), 100) AS c5, repeat(chr(97 + 6), 100) AS c6, repeat('z', 100) AS c7, repeat(chr(97 + 8), 100) AS c8, repeat(chr(97 + 9), 100) AS c9, repeat(chr(97 + 10), 100) AS c10, repeat(chr(97 + 11), 100) AS c11, repeat(chr(97 + 12), 100) AS c12, repeat(chr(97 + 13), 100) AS c13, repeat(chr(97 + 14), 100) AS c14, repeat(chr(97 + 15), 100) AS c15, repeat(chr(97 + 16), 100) AS c16, repeat(chr(97 + 17), 100) AS c17, repeat(chr(97 + 18), 100) AS c18, repeat(chr(97 + 19), 100) AS c19 FROM read_psam('{TEST_DIR}/A.psam'))
+TO '{TEST_DIR}/B.psam' (FORMAT csv, delim '\t', header true, quote '');
+
+query T
+SELECT list(IID ORDER BY IID) FROM b.genotypes WHERE ID = 'var100';
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+query T
+SELECT list(IID ORDER BY IID) FROM b.genotypes_by_sample_list;
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+query IT
+SELECT count(*) FILTER (WHERE c7 = repeat('z', 100)), min(IID) FROM b.genotypes WHERE ID = 'var100';
+----
+8	SAMP1
+
+# A .psam that no longer matches the ATTACH (another sample count): an IID-only query is served
+# from the cache; a query that must re-read the file says the file changed.
+statement ok
+COPY (SELECT 'only' AS "#IID", 'x' AS c0) TO '{TEST_DIR}/B.psam' (FORMAT csv, delim '\t', header true, quote '');
+
+query I
+SELECT count(IID) FROM b.genotypes WHERE ID = 'var100';
+----
+8
+
+statement error
+SELECT count(c7) FROM b.genotypes WHERE ID = 'var100';
+----
+changed since
+
+# chrX freq from a cached text .psam's SEX equals a direct read (sexchr_example has chrX and SEX).
+statement ok
+ATTACH 'test/data/sexchr_example' AS x (TYPE pfile_catalog);
+
+query I
+SELECT count(*) FROM x.genotypes;
+----
+30
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID, SEX, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM x.genotypes
+   EXCEPT ALL
+   SELECT ID, IID, SEX, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true))
+  UNION ALL
+  (SELECT ID, IID, SEX, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true)
+   EXCEPT ALL
+   SELECT ID, IID, SEX, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM x.genotypes));
+----
+0
