@@ -1,0 +1,82 @@
+# name: test/sql/read_pfile_freq_genotype_iid.test
+# description: freq := true in genotype orient over a sample-sharded catalog: a WHERE IID must not narrow the freq values (they cover the read's full sample set), while a read that does not use a freq column keeps the IID sample-block drop.
+# group: [sql]
+
+require plinking_duck
+
+# Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 2. Proof method from
+# read_pfile_catalog_iid_prune.test: every cell of sample block 'hi' of `badhi` has a garbage .pgen,
+# so a read that opens a 'hi' cell errors with "data.pgen", and a read that drops 'hi' succeeds.
+# Oracle for the values: plink_freq over the un-sharded source, large_example (3000 variants x 8 samples).
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/badhi' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badhi/CHROM=1/GROUP=hi/data.pgen' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badhi/CHROM=2/GROUP=hi/data.pgen' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/badhi/CHROM=3/GROUP=hi/data.pgen' (FORMAT csv, header false);
+
+statement ok
+CREATE VIEW vg AS SELECT * FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype', freq := true);
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+# (a) A freq column selected + WHERE IID: the values need every sample block, so the 'hi' cells are opened.
+statement error
+SELECT IID, ALT_FREQ FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype', freq := true) WHERE IID = 'SAMP2';
+----
+data.pgen
+
+# (a') The same through the SELECT * view.
+statement error
+SELECT IID, HET_CT FROM vg WHERE IID = 'SAMP2';
+----
+data.pgen
+
+# (b) The values are full-cohort: they equal plink_freq over the source, for every variant.
+query I
+SELECT count(*) FROM ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', freq := true) WHERE IID = 'SAMP2') EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/large_example.pgen', counts := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/large_example.pgen', counts := true)) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile(catalog := '{TEST_DIR}/mx.pfile.json', orient := 'genotype', freq := true) WHERE IID = 'SAMP2')));
+----
+0
+
+# (c) Guard: freq NOT referenced, through the SELECT * view (the ATTACH case): 'hi' is still dropped.
+query I
+SELECT count(*) FROM (SELECT IID, genotype FROM vg WHERE IID = 'SAMP2');
+----
+3000
+
+# (d) Guard: the same without the view. count(genotype) skips SAMP2's missing calls, as the source does.
+query I
+SELECT (SELECT count(genotype) FROM read_pfile(catalog := '{TEST_DIR}/badhi.pfile.json', orient := 'genotype', freq := true) WHERE IID = 'SAMP2')
+     = (SELECT count(genotype) FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'SAMP2');
+----
+true
+
+endloop
+
+# (e) Guard: a prepared statement run twice gives the same rows (the deferred drop applies once per bind).
+statement ok
+PREPARE p AS SELECT count(*) FROM vg WHERE IID = 'SAMP2';
+
+query I
+EXECUTE p;
+----
+3000
+
+query I
+EXECUTE p;
+----
+3000
