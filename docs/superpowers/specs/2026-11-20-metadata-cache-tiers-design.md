@@ -1,6 +1,6 @@
 # Metadata cache tiers for an 8M-sample × 170M-variant cohort — design
 
-Status: **draft, for Teague's review** (2026-11-20). Author: Claude Opus, from Teague's request:
+Status: **approved** (Teague, 2026-11-20; §6 answered). Author: Claude Opus, from Teague's request:
 "caching all metadata may be impossible on smaller memory machines … smart caching or caching tiers
 that don't take many gigabytes", and "is it worth creating a single global (sync'd) pgen header cache?"
 
@@ -119,14 +119,17 @@ each cell it touches.
 - **mmap the headers:** see §3.
 - **One process-wide header per variant chunk:** wrong, since each ancestry group's header differs.
 
-## 6. Open questions for Teague
+## 6. Decisions (Teague, 2026-11-20)
 
-1. Does `ATTACH … (CACHE false)` also turn off the tier-1 header cache for that catalog's reads, or is
-   the header cache governed only by `plinking_pgen_header_cache`? (Proposal: only the setting; the header
-   cache is process-wide, not per ATTACH.)
-2. Is DuckDB's object-cache limit (default 8 GiB, counted against `memory_limit`) the right bound, or do
-   you want a separate byte limit for headers?
-3. Rough real chunk size and group count, to size the test fixture (assumed: 1M-variant chunks × 5 groups).
+1. `ATTACH … (CACHE false)` does **not** turn off the tier-1 header cache. Only
+   `plinking_pgen_header_cache` does; the header cache is process-wide.
+2. The bound is DuckDB's object-cache limit (8 GiB by default, counted against `memory_limit`).
+   No separate byte limit.
+3. Chunks vary, but are likely **10–25M variants** each, with the samples split by ancestry. One
+   cell's header is then 90–225 MB (9 B per variant, arithmetic); today 16 threads would hold
+   1.4–3.6 GB for one cell.
+4. The cost of caching is accepted: a single-threaded full scan now keeps every cell's header
+   (measured on the 50-cell fixture: 1521 → 1949 MB peak).
 
 ## 7. Delivery
 
