@@ -4,6 +4,8 @@
 
 require plinking_duck
 
+require parquet
+
 # Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 2. The tall c.genotypes
 # view (PR 3) passes freq := true, so "rare variants in these samples" stays one query.
 
@@ -175,3 +177,20 @@ statement error
 SELECT * FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, dosages := true);
 ----
 incompatible with dosages := true
+
+# ---------------------------------------------------------------------------
+# A parquet .psam (review finding): the coded SEX comes from its SEX column alone, not from a
+# second full load. chrX/chrY must still match plink_freq.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_psam('test/data/sexchr_example.psam')) TO '{TEST_DIR}/sx.psam.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := '{TEST_DIR}/sx.psam.parquet')) EXCEPT ALL (SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) UNION ALL ((SELECT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM plink_freq('test/data/sexchr_example.pgen', counts := true)) EXCEPT ALL (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := '{TEST_DIR}/sx.psam.parquet'))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT ID, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/sexchr_example', orient := 'genotype', freq := true, psam := '{TEST_DIR}/sx.psam.parquet')) WHERE ID IN ('x1', 'y1') AND HET_CT IS NOT NULL;
+----
+2
