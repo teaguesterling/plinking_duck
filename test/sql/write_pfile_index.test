@@ -1,0 +1,176 @@
+# name: test/sql/write_pfile_index.test
+# description: COPY ... (FORMAT pfile, index true) writes <p>.pvar.index.parquet (views PR 4b): equal to the documented recipe, in every layout, and read_pfile uses it
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 4. large_example:
+# 3000 variants x 8 samples, CHROM 1/2/3; ID var<POS/100>. Here var5's ID is made NULL ('.'), which is
+# never indexed.
+
+statement ok
+CREATE TABLE src AS SELECT * REPLACE (CASE WHEN ID = 'var5' THEN NULL ELSE ID END AS ID)
+FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS;
+
+# ---------------------------------------------------------------------------
+# A file set.
+# ---------------------------------------------------------------------------
+statement ok
+COPY src TO '{TEST_DIR}/A' (FORMAT pfile, index true);
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/A.pvar.index.parquet');
+----
+2999
+
+# Equal to the recipe (both directions), and stored sorted by ID.
+query II
+SELECT
+  (SELECT count(*) FROM (SELECT ID, _pvar_ordinal FROM read_parquet('{TEST_DIR}/A.pvar.index.parquet')
+                         EXCEPT ALL SELECT ID, __ordinal FROM read_pfile('{TEST_DIR}/A', with_ordinal := true) WHERE ID IS NOT NULL)),
+  (SELECT count(*) FROM (SELECT ID, __ordinal FROM read_pfile('{TEST_DIR}/A', with_ordinal := true) WHERE ID IS NOT NULL
+                         EXCEPT ALL SELECT ID, _pvar_ordinal FROM read_parquet('{TEST_DIR}/A.pvar.index.parquet')));
+----
+0	0
+
+query I
+SELECT count(*) FROM (SELECT ID, lag(ID) OVER (ORDER BY file_row_number) AS prev
+                      FROM read_parquet('{TEST_DIR}/A.pvar.index.parquet', file_row_number = true))
+WHERE prev > ID;
+----
+0
+
+query TT
+SELECT name, type FROM parquet_schema('{TEST_DIR}/A.pvar.index.parquet') WHERE name <> 'duckdb_schema' ORDER BY name;
+----
+ID	BYTE_ARRAY
+_pvar_ordinal	INT64
+
+query II
+SELECT bool_and(compression = 'ZSTD'), max(row_group_num_rows) <= 8192 FROM parquet_metadata('{TEST_DIR}/A.pvar.index.parquet');
+----
+true	true
+
+query TT
+SELECT ID, CHROM FROM read_pfile('{TEST_DIR}/A') WHERE ID = 'var1100';
+----
+var1100	2
+
+# `index false` writes none; a force-rewrite without `index` removes the old one (a stale index loses rows).
+statement ok
+COPY src TO '{TEST_DIR}/B' (FORMAT pfile, index false);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/B.pvar.index.parquet');
+----
+0
+
+statement ok
+COPY src TO '{TEST_DIR}/A' (FORMAT pfile, force);
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/A.pvar.index.parquet');
+----
+0
+
+# No COPY replaces an existing index without force.
+statement ok
+COPY src TO '{TEST_DIR}/C' (FORMAT pfile, index);
+
+statement error
+COPY src TO '{TEST_DIR}/C' (FORMAT pfile, index);
+----
+force
+
+statement ok
+COPY src TO '{TEST_DIR}/C' (FORMAT pfile, index, force);
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/C.pvar.index.parquet');
+----
+2999
+
+# The index sits beside <prefix>.pgen, so a path override has no place for it.
+statement error
+COPY src TO '{TEST_DIR}/D' (FORMAT pfile, index, pvar '{TEST_DIR}/D2.pvar');
+----
+index
+
+# ---------------------------------------------------------------------------
+# A v1 catalog (shard_by CHROM): one index beside the .pfile.json, with the block column.
+# ---------------------------------------------------------------------------
+statement ok
+COPY src TO '{TEST_DIR}/V' (FORMAT pfile, shard_by 'CHROM', index true);
+
+query TT
+SELECT name, type FROM parquet_schema('{TEST_DIR}/V.pvar.index.parquet') WHERE name <> 'duckdb_schema' ORDER BY name;
+----
+ID	BYTE_ARRAY
+_pvar_ordinal	INT64
+_variant_block	INT32
+
+query I
+SELECT count(*) FROM (
+  SELECT ID, _variant_block, _pvar_ordinal FROM read_parquet('{TEST_DIR}/V.pvar.index.parquet')
+  EXCEPT ALL
+  (SELECT ID, 0, __ordinal FROM read_pfile('{TEST_DIR}/V/CHROM=1/data', psam := '{TEST_DIR}/V.psam', with_ordinal := true) WHERE ID IS NOT NULL
+   UNION ALL SELECT ID, 1, __ordinal FROM read_pfile('{TEST_DIR}/V/CHROM=2/data', psam := '{TEST_DIR}/V.psam', with_ordinal := true)
+   UNION ALL SELECT ID, 2, __ordinal FROM read_pfile('{TEST_DIR}/V/CHROM=3/data', psam := '{TEST_DIR}/V.psam', with_ordinal := true)));
+----
+0
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/V.pvar.index.parquet');
+----
+2999
+
+# The read uses it: with CHROM=3's .pvar garbage, WHERE ID on CHROM 1 still reads.
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/V/CHROM=3/data.pvar' (FORMAT csv, header false);
+
+query TT
+SELECT ID, CHROM FROM read_pfile('{TEST_DIR}/V') WHERE ID = 'var100';
+----
+var100	1
+
+# ---------------------------------------------------------------------------
+# A v2 matrix (shard_by CHROM + shard_samples): the block is the variant block.
+# ---------------------------------------------------------------------------
+statement ok
+COPY src TO '{TEST_DIR}/M' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, index true);
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/M.pvar.index.parquet');
+----
+2999
+
+query I
+SELECT count(*) FROM (
+  SELECT IID, genotype FROM read_pfile('{TEST_DIR}/M', orient := 'genotype') WHERE ID IN ('var100', 'var1100', 'var2100')
+  EXCEPT ALL
+  SELECT IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var1100', 'var2100'));
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/M', orient := 'genotype') WHERE ID IN ('var100', 'var1100', 'var2100');
+----
+24
+
+# ---------------------------------------------------------------------------
+# A v1 sample-sharded catalog: one variant block (block 0).
+# ---------------------------------------------------------------------------
+statement ok
+COPY src TO '{TEST_DIR}/S' (FORMAT pfile, shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']}, index true);
+
+query III
+SELECT count(*), min(_variant_block), max(_variant_block) FROM read_parquet('{TEST_DIR}/S.pvar.index.parquet');
+----
+2999	0	0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype') WHERE ID = 'var2100';
+----
+8
