@@ -4,6 +4,8 @@
 
 require plinking_duck
 
+require parquet
+
 # Spec: docs/superpowers/specs/2026-11-19-where-region-pushdown-and-attach-cache-design.md, Part 2.
 # The ATTACH is a snapshot: the cache is never re-validated against the files.
 
@@ -57,3 +59,135 @@ DETACH yc;
 
 statement ok
 DETACH dc;
+
+# ---------------------------------------------------------------------------
+# Part 2: each cached item, proved by changing the file after the first query
+#   (CACHE true, same ATTACH): the first read is served again, rows unchanged;
+#   (CACHE false, or a fresh ATTACH): the file is read again, so the change shows (an error).
+# Oracle for "unchanged": a table of the first query. One fixture directory per item.
+# ---------------------------------------------------------------------------
+
+# --- the catalog grid (.pfile.json) ---
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/g' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+ATTACH '{TEST_DIR}/g' AS g1 (TYPE pfile_catalog);
+
+statement ok
+ATTACH '{TEST_DIR}/g' AS g0 (TYPE pfile_catalog, CACHE false);
+
+statement ok
+CREATE TABLE g_first AS SELECT ID, genotypes FROM g1.genotypes;
+
+query I
+SELECT count(*) FROM g0.genotypes;
+----
+3000
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/g.pfile.json' (FORMAT csv, header false);
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes FROM g1.genotypes EXCEPT ALL SELECT * FROM g_first)
+  UNION ALL (SELECT * FROM g_first EXCEPT ALL SELECT ID, genotypes FROM g1.genotypes));
+----
+0
+
+endloop
+
+statement error
+SELECT count(*) FROM g0.genotypes;
+----
+
+statement ok
+DETACH g1;
+
+# A fresh ATTACH reads the file again (here ATTACH itself parses it).
+statement error
+ATTACH '{TEST_DIR}/g' AS g1 (TYPE pfile_catalog);
+----
+
+# --- a sample block's .psam ---
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/p' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+ATTACH '{TEST_DIR}/p' AS p1 (TYPE pfile_catalog);
+
+statement ok
+ATTACH '{TEST_DIR}/p' AS p0 (TYPE pfile_catalog, CACHE false);
+
+statement ok
+CREATE TABLE p_first AS SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes;
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/p/GROUP=hi/samples.psam' (FORMAT csv, header false);
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes EXCEPT ALL SELECT * FROM p_first)
+  UNION ALL (SELECT * FROM p_first EXCEPT ALL SELECT ID, genotypes, ALT_FREQ FROM p1.genotypes));
+----
+0
+
+statement error
+SELECT count(*) FROM p0.genotypes;
+----
+
+statement ok
+DETACH p1;
+
+statement ok
+ATTACH '{TEST_DIR}/p' AS p1 (TYPE pfile_catalog);
+
+statement error
+SELECT count(*) FROM p1.genotypes;
+----
+
+# --- the companion paths discovery chose (a bare file set with a text .pvar) ---
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/t' (FORMAT pfile);
+
+statement ok
+ATTACH '{TEST_DIR}/t' AS t1 (TYPE pfile_catalog);
+
+statement ok
+ATTACH '{TEST_DIR}/t' AS t0 (TYPE pfile_catalog, CACHE false);
+
+statement ok
+CREATE TABLE t_first AS SELECT ID, genotypes FROM t1.genotypes;
+
+# A .pvar.parquet appears after the first query; discovery prefers it, and it is garbage.
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/t.pvar.parquet' (FORMAT csv, header false);
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes FROM t1.genotypes EXCEPT ALL SELECT * FROM t_first)
+  UNION ALL (SELECT * FROM t_first EXCEPT ALL SELECT ID, genotypes FROM t1.genotypes));
+----
+0
+
+statement error
+SELECT count(*) FROM t0.genotypes;
+----
+
+statement ok
+DETACH t1;
+
+statement ok
+ATTACH '{TEST_DIR}/t' AS t1 (TYPE pfile_catalog);
+
+statement error
+SELECT count(*) FROM t1.genotypes;
+----
