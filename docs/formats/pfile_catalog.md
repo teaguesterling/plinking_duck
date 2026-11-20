@@ -752,11 +752,14 @@ catalog has no cell to read, so its `ATTACH` raises.
 **The ATTACH cache (`CACHE`, default `true`).** Queries on one `ATTACH` reuse the metadata that
 an earlier query on it read: the parsed `.pfile.json`, the companion paths that discovery chose,
 and each `.psam`'s IIDs, FIDs and SEX codes, in a compact form (about 4 bytes plus the IID's length
-per sample). So a second query does not fetch or parse them again. The cache keeps no other `.psam`
-column. A query that reads one (a phenotype, `PAT`) reads it from disk: a `.psam.parquet` reads only
-that column, but a text `.psam` is parsed again in full. At 8M samples, a text `.psam`'s other
-columns took about 1 GB of cache, and a query that reads them now takes 4.4 s instead of 2.4 s
-(measured). For a large cohort, use a `.psam.parquet` (`COPY … (FORMAT pfile, psam_parquet)`). The ATTACH is a
+per sample). So a second query does not fetch or parse them again, and its `IID`, `FID` and `SEX`
+columns are the ATTACH's snapshot. The cache keeps no other `.psam` column. A query that reads one
+(a phenotype, `PAT`) reads it from disk: a `.psam.parquet` reads only that column, but a text `.psam`
+is parsed again in full, and a text `.psam` whose sample count or columns changed since the ATTACH
+is an error. Measured at 8M samples with a text `.psam`: the cache used to hold about 1 GB of other
+columns; now an IID-only query takes 1.2–1.4 s (2.4 s before), and a query that reads a phenotype
+takes 5.2–5.6 s (3.0 s before). For a large cohort, use a `.psam.parquet`
+(`COPY … (FORMAT pfile, psam_parquet)`). The ATTACH is a
 snapshot: the cache is never checked against the files. A file that changes after the first
 query is seen after `DETACH` and a new `ATTACH`, or with `CACHE false`:
 
