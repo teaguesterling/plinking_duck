@@ -56,19 +56,49 @@ the parsed per-cell data that is small enough to keep. `ATTACH` can turn the cac
 
 **Measure, in the PR body:** the table above again, local and remote, cold and warm, with a text `.pvar` and with a `.pvar.parquet`. Expected: the `WHERE` matches `region :=` (inferred).
 
-## Part 2: the ATTACH cache (second PR, after Part 1's numbers)
+## Part 2: the ATTACH cache (second PR)
 
-The attached catalog's storage object keeps parsed per-cell state, shared by the queries on that `ATTACH`:
-- the `.psam` sample info;
-- the `.pgen` header (`PgenFileInfo` after phase 2);
-- the variant metadata, possibly, within a memory cap.
+**What Part 1 left, measured 2026-11-19** (remote, 40 ms latency, one run each):
 
-**What to cache is decided after Part 1 is measured. (Claude's call; Teague picked "Both", which was
-offered as "a capped cache … once the pushdown's warm cost is measured".)** Holding every variant
-needs about 2 GB per 10M variants (inferred from the 2,165 MB peak above), so at most a capped LRU
-of blocks is possible. A Part-2 design gets its own approval.
+| Warm query (second run in a session) | Time | Requests per query |
+|---|---|---|
+| bare file set, `c.genotypes WHERE CHROM … POS …` (10M variants) | 0.51 s | 8 HEAD (companion discovery: `.pgen`, `.psam`, `.psam.parquet`, `.fam.parquet`, 4 × `.pvar.parquet`), 1 `.psam` GET, 2-5 `.pvar.parquet` GETs |
+| 20 x 2 matrix catalog, `c.genotypes WHERE POS …` | 0.44 s | `.pfile.json` HEAD + GET, 2 x `.psam` HEAD + GET, `.pvar` HEAD + GET (560 KB, again), 2 x `.pgen` HEAD |
+| the bare file set with `SET parquet_metadata_cache = true` | 0.51 s | `.pvar.parquet` GETs 5 -> 2; no time saved |
 
-`CACHE false` gives today's behaviour: every query reads and parses its own data.
+So a warm query spends its time on about 10 serial metadata round trips. The `.pgen` index is
+already kept by the external file cache (#126). DuckDB's footer cache does not help.
+
+**The cache.** The attached catalog owns one cache object, held in DuckDB's `ObjectCache` under a key
+unique to that ATTACH and dropped at DETACH. The views pass that key to `read_pfile` (a new
+internal named parameter, `attach_cache := '<key>'`). `read_pfile` then takes from the cache, and
+fills it on a miss:
+
+1. the parsed catalog grid (`LoadCatalogGrid`): no `.pfile.json` HEAD or GET;
+2. the companion paths that discovery resolved, for each cell or file set: no HEAD requests;
+3. each `.psam`'s parsed sample metadata (`SampleInfo` and `PfileSampleMetadata`): no `.psam` GET
+   or parse.
+
+**Not cached in this PR:** the variant metadata. A full load is about 2 GB per 10M variants
+(inferred from a 2,165 MB peak), and with a `.pvar.parquet` the region load is already small. A text
+`.pvar` stays a per-query parse (the 560 KB GET above). A capped variant cache is a possible
+follow-up.
+
+**Validity.** The ATTACH is a snapshot: the cache is never re-validated against the files. A file
+that changes after ATTACH is seen after `DETACH` and `ATTACH`, or with `CACHE false`. **(Claude's
+call; validating by mtime would cost one HEAD per file, which is the cost being removed.)**
+
+**`ATTACH … (TYPE pfile_catalog, CACHE false)`** passes no key, so every query reads and parses
+its own metadata, as today. **(Teague.)** A direct `read_pfile` call is not cached.
+
+**Expected:** a warm query does only its data reads (the `.pgen` region records), so it takes about
+0.05-0.1 s instead of 0.44-0.51 s (inferred). Memory: the grid and the paths are small. A `.psam` of
+1M samples is tens of MB (inferred, to be measured).
+
+**Tests:** the same rows with and without `CACHE false`. A request-count check that a warm query
+on the cached ATTACH opens no `.pfile.json` or `.psam`: through the range server, or a test-only
+counter, the builder picks. `DETACH` frees the entry. Two ATTACHes of one catalog do not share a
+key.
 
 ## Order with the views work
 
