@@ -6429,6 +6429,35 @@ static void PruneSamplesByIid(ClientContext &context, PfileBindData &bind_data, 
 	ApplySampleKeep(bind_data, std::move(keep));
 }
 
+//! A WHERE's CHROM/POS constraints as the one-contig region that EnsureLazyVariants loads (the
+//! parquet .pvar is region-read; BuildEffectiveVariantList keeps the matching variants). False when
+//! nothing can be pushed: no CHROM, or more than one (RegionFilter holds one contig). With an active
+//! explicit region := the two intersect; a different contig or an empty interval returns false,
+//! because the explicit region and the WHERE then select no row anyway. The WHERE still runs on every
+//! row, so a pushed region only drops rows that the WHERE drops.
+static bool PushedRegion(const CellPruneConstraints &c, const RegionFilter &explicit_region, RegionFilter &out) {
+	if (!c.has_chrom || c.chroms.size() != 1) {
+		return false;
+	}
+	RegionFilter r;
+	r.active = true;
+	r.chrom = *c.chroms.begin();
+	r.start = c.has_pos ? std::max<int64_t>(1, c.pos_lo) : 0;
+	r.end = c.has_pos ? c.pos_hi : INT64_MAX;
+	if (explicit_region.active) {
+		if (explicit_region.chrom != r.chrom) {
+			return false;
+		}
+		r.start = std::max(r.start, explicit_region.start);
+		r.end = std::min(r.end, explicit_region.end);
+	}
+	if (r.start > r.end) {
+		return false;
+	}
+	out = r;
+	return true;
+}
+
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
@@ -6440,7 +6469,12 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	const bool prune_variants = bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
 	                            bind_data.sources.size() > 1 &&
 	                            bind_data.source_ranges.size() == bind_data.sources.size();
-	if (!prune_samples && !prune_variants) {
+	// Part 1 of the WHERE -> region design: a one-contig CHROM (+ POS) constraint narrows every
+	// source's .pvar load (lazy_variants defers it to InitGlobal), single file, list or catalog.
+	const bool push_region =
+	    bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
+	    (bind_data.orient_mode == OrientMode::VARIANT || bind_data.orient_mode == OrientMode::GENOTYPE);
+	if (!prune_samples && !prune_variants && !push_region) {
 		return;
 	}
 	CellPruneConstraints c;
@@ -6467,6 +6501,10 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	}
 	if (prune_samples) {
 		PruneSamplesByIid(context, bind_data, c);
+	}
+	RegionFilter pushed;
+	if (push_region && PushedRegion(c, bind_data.region, pushed)) {
+		bind_data.region = pushed;
 	}
 	if (!prune_variants || (!c.has_chrom && !c.has_pos)) {
 		return;
