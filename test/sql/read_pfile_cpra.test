@@ -138,3 +138,62 @@ query TT
 SELECT CPRA, ID FROM c.genotypes WHERE CPRA = '1:10000:T:C';
 ----
 1:10000:T:C	var100
+
+# ---------------------------------------------------------------------------
+# Review finding: a field can contain ':' (symbolic SV alleles such as <DUP:TANDEM>, breakend ALTs,
+# some contig names). Such a CPRA has more than four parts, so a constant that does not parse as
+# four parts can still equal a row. It must narrow nothing, in = and in IN.
+# Oracle: the concatenation, filtered by the same values (no pushdown).
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sv' (FORMAT pfile);
+
+# var1100 (2:10000) and var500 (1:50000) get ALTs that contain ':'.
+statement ok
+COPY (SELECT CHROM AS "#CHROM", POS, ID, REF,
+             CASE ID WHEN 'var1100' THEN '<DUP:TANDEM>' WHEN 'var500' THEN '<DEL:ME:ALU>' ELSE ALT END AS ALT
+      FROM read_pvar('{TEST_DIR}/sv.pvar'))
+TO '{TEST_DIR}/svx.pvar' (FORMAT csv, delim '\t', header true, quote '');
+
+query T
+SELECT list(CPRA ORDER BY ID) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE ID IN ('var1100', 'var500');
+----
+['2:10000:T:<DUP:TANDEM>', '1:50000:T:<DEL:ME:ALU>']
+
+# Mixed contigs.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:<DUP:TANDEM>');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar', orient := 'genotype') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:<DUP:TANDEM>');
+----
+16
+
+# One contig.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE CPRA IN ('1:10000:T:C', '1:50000:T:<DEL:ME:ALU>');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE CPRA = '1:50000:T:<DEL:ME:ALU>';
+----
+1
+
+# A catalog, every member with ':' in a field (the cell drop must not drop the block that holds it).
+statement ok
+COPY (SELECT * FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/svcat' (FORMAT pfile, shard_by 'CHROM');
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/svcat') WHERE CPRA IN ('2:10000:T:<DUP:TANDEM>', 'x:1:A:<DEL:ME>');
+----
+1
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/svcat') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:<DUP:TANDEM>');
+----
+2
