@@ -314,6 +314,9 @@ static vector<uint8_t> CodedSexesFromMetadata(ClientContext &context, const Pfil
 	if (meta.sex_col_idx == DConstants::INVALID_INDEX) {
 		return sexes;
 	}
+	if (meta.rows_deferred) {
+		return meta.coded_sexes.size() == sample_ct ? meta.coded_sexes : vector<uint8_t>();
+	}
 	sexes.reserve(sample_ct);
 	if (!meta.from_parquet) {
 		// The common text values without a Value per row (1M samples: ~0.9 s with one, measured).
@@ -402,6 +405,8 @@ static PfileSampleMetadata LoadPfileSampleMetadata(ClientContext &context, const
 	if (iid_idx == DConstants::INVALID_INDEX) {
 		throw IOException("read_pfile: .psam/.fam file '%s' has no IID column", path);
 	}
+	meta.iid_col_idx = iid_idx;
+	meta.fid_col_idx = fid_idx;
 
 	bool has_fid = (fid_idx != DConstants::INVALID_INDEX);
 
@@ -867,6 +872,9 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 	// materializes/reads unused covariate columns. Read at scan via a per-thread
 	// cached FetchChunk (thread-safe: FetchChunk on a shared const CDC).
 	unique_ptr<ColumnDataCollection> psam_cdc;
+	//! Cache tier 2: a rows_deferred text .psam's rows, parsed at InitGlobal only when the query
+	//! projects a .psam column other than IID / FID / SEX (LoadDeferredPsamRows).
+	vector<vector<string>> deferred_psam_rows;
 	vector<idx_t> psam_chunk_start_row; // cumulative chunk offsets (size ChunkCount()+1)
 	vector<idx_t> psam_col_to_cdc;      // header col idx -> psam_cdc col idx (INVALID if not projected)
 
@@ -1370,18 +1378,59 @@ static void BuildEffectiveVariantList(PfileSource &src, const RegionFilter &regi
 //! ATTACH cache (design Part 2) wrappers for the .psam loaders: a query of an ATTACH reuses the
 //! sample metadata an earlier query parsed. `kind` keeps the loaders apart, since one path can be
 //! loaded several ways. With no cache they are the plain loaders.
+//! The SEX column's value for one text .psam field: FillSampleMetadataValue's rule (missing, 0, or
+//! not an integer -> NULL), with PfileSampleMetadata::kSexNull for NULL.
+static int32_t TextSexOutput(const string &val) {
+	if (PfileIsMissingValue(val)) {
+		return PfileSampleMetadata::kSexNull;
+	}
+	try {
+		const int32_t v = std::stoi(val);
+		return v == 0 ? PfileSampleMetadata::kSexNull : v;
+	} catch (...) {
+		return PfileSampleMetadata::kSexNull;
+	}
+}
+
+//! `allow_deferred` (cache tier 2): a text .psam may come back from the cache with its rows deferred
+//! (PfileSampleMetadata::rows_deferred). A caller that needs the rows themselves (the sample-shard
+//! merge) passes false, and then a text .psam is parsed.
 static PfileSampleMetadata LoadPfileSampleMetadataCached(ClientContext &context, const string &path,
                                                          SampleInfo &sample_info_out, PfileAttachCache *cache,
-                                                         bool from_source) {
+                                                         bool from_source, bool allow_deferred = true) {
 	const string kind = from_source ? "source" : "full";
 	PfileSampleMetadata meta;
 	if (cache && cache->GetSamples(kind, path, sample_info_out, &meta)) {
-		return meta;
+		if (allow_deferred || !meta.rows_deferred) {
+			return meta;
+		}
+		sample_info_out = SampleInfo();
 	}
 	meta = from_source ? LoadPfileSampleMetadataFromSource(context, path, sample_info_out)
 	                   : LoadPfileSampleMetadata(context, path, sample_info_out);
 	if (cache) {
-		cache->PutSamples(kind, path, sample_info_out, &meta);
+		if (meta.from_parquet) {
+			cache->PutSamples(kind, path, sample_info_out, &meta);
+		} else {
+			// The cache keeps the IDs and SEX of a text .psam, never its rows.
+			PfileSampleMetadata cached;
+			cached.header = meta.header;
+			cached.iid_col_idx = meta.iid_col_idx;
+			cached.fid_col_idx = meta.fid_col_idx;
+			cached.sex_col_idx = meta.sex_col_idx;
+			cached.parent_col_indices = meta.parent_col_indices;
+			cached.rows_deferred = true;
+			cached.text_path = path;
+			if (meta.sex_col_idx != DConstants::INVALID_INDEX) {
+				cached.sex_values.reserve(meta.rows.size());
+				for (auto &row : meta.rows) {
+					cached.sex_values.push_back(meta.sex_col_idx < row.size() ? TextSexOutput(row[meta.sex_col_idx])
+					                                                          : PfileSampleMetadata::kSexNull);
+				}
+				cached.coded_sexes = CodedSexesFromMetadata(context, meta, sample_info_out.sample_ct);
+			}
+			cache->PutSamples(kind, path, sample_info_out, &cached);
+		}
 	}
 	return meta;
 }
@@ -1461,8 +1510,9 @@ static void LoadConcatSampleMetadata(ClientContext &context, PfileBindData &bind
 		const auto &shard = bind_data.sample_shards[k];
 		SampleInfo part;
 		if (full_metadata) {
-			PfileSampleMetadata meta =
-			    LoadPfileSampleMetadataCached(context, path, part, bind_data.attach_cache.get(), parquet_full);
+			// The merge below needs every shard's rows, so no deferred text .psam here.
+			PfileSampleMetadata meta = LoadPfileSampleMetadataCached(context, path, part, bind_data.attach_cache.get(),
+			                                                         parquet_full, /*allow_deferred=*/false);
 			if (parquet_full && k == 0 && paths.size() > 1) {
 				// PsamSelectSql adds these two columns to read the shards in order.
 				for (auto &name : meta.header.column_names) {
@@ -3198,6 +3248,66 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	return std::move(bind_data);
 }
 
+//! The .psam header columns a query projects (from column_ids via the orient column maps), sorted
+//! and unique. Empty outside genotype and sample orient.
+static vector<idx_t> ProjectedPsamColumns(const PfileBindData &bind_data, const vector<column_t> &column_ids) {
+	vector<idx_t> projected;
+	if (bind_data.orient_mode != OrientMode::SAMPLE && bind_data.orient_mode != OrientMode::GENOTYPE) {
+		return projected;
+	}
+	const idx_t ncol = bind_data.sample_metadata.header.column_names.size();
+	for (auto col_id : column_ids) {
+		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+			continue;
+		}
+		idx_t psam_col = DConstants::INVALID_INDEX;
+		if (bind_data.orient_mode == OrientMode::SAMPLE) {
+			if (col_id < bind_data.sample_orient_col_to_psam_col.size()) {
+				psam_col = bind_data.sample_orient_col_to_psam_col[col_id];
+			}
+		} else if (col_id >= bind_data.geno_sample_col_start && col_id < bind_data.geno_genotype_col) {
+			const idx_t rel = col_id - bind_data.geno_sample_col_start;
+			if (rel < bind_data.geno_sample_col_to_psam_col.size()) {
+				psam_col = bind_data.geno_sample_col_to_psam_col[rel];
+			}
+		}
+		if (psam_col < ncol) {
+			projected.push_back(psam_col);
+		}
+	}
+	std::sort(projected.begin(), projected.end());
+	projected.erase(std::unique(projected.begin(), projected.end()), projected.end());
+	return projected;
+}
+
+//! Cache tier 2: a rows_deferred text .psam (served from the ATTACH cache) is parsed again only when
+//! the query projects a column the cache does not hold (anything but IID, FID and SEX). The cache is
+//! the ATTACH's snapshot, so a file whose sample count or columns changed is an error.
+static void LoadDeferredPsamRows(ClientContext &context, const PfileBindData &bind_data, PfileGlobalState &gstate,
+                                 const vector<column_t> &column_ids) {
+	auto &meta = bind_data.sample_metadata;
+	if (!meta.rows_deferred) {
+		return;
+	}
+	bool needed = false;
+	for (auto c : ProjectedPsamColumns(bind_data, column_ids)) {
+		needed = needed || (c != meta.iid_col_idx && c != meta.fid_col_idx && c != meta.sex_col_idx);
+	}
+	if (!needed) {
+		return;
+	}
+	SampleInfo fresh_info;
+	auto fresh = LoadPfileSampleMetadata(context, meta.text_path, fresh_info);
+	if (fresh.rows.size() != bind_data.sample_info.sample_ct || fresh.header.column_names != meta.header.column_names) {
+		throw IOException(
+		    "read_pfile: '%s' changed since the ATTACH read it (%llu samples and columns (%s) now; "
+		    "%llu samples and columns (%s) then). DETACH and ATTACH again, or ATTACH with CACHE false.",
+		    meta.text_path, (unsigned long long)fresh.rows.size(), StringUtil::Join(fresh.header.column_names, ", "),
+		    (unsigned long long)bind_data.sample_info.sample_ct, StringUtil::Join(meta.header.column_names, ", "));
+	}
+	gstate.deferred_psam_rows = std::move(fresh.rows);
+}
+
 //! Projection-aware load of the parquet-source psam columns into the global state.
 //! Determines which psam columns the query projects (from column_ids via the orient
 //! column maps), queries ONLY those from the source, and records chunk offsets. A
@@ -3215,38 +3325,11 @@ static void BuildProjectedPsamCdc(ClientContext &context, const PfileBindData &b
 	const idx_t ncol = meta.header.column_names.size();
 	gstate.psam_col_to_cdc.assign(ncol, DConstants::INVALID_INDEX);
 
-	// Collect the projected psam header columns (dedup, then sort ascending).
-	vector<idx_t> projected;
-	for (auto col_id : column_ids) {
-		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
-			continue;
-		}
-		idx_t psam_col = DConstants::INVALID_INDEX;
-		if (bind_data.orient_mode == OrientMode::SAMPLE) {
-			// psam metadata columns are always the leading output columns (indices
-			// 0..N-1); the genotypes/per-variant columns are beyond that, in every
-			// genotypes mode (array/list/counts/stats/struct/columns).
-			if (col_id < bind_data.sample_orient_col_to_psam_col.size()) {
-				psam_col = bind_data.sample_orient_col_to_psam_col[col_id];
-			}
-		} else { // GENOTYPE
-			if (col_id >= bind_data.geno_sample_col_start && col_id < bind_data.geno_genotype_col) {
-				idx_t rel = col_id - bind_data.geno_sample_col_start;
-				if (rel < bind_data.geno_sample_col_to_psam_col.size()) {
-					psam_col = bind_data.geno_sample_col_to_psam_col[rel];
-				}
-			}
-		}
-		if (psam_col != DConstants::INVALID_INDEX && psam_col < ncol &&
-		    gstate.psam_col_to_cdc[psam_col] == DConstants::INVALID_INDEX) {
-			gstate.psam_col_to_cdc[psam_col] = 0; // mark; real CDC index assigned below
-			projected.push_back(psam_col);
-		}
-	}
+	// The projected psam header columns, sorted and unique.
+	vector<idx_t> projected = ProjectedPsamColumns(bind_data, column_ids);
 	if (projected.empty()) {
 		return; // no psam column projected — nothing to load
 	}
-	std::sort(projected.begin(), projected.end());
 	for (idx_t i = 0; i < projected.size(); i++) {
 		gstate.psam_col_to_cdc[projected[i]] = i;
 	}
@@ -4220,6 +4303,7 @@ static unique_ptr<GlobalTableFunctionState> PfileInitGlobal(ClientContext &conte
 	// Projection-aware psam column load (parquet source): materialize only the psam
 	// columns this query actually selects.
 	BuildProjectedPsamCdc(context, bind_data, *state, input.column_ids);
+	LoadDeferredPsamRows(context, bind_data, *state, input.column_ids);
 
 	return std::move(state);
 }
@@ -5080,8 +5164,32 @@ static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileGlobal
 	auto &meta = bind_data.sample_metadata;
 
 	if (!meta.from_parquet) {
-		if (sample_file_idx < meta.rows.size() && psam_col_idx < meta.rows[sample_file_idx].size()) {
-			FillSampleMetadataValue(out_vec, out_row, meta.rows[sample_file_idx][psam_col_idx], psam_col_idx, meta);
+		const auto *rows = &meta.rows;
+		if (meta.rows_deferred) {
+			// Cache tier 2: IID, FID and SEX from the ATTACH's snapshot; other columns from the rows
+			// LoadDeferredPsamRows parsed at InitGlobal.
+			const auto &info = bind_data.sample_info;
+			if (psam_col_idx == meta.iid_col_idx && sample_file_idx < info.iids.size()) {
+				FillSampleMetadataValue(out_vec, out_row, info.iids[sample_file_idx], psam_col_idx, meta);
+				return;
+			}
+			if (psam_col_idx == meta.fid_col_idx && sample_file_idx < info.fids.size()) {
+				FillSampleMetadataValue(out_vec, out_row, info.fids[sample_file_idx], psam_col_idx, meta);
+				return;
+			}
+			if (psam_col_idx == meta.sex_col_idx && sample_file_idx < meta.sex_values.size()) {
+				const int32_t v = meta.sex_values[sample_file_idx];
+				if (v == PfileSampleMetadata::kSexNull) {
+					FlatVector::SetNull(out_vec, out_row, true);
+				} else {
+					CompatFlatDataMutable<int32_t>(out_vec)[out_row] = v;
+				}
+				return;
+			}
+			rows = &gstate.deferred_psam_rows;
+		}
+		if (sample_file_idx < rows->size() && psam_col_idx < (*rows)[sample_file_idx].size()) {
+			FillSampleMetadataValue(out_vec, out_row, (*rows)[sample_file_idx][psam_col_idx], psam_col_idx, meta);
 		} else {
 			FlatVector::SetNull(out_vec, out_row, true);
 		}

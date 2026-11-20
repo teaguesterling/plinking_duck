@@ -3,6 +3,8 @@
 #include "duckdb.hpp"
 #include "psam_reader.hpp"
 
+#include <limits>
+
 namespace duckdb {
 
 //! Extended sample info for genotype orient mode: includes all psam columns.
@@ -32,6 +34,17 @@ struct PfileSampleMetadata {
 	//! True when the psam came from a parquet/non-native source: column data is not
 	//! in `rows`; the scan reads it from the projection-aware CDC in the global state.
 	bool from_parquet = false;
+
+	//! Cache tier 2 (Teague, 2026-11-20): a text .psam served from the ATTACH cache has no `rows`.
+	//! Its IID, FID and SEX columns come from the cache (SampleInfo iids/fids, sex_values) as the
+	//! ATTACH's snapshot; a query that projects another column parses `text_path` at InitGlobal.
+	bool rows_deferred = false;
+	string text_path;
+	//! rows_deferred only: the SEX column's output per sample (FillSampleMetadataValue's rule), with
+	//! kSexNull for NULL, and the coded SEX for chrX/Y (CodedSexesFromMetadata's result).
+	static constexpr int32_t kSexNull = std::numeric_limits<int32_t>::min();
+	vector<int32_t> sex_values;
+	vector<uint8_t> coded_sexes;
 };
 
 } // namespace duckdb
