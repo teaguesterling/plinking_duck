@@ -191,3 +191,64 @@ ATTACH '{TEST_DIR}/t' AS t1 (TYPE pfile_catalog);
 statement error
 SELECT count(*) FROM t1.genotypes;
 ----
+
+# ---------------------------------------------------------------------------
+# Part 3 (review findings): a setting that changes discovery is part of the cache key; the
+# cached memory is counted, and DETACH frees it.
+# ---------------------------------------------------------------------------
+
+# A bare file set with a text .psam and a .psam.parquet whose IIDs differ (PQ_*).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/f' (FORMAT pfile);
+
+statement ok
+COPY (SELECT 'PQ_' || IID AS IID FROM read_psam('{TEST_DIR}/f.psam')) TO '{TEST_DIR}/f.psam.parquet' (FORMAT parquet);
+
+statement ok
+ATTACH '{TEST_DIR}/f' AS fa (TYPE pfile_catalog);
+
+query T
+SELECT min(IID) FROM fa.genotypes_by_sample;
+----
+PQ_SAMP1
+
+# SET plinking_use_parquet_companions = false must still take effect on the cached ATTACH.
+statement ok
+SET plinking_use_parquet_companions = false;
+
+query T
+SELECT min(IID) FROM fa.genotypes_by_sample;
+----
+SAMP1
+
+statement ok
+RESET plinking_use_parquet_companions;
+
+query T
+SELECT min(IID) FROM fa.genotypes_by_sample;
+----
+PQ_SAMP1
+
+statement ok
+DETACH fa;
+
+# The cache is counted in DuckDB's memory accounting (OBJECT_CACHE), and DETACH frees it.
+statement ok
+ATTACH 'test/data/large_example' AS ma (TYPE pfile_catalog);
+
+statement ok
+SELECT count(*) FROM ma.genotypes_by_sample;
+
+query I
+SELECT memory_usage_bytes > 0 FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+----
+true
+
+statement ok
+DETACH ma;
+
+query I
+SELECT memory_usage_bytes FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+----
+0
