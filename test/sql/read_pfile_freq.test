@@ -299,15 +299,14 @@ SELECT count(*) FROM read_pfile('{TEST_DIR}/leak', freq := true);
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
-statement error
+# Genotype orient takes freq := true (read_pfile_freq_genotype.test checks its values).
+statement ok
 SELECT * FROM read_pfile('test/data/sexchr_example', freq := true, orient := 'genotype');
-----
-freq := true needs orient := 'variant'
 
 statement error
 SELECT * FROM read_pfile('test/data/sexchr_example', freq := true, orient := 'sample');
 ----
-freq := true needs orient := 'variant'
+freq := true needs orient := 'variant' or 'genotype'
 
 statement error
 SELECT * FROM read_pfile('test/data/sexchr_example', freq := true, dosages := true);
