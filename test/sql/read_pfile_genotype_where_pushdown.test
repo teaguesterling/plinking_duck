@@ -252,6 +252,7 @@ SELECT plinking_debug_genotype_where_pushed();
 2
 
 # WHERE genotype > 0.5
+# (a non-integer constant: the binder casts the column, so nothing is pushed)
 statement ok
 SELECT plinking_debug_genotype_where_pushed_reset();
 
@@ -260,12 +261,23 @@ SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large
 ----
 0
 
-# WHERE genotype + 0 > 0
+query I
+SELECT plinking_debug_genotype_where_pushed();
+----
+0
+
+# WHERE abs(genotype) > 0
+# (a function DuckDB does not fold away: nothing is pushed; DuckDB folds genotype + 0, so that form is)
 statement ok
 SELECT plinking_debug_genotype_where_pushed_reset();
 
 query I
-SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype + 0 > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE genotype + 0 > 0) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE genotype + 0 > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE genotype + 0 > 0)));
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE abs(genotype) > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM t WHERE abs(genotype) > 0) UNION ALL ((SELECT ID, IID, genotype FROM t WHERE abs(genotype) > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE abs(genotype) > 0)));
+----
+0
+
+query I
+SELECT plinking_debug_genotype_where_pushed();
 ----
 0
 
