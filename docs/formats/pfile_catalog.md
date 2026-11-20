@@ -684,18 +684,44 @@ The path resolves in order: a literal `.pfile.json` is used as-is; otherwise
 `<path>.pfile.json` if it exists; otherwise `<path>.pgen` as a bare fileset (one
 synthetic cell); otherwise `ATTACH` raises.
 
-The attached database holds seven views. Each one is backed by a shipped reader:
+The attached database holds ten views. Each one is backed by a shipped reader:
 
-| Relation | Backed by |
-|---|---|
-| `c.variants` | the distinct variant-block `.pvar` (`read_pvar`) |
-| `c.samples` | the distinct sample-block `.psam` (`read_psam`) |
-| `c.genotypes` | the catalog read, `read_pfile(catalog := …)`: one row per variant with every sample, plus the `plink_freq` columns (a matrix with holes: one row per variant per sample block, see below) |
-| `c.genotypes_by_sample` | the same cells, sample-oriented. For a matrix: `read_pfile(catalog := …, orient := 'sample')`, one row per sample across every block |
-| `c.cells` | `read_pfile_catalog` — one row per surviving cell |
-| `c.variant_blocks`, `c.sample_blocks` | the per-axis block tiling |
+| Relation | One row per | Backed by |
+|---|---|---|
+| `c.genotypes` | variant × sample | `read_pfile(catalog := …, orient := 'genotype', freq := true)`: `IID`, `genotype`, `CPRA` and the `plink_freq` columns |
+| `c.genotypes_by_variant` | variant | `read_pfile(catalog := …, genotypes := 'columns', freq := true)`: one column per sample IID, plus `CPRA` and the freq columns |
+| `c.genotypes_by_sample` | sample | `read_pfile(catalog := …, orient := 'sample', genotypes := 'columns', unique_column_names := true)`: one column per variant ID |
+| `c.genotypes_by_variant_list` | variant | `read_pfile(catalog := …, freq := true)`: a `genotypes` list, plus `CPRA` and the freq columns |
+| `c.genotypes_by_sample_list` | sample | `read_pfile(catalog := …, orient := 'sample')`: a `genotypes` list |
+| `c.variants` | variant | the distinct variant-block `.pvar` (`read_pvar`) |
+| `c.samples` | sample | the distinct sample-block `.psam` (`read_psam`) |
+| `c.cells` | cell | `read_pfile_catalog`: one row per surviving cell |
+| `c.variant_blocks`, `c.sample_blocks` | block | the per-axis block tiling |
 
-The four data views are the same for every kind. The structural views vary: `c.cells` is
+A bare file set reads the same shapes through `read_pfile('<prefix>', …)`.
+
+**Breaking change (views PR 3):** `c.genotypes` was one row per variant with a genotypes list. That
+view is now `c.genotypes_by_variant_list`, and the old `c.genotypes_by_sample` is now
+`c.genotypes_by_sample_list`. The tall `c.genotypes` makes the common reads one `WHERE`:
+
+```sql
+SELECT * FROM c.genotypes WHERE ID = 'rs123';                                        -- one variant
+SELECT * FROM c.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0;
+SELECT DISTINCT IID FROM c.genotypes WHERE ID IN ('rs1', 'rs2', 'rs3') AND genotype = 2;
+```
+
+- **Column names in the wide views.** `c.genotypes_by_sample` names each column by its variant ID.
+  A `.`, empty or duplicate ID is named by its `CPRA`, then `<CPRA>_<n>` if that is also taken.
+- **The width of a wide view.** Its schema has one column per sample, or per variant, so every query
+  on it binds all of them, and every query on `c.genotypes_by_sample` loads every `.pvar`. The bind
+  cost grows faster than the column count. Measured on 10,000 samples: `DESCRIBE` of the by-sample
+  read took 0.64 s at 10,000 variants, 2.38 s at 20,000 and 5.19 s at 30,000. A schema browser that
+  lists every column (`duckdb_columns()`) pays this too. For a large cohort, use `c.genotypes` with a
+  region or `IID` filter.
+- **The order of the list views.** Element *i* of a `genotypes` list is row *i* of `c.samples`
+  (`c.genotypes_by_variant_list`) or of `c.variants` (`c.genotypes_by_sample_list`).
+
+The genotype views are the same for every kind. The structural views vary: `c.cells` is
 the kind's own manifest; the block views carry each kind's structure — a matrix's typed
 per-key tiling, a multi-file cohort's shards on its concat axis, or one row for a single
 fileset. A v1 cohort's non-concat (shared) axis has no declared extent, so that block row
@@ -716,7 +742,7 @@ ATTACH 's3://bucket/cohort' AS c (TYPE pfile_catalog);               -- cached
 ATTACH 's3://bucket/cohort' AS c (TYPE pfile_catalog, CACHE false);  -- reads metadata every query
 ```
 
-The cache serves `c.genotypes` and `c.genotypes_by_sample`. `c.samples` and `c.variants` read
+The cache serves the five genotype views. `c.samples` and `c.variants` read
 their files every query, so after a file changes they can disagree with the cached views until a new
 `ATTACH`. A setting that changes which companion is found (`plinking_use_parquet_companions`,
 `file_search_path`) takes effect at once: it is part of the cache key. The variant metadata
@@ -738,33 +764,33 @@ SET parquet_metadata_cache = true;      -- parquet companion footers read once
 Measured on 2026-11-19, a warm query on an attached 20 × 2 matrix over a range server with 40 ms
 latency: 0.426 s without `enable_http_metadata_cache`, 0.183 s with it.
 
-**`c.genotypes` is one row per variant.** It is
+**The catalog read.** Every view of a catalog is
 [`read_pfile(catalog := …)`](../functions/read_pfile.md#catalog-input-catalog): within each
-variant block the sample blocks are concatenated, so each row's `genotypes` holds every sample
-of the cohort, in sample-block order. Each cell is read with its **template-resolved** `.pvar`
-and `.psam`, so a cell needs no companion files of its own.
+variant block the sample blocks are concatenated, and each cell is read with its
+**template-resolved** `.pvar` and `.psam`. A `WHERE` on `CHROM` or `POS` drops whole variant blocks
+before they are read, when the catalog's declared ranges prove that no row can match. In
+`c.genotypes`, a `WHERE IID` also drops sample blocks, when the query reads no freq column (a
+`SELECT *` reads them, so name the columns). The filter still runs on the rest, so the rows are the
+same.
 
-A `WHERE` on `CHROM` or `POS` drops whole variant blocks before they are read, when the
-catalog's declared ranges prove that no row can match. The filter still runs on the rest, so
-the rows are the same. For example, `SELECT * FROM c.genotypes WHERE CHROM = '2'` opens only
-the `CHROM=2` block's cells.
+**A matrix with holes** (an absent cell) has no 2-D read yet. On a grid with more than one sample
+block, `c.genotypes` is the `UNION ALL` of the present cells' tall reads: a hole gives no rows, and
+each row's freq columns count only its own sample block. The four wide and list views raise
+"a matrix with holes is not supported yet" at bind, so use `c.genotypes`. On a grid with one sample
+block, a hole removes a whole variant block: the variant-row views work, and the sample-row views
+work only when each cell has its own `.pvar` beside its `.pgen` (the writer's layout does not).
 
-In v0.16.0 and earlier, a matrix's `c.genotypes` returned one row per variant **per sample
-block**, each row with only that block's samples. A matrix **with holes** still does: a 2-D read
-of a holed grid is not defined yet. There, `count(*) FROM c.genotypes` is variants × sample
-blocks, the `genotypes` column is a fixed `ARRAY` only when every sample block has the same
-width (else a `LIST`), and a `WHERE` drops no cell.
+**The variant-row views have the `CPRA` column** ([`CHROM:POS:REF:ALT`](../functions/read_pfile.md#the-cpra-column)), so `SELECT * FROM c.genotypes WHERE CPRA = '1:10000:T:C'` works and reads only that region. `COPY (SELECT * FROM c.genotypes_by_variant_list) …` writes it as an extra column of the text `.pvar`, as it does the freq columns (a `.pvar.parquet` companion keeps only CHROM to ALT and `__vidx`).
 
-**`c.genotypes` has the `CPRA` column** ([`CHROM:POS:REF:ALT`](../functions/read_pfile.md#the-cpra-column)), so `SELECT * FROM c.genotypes WHERE CPRA = '1:10000:T:C'` works and reads only that region. `COPY (SELECT * FROM c.genotypes) …` writes it as an extra column of the text `.pvar`, as it does the freq columns (a `.pvar.parquet` companion keeps only CHROM to ALT and `__vidx`).
-
-**`c.genotypes` has the `plink_freq` columns.** Every kind passes
+**The variant-row views have the `plink_freq` columns.** Every kind passes
 [`freq := true`](../functions/read_pfile.md#frequency-columns-freq), so the view adds `ALT_FREQ`,
 `OBS_CT`, `HOM_REF_CT`, `HET_CT`, `HOM_ALT_CT` and `MISSING_CT`, with `plink_freq(counts := true)`'s
 values over the whole cohort. A query that names only these columns reads counts, not genotypes:
-`SELECT ID, HET_CT FROM c.genotypes WHERE ALT_FREQ < 0.01`. On a matrix with holes, each row counts
-only its own sample block. `c.genotypes_by_sample` does not have these columns.
+`SELECT ID, HET_CT FROM c.genotypes_by_variant_list WHERE ALT_FREQ < 0.01` (on the tall `c.genotypes`
+it gives one row per sample). The sample-row views do not have these
+columns.
 
-`COPY (SELECT * FROM c.genotypes) TO … (FORMAT pfile)` writes the six columns into the output
+`COPY (SELECT * FROM c.genotypes_by_variant_list) TO … (FORMAT pfile)` writes the six columns into the output
 `.pvar` as extra columns, because the writer keeps every extra input column. Name the columns to
 write, or use `SELECT * EXCLUDE (CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT)`.
 
@@ -799,11 +825,9 @@ verifies every present cell first. Holes are never verified. See
 
 ### What version 2 does not do yet
 
-- **No sample-oriented read of a matrix with holes.** `c.genotypes_by_sample` is the 2-D read
-  ([`read_pfile(catalog := …)`](../functions/read_pfile.md#catalog-input-catalog)). It
-  gives one row per sample, with every variant from every variant block. On a matrix with a hole
-  (an absent cell), it raises an error, because a 2-D read of a holed grid is not defined yet.
-  `c.genotypes` and the other relations read a holed matrix normally.
+- **No 2-D read of a matrix with holes.** On a holed grid with more than one sample block, the
+  wide and list genotype views raise an error, and `c.genotypes` reads the present cells (see
+  "A matrix with holes" above). The target is NULL in a hole's positions; it is not built yet.
 
 - **Cell skip has limits.** A `WHERE` on `CHROM` / `POS` drops variant blocks of
   `c.genotypes`. A `WHERE IID = …` or `IID IN (…)` drops sample blocks of

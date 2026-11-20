@@ -108,14 +108,14 @@ statement ok
 ATTACH '__TEST_DIR__/ss.pfile.json' AS ssw (TYPE pfile_catalog);
 
 query II
-SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM ssw.genotypes EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example')))
-     + (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example') EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM ssw.genotypes)),
+SELECT (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM ssw.genotypes_by_variant_list EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example')))
+     + (SELECT count(*) FROM (SELECT CHROM, POS, ID, REF, ALT, genotypes FROM read_pfile('test/data/large_example') EXCEPT ALL SELECT CHROM, POS, ID, REF, ALT, genotypes FROM ssw.genotypes_by_variant_list)),
        (SELECT count(*) FROM ssw.samples);
 ----
 0	8
 
 query I
-SELECT count(*) FROM (SELECT IID, genotypes FROM ssw.genotypes_by_sample EXCEPT ALL SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample'));
+SELECT count(*) FROM (SELECT IID, genotypes FROM ssw.genotypes_by_sample_list EXCEPT ALL SELECT IID, genotypes FROM read_pfile('test/data/large_example', orient := 'sample'));
 ----
 0
 
