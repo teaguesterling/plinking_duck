@@ -1,0 +1,385 @@
+# name: test/sql/attach_pfile_catalog_views.test
+# description: the five ATTACH genotype views (tall genotypes, wide genotypes_by_variant / genotypes_by_sample, and their _list forms) on every catalog kind equal read_pfile on the source
+# group: [sql]
+
+require plinking_duck
+
+# Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, sections 1, 1b and 3. Oracle:
+# large_example (3000 variants x 8 samples, IDs var1..var3000) read directly. Kinds: b = the bare
+# file set, vs = a v1 variant-sharded catalog, ss = a v1 sample-sharded catalog, mx = a 3 x 2 matrix.
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/vs' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/ss' (FORMAT pfile, shard_samples {a: ['SAMP1', 'SAMP2', 'SAMP3'], b: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/mx' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+ATTACH 'test/data/large_example' AS b (TYPE pfile_catalog);
+
+statement ok
+ATTACH '{TEST_DIR}/vs' AS vs (TYPE pfile_catalog);
+
+statement ok
+ATTACH '{TEST_DIR}/ss' AS ss (TYPE pfile_catalog);
+
+statement ok
+ATTACH '{TEST_DIR}/mx' AS mx (TYPE pfile_catalog);
+
+# Every kind has the five views.
+query II
+SELECT database_name, list(view_name ORDER BY view_name) FROM duckdb_views()
+WHERE database_name IN ('b', 'vs', 'ss', 'mx') AND view_name LIKE 'genotypes%' GROUP BY 1 ORDER BY 1;
+----
+b	[genotypes, genotypes_by_sample, genotypes_by_sample_list, genotypes_by_variant, genotypes_by_variant_list]
+mx	[genotypes, genotypes_by_sample, genotypes_by_sample_list, genotypes_by_variant, genotypes_by_variant_list]
+ss	[genotypes, genotypes_by_sample, genotypes_by_sample_list, genotypes_by_variant, genotypes_by_variant_list]
+vs	[genotypes, genotypes_by_sample, genotypes_by_sample_list, genotypes_by_variant, genotypes_by_variant_list]
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+# --- b ---
+# Tall c.genotypes = genotype orient with freq and CPRA (Review Focus 1).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM b.genotypes) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) UNION ALL ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM b.genotypes)));
+----
+0
+
+# Wide by variant: one column per IID (Review Focus 2).
+query I
+SELECT count(*) FROM ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM b.genotypes_by_variant) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) UNION ALL ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM b.genotypes_by_variant)));
+----
+0
+
+# Wide by sample: one column per variant ID.
+query I
+SELECT count(*) FROM ((SELECT IID, var1, var100, var1100, var3000 FROM b.genotypes_by_sample) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) UNION ALL ((SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM b.genotypes_by_sample)));
+----
+0
+
+# The list views keep today's shape.
+query I
+SELECT count(*) FROM b.genotypes_by_variant_list;
+----
+3000
+
+query I
+SELECT count(*) FROM b.genotypes_by_sample_list;
+----
+8
+
+# List order: element i of a list row is row i of b.samples / b.variants (Review Focus 4).
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT ID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM b.genotypes_by_variant_list) l
+  JOIN (SELECT IID, row_number() OVER () AS i FROM b.samples) s USING (i)
+  JOIN b.genotypes t ON t.ID = l.ID AND t.IID = s.IID;
+----
+24000	0
+
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT IID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM b.genotypes_by_sample_list) l
+  JOIN (SELECT ID, row_number() OVER () AS i FROM b.variants) v USING (i)
+  JOIN b.genotypes t ON t.ID = v.ID AND t.IID = l.IID;
+----
+24000	0
+
+# Q1 / Q2 / Q3 on the tall view (Review Focus 5).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM b.genotypes WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM b.genotypes WHERE ID = 'var100')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM b.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM b.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT DISTINCT IID FROM b.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) UNION ALL ((SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM b.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2)));
+----
+0
+
+# --- vs ---
+# Tall c.genotypes = genotype orient with freq and CPRA (Review Focus 1).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM vs.genotypes) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) UNION ALL ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM vs.genotypes)));
+----
+0
+
+# Wide by variant: one column per IID (Review Focus 2).
+query I
+SELECT count(*) FROM ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM vs.genotypes_by_variant) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) UNION ALL ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM vs.genotypes_by_variant)));
+----
+0
+
+# Wide by sample: one column per variant ID.
+query I
+SELECT count(*) FROM ((SELECT IID, var1, var100, var1100, var3000 FROM vs.genotypes_by_sample) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) UNION ALL ((SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM vs.genotypes_by_sample)));
+----
+0
+
+# The list views keep today's shape.
+query I
+SELECT count(*) FROM vs.genotypes_by_variant_list;
+----
+3000
+
+query I
+SELECT count(*) FROM vs.genotypes_by_sample_list;
+----
+8
+
+# List order: element i of a list row is row i of vs.samples / vs.variants (Review Focus 4).
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT ID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM vs.genotypes_by_variant_list) l
+  JOIN (SELECT IID, row_number() OVER () AS i FROM vs.samples) s USING (i)
+  JOIN vs.genotypes t ON t.ID = l.ID AND t.IID = s.IID;
+----
+24000	0
+
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT IID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM vs.genotypes_by_sample_list) l
+  JOIN (SELECT ID, row_number() OVER () AS i FROM vs.variants) v USING (i)
+  JOIN vs.genotypes t ON t.ID = v.ID AND t.IID = l.IID;
+----
+24000	0
+
+# Q1 / Q2 / Q3 on the tall view (Review Focus 5).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM vs.genotypes WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM vs.genotypes WHERE ID = 'var100')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM vs.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM vs.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT DISTINCT IID FROM vs.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) UNION ALL ((SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM vs.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2)));
+----
+0
+
+# --- ss ---
+# Tall c.genotypes = genotype orient with freq and CPRA (Review Focus 1).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM ss.genotypes) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) UNION ALL ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM ss.genotypes)));
+----
+0
+
+# Wide by variant: one column per IID (Review Focus 2).
+query I
+SELECT count(*) FROM ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM ss.genotypes_by_variant) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) UNION ALL ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM ss.genotypes_by_variant)));
+----
+0
+
+# Wide by sample: one column per variant ID.
+query I
+SELECT count(*) FROM ((SELECT IID, var1, var100, var1100, var3000 FROM ss.genotypes_by_sample) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) UNION ALL ((SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM ss.genotypes_by_sample)));
+----
+0
+
+# The list views keep today's shape.
+query I
+SELECT count(*) FROM ss.genotypes_by_variant_list;
+----
+3000
+
+query I
+SELECT count(*) FROM ss.genotypes_by_sample_list;
+----
+8
+
+# List order: element i of a list row is row i of ss.samples / ss.variants (Review Focus 4).
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT ID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM ss.genotypes_by_variant_list) l
+  JOIN (SELECT IID, row_number() OVER () AS i FROM ss.samples) s USING (i)
+  JOIN ss.genotypes t ON t.ID = l.ID AND t.IID = s.IID;
+----
+24000	0
+
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT IID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM ss.genotypes_by_sample_list) l
+  JOIN (SELECT ID, row_number() OVER () AS i FROM ss.variants) v USING (i)
+  JOIN ss.genotypes t ON t.ID = v.ID AND t.IID = l.IID;
+----
+24000	0
+
+# Q1 / Q2 / Q3 on the tall view (Review Focus 5).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM ss.genotypes WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM ss.genotypes WHERE ID = 'var100')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM ss.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM ss.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT DISTINCT IID FROM ss.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) UNION ALL ((SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM ss.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2)));
+----
+0
+
+# --- mx ---
+# Tall c.genotypes = genotype orient with freq and CPRA (Review Focus 1).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM mx.genotypes) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) UNION ALL ((SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', orient := 'genotype', freq := true)) EXCEPT ALL (SELECT ID, IID, genotype, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM mx.genotypes)));
+----
+0
+
+# Wide by variant: one column per IID (Review Focus 2).
+query I
+SELECT count(*) FROM ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM mx.genotypes_by_variant) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) UNION ALL ((SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM read_pfile('test/data/large_example', genotypes := 'columns', freq := true)) EXCEPT ALL (SELECT ID, SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8, CPRA, ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT FROM mx.genotypes_by_variant)));
+----
+0
+
+# Wide by sample: one column per variant ID.
+query I
+SELECT count(*) FROM ((SELECT IID, var1, var100, var1100, var3000 FROM mx.genotypes_by_sample) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) UNION ALL ((SELECT IID, var1, var100, var1100, var3000 FROM read_pfile('test/data/large_example', orient := 'sample', genotypes := 'columns')) EXCEPT ALL (SELECT IID, var1, var100, var1100, var3000 FROM mx.genotypes_by_sample)));
+----
+0
+
+# The list views keep today's shape.
+query I
+SELECT count(*) FROM mx.genotypes_by_variant_list;
+----
+3000
+
+query I
+SELECT count(*) FROM mx.genotypes_by_sample_list;
+----
+8
+
+# List order: element i of a list row is row i of mx.samples / mx.variants (Review Focus 4).
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT ID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM mx.genotypes_by_variant_list) l
+  JOIN (SELECT IID, row_number() OVER () AS i FROM mx.samples) s USING (i)
+  JOIN mx.genotypes t ON t.ID = l.ID AND t.IID = s.IID;
+----
+24000	0
+
+query II
+SELECT count(*), count(*) FILTER (t.genotype IS DISTINCT FROM l.g) FROM
+  (SELECT IID, unnest(genotypes) AS g, generate_subscripts(genotypes, 1) AS i FROM mx.genotypes_by_sample_list) l
+  JOIN (SELECT ID, row_number() OVER () AS i FROM mx.variants) v USING (i)
+  JOIN mx.genotypes t ON t.ID = v.ID AND t.IID = l.IID;
+----
+24000	0
+
+# Q1 / Q2 / Q3 on the tall view (Review Focus 5).
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM mx.genotypes WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100') EXCEPT ALL (SELECT ID, IID, genotype FROM mx.genotypes WHERE ID = 'var100')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT ID, IID, genotype FROM mx.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) UNION ALL ((SELECT ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0) EXCEPT ALL (SELECT ID, IID, genotype FROM mx.genotypes WHERE CHROM = '1' AND POS BETWEEN 3000 AND 4000 AND genotype > 0)));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT DISTINCT IID FROM mx.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) UNION ALL ((SELECT DISTINCT IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2) EXCEPT ALL (SELECT DISTINCT IID FROM mx.genotypes WHERE ID IN ('var100', 'var200', 'var1100') AND genotype = 2)));
+----
+0
+
+endloop
+
+# The tall view's row count.
+query I
+SELECT count(*) FROM mx.genotypes;
+----
+24000
+
+# ---------------------------------------------------------------------------
+# unique_column_names := true (section 3): a '.', empty or duplicate ID column is named by its CPRA,
+# then _<n>. dup: POS 100 and 200 have ID '.', POS 300 and 400 both have ID 'var4' (large_example's
+# IDs are var<POS/100>).
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT CHROM, POS,
+             CASE WHEN POS IN (100, 200) THEN '.' WHEN POS = 300 THEN 'var4' ELSE ID END AS ID,
+             REF, ALT, genotypes
+      FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '1' AND POS <= 500 ORDER BY POS)
+TO '{TEST_DIR}/dup' (FORMAT pfile);
+
+query I
+SELECT (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM read_pfile('{TEST_DIR}/dup', orient := 'sample', genotypes := 'columns', unique_column_names := true)))
+     = (SELECT ['IID'] || list(CASE WHEN POS IN (100, 200, 400) THEN CHROM || ':' || POS || ':' || REF || ':' || ALT ELSE ID END ORDER BY POS)
+        FROM read_pvar('{TEST_DIR}/dup.pvar'));
+----
+true
+
+# Without the option, a duplicate ID is still an error.
+statement error
+SELECT * FROM read_pfile('{TEST_DIR}/dup', orient := 'sample', genotypes := 'columns');
+----
+appears more than once
+
+# The ATTACH by-sample view uses the option.
+statement ok
+ATTACH '{TEST_DIR}/dup' AS d (TYPE pfile_catalog);
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM d.genotypes_by_sample);
+----
+6
+
+# ---------------------------------------------------------------------------
+# Review finding (Critical): a holed matrix's tall view is the UNION ALL of the present cells' reads.
+# Sample blocks whose .psam headers differ (#FID IID vs #IID SEX) must still put each value under its
+# own column name, not by position. hm: the 3 x 2 matrix, lo = SAMP1-3, hi = SAMP4-8; hole: CHROM 3 x hi.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/hm' (FORMAT pfile, shard_by 'CHROM', shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3'], hi: ['SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#FID', 'IID'), ('F1', 'SAMP1'), ('F2', 'SAMP2'), ('F3', 'SAMP3')))
+TO '{TEST_DIR}/hm/GROUP=lo/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#IID', 'SEX'), ('SAMP4', '1'), ('SAMP5', '2'), ('SAMP6', '1'), ('SAMP7', '2'), ('SAMP8', '1')))
+TO '{TEST_DIR}/hm/GROUP=hi/samples.psam' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT regexp_replace(content, '}\s*$', ', "holes": [{"CHROM": "3", "GROUP": "hi"}]}') FROM read_text('{TEST_DIR}/hm.pfile.json'))
+TO '{TEST_DIR}/hmh.pfile.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x01');
+
+statement ok
+ATTACH '{TEST_DIR}/hmh.pfile.json' AS hh (TYPE pfile_catalog);
+
+# Every IID is a real IID, and SAMP5 has its two present variant blocks (CHROM 1 and 2).
+query I
+SELECT list(DISTINCT IID ORDER BY IID) FROM hh.genotypes;
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+query I
+SELECT count(*) FROM hh.genotypes WHERE IID = 'SAMP5';
+----
+2000
+
+# Each block's own columns carry its values; the other block's are NULL.
+query IIII
+SELECT count(*) FILTER (IID = 'SAMP1' AND FID = 'F1'), count(*) FILTER (IID = 'SAMP5' AND SEX = 2),
+       count(*) FILTER (IID = 'SAMP5' AND FID IS NOT NULL), count(*) FILTER (IID = 'SAMP1' AND SEX IS NOT NULL)
+FROM hh.genotypes;
+----
+3000	2000	0	0

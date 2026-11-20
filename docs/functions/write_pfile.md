@@ -67,6 +67,7 @@ target is stripped to the prefix, so `TO 'out'` and `TO 'out.pfile'` both write
 | `pvar` / `pgen` / `psam` | `VARCHAR` | `prefix.{pvar,pgen,psam}` | Per-file path overrides (symmetric with the reader's path overrides). |
 | `pvar_parquet` | flag | off | Also write a region-prunable parquet `.pvar` companion. See [Parquet `.pvar` companion](#parquet-pvar-companion-pvar_parquet). |
 | `psam_parquet` | flag | off | Also write a parquet `.psam` companion (a single `IID` column for the bundle). See [Parquet `.psam` companion](#parquet-psam-companion-psam_parquet). |
+| `index` | flag | off | Also write the ID index `<prefix>.pvar.index.parquet`, so a `WHERE ID` reads only the matching variants. See [ID index](#id-index-index). |
 | `shard_by` | `VARCHAR` | *(none)* | Shard along the **variant** axis by a key column. See [Sharded output](#sharded-output-shard_by). |
 | `shard_samples` | `STRUCT` | *(none)* | Shard along the **sample** axis into named IID groups. See [Sample-sharded output](#sample-sharded-output-shard_samples). |
 | `force` | `BOOLEAN` | `false` | Replace existing output. Without it, a `COPY` onto an existing target is an error. See [Existing output](#existing-output-force). |
@@ -148,6 +149,23 @@ matrix write emits one `.psam.parquet` per sample axis, and the catalog declares
 each. As with `pvar_parquet`, a rewrite with `force` and without `psam_parquet`
 removes a stale companion.
 The reader side is in [Reading parquet companions](../formats/pfile_catalog.md#reading-parquet-companions).
+
+### ID index (`index`)
+
+`COPY … TO 'out' (FORMAT pfile, index)` also writes `out.pvar.index.parquet`, after the other files.
+It has one row per variant with an ID, sorted by `ID`: `ID`, `_pvar_ordinal` (the `.pgen` record
+index), and, for a sharded or matrix write, `_variant_block` (the variant block's position in the
+catalog). It is written with `PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192`. A `NULL`
+(`.`) or empty ID is left out.
+
+- `read_pfile` finds it by name. See [The ID index](read_pfile.md#the-id-index-ppvarindexparquet).
+- A rewrite with `force` removes an old index first, with or without `index`: an index of other
+  output loses rows. Without `force`, an existing index refuses the COPY, as the other files do.
+- `index` cannot be combined with a `pvar`, `pgen` or `psam` path override.
+- The index is written last, after the other files are in place. If that step fails, the COPY
+  reports an error, the new files stay, and no index is left (a read is then only slower).
+- A standalone `COPY … (FORMAT pvar)` to `<p>.pvar` also removes `<p>.pvar.index.parquet` under
+  `force` (and refuses without it), since the index holds the old IDs.
 
 ### Local-only
 
@@ -382,7 +400,7 @@ catalog has no `holes`. Read it back the usual ways:
   verify. `region := '2:…'` prunes on both the contig and the `POS` bounds.
 - `ATTACH 'out.pfile.json' (TYPE pfile_catalog)` — the structural relations
   (`c.variants`, `c.samples`, `c.cells`, `c.variant_blocks`, `c.sample_blocks`) and
-  the variant-oriented `c.genotypes`. Each cell is read through its template-resolved
+  the five genotype views (the tall `c.genotypes`, and the wide and list views). Each cell is read through its template-resolved
   `.pvar` and `.psam`, so a cell needs no companion of its own.
 - One cell, directly, with the block's shared companions:
   `read_pfile('out/CHROM=1/GROUP=batch1/data', pvar := 'out/CHROM=1/variants.pvar', psam := 'out/GROUP=batch1/samples.psam')`.
@@ -413,7 +431,7 @@ failure leaves no catalog, never a stale one.
 
 To read the whole matrix as one cohort, use
 [`read_pfile(catalog := …)`](read_pfile.md#catalog-input-catalog), or `ATTACH` it and
-query `c.genotypes_by_sample` (one row per sample, with every variant).
+query `c.genotypes_by_sample_list` (one row per sample, with every variant in a list) or `c.genotypes` (one row per variant × sample).
 
 ## Standalone formats
 

@@ -37,8 +37,7 @@ ConcatPgenReader::~ConcatPgenReader() {
 	for (auto &m : members) {
 		if (m->open) {
 			plink2::PglErr ce = plink2::kPglRetSuccess;
-			plink2::CleanupPgr(&m->pgr, &ce);
-			plink2::CleanupPgfi(&m->pgfi, &ce);
+			plink2::CleanupPgr(&m->pgr, &ce); // before m->header is released
 		}
 	}
 }
@@ -74,43 +73,10 @@ void ConcatPgenReader::Open(ClientContext &context, bool use_vfs, const vector<P
 			m->subset = BuildSampleSubset(shard.raw_sample_ct, local);
 		}
 
-		plink2::PreinitPgfi(&m->pgfi);
 		plink2::PreinitPgr(&m->pgr);
-		char errstr_buf[plink2::kPglErrstrBufBlen];
-		plink2::PgenHeaderCtrl header_ctrl;
-		uintptr_t pgfi_alloc_cacheline_ct = 0;
-		plink2::PglErr err =
-		    plink2::PgfiInitPhase1(shard.pgen_path.c_str(), nullptr, raw_variant_ct, shard.raw_sample_ct, &header_ctrl,
-		                           &m->pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
-		if (err != plink2::kPglRetSuccess) {
-			plink2::PglErr ce = plink2::kPglRetSuccess;
-			plink2::CleanupPgfi(&m->pgfi, &ce);
-			throw IOException("read_pfile: failed to open sample shard '%s': %s", shard.pgen_path, errstr_buf);
-		}
-		if (pgfi_alloc_cacheline_ct > 0) {
-			m->pgfi_alloc.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-		}
-		uint32_t max_vrec_width = 0;
-		uintptr_t pgr_alloc_cacheline_ct = 0;
-		err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, m->pgfi.raw_variant_ct, &max_vrec_width, &m->pgfi,
-		                             m->pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
-		if (err != plink2::kPglRetSuccess) {
-			plink2::PglErr ce = plink2::kPglRetSuccess;
-			plink2::CleanupPgfi(&m->pgfi, &ce);
-			throw IOException("read_pfile: failed to initialize sample shard '%s' (phase 2): %s", shard.pgen_path,
-			                  errstr_buf);
-		}
-		if (pgr_alloc_cacheline_ct > 0) {
-			m->pgr_alloc.Allocate(pgr_alloc_cacheline_ct * plink2::kCacheline);
-		}
-		err = plink2::PgrInit(shard.pgen_path.c_str(), max_vrec_width, &m->pgfi, &m->pgr,
-		                      m->pgr_alloc.As<unsigned char>());
-		if (err != plink2::kPglRetSuccess) {
-			plink2::PglErr ce = plink2::kPglRetSuccess;
-			plink2::CleanupPgr(&m->pgr, &ce);
-			plink2::CleanupPgfi(&m->pgfi, &ce);
-			throw IOException("read_pfile: PgrInit failed for sample shard '%s'", shard.pgen_path);
-		}
+		m->header = AcquirePgenHeader(context, use_vfs, shard.pgen_path, raw_variant_ct, shard.raw_sample_ct,
+		                              "read_pfile: failed to open sample shard");
+		InitPgenReaderOn(*m->header, shard.pgen_path, m->pgr, m->pgr_alloc, "read_pfile: sample shard");
 		m->open = true;
 		if (m->has_subset) {
 			plink2::PgrSetSampleSubsetIndex(m->subset.CumulativePopcounts(), &m->pgr, &m->pssi);

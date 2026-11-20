@@ -85,7 +85,7 @@ statement ok
 ATTACH '{TEST_DIR}/bad.pfile.json' AS c (TYPE pfile_catalog);
 
 query I
-SELECT count(*) FROM c.genotypes WHERE CHROM = '1';
+SELECT count(*) FROM c.genotypes_by_variant_list WHERE CHROM = '1';
 ----
 1000
 

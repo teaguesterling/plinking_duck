@@ -190,6 +190,35 @@ default pending broad validation — A/B it on your data and enable per session.
 | `plinking_use_parquet_companions` | `true` | Prefer `.pvar.parquet` / `.psam.parquet` companions |
 | `plinking_pgen_io` | `'auto'` | How `.pgen` bytes are read: `auto` (remote→VFS, local→native `fopen`), `native`, `vfs`, `localize` (download to a local temp, then native — best for remote full scans). See below |
 | `plinking_localize_dir` | `''` | Temp dir for `plinking_pgen_io := 'localize'` (empty → DuckDB's `temporary_directory`) |
+| `plinking_pgen_header_cache` | `true` | Keep each decoded `.pgen` header once per database, shared by every thread and query of `read_pfile`. See below |
+
+### The `.pgen` header cache
+
+Before `read_pfile` can read a `.pgen`, pgenlib decodes the file's variant index: 9 bytes per
+variant (90 MB and about 52 ms for 10 million variants, measured). Without a cache, every scan
+thread decodes its own copy, and every query decodes again.
+
+With `plinking_pgen_header_cache` (the default), each header is decoded once per database (DuckDB's
+object cache belongs to one database) and shared:
+
+| 10M-variant file set, full scan | 1 thread | 4 threads | 16 threads |
+|---|---|---|---|
+| peak memory, without the cache | 2168 MB | 2439 MB | 3519 MB |
+| peak memory, with the cache | 2168 MB | 2181 MB | 2231 MB |
+
+- **The key is the file's identity.** A local `.pgen` is keyed by device, inode, size and
+  modification time (nanoseconds), also when it is read through the VFS. A remote one is keyed by
+  size, last-modified time and version tag (the ETag). A remote file with neither a version tag nor
+  a modification time is not cached. A rewritten file is decoded again.
+- **A `localize` copy is not cached.** Each query reads a new temp copy, so its header could never
+  be used again.
+- **The cache keeps headers after the query.** A single-threaded full scan of a catalog now keeps
+  every cell's header. That is +430 MB for 50 cells of 1M variants (measured), and up to DuckDB's
+  object-cache limit for a large cohort. The limit (8 GiB by default) counts against `memory_limit`,
+  and the least recently used header goes first.
+- **`ATTACH … (CACHE false)` does not turn it off.** Only `SET plinking_pgen_header_cache = false` does.
+- **A split-index `.pgen` (`.pgi`) is keyed by the `.pgen` only.** Rewrite both files together.
+- The analysis functions (`plink_freq`, `plink_glm` and the others) do not use it yet.
 
 ### Remote / cloud `.pgen` reads
 

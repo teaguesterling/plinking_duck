@@ -1,0 +1,199 @@
+# name: test/sql/read_pfile_cpra.test
+# description: read_pfile's virtual CPRA column (CHROM:POS:REF:ALT): not in SELECT *, computed only when named, and a WHERE on it narrows the read like CHROM + POS
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 2c. large_example:
+# 3000 variants x 8 samples, CHROM 1/2/3, POS 100..100000 step 100; var100 = 1:10000 T>C,
+# var200 = 1:20000 T>C, var1100 = 2:10000 T>C.
+
+foreach threads 1 4
+
+statement ok
+SET threads = ${threads};
+
+# The value, on every row, in both orients.
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example')
+WHERE CPRA IS DISTINCT FROM (CHROM || ':' || POS || ':' || REF || ':' || ALT);
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype')
+WHERE CPRA IS DISTINCT FROM (CHROM || ':' || POS || ':' || REF || ':' || ALT);
+----
+0
+
+query T
+SELECT CPRA FROM read_pfile('test/data/large_example') WHERE ID = 'var100';
+----
+1:10000:T:C
+
+endloop
+
+# Not in SELECT *, and count(*) is unchanged (Review Focus 1, 2).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_pfile('test/data/large_example')) WHERE column_name = 'CPRA';
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example');
+----
+3000
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype');
+----
+24000
+
+# Genotype orient: the CPRA id is not a .psam column (Review Focus 3).
+query TTT
+SELECT CPRA, IID, ID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100' AND IID = 'SAMP1';
+----
+1:10000:T:C	SAMP1	var100
+
+# Sample orient has no per-variant row (Review Focus 5).
+statement error
+SELECT CPRA FROM read_pfile('test/data/large_example', orient := 'sample');
+----
+CPRA
+
+# WHERE on CPRA.
+query T
+SELECT ID FROM read_pfile('test/data/large_example') WHERE CPRA = '1:10000:T:C';
+----
+var100
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example') WHERE CPRA IN ('1:10000:T:C', '1:20000:T:C');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE CPRA IN ('1:10000:T:C', '1:20000:T:C');
+----
+16
+
+query I
+SELECT list(ID ORDER BY ID) FROM read_pfile('test/data/large_example') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:C');
+----
+[var100, var1100]
+
+# Constants that no CPRA equals: zero rows, no error.
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example') WHERE CPRA = '1:10000';
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example') WHERE CPRA = 'garbage';
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example') WHERE CPRA = '1:x:T:C';
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example') WHERE CPRA = '1:10000:A:G';
+----
+0
+
+# The narrowing, without timing: drop3.pvar.parquet lacks one chr3 row, so a full load fails its
+# count check, and a chr1 region load does not (as in read_pfile_where_region_pushdown.test).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/A' (FORMAT pfile, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/A.pvar.parquet') WHERE NOT (CHROM = '3' AND POS = 100000) ORDER BY __vidx)
+TO '{TEST_DIR}/drop3.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 500);
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet');
+----
+variant count mismatch
+
+query T
+SELECT ID FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE CPRA = '1:10000:T:C';
+----
+var100
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE CPRA IN ('1:10000:T:C', '1:20000:T:C');
+----
+2
+
+# The ATTACH view names CPRA.
+statement ok
+ATTACH 'test/data/large_example' AS c (TYPE pfile_catalog);
+
+query TT
+SELECT CPRA, ID FROM c.genotypes_by_variant_list WHERE CPRA = '1:10000:T:C';
+----
+1:10000:T:C	var100
+
+# ---------------------------------------------------------------------------
+# Review finding: a field can contain ':' (symbolic SV alleles such as <DUP:TANDEM>, breakend ALTs,
+# some contig names). Such a CPRA has more than four parts, so a constant that does not parse as
+# four parts can still equal a row. It must narrow nothing, in = and in IN.
+# Oracle: the concatenation, filtered by the same values (no pushdown).
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/sv' (FORMAT pfile);
+
+# var1100 (2:10000) and var500 (1:50000) get ALTs that contain ':'.
+statement ok
+COPY (SELECT CHROM AS "#CHROM", POS, ID, REF,
+             CASE ID WHEN 'var1100' THEN '<DUP:TANDEM>' WHEN 'var500' THEN '<DEL:ME:ALU>' ELSE ALT END AS ALT
+      FROM read_pvar('{TEST_DIR}/sv.pvar'))
+TO '{TEST_DIR}/svx.pvar' (FORMAT csv, delim '\t', header true, quote '');
+
+query T
+SELECT list(CPRA ORDER BY ID) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE ID IN ('var1100', 'var500');
+----
+['2:10000:T:<DUP:TANDEM>', '1:50000:T:<DEL:ME:ALU>']
+
+# Mixed contigs.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:<DUP:TANDEM>');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar', orient := 'genotype') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:<DUP:TANDEM>');
+----
+16
+
+# One contig.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE CPRA IN ('1:10000:T:C', '1:50000:T:<DEL:ME:ALU>');
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar') WHERE CPRA = '1:50000:T:<DEL:ME:ALU>';
+----
+1
+
+# A catalog, every member with ':' in a field (the cell drop must not drop the block that holds it).
+statement ok
+COPY (SELECT * FROM read_pfile('{TEST_DIR}/sv', pvar := '{TEST_DIR}/svx.pvar', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/svcat' (FORMAT pfile, shard_by 'CHROM');
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/svcat') WHERE CPRA IN ('2:10000:T:<DUP:TANDEM>', 'x:1:A:<DEL:ME>');
+----
+1
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/svcat') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:<DUP:TANDEM>');
+----
+2

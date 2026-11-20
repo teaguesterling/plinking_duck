@@ -1,0 +1,222 @@
+# name: test/sql/plink_pgen_header_cache.test
+# description: cache tier 1 in the other readers — read_pgen and the plink_* functions decode each .pgen header once per database, shared by their bind, their threads, their next query and read_pfile
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-20-metadata-cache-tiers-design.md, tier 1 (delivery step 2).
+# Each function reads its own copy of large_example (3000 variants x 8 samples), so no decode is
+# shared between functions by accident. Two runs of one function: 1 decode in total. Before this
+# change these functions bypassed the cache, so the counter stayed 0.
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE src AS SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS;
+
+foreach fn freq hardy missing ld glm rpgen
+
+statement ok
+COPY src TO '{TEST_DIR}/f_{fn}' (FORMAT pfile);
+
+endloop
+
+# --- plink_freq
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_freq('{TEST_DIR}/f_freq.pgen');
+----
+3000
+
+query I
+SELECT count(*) FROM plink_freq('{TEST_DIR}/f_freq.pgen', counts := true);
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- plink_hardy
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_hardy('{TEST_DIR}/f_hardy.pgen');
+----
+3000
+
+query I
+SELECT count(*) FROM plink_hardy('{TEST_DIR}/f_hardy.pgen');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- plink_missing
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_missing('{TEST_DIR}/f_missing.pgen');
+----
+3000
+
+query I
+SELECT count(*) FROM plink_missing('{TEST_DIR}/f_missing.pgen', mode := 'sample');
+----
+8
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- plink_ld
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_ld('{TEST_DIR}/f_ld.pgen', region := '1:100-1000', window_kb := 1, r2_threshold := 0.0);
+----
+45
+
+query I
+SELECT count(*) FROM plink_ld('{TEST_DIR}/f_ld.pgen', region := '1:100-1000', window_kb := 1, r2_threshold := 0.0);
+----
+45
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- plink_glm
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_glm('{TEST_DIR}/f_glm', phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7]);
+----
+3000
+
+query I
+SELECT count(*) FROM plink_glm('{TEST_DIR}/f_glm', phenotype := [1.2, 3.4, 2.1, 5.6, 4.3, 0.9, 3.8, 2.7]);
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- read_pgen
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pgen('{TEST_DIR}/f_rpgen.pgen');
+----
+3000
+
+query I
+SELECT count(genotypes) FROM read_pgen('{TEST_DIR}/f_rpgen.pgen');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- read_pfile shares the header read_pgen decoded (one entry per file, whichever reader opens it).
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/f_rpgen');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- plink_score and plink_pca (their own fixtures, read once before in no test above).
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_score('test/data/pgen_example.pgen', weights := [1.0, 0.5, -0.5, 2.0]);
+----
+4
+
+query I
+SELECT count(*) FROM plink_score('test/data/pgen_example.pgen', weights := [1.0, 0.5, -0.5, 2.0]);
+----
+4
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) > 0 FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3);
+----
+true
+
+query I
+SELECT count(*) > 0 FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3);
+----
+true
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- The setting turns it off here too.
+statement ok
+SET plinking_pgen_header_cache = false;
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_freq('{TEST_DIR}/f_freq.pgen');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes() >= 1;
+----
+true

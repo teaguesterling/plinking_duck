@@ -25,6 +25,7 @@ read_pfile(prefix VARCHAR | LIST(VARCHAR) [, pgen := ..., pvar := ..., psam := .
 | `orient` | `VARCHAR` | `'variant'` | Output orientation: `'variant'`, `'genotype'`, or `'sample'` |
 | `combine_samples` | `VARCHAR` | `'implicit'` | Multi-file only: how shards' samples combine — `'implicit'` (positional trust), `'identical'` (verify IIDs), `'concatenate'` (sample-sharded: same variants, different samples), or `'disjoint'` (`'concatenate'` + verify IIDs are unique across shards). See [Multi-File Input](#multi-file-input) |
 | `genotypes` | `VARCHAR` | `'array'` | Genotype output: `'array'`, `'list'`, `'columns'`, `'struct'`, or the aggregate modes `'counts'` / `'stats'` (per-sample summaries in sample orient) |
+| `unique_column_names` | `BOOLEAN` | `false` | Only with `orient := 'sample'` and `genotypes := 'columns'` (ignored otherwise): a `.`, empty or duplicate variant ID column is named by its `CPRA` (then `<CPRA>_<n>`), not an error. The ATTACH `c.genotypes_by_sample` view passes it. Without it, a duplicate ID is an error |
 | `phased` | `BOOLEAN` | `false` | Output phased haplotype pairs instead of dosage counts |
 | `dosages` | `BOOLEAN` | `false` | Output dosage values instead of hard calls |
 | `samples` | `LIST(VARCHAR)` or `LIST(INTEGER)` | All | Filter to specific samples |
@@ -63,6 +64,61 @@ When both `region` and `variants` are specified, the result is the intersection 
 
 With `with_ordinal := true`, an extra `__ordinal` `BIGINT` column carries each variant's natural (original) 0-based index. It is supported **only with `orient := 'variant'`** (the default); the other orient modes reject it in bind rather than emit a wrong ordinal. For a multi-file list the ordinal is **per-source** (each shard restarts at 0), matching [`read_pvar`](read_pvar.md#named-parameters) and `pfile_partitions`.
 
+### The `CPRA` column
+
+In variant and genotype orient, `read_pfile` has a virtual column `CPRA` (`VARCHAR`): the variant's
+`CHROM:POS:REF:ALT`, for example `1:10000:T:C`. A multiallelic ALT stays one string (`1:3000:G:A,C`).
+`SELECT *` does not include it, and it costs nothing unless a query names it:
+
+```sql
+SELECT CPRA, ID FROM read_pfile('cohort') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:C');
+```
+
+A `WHERE CPRA = '…'` or `CPRA IN (…)` narrows the read like the same `CHROM` and `POS` filter: one
+contig loads only that region of the `.pvar.parquet`, and a catalog drops the other variant blocks.
+A value that is not four `:`-separated parts with an integer `POS` narrows nothing, and the `WHERE`
+decides. For example, `'1:10000'` and `'rs123'` give no row and no error. A symbolic SV allele
+(`'2:10000:T:<DUP:TANDEM>'`) finds its row, but it does not narrow the load, and neither does an `IN`
+list that holds one. `CPRA = '1:10000'` gives no row, while `variants := ['1:10000']` selects that
+site: `CPRA` is a string, compared exactly. The `ID` column is unchanged: it is what the `.pvar` holds.
+Sample orient has no `CPRA`.
+
+### The ID index (`<p>.pvar.index.parquet`)
+
+A `WHERE ID = '…'` or `ID IN (…)` reads every `.pvar` row to find the IDs, because a `.pvar` is sorted by
+position, not by ID. An optional index file fixes this. It holds one row per variant, sorted by `ID`:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `ID` | `VARCHAR` | The variant ID. `.` and empty IDs are left out. |
+| `_variant_block` | `INTEGER` | A catalog only: the variant block, counted from 0 in the catalog's order |
+| `_pvar_ordinal` | `BIGINT` | The variant's record index in that block's `.pgen`, counted from 0: `__ordinal` of `with_ordinal := true`, and `__vidx` of a `.pvar.parquet` |
+
+`read_pfile` looks for it by name: `<p>.pvar.index.parquet` beside `<p>.pgen` (a file set, or each file
+of a list), or beside `<p>.pfile.json` (a catalog). A read made only from `pgen :=`, `pvar :=` and
+`psam :=` has no prefix, so it uses no index. With the index:
+
+- A catalog opens only the variant blocks that hold the IDs.
+- With a `.pvar.parquet`, only the index's rows are loaded. With a text `.pvar`, the whole file is
+  parsed, but only the index's rows are read from the `.pgen`.
+- With a region (`region :=`, or a `WHERE` on `CHROM`/`POS`), the region load is used, and the index's
+  rows still limit the read.
+
+The `WHERE` still runs on every row, so a stale index can lose rows, but it never adds one. A `WHERE`
+that names `.` or `''` does not use the index. `SET plinking_use_parquet_companions = false` turns
+the lookup off. `COPY … (FORMAT pfile, index)` writes the index (see [`write_pfile`](write_pfile.md#id-index-index)).
+For files written by another tool, build it for a file set with this recipe:
+
+```sql
+COPY (SELECT ID, __ordinal AS _pvar_ordinal FROM read_pfile('cohort', with_ordinal := true)
+      WHERE ID IS NOT NULL AND ID NOT IN ('.', '') ORDER BY ID)
+TO 'cohort.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
+```
+
+For a catalog, take the same rows from each variant block's files, add the block number as
+`_variant_block`, and write one file beside the `.pfile.json`. See
+[the catalog format](../formats/pfile_catalog.md).
+
 ### Frequency Columns (`freq`)
 
 With `freq := true`, six columns follow the genotype columns (and come before `__ordinal`). They are the value columns of [`plink_freq(counts := true)`](plink_freq.md), and each one holds the value `plink_freq` gives for the same variant and the same samples:
@@ -91,7 +147,7 @@ SELECT ID, ALT_FREQ, HET_CT FROM read_pfile('data/cohort', freq := true)
 WHERE ALT_FREQ < 0.01 AND HET_CT > 0;
 ```
 
-`ATTACH … (TYPE pfile_catalog)` passes `freq := true` for `c.genotypes`, so `SELECT ID, HET_CT FROM c.genotypes` uses this path.
+`ATTACH … (TYPE pfile_catalog)` passes `freq := true` for its variant-row views, so `SELECT ID, HET_CT FROM c.genotypes_by_variant_list` uses this path.
 
 `COPY (SELECT * FROM read_pfile(…, freq := true)) TO … (FORMAT pfile)` writes the six columns into the output `.pvar` as extra columns, because the writer keeps every extra input column. Name the columns to write, or use `SELECT * EXCLUDE (ALT_FREQ, OBS_CT, HOM_REF_CT, HET_CT, HOM_ALT_CT, MISSING_CT)`.
 
@@ -286,7 +342,7 @@ SELECT * FROM read_pfile('/data/cohort', samples := [5], orient := 'sample');
 
 **When each file is read.** In variant and genotype orient, bind reads each sample block's `.psam`, but no cell's `.pgen` or `.pvar`. Bind takes each cell's variant and sample counts from the catalog. When the scan starts, it opens the `.pgen` header and `.pvar` of each cell that a `WHERE` on `CHROM` / `POS` did not drop, and checks each header against the counts the catalog declares. In genotype orient, a `WHERE IID = '…'` or `WHERE IID IN (…)` also drops the sample blocks that hold none of those IIDs, so their `.pgen` is never opened. This does not apply with `af_range` or `ac_range`, which compute over the whole sample set. With `freq := true`, a query that selects or filters a `freq` column also reads every sample block, because the values cover the full sample set; a query on the same read that uses no `freq` column still drops them. Bind also does not check that a cell's files exist: it takes the paths the catalog names. So `DESCRIBE` or `PREPARE` of a catalog read opens no `.pgen`, parses no `.pvar`, and checks no cell file (on a remote store, it sends no HEAD request for them). An error in a cell's files, or a count that disagrees with the catalog, shows when the query runs, and only for a cell the query reads. A version 1 catalog declares no sample counts, so bind opens its first cell's `.pgen` header. With `SET plinking_pgen_io = 'localize'`, bind copies and opens every `.pgen`. Sample orient reads every `.pvar` at bind, because its schema needs the variant count. `variants := [...]` also reads the `.pvar` at bind, to resolve the IDs.
 
-A catalog names every input, so `pgen :=`, `pvar :=` and `psam :=` are errors with it (with a discovered catalog too: the error says to pass `catalog := false`). A `catalog := '<path>'` with a positional prefix is also an error. With more than one sample block, `combine_samples` defaults to `'concatenate'`. `'disjoint'` also checks that the IIDs are unique across the sample blocks. `'implicit'` and `'identical'` are errors, because the sample blocks hold different samples. `ATTACH … (TYPE pfile_catalog)` uses this read for `c.genotypes_by_sample`.
+A catalog names every input, so `pgen :=`, `pvar :=` and `psam :=` are errors with it (with a discovered catalog too: the error says to pass `catalog := false`). A `catalog := '<path>'` with a positional prefix is also an error. With more than one sample block, `combine_samples` defaults to `'concatenate'`. `'disjoint'` also checks that the IIDs are unique across the sample blocks. `'implicit'` and `'identical'` are errors, because the sample blocks hold different samples. `ATTACH … (TYPE pfile_catalog)` uses this read for `c.genotypes_by_sample_list` (and, with `genotypes := 'columns'`, for `c.genotypes_by_sample`).
 
 The list of prefixes can come from anywhere: a literal list, a **glob** (`read_pfile('data/chr*.pgen')`), or a **catalog macro** returning a `VARCHAR[]` of shard prefixes — e.g. the scalarfs `pathmacro:` protocol, which `read_pfile` resolves to local shard paths and reads directly: `read_pfile('pathmacro:cohort?gene=BRCA1')`.
 
@@ -323,6 +379,21 @@ These push no region and load every variant, with the same rows: more than one c
 (`CHROM IN ('1', '2')`), `POS` with no `CHROM`, an `OR`, or a function of `POS`. With
 `region :=` as well, the two intersect. Sample orient, and `variants := [...]`, still load
 the whole `.pvar` at bind.
+
+In `orient := 'genotype'`, a `WHERE` on `genotype` becomes the scan's genotype filter, the one
+behind `include_genotypes`. The scan then skips a variant with no matching call before it decodes
+it, and does not build the rows the filter drops. It applies to `=`, `<>`, `<`, `<=`, `>`, `>=`,
+`BETWEEN`, `IN (…)`, `IS NULL` and `IS NOT NULL`, joined with `AND`. A missing call is `NULL`, so
+`genotype > 0` and `genotype <> 0` select het and hom-alt, and only `IS NULL` selects missing. With
+`include_genotypes :=` as well, the two intersect. The freq columns and `af_range` / `ac_range`
+still count every call. `OR`, a predicate that DuckDB cannot reduce to the bare column against
+an integer constant (`abs(genotype) > 0`; `genotype > 0.5`, where the binder casts the column),
+and phased or dosage output push nothing; the rows are the same either way.
+```sql
+-- the hom-alt carriers of a list of variants
+SELECT DISTINCT IID FROM read_pfile('cohort', orient := 'genotype')
+WHERE ID IN ('rs1', 'rs2', 'rs3') AND genotype = 2;
+```
 
 In `orient := 'genotype'` over sample shards (a catalog with more than one sample block, or a
 `combine_samples := 'concatenate'` / `'disjoint'` list), a `WHERE IID = '…'` or

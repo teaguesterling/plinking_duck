@@ -15,7 +15,7 @@ ATTACH 'test/data/pfile_catalog_single.pfile.json' AS s (TYPE pfile_catalog);
 
 # c.genotypes = read_pfile over the one fileset (self-checking, no hardcoded count).
 query T
-SELECT (SELECT count(*) FROM s.genotypes) =
+SELECT (SELECT count(*) FROM s.genotypes_by_variant_list) =
        (SELECT count(*) FROM read_pfile('test/data/large_example'));
 ----
 true
@@ -40,7 +40,7 @@ SELECT count(*) FROM s.cells;
 
 # genotypes_by_sample: same fileset, sample-oriented.
 query T
-SELECT (SELECT count(*) FROM s.genotypes_by_sample) =
+SELECT (SELECT count(*) FROM s.genotypes_by_sample_list) =
        (SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'sample'));
 ----
 true
@@ -57,7 +57,7 @@ statement ok
 ATTACH 'test/data/pfile_catalog_single' AS p (TYPE pfile_catalog);
 
 query T
-SELECT (SELECT count(*) FROM p.genotypes) = (SELECT count(*) FROM s.genotypes);
+SELECT (SELECT count(*) FROM p.genotypes_by_variant_list) = (SELECT count(*) FROM s.genotypes_by_variant_list);
 ----
 true
 
@@ -68,7 +68,7 @@ statement ok
 ATTACH 'test/data/large_example' AS b (TYPE pfile_catalog);
 
 query T
-SELECT (SELECT count(*) FROM b.genotypes) =
+SELECT (SELECT count(*) FROM b.genotypes_by_variant_list) =
        (SELECT count(*) FROM read_pfile('test/data/large_example'));
 ----
 true
@@ -106,9 +106,9 @@ TO '{TEST_DIR}/sharded' (FORMAT pfile, shard_by 'CHROM');
 statement ok
 ATTACH '{TEST_DIR}/sharded.pfile.json' AS m (TYPE pfile_catalog);
 
-# m.genotypes = all variants across the shards = the source cohort.
+# m.genotypes_by_variant_list = all variants across the shards = the source cohort.
 query T
-SELECT (SELECT count(*) FROM m.genotypes) =
+SELECT (SELECT count(*) FROM m.genotypes_by_variant_list) =
        (SELECT count(*) FROM read_pfile('test/data/pfile_example'));
 ----
 true
@@ -130,21 +130,22 @@ SELECT count(*) FROM m.sample_blocks;
 # genotype relations read through read_pfile(..., combine_samples := 'concatenate', pvar := shared).
 # le_cat_{a,b,c} are contiguous sample splits of large_example (1 + 2 + 5 samples), so the
 # unsplit fileset is the oracle. Before P13-008 this ATTACH raised "not supported yet".
-# c.genotypes carries the freq := true columns (P13-006 §5), so the oracle reads them too: the
+# c.genotypes carries the freq := true columns (P13-006 §5) and the virtual CPRA (views PR 2b), so the
+# oracle reads them too: the
 # shards' summed counts must equal the unsplit fileset's.
 # ---------------------------------------------------------------------------
 statement ok
 ATTACH 'test/data/pfile_catalog_le_samples.pfile.json' AS ss (TYPE pfile_catalog);
 
 query II
-SELECT (SELECT count(*) FROM (FROM ss.genotypes EXCEPT ALL FROM read_pfile('test/data/large_example', freq := true))),
-       (SELECT count(*) FROM ss.genotypes);
+SELECT (SELECT count(*) FROM (FROM ss.genotypes_by_variant_list EXCEPT ALL SELECT *, CPRA FROM read_pfile('test/data/large_example', freq := true))),
+       (SELECT count(*) FROM ss.genotypes_by_variant_list);
 ----
 0	3000
 
 query II
-SELECT (SELECT count(*) FROM (FROM ss.genotypes_by_sample EXCEPT ALL FROM read_pfile('test/data/large_example', orient := 'sample'))),
-       (SELECT count(*) FROM ss.genotypes_by_sample);
+SELECT (SELECT count(*) FROM (FROM ss.genotypes_by_sample_list EXCEPT ALL FROM read_pfile('test/data/large_example', orient := 'sample'))),
+       (SELECT count(*) FROM ss.genotypes_by_sample_list);
 ----
 0	8
 
@@ -163,8 +164,8 @@ statement ok
 ATTACH 'test/data/pfile_catalog_pca_samples_one.pfile.json' AS p1 (TYPE pfile_catalog);
 
 query II
-SELECT (SELECT count(*) FROM (FROM p1.genotypes EXCEPT ALL FROM read_pfile('test/data/pca_cat_b', pvar := 'test/data/pca_example.pvar', freq := true))),
-       (SELECT count(*) FROM p1.genotypes);
+SELECT (SELECT count(*) FROM (FROM p1.genotypes_by_variant_list EXCEPT ALL SELECT *, CPRA FROM read_pfile('test/data/pca_cat_b', pvar := 'test/data/pca_example.pvar', freq := true))),
+       (SELECT count(*) FROM p1.genotypes_by_variant_list);
 ----
 0	500
 

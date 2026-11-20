@@ -13,6 +13,7 @@
 #include "psam_reader.hpp"
 #include "pfile_sample_metadata.hpp"
 #include "pfile_attach_cache.hpp"
+#include "pgen_header_cache.hpp"
 
 #include <unordered_map>
 
@@ -80,6 +81,10 @@ static std::atomic<int64_t> g_sparse_variants_decoded {0};
 // the concat reader itself can prove it. Reset together with the variant counter.
 static std::atomic<int64_t> g_sparse_concat_dense_shards {0};
 static std::atomic<int64_t> g_sparse_concat_altmajor_shards {0};
+
+//! Test-only: optimizer hook calls in which a WHERE on genotype compiled into the scan's genotype filter
+//! (views PR 2a). EXPLAIN and each rebind count too.
+static std::atomic<int64_t> g_genotype_where_pushed {0};
 
 // ---------------------------------------------------------------------------
 // Region parsing
@@ -609,6 +614,19 @@ struct PfileBindData : public TableFunctionData {
 	//! lazy_variants only: each source's declared genomic range (parallel to `sources`), for the
 	//! stage-4 pushdown_complex_filter hook, which drops sources a WHERE on CHROM/POS cannot reach.
 	vector<ShardEntry> source_ranges;
+	//! Views PR 4a (the ID index), lazy_variants only, parallel to `sources`: a catalog's variant block
+	//! per source (source_blocks), or a non-catalog source's prefix (source_prefixes), where the
+	//! <p>.pvar.index.parquet lookup starts.
+	vector<idx_t> source_blocks;
+	vector<string> source_prefixes;
+	//! The index rows that a WHERE ID = / IN found, per source (parallel to `sources`; empty when no
+	//! index was used). An active entry is the source's variant set; with a parquet .pvar and no region,
+	//! EnsureLazyVariants loads only those rows.
+	struct IdOrdinals {
+		bool active = false;
+		vector<uint32_t> ordinals; //! sorted, unique
+	};
+	vector<IdOrdinals> id_ordinals;
 	//! P13-006 §10.5 / stage 5: a lazy_variants read whose catalog declares the cells' counts also
 	//! leaves their .pgen headers unopened at bind. Bind takes each cell's counts from the catalog;
 	//! EnsureLazyVariants opens the header of each source that survives pruning and checks it against
@@ -862,6 +880,51 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 // Local state (per-thread)
 // ---------------------------------------------------------------------------
 
+//! Views PR 2b: the virtual column CPRA = CHROM:POS:REF:ALT (VARCHAR), in variant and genotype orient.
+//! A virtual column (get_virtual_columns) is not in SELECT * and is computed only when a query names
+//! it. Its id is above every schema column, so each scan handles it before any lookup by column index.
+//! A function, not a global: VIRTUAL_COLUMN_START is an extern const in another translation unit,
+//! so a global initialized from it depends on static-initialization order (clang-tidy
+//! cppcoreguidelines-interfaces-global-init).
+static column_t CpraColumnId() {
+	return VIRTUAL_COLUMN_START + 1;
+}
+
+//! The CPRA value of variant `vidx` (a multiallelic ALT stays one string).
+static string CpraOf(const VariantMetadataIndex &v, uint32_t vidx) {
+	return v.GetChrom(vidx) + ":" + std::to_string(v.GetPos(vidx)) + ":" + v.GetRef(vidx) + ":" + v.GetAlt(vidx);
+}
+
+//! The parsed form of a CPRA constant: exactly four ':'-separated parts with an integer POS. Any other
+//! string narrows nothing: it may still equal a row whose REF, ALT or contig contains ':' (a symbolic
+//! SV allele such as <DUP:TANDEM>, a breakend ALT), and the WHERE then decides.
+static bool ParseCpraConstant(const string &s, string &chrom, int64_t &pos) {
+	auto parts = StringUtil::Split(s, ':');
+	if (parts.size() != 4 || parts[0].empty() || parts[1].empty()) {
+		return false;
+	}
+	for (auto ch : parts[1]) {
+		if (ch < '0' || ch > '9') {
+			return false;
+		}
+	}
+	if (parts[1].size() > 10) {
+		return false;
+	}
+	chrom = parts[0];
+	pos = std::stoll(parts[1]);
+	return true;
+}
+
+static virtual_column_map_t PfileGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {
+	virtual_column_map_t result;
+	if (bind_data_p && bind_data_p->Cast<PfileBindData>().orient_mode == OrientMode::SAMPLE) {
+		return result; // sample orient has no per-variant row
+	}
+	result.insert(make_pair(CpraColumnId(), TableColumn("CPRA", LogicalType::VARCHAR)));
+	return result;
+}
+
 // freq := true: one variant's plink_freq(counts := true) values (see plink_freq.cpp's scan — the
 // same two paths, the same NULL rules). On autosomes and PAR, PgrGetCounts over the output samples;
 // on chrX non-PAR / chrY / chrMT, the decoded hardcalls through ComputeSexAwareCounts.
@@ -876,8 +939,8 @@ struct PfileLocalState : public LocalTableFunctionState {
 	//! freq := true, genotype orient: the current variant's values, computed once in load_variant
 	//! and repeated on each of its sample rows.
 	FreqValues tall_freq;
-	plink2::PgenFileInfo pgfi;
-	AlignedBuffer pgfi_alloc_buf;
+	//! The decoded header of the open source's .pgen (cache tier 1); pgr points into it.
+	shared_ptr<PgenHeader> header;
 
 	plink2::PgenReader pgr;
 	AlignedBuffer pgr_alloc_buf;
@@ -946,8 +1009,7 @@ struct PfileLocalState : public LocalTableFunctionState {
 	~PfileLocalState() override {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
-			plink2::CleanupPgr(&pgr, &reterr);
-			plink2::CleanupPgfi(&pgfi, &reterr);
+			plink2::CleanupPgr(&pgr, &reterr); // before `header` (pgr points into it) is released
 		}
 	}
 };
@@ -967,8 +1029,13 @@ struct PfileLocalState : public LocalTableFunctionState {
 //! Load one source's .pvar (src.pvar_path) into src.variants, and check its count against the
 //! .pgen header. A parquet .pvar is region-pushed. Called at bind, or at InitGlobal for a
 //! deferred (lazy_variants) read.
-static void LoadSourceVariants(ClientContext &context, PfileSource &src, const RegionFilter &region) {
-	if (region.active && IsParquetFile(src.pvar_path)) {
+static void LoadSourceVariants(ClientContext &context, PfileSource &src, const RegionFilter &region,
+                               const vector<uint32_t> *id_ordinals = nullptr) {
+	if (id_ordinals && !region.active && IsParquetFile(src.pvar_path)) {
+		// Views PR 4a: only the rows the ID index found (with a region, the region load is used).
+		src.variants = LoadVariantMetadataFromParquetOrdinals(context, src.pvar_path, *id_ordinals,
+		                                                      static_cast<idx_t>(src.raw_variant_ct), "read_pfile");
+	} else if (region.active && IsParquetFile(src.pvar_path)) {
 		src.variants =
 		    LoadVariantMetadataFromParquetRegion(context, src.pvar_path, region.chrom, region.start, region.end,
 		                                         static_cast<idx_t>(src.raw_variant_ct), "read_pfile");
@@ -1705,46 +1772,16 @@ static void FillSampleMatrix(ClientContext &context, PfileBindData &bind_data_re
 		plink2::PreinitPgfi(&tmp_pgfi);
 		plink2::PgenReader tmp_pgr;
 		plink2::PreinitPgr(&tmp_pgr);
-		AlignedBuffer pgfi_alloc2;
+		shared_ptr<PgenHeader> tmp_header; // tmp_pgr points into it; CleanupPgr(tmp_pgr) runs before this block ends
 		AlignedBuffer pgr_alloc2;
 		plink2::PgrSampleSubsetIndex pssi2;
 		plink2::PgrClearSampleSubsetIndex(nullptr, &pssi2);
 		if (!pr_cat) {
-			char errstr_buf2[plink2::kPglErrstrBufBlen];
-			plink2::PgenHeaderCtrl header_ctrl2;
-			uintptr_t pgfi_alloc_ct2 = 0;
-			err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data->raw_sample_ct,
-			                             &header_ctrl2, &tmp_pgfi, &pgfi_alloc_ct2, errstr_buf2);
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read: %s", errstr_buf2);
-			}
-			if (pgfi_alloc_ct2 > 0) {
-				pgfi_alloc2.Allocate(pgfi_alloc_ct2 * plink2::kCacheline);
-			}
-			uint32_t max_vrec2 = 0;
-			uintptr_t pgr_alloc_ct2 = 0;
-			err = plink2::PgfiInitPhase2(header_ctrl2, 0, 0, 0, 0, tmp_pgfi.raw_variant_ct, &max_vrec2, &tmp_pgfi,
-			                             pgfi_alloc2.As<unsigned char>(), &pgr_alloc_ct2, errstr_buf2);
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: failed to init PgenReader for sample-orient pre-read (phase 2): %s",
-				                  errstr_buf2);
-			}
-			if (pgr_alloc_ct2 > 0) {
-				pgr_alloc2.Allocate(pgr_alloc_ct2 * plink2::kCacheline);
-			}
-			err =
-			    plink2::PgrInit(src.pgen_path.c_str(), max_vrec2, &tmp_pgfi, &tmp_pgr, pgr_alloc2.As<unsigned char>());
-			if (err != plink2::kPglRetSuccess) {
-				plink2::PglErr ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgr(&tmp_pgr, &ce);
-				ce = plink2::kPglRetSuccess;
-				plink2::CleanupPgfi(&tmp_pgfi, &ce);
-				throw IOException("read_pfile: PgrInit failed for sample-orient pre-read");
-			}
+			// tmp_pgfi stays preinit'd (its Cleanup calls are no-ops); the decoded header is cache tier 1's.
+			tmp_header = AcquirePgenHeader(context, bind_data->use_vfs, src.pgen_path, src.raw_variant_ct,
+			                               bind_data->raw_sample_ct,
+			                               "read_pfile: failed to init PgenReader for sample-orient pre-read");
+			InitPgenReaderOn(*tmp_header, src.pgen_path, tmp_pgr, pgr_alloc2, "read_pfile: sample-orient pre-read");
 			if (bind_data->has_sample_subset) {
 				plink2::PgrSetSampleSubsetIndex(preread_subset.CumulativePopcounts(), &tmp_pgr, &pssi2);
 			} else {
@@ -2450,6 +2487,9 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 			// list has none, and source_ranges stays empty, which turns that drop off.
 			if (from_catalog) {
 				bind_data->source_ranges.push_back(grid.variant_ranges[grid.cells[si].variant_block]);
+				bind_data->source_blocks.push_back(grid.cells[si].variant_block);
+			} else {
+				bind_data->source_prefixes.push_back(prefixes[si]);
 			}
 			bind_data->sources.push_back(std::move(src)); // region / variant_range apply at InitGlobal
 			continue;
@@ -2801,51 +2841,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 				plink2::PreinitPgfi(&cf_pgfi);
 				plink2::PgenReader cf_pgr;
 				plink2::PreinitPgr(&cf_pgr);
-				AlignedBuffer cf_pgfi_alloc;
+				shared_ptr<PgenHeader>
+				    cf_header; // cf_pgr points into it; CleanupPgr(cf_pgr) runs before this block ends
 				AlignedBuffer cf_pgr_alloc;
 				plink2::PgrSampleSubsetIndex cf_pssi;
 				plink2::PgrClearSampleSubsetIndex(nullptr, &cf_pssi);
 				if (!cf_cat) {
-					char cf_errstr[plink2::kPglErrstrBufBlen];
-					plink2::PgenHeaderCtrl cf_hdr;
-					uintptr_t cf_pgfi_alloc_ct = 0;
-
-					err = plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct,
-					                             bind_data->raw_sample_ct, &cf_hdr, &cf_pgfi, &cf_pgfi_alloc_ct,
-					                             cf_errstr);
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&cf_pgfi, &ce);
-						throw IOException("read_pfile: failed to init PgenReader for count filter: %s", cf_errstr);
-					}
-
-					if (cf_pgfi_alloc_ct > 0) {
-						cf_pgfi_alloc.Allocate(cf_pgfi_alloc_ct * plink2::kCacheline);
-					}
-
-					uint32_t cf_max_vrec = 0;
-					uintptr_t cf_pgr_alloc_ct = 0;
-					err = plink2::PgfiInitPhase2(cf_hdr, 0, 0, 0, 0, cf_pgfi.raw_variant_ct, &cf_max_vrec, &cf_pgfi,
-					                             cf_pgfi_alloc.As<unsigned char>(), &cf_pgr_alloc_ct, cf_errstr);
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&cf_pgfi, &ce);
-						throw IOException("read_pfile: count filter PgenReader init failed (phase 2): %s", cf_errstr);
-					}
-
-					if (cf_pgr_alloc_ct > 0) {
-						cf_pgr_alloc.Allocate(cf_pgr_alloc_ct * plink2::kCacheline);
-					}
-
-					err = plink2::PgrInit(src.pgen_path.c_str(), cf_max_vrec, &cf_pgfi, &cf_pgr,
-					                      cf_pgr_alloc.As<unsigned char>());
-					if (err != plink2::kPglRetSuccess) {
-						plink2::PglErr ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgr(&cf_pgr, &ce);
-						ce = plink2::kPglRetSuccess;
-						plink2::CleanupPgfi(&cf_pgfi, &ce);
-						throw IOException("read_pfile: PgrInit failed for count filter");
-					}
+					// cf_pgfi stays preinit'd (its Cleanup calls are no-ops); the decoded header is cache tier 1's.
+					cf_header = AcquirePgenHeader(context, bind_data->use_vfs, src.pgen_path, src.raw_variant_ct,
+					                              bind_data->raw_sample_ct,
+					                              "read_pfile: failed to init PgenReader for count filter");
+					InitPgenReaderOn(*cf_header, src.pgen_path, cf_pgr, cf_pgr_alloc, "read_pfile: count filter");
 
 					// Set up sample subsetting for PgrGetCounts
 					if (bind_data->has_sample_subset && bind_data->count_filter_subset) {
@@ -2963,12 +2969,31 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 
 			// Check for duplicate variant IDs (variant IDs can duplicate unlike sample
 			// IIDs) — across ALL sources, in global (shard) order.
+			// unique_column_names := true (views PR 3, the ATTACH by-sample view): a '.', empty or
+			// duplicate ID is named by its CPRA, then CPRA_<n>, in variant order, instead of an error.
+			bool unique_names = false;
+			{
+				auto un_it = input.named_parameters.find("unique_column_names");
+				if (un_it != input.named_parameters.end() && !un_it->second.IsNull()) {
+					unique_names = BooleanValue::Get(un_it->second.DefaultCastAs(LogicalType::BOOLEAN));
+				}
+			}
 			std::unordered_set<string> seen_names;
 			for (auto &src : bind_data->sources) {
 				uint32_t src_ct = src.EffectiveVariantCt();
 				for (uint32_t ev = 0; ev < src_ct; ev++) {
 					uint32_t vidx = src.has_effective_variant_list ? src.effective_variant_indices[ev] : ev;
 					string col_name = variant_col_name(src, vidx);
+					if (unique_names) {
+						const auto id = src.variants.GetId(vidx);
+						if (id.empty() || id == "." || seen_names.count(col_name)) {
+							const string cpra = CpraOf(src.variants, vidx);
+							col_name = cpra;
+							for (idx_t n = 1; seen_names.count(col_name); n++) {
+								col_name = cpra + "_" + std::to_string(n);
+							}
+						}
+					}
 					if (!seen_names.insert(col_name).second) {
 						throw InvalidInputException(
 						    "read_pfile: genotypes := 'columns' with orient := 'sample' requires unique variant "
@@ -3886,8 +3911,16 @@ static void EnsureLazyVariants(ClientContext &context, const PfileBindData &bind
 		}
 		src.has_effective_variant_list = false;
 		src.effective_variant_indices.clear();
-		LoadSourceVariants(context, src, bind_data.region);
-		BuildEffectiveVariantList(src, bind_data.region, {}, false);
+		const bool by_id = src_idx < bind_data.id_ordinals.size() && bind_data.id_ordinals[src_idx].active;
+		const vector<uint32_t> *ordinals = by_id ? &bind_data.id_ordinals[src_idx].ordinals : nullptr;
+		LoadSourceVariants(context, src, bind_data.region, ordinals);
+		if (by_id) {
+			// The index rows are the source's variant set, whatever .pvar load ran.
+			std::unordered_set<uint32_t> id_set(ordinals->begin(), ordinals->end());
+			BuildEffectiveVariantList(src, bind_data.region, id_set, true);
+		} else {
+			BuildEffectiveVariantList(src, bind_data.region, {}, false);
+		}
 		if (bind_data.has_variant_range) {
 			ApplyVariantRange(src, bind_data.variant_range_lo, bind_data.variant_range_hi);
 		}
@@ -4200,8 +4233,7 @@ static void OpenSourceReader(ClientContext &context, PfileLocalState &state, con
 	if (bind_data.IsConcat()) {
 		// One source per variant block; the reader spans every sample shard of THIS block
 		// (a fresh ConcatPgenReader replaces the previous block's, which closes its files).
-		// pgfi/pgr are preinit'd only, so the destructor's Cleanup* calls are no-ops.
-		plink2::PreinitPgfi(&state.pgfi);
+		// pgr is preinit'd only, so the destructor's CleanupPgr is a no-op.
 		plink2::PreinitPgr(&state.pgr);
 		plink2::PgrClearSampleSubsetIndex(nullptr, &state.pssi);
 		state.concat = make_uniq<ConcatPgenReader>();
@@ -4213,10 +4245,10 @@ static void OpenSourceReader(ClientContext &context, PfileLocalState &state, con
 		return;
 	}
 	if (state.initialized) {
-		// Tear down the reader currently open on another source (pgr before pgfi).
+		// Tear down the reader currently open on another source (pgr before its header).
 		plink2::PglErr ce = plink2::kPglRetSuccess;
 		plink2::CleanupPgr(&state.pgr, &ce);
-		plink2::CleanupPgfi(&state.pgfi, &ce);
+		state.header.reset();
 		state.initialized = false;
 	}
 
@@ -4224,54 +4256,9 @@ static void OpenSourceReader(ClientContext &context, PfileLocalState &state, con
 	PgenVfsScope pgen_vfs_scope(context, bind_data.use_vfs);
 
 	const PfileSource &src = bind_data.sources[source_idx];
-
-	plink2::PreinitPgfi(&state.pgfi);
-	plink2::PreinitPgr(&state.pgr);
-
-	char errstr_buf[plink2::kPglErrstrBufBlen];
-	plink2::PgenHeaderCtrl header_ctrl;
-	uintptr_t pgfi_alloc_cacheline_ct = 0;
-
-	plink2::PglErr err =
-	    plink2::PgfiInitPhase1(src.pgen_path.c_str(), nullptr, src.raw_variant_ct, bind_data.raw_sample_ct,
-	                           &header_ctrl, &state.pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state.pgfi, &cleanup_err);
-		throw IOException("read_pfile: thread init failed (phase 1) for '%s': %s", src.pgen_path, errstr_buf);
-	}
-
-	if (pgfi_alloc_cacheline_ct > 0) {
-		state.pgfi_alloc_buf.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-	} else {
-		state.pgfi_alloc_buf.Reset();
-	}
-
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state.pgfi.raw_variant_ct, &max_vrec_width, &state.pgfi,
-	                             state.pgfi_alloc_buf.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state.pgfi, &cleanup_err);
-		throw IOException("read_pfile: thread init failed (phase 2) for '%s': %s", src.pgen_path, errstr_buf);
-	}
-
-	if (pgr_alloc_cacheline_ct > 0) {
-		state.pgr_alloc_buf.Allocate(pgr_alloc_cacheline_ct * plink2::kCacheline);
-	} else {
-		state.pgr_alloc_buf.Reset();
-	}
-
-	err = plink2::PgrInit(src.pgen_path.c_str(), max_vrec_width, &state.pgfi, &state.pgr,
-	                      state.pgr_alloc_buf.As<unsigned char>());
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgr(&state.pgr, &cleanup_err);
-		cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state.pgfi, &cleanup_err);
-		throw IOException("read_pfile: PgrInit failed for '%s'", src.pgen_path);
-	}
+	state.header = AcquirePgenHeader(context, bind_data.use_vfs, src.pgen_path, src.raw_variant_ct,
+	                                 bind_data.raw_sample_ct, "read_pfile: thread init failed");
+	InitPgenReaderOn(*state.header, src.pgen_path, state.pgr, state.pgr_alloc_buf, "read_pfile");
 
 	// Re-bind the sample-subset index to the (new) pgr. cumulative_popcounts_buf was
 	// filled once in PfileInitLocal and is identical across sources.
@@ -4576,6 +4563,12 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 			auto file_col = column_ids[out_col];
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+			if (file_col == CpraColumnId()) {
+				auto &cvec = output.data[out_col];
+				CompatFlatDataMutable<string_t>(cvec)[rows_emitted] =
+				    StringVector::AddString(cvec, CpraOf(source.variants, vidx));
 				continue;
 			}
 
@@ -5283,6 +5276,12 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 			auto file_col = column_ids[out_col];
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+			if (file_col == CpraColumnId()) {
+				auto &cvec = output.data[out_col];
+				CompatFlatDataMutable<string_t>(cvec)[rows_emitted] =
+				    StringVector::AddString(cvec, CpraOf(source.variants, vidx));
 				continue;
 			}
 
@@ -6277,7 +6276,11 @@ static idx_t CellPruneColumnOf(const LogicalGet &get, const Expression &e) {
 	}
 	auto &ids = get.GetColumnIds();
 	const idx_t i = binding.column_index.GetIndex();
-	if (i >= ids.size() || ids[i].IsVirtualColumn() || ids[i].IsPushdownExtract() || ids[i].HasType()) {
+	if (i >= ids.size() || ids[i].IsPushdownExtract() || ids[i].HasType()) {
+		return DConstants::INVALID_INDEX;
+	}
+	// Of the virtual columns, only CPRA (views PR 2b) is a constraint source.
+	if (ids[i].IsVirtualColumn() && ids[i].GetPrimaryIndex() != CpraColumnId()) {
 		return DConstants::INVALID_INDEX;
 	}
 	return ids[i].GetPrimaryIndex();
@@ -6307,6 +6310,10 @@ struct CellPruneConstraints {
 	idx_t iid_col = DConstants::INVALID_INDEX;
 	bool has_iid = false;
 	std::set<string> iids;
+	//! The ID column (variant and genotype orient), and the ID values a row may have (views PR 4a).
+	idx_t id_col = PfileBindData::ID_COL;
+	bool has_id = false;
+	std::set<string> ids;
 
 	static void Intersect(bool &has, std::set<string> &current, const std::set<string> &values) {
 		if (!has) {
@@ -6327,6 +6334,9 @@ struct CellPruneConstraints {
 	}
 	void AllowIids(const std::set<string> &values) {
 		Intersect(has_iid, iids, values);
+	}
+	void AllowIds(const std::set<string> &values) {
+		Intersect(has_id, ids, values);
 	}
 	//! POS <type> v, for one comparison type with the column on the left.
 	void NarrowPos(ExpressionType type, int64_t v) {
@@ -6397,7 +6407,33 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
 		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
 		const idx_t in_col = kids.size() < 2 ? DConstants::INVALID_INDEX : CellPruneColumnOf(get, *kids[0]);
-		if (in_col == DConstants::INVALID_INDEX || (in_col != c.chrom_col && in_col != c.iid_col)) {
+		if (in_col == CpraColumnId() && c.chrom_col != DConstants::INVALID_INDEX) {
+			// CPRA IN (...): the contigs, and the POS span, of the members. A member that does not parse as
+			// four parts may still equal a row whose REF, ALT or contig contains ':' (a symbolic SV allele
+			// such as <DUP:TANDEM>), so it stops the narrowing, as an unfoldable member does.
+			std::set<string> chroms;
+			int64_t lo = std::numeric_limits<int64_t>::max(), hi = std::numeric_limits<int64_t>::lowest();
+			for (idx_t i = 1; i < kids.size(); i++) {
+				Value v;
+				if (!CellPruneConstant(context, *kids[i], v) || v.type().id() != LogicalTypeId::VARCHAR) {
+					return;
+				}
+				string chrom;
+				int64_t pos;
+				if (!ParseCpraConstant(v.GetValue<string>(), chrom, pos)) {
+					return;
+				}
+				chroms.insert(chrom);
+				lo = std::min(lo, pos);
+				hi = std::max(hi, pos);
+			}
+			c.AllowChroms(chroms);
+			c.NarrowPos(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo);
+			c.NarrowPos(ExpressionType::COMPARE_LESSTHANOREQUALTO, hi);
+			return;
+		}
+		if (in_col == DConstants::INVALID_INDEX ||
+		    (in_col != c.chrom_col && in_col != c.iid_col && in_col != c.id_col)) {
 			return;
 		}
 		std::set<string> values;
@@ -6410,6 +6446,8 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 		}
 		if (in_col == c.chrom_col) {
 			c.AllowChroms(values);
+		} else if (in_col == c.id_col) {
+			c.AllowIds(values);
 		} else {
 			c.AllowIids(values);
 		}
@@ -6452,10 +6490,20 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (col == DConstants::INVALID_INDEX || !CellPruneConstant(context, *other, v)) {
 		return;
 	}
-	if (col == c.chrom_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
+	if (col == CpraColumnId() && c.chrom_col != DConstants::INVALID_INDEX && cmp == ExpressionType::COMPARE_EQUAL &&
+	    v.type().id() == LogicalTypeId::VARCHAR) {
+		string chrom;
+		int64_t pos;
+		if (ParseCpraConstant(v.GetValue<string>(), chrom, pos)) {
+			c.AllowChroms({chrom});
+			c.NarrowPos(ExpressionType::COMPARE_EQUAL, pos);
+		}
+	} else if (col == c.chrom_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowChroms({v.GetValue<string>()});
 	} else if (col == c.iid_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowIids({v.GetValue<string>()});
+	} else if (col == c.id_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
+		c.AllowIds({v.GetValue<string>()});
 	} else if (col == c.pos_col && v.DefaultTryCastAs(LogicalType::BIGINT)) {
 		c.NarrowPos(cmp, v.GetValue<int64_t>());
 	}
@@ -6538,6 +6586,272 @@ static bool PushedRegion(const CellPruneConstraints &c, const RegionFilter &expl
 	return true;
 }
 
+//! Whether `g` (a hardcall 0, 1 or 2) satisfies `g <cmp> c`. False in `known` for any other comparison.
+static bool GenotypeCmpHolds(ExpressionType cmp, double g, double c, bool &known) {
+	known = true;
+	switch (cmp) {
+	case ExpressionType::COMPARE_EQUAL:
+		return g == c;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return g != c;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return g < c;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return g <= c;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return g > c;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return g >= c;
+	default:
+		known = false;
+		return true;
+	}
+}
+
+//! Views PR 2a: narrow `allowed` (index 0-2: the hardcall 0/1/2; index 3: missing, which genotype
+//! orient emits as NULL) by what a WHERE conjunct says about the `genotype` column (`gcol`).
+//! Returns true when something narrowed it. A comparison excludes missing (NULL never compares
+//! true); IS NULL keeps only missing. Any other form (OR, NOT, a function or cast on the column,
+//! IS DISTINCT FROM) narrows nothing, so the pushed filter only ever keeps more calls.
+static bool CollectGenotypeAllowed(ClientContext &context, const LogicalGet &get, const Expression &e, idx_t gcol,
+                                   bool allowed[4]) {
+	const auto type = e.GetExpressionType();
+	if (type == ExpressionType::CONJUNCTION_AND) {
+		bool any = false;
+		for (auto &child : e.Cast<BoundConjunctionExpression>().GetChildren()) {
+			any |= CollectGenotypeAllowed(context, get, *child, gcol, allowed);
+		}
+		return any;
+	}
+	auto narrow = [&](const bool keep[4]) {
+		for (idx_t i = 0; i < 4; i++) {
+			allowed[i] = allowed[i] && keep[i];
+		}
+		return true;
+	};
+	auto as_double = [&](const Expression &x, double &out) {
+		Value v;
+		if (!CellPruneConstant(context, x, v) || !v.DefaultTryCastAs(LogicalType::DOUBLE)) {
+			return false;
+		}
+		out = v.GetValue<double>();
+		return true;
+	};
+	if ((type == ExpressionType::OPERATOR_IS_NULL || type == ExpressionType::OPERATOR_IS_NOT_NULL) &&
+	    e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
+		if (kids.size() != 1 || CellPruneColumnOf(get, *kids[0]) != gcol) {
+			return false;
+		}
+		const bool is_null = type == ExpressionType::OPERATOR_IS_NULL;
+		const bool keep[4] = {!is_null, !is_null, !is_null, is_null};
+		return narrow(keep);
+	}
+	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
+		if (kids.size() < 2 || CellPruneColumnOf(get, *kids[0]) != gcol) {
+			return false;
+		}
+		bool keep[4] = {false, false, false, false};
+		for (idx_t i = 1; i < kids.size(); i++) {
+			double c;
+			if (!as_double(*kids[i], c)) {
+				return false; // one unknown member: the set could be anything
+			}
+			for (idx_t g = 0; g < 3; g++) {
+				keep[g] = keep[g] || static_cast<double>(g) == c;
+			}
+		}
+		return narrow(keep);
+	}
+	if (e.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &fn = e.Cast<BoundFunctionExpression>();
+	if (type == ExpressionType::COMPARE_BETWEEN) {
+		if (!BoundBetweenExpression::HasValidBindData(fn) ||
+		    CellPruneColumnOf(get, BoundBetweenExpression::Input(fn)) != gcol) {
+			return false;
+		}
+		double lo, hi;
+		if (!as_double(BoundBetweenExpression::LowerBound(fn), lo) ||
+		    !as_double(BoundBetweenExpression::UpperBound(fn), hi)) {
+			return false;
+		}
+		bool keep[4] = {false, false, false, false};
+		for (idx_t g = 0; g < 3; g++) {
+			bool k1, k2;
+			const bool a = GenotypeCmpHolds(BoundBetweenExpression::LowerComparisonType(fn), double(g), lo, k1);
+			const bool b = GenotypeCmpHolds(BoundBetweenExpression::UpperComparisonType(fn), double(g), hi, k2);
+			if (!k1 || !k2) {
+				return false;
+			}
+			keep[g] = a && b;
+		}
+		return narrow(keep);
+	}
+	if (!BoundComparisonExpression::IsComparison(e)) {
+		return false;
+	}
+	auto &left = BoundComparisonExpression::Left(fn);
+	auto &right = BoundComparisonExpression::Right(fn);
+	const Expression *other = &right;
+	ExpressionType cmp = type;
+	if (CellPruneColumnOf(get, left) != gcol) {
+		if (CellPruneColumnOf(get, right) != gcol) {
+			return false;
+		}
+		other = &left;
+		cmp = FlipComparisonExpression(type);
+	}
+	double c;
+	if (!as_double(*other, c)) {
+		return false;
+	}
+	bool keep[4] = {false, false, false, false};
+	for (idx_t g = 0; g < 3; g++) {
+		bool known;
+		keep[g] = GenotypeCmpHolds(cmp, double(g), c, known);
+		if (!known) {
+			return false;
+		}
+	}
+	return narrow(keep);
+}
+
+//! Views PR 4a: the rows of the ID index at `index_path` whose ID is in `ids`, as (variant block,
+//! ordinal) pairs. An index with no _variant_block column gives block 0. A negative ordinal, or one
+//! past uint32, is skipped (it indexes no .pgen record).
+static vector<std::pair<idx_t, uint32_t>> QueryIdIndex(ClientContext &context, const string &index_path,
+                                                       const std::set<string> &ids, bool &has_block_out) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto escaped_path = StringUtil::Replace(index_path, "'", "''");
+	auto schema = conn.Query("SELECT * FROM read_parquet('" + escaped_path + "') LIMIT 0");
+	if (schema->HasError()) {
+		throw IOException("read_pfile: failed to read the ID index '%s': %s", index_path, schema->GetError());
+	}
+	bool has_id = false, has_ordinal = false;
+	has_block_out = false;
+	for (auto &name : CompatResultNames(*schema)) {
+		has_id = has_id || name == "ID";
+		has_ordinal = has_ordinal || name == "_pvar_ordinal";
+		has_block_out = has_block_out || name == "_variant_block";
+	}
+	if (!has_id || !has_ordinal) {
+		throw InvalidInputException("read_pfile: the ID index '%s' needs the columns ID and _pvar_ordinal", index_path);
+	}
+	string in_list;
+	for (auto &id : ids) {
+		in_list += (in_list.empty() ? "'" : ", '") + StringUtil::Replace(id, "'", "''") + "'";
+	}
+	auto result = conn.Query(string("SELECT ") + (has_block_out ? "CAST(_variant_block AS BIGINT)" : "0") +
+	                         ", CAST(_pvar_ordinal AS BIGINT) FROM read_parquet('" + escaped_path + "') WHERE ID IN (" +
+	                         in_list + ")");
+	if (result->HasError()) {
+		throw IOException("read_pfile: the ID index query failed on '%s': %s", index_path, result->GetError());
+	}
+	vector<std::pair<idx_t, uint32_t>> rows;
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			auto block = chunk->GetValue(0, r);
+			auto ordinal = chunk->GetValue(1, r);
+			if (block.IsNull() || ordinal.IsNull()) {
+				continue;
+			}
+			const int64_t b = block.GetValue<int64_t>();
+			const int64_t o = ordinal.GetValue<int64_t>();
+			if (b < 0 || o < 0 || o > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+				continue;
+			}
+			rows.emplace_back(static_cast<idx_t>(b), static_cast<uint32_t>(o));
+		}
+	}
+	return rows;
+}
+
+//! Views PR 4a: look up a WHERE ID's values in the ID index. A catalog has one index, beside its
+//! .pfile.json; `keep` then marks the sources (variant blocks) that hold a match. A file set or a list
+//! has one index per source, beside its .pgen, and drops nothing (`keep` stays empty). Each source
+//! that an index covers gets its ordinals as its variant set (bind_data.id_ordinals).
+static void ApplyIdIndex(ClientContext &context, PfileBindData &bind_data, const std::set<string> &ids,
+                         vector<bool> &keep) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	const idx_t n = bind_data.sources.size();
+	auto finish = [](PfileBindData::IdOrdinals &o) {
+		std::sort(o.ordinals.begin(), o.ordinals.end());
+		o.ordinals.erase(std::unique(o.ordinals.begin(), o.ordinals.end()), o.ordinals.end());
+	};
+	if (bind_data.source_blocks.size() == n) {
+		const string &cat = bind_data.lazy_pgen_catalog_path;
+		const string suffix = ".pfile.json";
+		if (!StringUtil::EndsWith(cat, suffix)) {
+			return;
+		}
+		const string index_path = cat.substr(0, cat.size() - suffix.size()) + ".pvar.index.parquet";
+		if (!fs.FileExists(index_path)) {
+			return;
+		}
+		bool has_block = false;
+		auto rows = QueryIdIndex(context, index_path, ids, has_block);
+		if (!has_block) {
+			for (auto b : bind_data.source_blocks) {
+				if (b != 0) {
+					throw InvalidInputException(
+					    "read_pfile: the ID index '%s' has no _variant_block column, but the catalog has more "
+					    "than one variant block",
+					    index_path);
+				}
+			}
+		}
+		std::unordered_map<idx_t, vector<uint32_t>> by_block;
+		for (auto &r : rows) {
+			by_block[r.first].push_back(r.second);
+		}
+		bind_data.id_ordinals.assign(n, PfileBindData::IdOrdinals());
+		keep.assign(n, false);
+		for (idx_t i = 0; i < n; i++) {
+			auto &o = bind_data.id_ordinals[i];
+			o.active = true; // a block with no match reads no row, even when it is the one kept
+			auto it = by_block.find(bind_data.source_blocks[i]);
+			if (it != by_block.end()) {
+				keep[i] = true;
+				o.ordinals = it->second;
+				finish(o);
+			}
+		}
+		return;
+	}
+	if (bind_data.source_prefixes.size() != n) {
+		return;
+	}
+	for (idx_t i = 0; i < n; i++) {
+		string prefix = bind_data.source_prefixes[i];
+		if (prefix.empty()) {
+			continue; // a read made only from overrides has no prefix, so no index
+		}
+		if (StringUtil::EndsWith(prefix, ".pgen")) {
+			prefix = prefix.substr(0, prefix.size() - 5);
+		}
+		const string index_path = ResolveExistingPath(context, fs, prefix + ".pvar.index.parquet");
+		if (index_path.empty()) {
+			continue;
+		}
+		bool has_block = false;
+		auto rows = QueryIdIndex(context, index_path, ids, has_block);
+		if (bind_data.id_ordinals.size() != n) {
+			bind_data.id_ordinals.assign(n, PfileBindData::IdOrdinals());
+		}
+		auto &o = bind_data.id_ordinals[i];
+		o.active = true;
+		for (auto &r : rows) {
+			o.ordinals.push_back(r.second);
+		}
+		finish(o);
+	}
+}
+
 static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<PfileBindData>();
@@ -6554,8 +6868,33 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	const bool push_region =
 	    bind_data.lazy_variants && !bind_data.lazy_variants_loaded &&
 	    (bind_data.orient_mode == OrientMode::VARIANT || bind_data.orient_mode == OrientMode::GENOTYPE);
-	if (!prune_samples && !prune_variants && !push_region) {
+	// Views PR 2a: a WHERE on the scalar genotype column becomes the scan's genotype filter.
+	const bool push_genotype = bind_data.orient_mode == OrientMode::GENOTYPE && !bind_data.include_phased &&
+	                           !bind_data.include_dosages && !bind_data.lazy_variants_loaded;
+	if (!prune_samples && !prune_variants && !push_region && !push_genotype) {
 		return;
+	}
+	if (push_genotype) {
+		bool allowed[4] = {true, true, true, true};
+		bool any = false;
+		for (auto &f : filters) {
+			any |= CollectGenotypeAllowed(context, get, *f, bind_data.geno_genotype_col, allowed);
+		}
+		if (any) {
+			// Intersect with include_genotypes / genotype_range (if given); the WHERE still runs on
+			// every row. Set before PruneSamplesByIid, which rebuilds count_filter_subset when active.
+			auto &gf = bind_data.genotype_filter;
+			for (idx_t g = 0; g < 3; g++) {
+				gf.allowed[g] = gf.active ? (gf.allowed[g] && allowed[g]) : allowed[g];
+			}
+			gf.include_missing = gf.active ? (gf.include_missing && allowed[3]) : allowed[3];
+			gf.active = true;
+			if (bind_data.has_sample_subset && !bind_data.count_filter_subset) {
+				bind_data.count_filter_subset =
+				    make_uniq<SampleSubset>(BuildSampleSubset(bind_data.raw_sample_ct, bind_data.sample_indices));
+			}
+			g_genotype_where_pushed.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 	CellPruneConstraints c;
 	if (prune_samples) {
@@ -6563,6 +6902,7 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 		if (bind_data.orient_mode == OrientMode::SAMPLE) {
 			c.chrom_col = DConstants::INVALID_INDEX;
 			c.pos_col = DConstants::INVALID_INDEX;
+			c.id_col = DConstants::INVALID_INDEX;
 			for (idx_t j = 0; j < bind_data.sample_orient_col_to_psam_col.size(); j++) {
 				if (psam_cols[bind_data.sample_orient_col_to_psam_col[j]] == "IID") {
 					c.iid_col = j;
@@ -6586,23 +6926,56 @@ static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, 
 	if (push_region && PushedRegion(c, bind_data.region, pushed)) {
 		bind_data.region = pushed;
 	}
-	if (!prune_variants || (!c.has_chrom && !c.has_pos)) {
+	// Views PR 4a: a WHERE ID = / IN looks up the ID index. '.' and '' are never indexed, so a WHERE that
+	// names one cannot use it. The WHERE still runs on every row.
+	vector<bool> id_keep;
+	if (push_region && bind_data.id_ordinals.empty() && c.has_id && !c.ids.empty() && !c.ids.count(".") &&
+	    !c.ids.count("") && GetUseParquetCompanions(context)) {
+		ApplyIdIndex(context, bind_data, c.ids, id_keep);
+	}
+	const bool range_drop = prune_variants && (c.has_chrom || c.has_pos);
+	if (!range_drop && id_keep.empty()) {
 		return;
+	}
+	const idx_t n = bind_data.sources.size();
+	const bool carry_ranges = bind_data.source_ranges.size() == n;
+	const bool carry_blocks = bind_data.source_blocks.size() == n;
+	const bool carry_ids = bind_data.id_ordinals.size() == n;
+	vector<idx_t> kept_idx;
+	for (idx_t i = 0; i < n; i++) {
+		if ((!range_drop || c.MayOverlap(bind_data.source_ranges[i])) && (id_keep.empty() || id_keep[i])) {
+			kept_idx.push_back(i);
+		}
+	}
+	if (kept_idx.empty()) {
+		kept_idx.push_back(0);
 	}
 	vector<PfileSource> kept;
 	vector<ShardEntry> kept_ranges;
-	for (idx_t i = 0; i < bind_data.sources.size(); i++) {
-		if (c.MayOverlap(bind_data.source_ranges[i])) {
-			kept.push_back(std::move(bind_data.sources[i]));
+	vector<idx_t> kept_blocks;
+	vector<PfileBindData::IdOrdinals> kept_ids;
+	for (auto i : kept_idx) {
+		kept.push_back(std::move(bind_data.sources[i]));
+		if (carry_ranges) {
 			kept_ranges.push_back(bind_data.source_ranges[i]);
 		}
-	}
-	if (kept.empty()) {
-		kept.push_back(std::move(bind_data.sources[0]));
-		kept_ranges.push_back(bind_data.source_ranges[0]);
+		if (carry_blocks) {
+			kept_blocks.push_back(bind_data.source_blocks[i]);
+		}
+		if (carry_ids) {
+			kept_ids.push_back(std::move(bind_data.id_ordinals[i]));
+		}
 	}
 	bind_data.sources = std::move(kept);
-	bind_data.source_ranges = std::move(kept_ranges);
+	if (carry_ranges) {
+		bind_data.source_ranges = std::move(kept_ranges);
+	}
+	if (carry_blocks) {
+		bind_data.source_blocks = std::move(kept_blocks);
+	}
+	if (carry_ids) {
+		bind_data.id_ordinals = std::move(kept_ids);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -6620,6 +6993,25 @@ static void DebugSparseVariantsResetFunc(DataChunk &args, ExpressionState &, Vec
 	g_sparse_variants_decoded.store(0, std::memory_order_relaxed);
 	g_sparse_concat_dense_shards.store(0, std::memory_order_relaxed);
 	g_sparse_concat_altmajor_shards.store(0, std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
+}
+
+static void DebugPgenHeaderDecodesFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(g_pgen_header_decodes.load(std::memory_order_relaxed)), args.size());
+}
+
+static void DebugPgenHeaderDecodesResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	g_pgen_header_decodes.store(0, std::memory_order_relaxed);
+	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
+}
+
+static void DebugGenotypeWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(g_genotype_where_pushed.load(std::memory_order_relaxed)),
+	                        args.size());
+}
+
+static void DebugGenotypeWherePushedResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	g_genotype_where_pushed.store(0, std::memory_order_relaxed);
 	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
 }
 
@@ -6650,6 +7042,8 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		fn.filter_pushdown = true;
 		// Stage 4: a WHERE on CHROM/POS drops catalog variant blocks before any is opened.
 		fn.pushdown_complex_filter = PfilePushdownComplexFilter;
+		// Views PR 2b: CPRA, selectable by name, not in SELECT *.
+		fn.get_virtual_columns = PfileGetVirtualColumns;
 		// Composable selection: a STRUCT whose samples/region/variants/variant_range
 		// fields seed the axes; the individual params override per-field
 		// (most-specific-wins). samples/variants are ANY — type dispatch is in bind.
@@ -6663,6 +7057,7 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		                            {"phased", LogicalType::BOOLEAN},
 		                            {"region", LogicalType::VARCHAR},
 		                            {"attach_cache", LogicalType::VARCHAR},
+		                            {"unique_column_names", LogicalType::BOOLEAN},
 		                            {"samples", LogicalType::ANY},
 		                            {"variants", LogicalType::ANY},
 		                            {"selection", LogicalType::ANY},
@@ -6729,6 +7124,29 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	RegisterScalarWithDesc(loader, dbg_sparse_reset, {},
 	                       "Test-only: reset the sparse-difflist proof-ran counter to 0, returns 0 (P13-011).",
 	                       {"SELECT plinking_debug_sparse_variants_reset()"});
+	ScalarFunction dbg_gw("plinking_debug_genotype_where_pushed", {}, LogicalType::BIGINT,
+	                      DebugGenotypeWherePushedFunc);
+	dbg_gw.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_gw, {},
+	                       "Test-only: reads whose WHERE on genotype compiled into the scan's genotype filter since "
+	                       "the last reset (views PR 2a).",
+	                       {"SELECT plinking_debug_genotype_where_pushed()"});
+	ScalarFunction dbg_gw_reset("plinking_debug_genotype_where_pushed_reset", {}, LogicalType::BIGINT,
+	                            DebugGenotypeWherePushedResetFunc);
+	dbg_gw_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_gw_reset, {}, "Test-only: reset plinking_debug_genotype_where_pushed to 0.",
+	                       {"SELECT plinking_debug_genotype_where_pushed_reset()"});
+	ScalarFunction dbg_hdr("plinking_debug_pgen_header_decodes", {}, LogicalType::BIGINT, DebugPgenHeaderDecodesFunc);
+	dbg_hdr.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_hdr, {},
+	                       "Test-only: .pgen header decodes (PgfiInitPhase2 runs) by read_pfile since the last reset "
+	                       "(cache tier 1).",
+	                       {"SELECT plinking_debug_pgen_header_decodes()"});
+	ScalarFunction dbg_hdr_reset("plinking_debug_pgen_header_decodes_reset", {}, LogicalType::BIGINT,
+	                             DebugPgenHeaderDecodesResetFunc);
+	dbg_hdr_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_hdr_reset, {}, "Test-only: reset plinking_debug_pgen_header_decodes to 0.",
+	                       {"SELECT plinking_debug_pgen_header_decodes_reset()"});
 	ScalarFunction dbg_concat_dense("plinking_debug_sparse_concat_dense", {}, LogicalType::BIGINT,
 	                                DebugSparseConcatDenseFunc);
 	dbg_concat_dense.SetVolatile();
