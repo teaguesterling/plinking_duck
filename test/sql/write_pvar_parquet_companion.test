@@ -59,6 +59,14 @@ SELECT DISTINCT compression, row_group_id FROM parquet_metadata('{TEST_DIR}/pq.p
 ----
 ZSTD	0
 
+# Parquet format version 2 (Teague, 2026-11-19): V2 pages use delta encodings, so a sorted POS /
+# ordinal column is about 230 bytes, not about 1 MB (measured on 400,000 variants: the .pvar.parquet
+# is 6.3x smaller, the 1M-sample .psam.parquet 3.7x, and no read is slower).
+query I
+SELECT format_version FROM parquet_file_metadata('{TEST_DIR}/pq.pvar.parquet');
+----
+2
+
 # Without the option no companion is written.
 statement ok
 COPY (SELECT * FROM read_pfile('test/data/pfile_example', genotypes := 'struct') ORDER BY CHROM, POS)
