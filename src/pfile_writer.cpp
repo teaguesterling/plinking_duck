@@ -399,7 +399,8 @@ void PvarParquetFlush(PvarWriteGlobalState &g) {
 	g.pq_app->Close();
 	string target = g.path + ".parquet";
 	auto r = g.pq_con->Query("COPY (SELECT CHROM, POS, ID, REF, ALT, __vidx FROM __pvar_pq ORDER BY __vidx) TO '" +
-	                         StringUtil::Replace(target, "'", "''") + "' (FORMAT parquet, COMPRESSION zstd)");
+	                         StringUtil::Replace(target, "'", "''") +
+	                         "' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd)");
 	if (r->HasError()) {
 		throw IOException("write pvar: cannot write the parquet companion '%s': %s", target, r->GetError());
 	}
@@ -1425,8 +1426,9 @@ void WritePsamParquet(DatabaseInstance &db, const string &psam_path, const vecto
 		app.Close();
 	}
 	string target = psam_path + ".parquet";
-	auto c = con.Query("COPY (SELECT " + cols + " FROM __psam_pq ORDER BY " + QuotePsamIdent(ord_name) + ") TO '" +
-	                   StringUtil::Replace(target, "'", "''") + "' (FORMAT parquet, COMPRESSION zstd)");
+	auto c =
+	    con.Query("COPY (SELECT " + cols + " FROM __psam_pq ORDER BY " + QuotePsamIdent(ord_name) + ") TO '" +
+	              StringUtil::Replace(target, "'", "''") + "' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd)");
 	if (c->HasError()) {
 		throw IOException("write psam: cannot write the parquet companion '%s': %s", target, c->GetError());
 	}
