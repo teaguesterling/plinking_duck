@@ -42,16 +42,18 @@ static shared_ptr<PgenHeader> DecodePgenHeader(ClientContext &context, bool use_
 	return h;
 }
 
-//! The cache key: the path, the file's identity, and the counts the caller expects (phase 1 checks
-//! them, so a caller expecting other counts decodes afresh and gets pgenlib's error). A stale header
-//! gives WRONG records, not lost rows, so the identity is as strict as the file allows:
+//! The cache key: the path and the file's identity. The counts a caller expects are not part of it:
+//! a bind that passes UINT32_MAX and a scan that passes the exact counts share one entry, and a hit
+//! whose counts differ from the caller's is decoded afresh, uncached, so phase 1 raises pgenlib's own
+//! error (AcquirePgenHeader). A stale header gives WRONG records, not lost rows, so the identity is as
+//! strict as the file allows:
 //! - a path stat() can see (a local file, on any route, including plinking_pgen_io = 'vfs'): device,
 //!   inode, size and mtime in nanoseconds. A rewrite that promotes by rename (our writer) gets a new
 //!   inode, even within the same second at the same size;
 //! - otherwise (a remote path): DuckDB's size, last-modified time and version tag (the ETag, for
 //!   httpfs). A file with neither a version tag nor a modification time is not cached.
 //! Returns "" when the identity cannot be read: that open is then not cached.
-static string PgenHeaderKey(ClientContext &context, const string &pgen_path, uint32_t variant_ct, uint32_t sample_ct) {
+static string PgenHeaderKey(ClientContext &context, const string &pgen_path) {
 	string identity;
 	struct stat st;
 	if (stat(pgen_path.c_str(), &st) == 0) {
@@ -73,7 +75,7 @@ static string PgenHeaderKey(ClientContext &context, const string &pgen_path, uin
 			return "";
 		}
 	}
-	return StringUtil::Format("plinking_pgen_header:%s|%s|v=%u|s=%u", pgen_path, identity, variant_ct, sample_ct);
+	return StringUtil::Format("plinking_pgen_header:%s|%s", pgen_path, identity);
 }
 
 static bool PgenHeaderCacheEnabled(ClientContext &context) {
@@ -81,21 +83,27 @@ static bool PgenHeaderCacheEnabled(ClientContext &context) {
 	return !context.TryGetCurrentSetting("plinking_pgen_header_cache", v) || v.IsNull() || v.GetValue<bool>();
 }
 
+//! Whether a header matches the counts a caller expects (UINT32_MAX = unknown, matches any).
+static bool CountsMatch(const PgenHeader &h, uint32_t variant_ct, uint32_t sample_ct) {
+	return (variant_ct == UINT32_MAX || variant_ct == h.pgfi.raw_variant_ct) &&
+	       (sample_ct == UINT32_MAX || sample_ct == h.pgfi.raw_sample_ct);
+}
+
 shared_ptr<PgenHeader> AcquirePgenHeader(ClientContext &context, bool use_vfs, const string &pgen_path,
                                          uint32_t variant_ct, uint32_t sample_ct, const string &what) {
-	if (!PgenHeaderCacheEnabled(context)) {
+	auto uncached = [&]() {
 		return DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
+	};
+	if (!PgenHeaderCacheEnabled(context) || IsLocalizedPgenTemp(pgen_path)) {
+		return uncached();
 	}
-	if (IsLocalizedPgenTemp(pgen_path)) {
-		return DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
-	}
-	const string key = PgenHeaderKey(context, pgen_path, variant_ct, sample_ct);
+	const string key = PgenHeaderKey(context, pgen_path);
 	if (key.empty()) {
-		return DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
+		return uncached();
 	}
 	auto &cache = ObjectCache::GetObjectCache(context);
 	if (auto hit = cache.Get<PgenHeader>(key)) {
-		return hit;
+		return CountsMatch(*hit, variant_ct, sample_ct) ? hit : uncached();
 	}
 	// One decode per key: the first caller decodes under the key's lock, later callers wait and share
 	// it. Different keys decode in parallel (a full scan opens several cells at once).
@@ -110,23 +118,26 @@ shared_ptr<PgenHeader> AcquirePgenHeader(ClientContext &context, bool use_vfs, c
 		}
 		key_lock = slot;
 	}
-	shared_ptr<PgenHeader> h;
-	{
-		std::lock_guard<std::mutex> g(*key_lock);
-		h = cache.Get<PgenHeader>(key);
-		if (!h) {
-			h = DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
-			cache.Put(key, h);
+	// Drop the key's lock from the map on every exit, a throwing decode included, unless another caller
+	// still waits on it (the map's reference and ours are the only two then).
+	struct EraseLock {
+		const string &key;
+		~EraseLock() {
+			std::lock_guard<std::mutex> g(locks_mutex);
+			auto it = locks.find(key);
+			if (it != locks.end() && it->second.use_count() <= 2) {
+				locks.erase(it);
+			}
 		}
+	} erase_lock {key};
+	std::lock_guard<std::mutex> g(*key_lock);
+	auto h = cache.Get<PgenHeader>(key);
+	if (!h) {
+		h = DecodePgenHeader(context, use_vfs, pgen_path, variant_ct, sample_ct, what);
+		cache.Put(key, h);
+		return h;
 	}
-	{
-		std::lock_guard<std::mutex> g(locks_mutex);
-		auto it = locks.find(key);
-		if (it != locks.end() && it->second.use_count() <= 2) { // the map's and ours: nobody waits
-			locks.erase(it);
-		}
-	}
-	return h;
+	return CountsMatch(*h, variant_ct, sample_ct) ? h : uncached();
 }
 
 void InitPgenReaderOn(const PgenHeader &header, const string &pgen_path, plink2::PgenReader &pgr,
