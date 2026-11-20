@@ -1,0 +1,292 @@
+# name: test/sql/read_pfile_pgen_header_cache.test
+# description: cache tier 1 — read_pfile decodes each .pgen header once per process, shared by every thread and every query, and decodes again when the file changes
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-20-metadata-cache-tiers-design.md, tier 1. The signal is
+# plinking_debug_pgen_header_decodes(): one count per PgfiInitPhase2 run. Measured before the cache:
+# 4 per query at 4 threads (one per thread), and 4 again on the next query.
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE src AS SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS;
+
+statement ok
+COPY src TO '{TEST_DIR}/A' (FORMAT pfile);
+
+# The oracle: the same rows from the source file set (another .pgen, so another cache entry).
+statement ok
+CREATE TABLE oracle AS SELECT CHROM, POS, ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype');
+
+# --- One decode per file, across 4 threads; none on the next query. wes_chr10: 30000 variants, so
+# --- every thread claims batches.
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- The rows are the source's.
+query I
+SELECT count(*) FROM (
+  (SELECT CHROM, POS, ID, IID, genotype FROM read_pfile('{TEST_DIR}/A', orient := 'genotype') EXCEPT ALL SELECT * FROM oracle)
+  UNION ALL
+  (SELECT * FROM oracle EXCEPT ALL SELECT CHROM, POS, ID, IID, genotype FROM read_pfile('{TEST_DIR}/A', orient := 'genotype')));
+----
+0
+
+# --- A rewritten .pgen (new size / mtime) is decoded again, and its new genotypes are read. Every
+# --- genotype becomes hom-alt (2), so a stale header would also show as wrong counts.
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+statement ok
+COPY (SELECT * REPLACE (list_transform(genotypes, lambda g: 2::TINYINT) AS genotypes) FROM read_pfile('{TEST_DIR}/A') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/A' (FORMAT pfile, force, samples ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE genotype = 2) FROM read_pfile('{TEST_DIR}/A', orient := 'genotype');
+----
+24000	24000
+
+query I
+SELECT plinking_debug_pgen_header_decodes() >= 1;
+----
+true
+
+# --- A catalog: one decode per cell, once.
+statement ok
+COPY src TO '{TEST_DIR}/V' (FORMAT pfile, shard_by 'CHROM');
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/V');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+3
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/V');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+3
+
+# --- A sample-sharded cohort (ConcatPgenReader): one decode per sample shard, once. (count(genotype):
+# --- a count(*) projects no genotype column, so it opens no .pgen. 18000 = the source's non-missing
+# --- genotypes, measured.)
+statement ok
+COPY src TO '{TEST_DIR}/S' (FORMAT pfile, shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotype) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype');
+----
+18000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+2
+
+query I
+SELECT count(genotype) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype');
+----
+18000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+2
+
+# --- The count filter and the sample-orient pre-read share the scan's header. (Every large_example
+# --- variant has ALT_FREQ 0.5, measured, so ac_range 16..16 keeps none.)
+statement ok
+COPY src TO '{TEST_DIR}/F' (FORMAT pfile);
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/F');
+----
+3000
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', ac_range := {min: 16, max: 16});
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', orient := 'sample');
+----
+8
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+1
+
+# --- ATTACH ... (CACHE false) does not turn the header cache off (Teague, 2026-11-20).
+statement ok
+ATTACH '{TEST_DIR}/V' AS c (TYPE pfile_catalog, CACHE false);
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotype) FROM c.genotypes;
+----
+18000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+0
+
+# --- plinking_pgen_header_cache = false: every open decodes again.
+statement ok
+SET plinking_pgen_header_cache = false;
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT plinking_debug_pgen_header_decodes() >= 1;
+----
+true
+
+statement ok
+RESET plinking_pgen_header_cache;
+
+# ---------------------------------------------------------------------------
+# Review finding: on the VFS route the key was size + mtime in seconds. A same-size rewrite in the
+# same second kept the old key (a stale header gives wrong records). A local file is now keyed by
+# stat() on every route; this rewrite (each variant's genotypes reversed) keeps the size, 10520 B
+# (measured), and is promoted by rename (a new inode).
+# ---------------------------------------------------------------------------
+statement ok
+SET plinking_pgen_io = 'vfs';
+
+statement ok
+COPY src TO '{TEST_DIR}/R' (FORMAT pfile);
+
+query I
+SELECT plinking_debug_pgen_header_decodes_reset();
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/R');
+----
+3000
+
+statement ok
+COPY (SELECT * REPLACE (list_reverse(genotypes) AS genotypes) FROM read_pfile('{TEST_DIR}/R') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/R' (FORMAT pfile, force, samples ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4', 'SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']);
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/R');
+----
+3000
+
+query I
+SELECT plinking_debug_pgen_header_decodes();
+----
+2
+
+query I
+SELECT count(*) FROM (
+  SELECT genotypes FROM read_pfile('{TEST_DIR}/R')
+  EXCEPT ALL
+  SELECT list_reverse(genotypes)::TINYINT[8] FROM read_pfile('test/data/large_example'));
+----
+0
+
+statement ok
+RESET plinking_pgen_io;
+
+# ---------------------------------------------------------------------------
+# Review finding: under 'localize' each query reads a new temp copy, so a cached header could never
+# be hit again and only held memory. A localize temp is not cached: the object cache does not grow.
+# ---------------------------------------------------------------------------
+statement ok
+SET plinking_pgen_io = 'localize';
+
+statement ok
+CREATE TABLE oc0 AS SELECT coalesce(sum(memory_usage_bytes), 0) AS b FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT count(genotypes) FROM read_pfile('test/data/wes_chr10');
+----
+30000
+
+query I
+SELECT (SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE') - (SELECT b FROM oc0);
+----
+0
+
+statement ok
+RESET plinking_pgen_io;

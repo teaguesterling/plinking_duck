@@ -11,6 +11,7 @@
 // a bug. Cross-check against `plink2 --r2` before relying on exact-match semantics.
 
 #include "plink_ld.hpp"
+#include "pgen_header_cache.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
 #include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
@@ -506,17 +507,6 @@ static LdResult ComputeWeightedLdStats(const uintptr_t *genovec_a, const uintptr
 // ---------------------------------------------------------------------------
 
 struct PlinkLdBindData : public TableFunctionData {
-	PlinkLdBindData() {
-		plink2::PreinitPgfi(&shared_pgfi);
-	}
-
-	~PlinkLdBindData() override {
-		if (shared_pgfi_initialized) {
-			plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-			plink2::CleanupPgfi(&shared_pgfi, &cleanup_err);
-		}
-	}
-
 	string pgen_path;
 	bool use_vfs = false;             // route .pgen opens through DuckDB's VFS (plinking_pgen_io)
 	PgenLocalizeGuard localize_guard; // owns downloaded temp .pgen for 'localize' (per-query)
@@ -531,14 +521,10 @@ struct PlinkLdBindData : public TableFunctionData {
 	uint32_t raw_sample_ct = 0;
 
 	// Shared immutable pgenlib file metadata. PgfiInitPhase2 can allocate large
-	// per-variant index arrays for whole-genome PGENs, so keep one copy in bind
-	// data and let each local PgenReader copy the struct/pointers instead of
-	// re-running Phase2 per worker.
-	plink2::PgenFileInfo shared_pgfi;
-	AlignedBuffer shared_pgfi_alloc_buf;
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
-	bool shared_pgfi_initialized = false;
+	// per-variant index arrays for whole-genome PGENs, so keep one copy and let each
+	// local PgenReader copy the struct/pointers instead of re-running Phase2 per worker.
+	// Since cache tier 1 the copy is the database-wide PgenHeader, shared with later queries.
+	shared_ptr<PgenHeader> header;
 
 	// Sample subsetting
 	bool has_sample_subset = false;
@@ -864,49 +850,13 @@ static unique_ptr<FunctionData> PlinkLdBind(ClientContext &context, TableFunctio
 	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
 	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs, PgenVfsRole::HEADER); // bind: the scan reuses its blocks
 
-	char errstr_buf[plink2::kPglErrstrBufBlen];
-	plink2::PgenHeaderCtrl header_ctrl;
-	uintptr_t pgfi_alloc_cacheline_ct = 0;
-
-	plink2::PglErr err =
-	    plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX, &header_ctrl,
-	                           &bind_data->shared_pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
-
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&bind_data->shared_pgfi, &cleanup_err);
-		throw IOException("plink_ld: failed to open '%s': %s", bind_data->pgen_path, errstr_buf);
-	}
-
-	bind_data->raw_variant_ct = bind_data->shared_pgfi.raw_variant_ct;
-	bind_data->raw_sample_ct = bind_data->shared_pgfi.raw_sample_ct;
-
-	if (pgfi_alloc_cacheline_ct > 0) {
-		bind_data->shared_pgfi_alloc_buf.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-	}
-
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, bind_data->shared_pgfi.raw_variant_ct,
-	                             &bind_data->max_vrec_width, &bind_data->shared_pgfi,
-	                             bind_data->shared_pgfi_alloc_buf.As<unsigned char>(),
-	                             &bind_data->pgr_alloc_cacheline_ct, errstr_buf);
-
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&bind_data->shared_pgfi, &cleanup_err);
-		throw IOException("plink_ld: failed to initialize '%s' (phase 2): %s", bind_data->pgen_path, errstr_buf);
-	}
-	bind_data->shared_pgfi_initialized = true;
-
-	// Force local readers to open their own file handles instead of racing to
-	// steal the shared Phase-1 FILE* from the bind-time PgenFileInfo.
-	if (bind_data->shared_pgfi.shared_ff) {
-		std::fclose(bind_data->shared_pgfi.shared_ff);
-		bind_data->shared_pgfi.shared_ff = nullptr;
-	}
-	if (bind_data->shared_pgfi.pgi_ff) {
-		std::fclose(bind_data->shared_pgfi.pgi_ff);
-		bind_data->shared_pgfi.pgi_ff = nullptr;
-	}
+	// AcquirePgenHeader closes the header's shared_ff (and phase 2 its pgi_ff), so each local reader
+	// opens its own file handle.
+	bind_data->header = AcquirePgenHeader(context, bind_data->use_vfs, bind_data->pgen_path, UINT32_MAX, UINT32_MAX,
+	                                      "plink_ld: failed to open");
+	bind_data->raw_variant_ct = bind_data->header->pgfi.raw_variant_ct;
+	bind_data->raw_sample_ct = bind_data->header->pgfi.raw_sample_ct;
+	plink2::PglErr err = plink2::kPglRetSuccess;
 
 	// --- Load variant metadata ---
 	bool metadata_region_pushed = false;
@@ -1091,23 +1041,10 @@ static unique_ptr<LocalTableFunctionState> PlinkLdInitLocal(ExecutionContext &co
 	// --- Initialize per-thread PgenReader from bind-time shared PgenFileInfo ---
 	PgenVfsScope pgen_vfs_scope(context.client, bind_data.use_vfs);
 	plink2::PreinitPgr(&state->pgr);
-	if (!bind_data.shared_pgfi_initialized) {
+	if (!bind_data.header) {
 		throw InternalException("plink_ld: shared pgen metadata was not initialized");
 	}
-
-	if (bind_data.pgr_alloc_cacheline_ct > 0) {
-		state->pgr_alloc_buf.Allocate(bind_data.pgr_alloc_cacheline_ct * plink2::kCacheline);
-	}
-
-	plink2::PglErr err = plink2::PgrInit(bind_data.pgen_path.c_str(), bind_data.max_vrec_width,
-	                                     const_cast<plink2::PgenFileInfo *>(&bind_data.shared_pgfi), &state->pgr,
-	                                     state->pgr_alloc_buf.As<unsigned char>());
-
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgr(&state->pgr, &cleanup_err);
-		throw IOException("plink_ld: PgrInit failed for '%s'", bind_data.pgen_path);
-	}
+	InitPgenReaderOn(*bind_data.header, bind_data.pgen_path, state->pgr, state->pgr_alloc_buf, "plink_ld");
 
 	// Set up sample subsetting
 	if (bind_data.has_sample_subset && bind_data.sample_subset) {

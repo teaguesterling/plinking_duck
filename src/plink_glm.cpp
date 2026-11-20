@@ -1,4 +1,5 @@
 #include "plink_glm.hpp"
+#include "pgen_header_cache.hpp"
 #include "duckdb_compat.hpp"
 #include "register_helper.hpp"
 #include "named_parameter_compat.hpp" // DeclareNamedParameters / NamedParamMap (DuckDB v2.0 typed kwargs)
@@ -340,8 +341,7 @@ struct LogisticBuffers {
 };
 
 struct PlinkGlmLocalState : public LocalTableFunctionState {
-	plink2::PgenFileInfo pgfi;
-	AlignedBuffer pgfi_alloc_buf;
+	shared_ptr<PgenHeader> header; //! decoded .pgen header (cache tier 1); pgr points into it
 
 	plink2::PgenReader pgr;
 	AlignedBuffer pgr_alloc_buf;
@@ -363,7 +363,7 @@ struct PlinkGlmLocalState : public LocalTableFunctionState {
 		if (initialized) {
 			plink2::PglErr reterr = plink2::kPglRetSuccess;
 			plink2::CleanupPgr(&pgr, &reterr);
-			plink2::CleanupPgfi(&pgfi, &reterr);
+			// the header is released after pgr (member order)
 		}
 	}
 };
@@ -451,43 +451,12 @@ static unique_ptr<FunctionData> PlinkGlmBind(ClientContext &context, TableFuncti
 	bind_data->use_vfs = PgenIoUseVfs(context, bind_data->pgen_path);
 	PgenVfsScope pgen_vfs_scope(context, bind_data->use_vfs, PgenVfsRole::HEADER); // bind: the scan reuses its blocks
 
-	plink2::PgenFileInfo pgfi;
-	plink2::PreinitPgfi(&pgfi);
-
-	char errstr_buf[plink2::kPglErrstrBufBlen];
-	plink2::PgenHeaderCtrl header_ctrl;
-	uintptr_t pgfi_alloc_cacheline_ct = 0;
-
-	plink2::PglErr err = plink2::PgfiInitPhase1(bind_data->pgen_path.c_str(), nullptr, UINT32_MAX, UINT32_MAX,
-	                                            &header_ctrl, &pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
-
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&pgfi, &cleanup_err);
-		throw IOException("plink_glm: failed to open '%s': %s", bind_data->pgen_path, errstr_buf);
-	}
-
+	// The decoded header (cache tier 1): shared with the scan threads and later queries.
+	auto bind_header = AcquirePgenHeader(context, bind_data->use_vfs, bind_data->pgen_path, UINT32_MAX, UINT32_MAX,
+	                                     "plink_glm: failed to open");
+	const plink2::PgenFileInfo &pgfi = bind_header->pgfi;
 	bind_data->raw_variant_ct = pgfi.raw_variant_ct;
 	bind_data->raw_sample_ct = pgfi.raw_sample_ct;
-
-	// Phase 2
-	AlignedBuffer pgfi_alloc;
-	if (pgfi_alloc_cacheline_ct > 0) {
-		pgfi_alloc.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-	}
-
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
-
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, pgfi.raw_variant_ct, &max_vrec_width, &pgfi,
-	                             pgfi_alloc.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
-
-	plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-	plink2::CleanupPgfi(&pgfi, &cleanup_err);
-
-	if (err != plink2::kPglRetSuccess) {
-		throw IOException("plink_glm: failed to initialize '%s' (phase 2): %s", bind_data->pgen_path, errstr_buf);
-	}
 
 	// --- Load variant metadata ---
 	bind_data->variants = LoadVariantMetadata(context, bind_data->pvar_path, "plink_glm");
@@ -885,53 +854,10 @@ static unique_ptr<LocalTableFunctionState> PlinkGlmInitLocal(ExecutionContext &c
 
 	// --- Initialize per-thread PgenFileInfo + PgenReader ---
 	PgenVfsScope pgen_vfs_scope(context.client, bind_data.use_vfs);
-	plink2::PreinitPgfi(&state->pgfi);
 	plink2::PreinitPgr(&state->pgr);
-
-	char errstr_buf[plink2::kPglErrstrBufBlen];
-	plink2::PgenHeaderCtrl header_ctrl;
-	uintptr_t pgfi_alloc_cacheline_ct = 0;
-
-	plink2::PglErr err =
-	    plink2::PgfiInitPhase1(bind_data.pgen_path.c_str(), nullptr, bind_data.raw_variant_ct, bind_data.raw_sample_ct,
-	                           &header_ctrl, &state->pgfi, &pgfi_alloc_cacheline_ct, errstr_buf);
-
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state->pgfi, &cleanup_err);
-		throw IOException("plink_glm: thread init failed (phase 1): %s", errstr_buf);
-	}
-
-	if (pgfi_alloc_cacheline_ct > 0) {
-		state->pgfi_alloc_buf.Allocate(pgfi_alloc_cacheline_ct * plink2::kCacheline);
-	}
-
-	uint32_t max_vrec_width = 0;
-	uintptr_t pgr_alloc_cacheline_ct = 0;
-
-	err = plink2::PgfiInitPhase2(header_ctrl, 0, 0, 0, 0, state->pgfi.raw_variant_ct, &max_vrec_width, &state->pgfi,
-	                             state->pgfi_alloc_buf.As<unsigned char>(), &pgr_alloc_cacheline_ct, errstr_buf);
-
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state->pgfi, &cleanup_err);
-		throw IOException("plink_glm: thread init failed (phase 2): %s", errstr_buf);
-	}
-
-	if (pgr_alloc_cacheline_ct > 0) {
-		state->pgr_alloc_buf.Allocate(pgr_alloc_cacheline_ct * plink2::kCacheline);
-	}
-
-	err = plink2::PgrInit(bind_data.pgen_path.c_str(), max_vrec_width, &state->pgfi, &state->pgr,
-	                      state->pgr_alloc_buf.As<unsigned char>());
-
-	if (err != plink2::kPglRetSuccess) {
-		plink2::PglErr cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgr(&state->pgr, &cleanup_err);
-		cleanup_err = plink2::kPglRetSuccess;
-		plink2::CleanupPgfi(&state->pgfi, &cleanup_err);
-		throw IOException("plink_glm: PgrInit failed for '%s'", bind_data.pgen_path);
-	}
+	state->header = AcquirePgenHeader(context.client, bind_data.use_vfs, bind_data.pgen_path, bind_data.raw_variant_ct,
+	                                  bind_data.raw_sample_ct, "plink_glm: thread init failed");
+	InitPgenReaderOn(*state->header, bind_data.pgen_path, state->pgr, state->pgr_alloc_buf, "plink_glm");
 
 	// Set up sample subsetting
 	if (bind_data.has_sample_subset && bind_data.sample_subset) {

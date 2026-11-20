@@ -13,6 +13,7 @@
 // One reader per scan thread (a PgenReader's FILE* is not thread-safe).
 #pragma once
 
+#include "pgen_header_cache.hpp"
 #include "duckdb.hpp"
 #include "plink_common.hpp"
 
@@ -77,9 +78,8 @@ public:
 
 private:
 	struct Member {
-		plink2::PgenFileInfo pgfi;
+		shared_ptr<PgenHeader> header; //! decoded .pgen header (cache tier 1); pgr points into it
 		plink2::PgenReader pgr;
-		AlignedBuffer pgfi_alloc;
 		AlignedBuffer pgr_alloc;
 		bool open = false;
 

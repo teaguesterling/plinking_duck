@@ -32,6 +32,7 @@ set(EXTENSION_SOURCES
     src/vcf_reader.cpp
     src/pgen_vfs_opener.cpp
     src/pgen_concat_reader.cpp
+    src/pgen_header_cache.cpp
     src/catalog_cohort.cpp)
 
 # plink_pca requires Eigen3 — added conditionally after find_package below
