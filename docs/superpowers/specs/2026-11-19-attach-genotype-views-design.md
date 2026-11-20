@@ -243,8 +243,10 @@ becomes `POS` bounds (§2c). An index is needed only for the names that are not 
 - `_pvar_ordinal` / `_psam_ordinal` is the row in that block's `.pvar` / `.psam` (0-based), so the
   column has one meaning in both forms. **(Claude's call.)**
 - The writer writes each index with `(FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd)`.
-  **(Teague, 2026-11-19.)** A test reads the written file's footer (`parquet_metadata`) and
-  checks the codec is ZSTD and the pages are V2.
+  **(Teague, 2026-11-19.)** A test checks `parquet_metadata(…).compression = 'ZSTD'` and
+  `parquet_file_metadata(…).format_version = 2`. Measured on 1,000 sorted `rs<n>` IDs: V2 writes
+  `DELTA_LENGTH_BYTE_ARRAY` / `DELTA_BINARY_PACKED` and 1,082 bytes, against `PLAIN` and 2,586
+  bytes for V1.
 - Row groups are small enough that one `ID =` lookup reads one row group (the builder picks the
   size and measures it). Parquet min/max statistics on the sorted key let DuckDB skip the other
   row groups.
