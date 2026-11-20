@@ -187,7 +187,9 @@ static string MatrixGenotypesSql(const vector<MatrixCell> &cells, const string &
 	}
 	string sql;
 	for (idx_t i = 0; i < cells.size(); i++) {
-		sql += (i ? " UNION ALL " : "");
+		// BY NAME: the cells of different sample blocks can have different .psam columns (genotype
+		// orient emits them), so a positional UNION would file one block's values under another's names.
+		sql += (i ? " UNION ALL BY NAME " : "");
 		sql += "SELECT " + select + " FROM read_pfile(" + SQLString::ToString(cells[i].prefix) +
 		       ", pvar := " + SQLString::ToString(cells[i].pvar) + ", psam := " + SQLString::ToString(cells[i].psam);
 		if (list_if_uneven && !uniform) {

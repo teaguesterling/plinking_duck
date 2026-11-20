@@ -377,7 +377,7 @@ catalog has no `holes`. Read it back the usual ways:
   verify. `region := '2:…'` prunes on both the contig and the `POS` bounds.
 - `ATTACH 'out.pfile.json' (TYPE pfile_catalog)` — the structural relations
   (`c.variants`, `c.samples`, `c.cells`, `c.variant_blocks`, `c.sample_blocks`) and
-  the variant-oriented `c.genotypes`. Each cell is read through its template-resolved
+  the five genotype views (the tall `c.genotypes`, and the wide and list views). Each cell is read through its template-resolved
   `.pvar` and `.psam`, so a cell needs no companion of its own.
 - One cell, directly, with the block's shared companions:
   `read_pfile('out/CHROM=1/GROUP=batch1/data', pvar := 'out/CHROM=1/variants.pvar', psam := 'out/GROUP=batch1/samples.psam')`.
@@ -408,7 +408,7 @@ failure leaves no catalog, never a stale one.
 
 To read the whole matrix as one cohort, use
 [`read_pfile(catalog := …)`](read_pfile.md#catalog-input-catalog), or `ATTACH` it and
-query `c.genotypes_by_sample` (one row per sample, with every variant).
+query `c.genotypes_by_sample_list` (one row per sample, with every variant in a list) or `c.genotypes` (one row per variant × sample).
 
 ## Standalone formats
 
