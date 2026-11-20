@@ -233,7 +233,11 @@ PQ_SAMP1
 statement ok
 DETACH fa;
 
-# The cache is counted in DuckDB's memory accounting (OBJECT_CACHE), and DETACH frees it.
+# The cache is counted in DuckDB's memory accounting (OBJECT_CACHE), and DETACH frees it. Earlier
+# ATTACHes in this file are still attached, so compare with the value before this one.
+statement ok
+CREATE TABLE oc_before AS SELECT memory_usage_bytes AS b FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+
 statement ok
 ATTACH 'test/data/large_example' AS ma (TYPE pfile_catalog);
 
@@ -241,7 +245,7 @@ statement ok
 SELECT count(*) FROM ma.genotypes_by_sample;
 
 query I
-SELECT memory_usage_bytes > 0 FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+SELECT memory_usage_bytes > (SELECT b FROM oc_before) FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
 ----
 true
 
@@ -249,6 +253,6 @@ statement ok
 DETACH ma;
 
 query I
-SELECT memory_usage_bytes FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
+SELECT memory_usage_bytes = (SELECT b FROM oc_before) FROM duckdb_memory() WHERE tag = 'OBJECT_CACHE';
 ----
-0
+true
