@@ -227,6 +227,15 @@ static PfileSampleMetadata LoadPfileSampleMetadataFromSource(ClientContext &cont
 		                  StringUtil::Join(meta.header.column_names, ", "));
 	}
 	meta.iid_col_idx = iid_idx;
+	// The special columns have the text .psam's output types whatever the source stores: SEX INTEGER,
+	// PAT/MAT VARCHAR. FillSampleMetadataValue writes an int32 / a string_t into them, so a source type
+	// (TINYINT SEX, INTEGER PAT) as the output type gave wrong values (all NULL).
+	if (meta.sex_col_idx != DConstants::INVALID_INDEX) {
+		meta.header.column_types[meta.sex_col_idx] = LogicalType::INTEGER;
+	}
+	for (auto p : meta.parent_col_indices) {
+		meta.header.column_types[p] = LogicalType::VARCHAR;
+	}
 
 	auto cnt_res = conn.Query("SELECT COUNT(*) FROM '" + escaped + "'");
 	if (cnt_res->HasError()) {
@@ -5102,6 +5111,61 @@ static void EmitSampleMetadataColumn(const PfileBindData &bind_data, PfileGlobal
 	}
 	idx_t local = sample_file_idx - starts[chunk_idx];
 	Vector &src = lstate.psam_chunk.data[cdc_col];
+
+	// An integer SEX source: read the value directly (the string route below cost ~1 us per row: 8.7 s
+	// for 8M samples, measured). Same rule as FillSampleMetadataValue's stoi: NULL, 0, or a value
+	// outside int32 -> NULL.
+	if (psam_col_idx == meta.sex_col_idx && src.GetType().IsIntegral()) {
+		if (!FlatVector::Validity(src).RowIsValid(local)) {
+			FlatVector::SetNull(out_vec, out_row, true);
+			return;
+		}
+		int64_t v = 0;
+		bool in_range = true;
+		switch (src.GetType().InternalType()) {
+		case PhysicalType::INT8:
+			v = FlatVector::GetData<int8_t>(src)[local];
+			break;
+		case PhysicalType::INT16:
+			v = FlatVector::GetData<int16_t>(src)[local];
+			break;
+		case PhysicalType::INT32:
+			v = FlatVector::GetData<int32_t>(src)[local];
+			break;
+		case PhysicalType::INT64:
+			v = FlatVector::GetData<int64_t>(src)[local];
+			break;
+		case PhysicalType::UINT8:
+			v = FlatVector::GetData<uint8_t>(src)[local];
+			break;
+		case PhysicalType::UINT16:
+			v = FlatVector::GetData<uint16_t>(src)[local];
+			break;
+		case PhysicalType::UINT32:
+			v = FlatVector::GetData<uint32_t>(src)[local];
+			break;
+		case PhysicalType::UINT64: {
+			const uint64_t u = FlatVector::GetData<uint64_t>(src)[local];
+			in_range = u <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+			v = in_range ? static_cast<int64_t>(u) : 0;
+			break;
+		}
+		default:
+			in_range = false; // HUGEINT etc.: the string route below
+			break;
+		}
+		if (src.GetType().InternalType() == PhysicalType::INT128 ||
+		    src.GetType().InternalType() == PhysicalType::UINT128) {
+			FillSampleMetadataValue(out_vec, out_row, src.GetValue(local).ToString(), psam_col_idx, meta);
+			return;
+		}
+		if (!in_range || v == 0 || v < std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max()) {
+			FlatVector::SetNull(out_vec, out_row, true);
+		} else {
+			CompatFlatDataMutable<int32_t>(out_vec)[out_row] = static_cast<int32_t>(v);
+		}
+		return;
+	}
 
 	// SEX/PAT/MAT and any VARCHAR-typed output column go through the string-based
 	// FillSampleMetadataValue (SEX 0->NULL, PAT/MAT "0"->NULL, missing sentinels).
