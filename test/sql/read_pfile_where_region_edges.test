@@ -1,0 +1,118 @@
+# name: test/sql/read_pfile_where_region_edges.test
+# description: a WHERE narrowed into a region must keep every row the WHERE keeps: variants at POS 0, and a .pvar whose POS values are out of order within a contig
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Review findings on the WHERE -> region change (2026-11-19). Oracle: a table copy of the same read,
+# filtered by the same WHERE (a table has no pushdown into read_pfile, so it is the unnarrowed answer).
+#
+# z: three chr1 variants at POS 0, 10000, 20000 (POS 0 = an unplaced variant, as in array .bim files).
+# u: the same three with POS 30000, 10000, 20000, out of order within the contig (another tool's
+#    file; the pfile writer refuses unsorted input).
+# Both reuse a writer-made .pgen of three variants; only the .pvar text is replaced.
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '1' AND POS <= 300 ORDER BY POS)
+TO '{TEST_DIR}/z' (FORMAT pfile);
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#CHROM', 'POS', 'ID', 'REF', 'ALT'), ('1', '0', 'z0', 'A', 'G'), ('1', '10000', 'z1', 'A', 'G'), ('1', '20000', 'z2', 'A', 'G')))
+TO '{TEST_DIR}/z.pvar' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '1' AND POS <= 300 ORDER BY POS)
+TO '{TEST_DIR}/u' (FORMAT pfile);
+
+statement ok
+COPY (SELECT * FROM (VALUES ('#CHROM', 'POS', 'ID', 'REF', 'ALT'), ('1', '30000', 'u0', 'A', 'G'), ('1', '10000', 'u1', 'A', 'G'), ('1', '20000', 'u2', 'A', 'G')))
+TO '{TEST_DIR}/u.pvar' (FORMAT csv, delim '\t', header false, quote '');
+
+statement ok
+COPY (SELECT CHROM, POS, ID, REF, ALT, (row_number() OVER () - 1)::BIGINT AS __vidx FROM read_pvar('{TEST_DIR}/z.pvar'))
+TO '{TEST_DIR}/zp.pvar.parquet' (FORMAT parquet);
+
+statement ok
+CREATE TABLE zt AS SELECT * FROM read_pfile('{TEST_DIR}/z');
+
+statement ok
+CREATE TABLE ut AS SELECT * FROM read_pfile('{TEST_DIR}/u');
+
+statement ok
+CREATE TABLE utg AS SELECT * FROM read_pfile('{TEST_DIR}/u', orient := 'genotype');
+
+# The fixtures are what they claim.
+query I
+SELECT list(POS ORDER BY ID) FROM zt;
+----
+[0, 10000, 20000]
+
+query I
+SELECT list(POS ORDER BY ID) FROM ut;
+----
+[30000, 10000, 20000]
+
+# ---------------------------------------------------------------------------
+# C1: a POS bound must not drop a POS-0 variant
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM zt WHERE CHROM = '1' AND POS <= 15000;
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/z') WHERE CHROM = '1' AND POS <= 15000;
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/z') WHERE CHROM = '1' AND POS <> 10000;
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/z', pvar := '{TEST_DIR}/zp.pvar.parquet') WHERE CHROM = '1' AND POS <= 15000;
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/z', region := '1') WHERE CHROM = '1' AND POS <= 15000;
+----
+2
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/z', orient := 'genotype') WHERE CHROM = '1' AND POS < 1;
+----
+8
+
+# ---------------------------------------------------------------------------
+# I1: POS out of order within the contig: the narrowed load must still find every match
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM ut WHERE CHROM = '1' AND POS BETWEEN 25000 AND 35000;
+----
+1
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/u') WHERE CHROM = '1' AND POS BETWEEN 25000 AND 35000;
+----
+1
+
+query I
+SELECT (SELECT count(*) FROM read_pfile('{TEST_DIR}/u', orient := 'genotype') WHERE CHROM = '1' AND POS BETWEEN 25000 AND 35000)
+     = (SELECT count(*) FROM utg WHERE CHROM = '1' AND POS BETWEEN 25000 AND 35000);
+----
+true
+
+query I
+SELECT list(ID ORDER BY ID) FROM read_pfile('{TEST_DIR}/u') WHERE CHROM = '1' AND POS BETWEEN 5000 AND 25000;
+----
+[u1, u2]
+
+# region := had the same defect before the WHERE change; the fix covers it too.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/u', region := '1:25000-35000');
+----
+1

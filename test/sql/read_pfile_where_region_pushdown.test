@@ -144,9 +144,9 @@ SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHER
 ----
 0
 
-# pushes nothing: CHROM = '1' AND POS + 0 BETWEEN 100 AND 300
+# pushes no POS bound (a function of POS; DuckDB folds POS + 0 away, so that form is not one): CHROM = '1' AND abs(POS) BETWEEN 100 AND 300
 query I
-SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' AND POS + 0 BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND POS + 0 BETWEEN 100 AND 300) UNION ALL ((SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND POS + 0 BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' AND POS + 0 BETWEEN 100 AND 300)));
+SELECT count(*) FROM ((SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300) UNION ALL ((SELECT ID, genotypes FROM read_pfile('test/data/large_example') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300) EXCEPT ALL (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/A') WHERE CHROM = '1' AND abs(POS) BETWEEN 100 AND 300)));
 ----
 0
 
