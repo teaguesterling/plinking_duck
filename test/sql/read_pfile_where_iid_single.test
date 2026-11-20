@@ -1,0 +1,131 @@
+# name: test/sql/read_pfile_where_iid_single.test
+# description: on a single cohort (one sample set), a WHERE IID = / IN in genotype orient narrows the read's sample set, as it already does for sample-sharded cohorts; rows equal a full read
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Measured 2026-11-20 (8M samples, cached ATTACH): WHERE ID AND IID = 'per5' took 1.14 s, WHERE ID
+# alone 0.60 s. The IID filter compared 8M IID strings, because PruneSamplesByIid ran only for
+# sample-sharded cohorts. Signal: plinking_debug_iid_where_pushed() counts reads it narrowed.
+# large_example: 3000 variants x 8 samples (SAMP1..8), var100 = 1:10000.
+
+statement ok
+SET threads = 4;
+
+# --- A file set.
+query I
+SELECT plinking_debug_iid_where_pushed_reset();
+----
+0
+
+query TT
+SELECT ID, IID FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID = 'var100' AND IID = 'SAMP3';
+----
+var100	SAMP3
+
+query I
+SELECT plinking_debug_iid_where_pushed();
+----
+1
+
+# The rows equal a full read, for IN and for an IID filter over every variant.
+query I
+SELECT count(*) FROM (
+  (SELECT CHROM, POS, ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7')
+   EXCEPT ALL
+   SELECT CHROM, POS, ID, IID, genotype FROM (SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype') LIMIT 100000) WHERE IID IN ('SAMP2', 'SAMP7'))
+  UNION ALL
+  (SELECT CHROM, POS, ID, IID, genotype FROM (SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype') LIMIT 100000) WHERE IID IN ('SAMP2', 'SAMP7')
+   EXCEPT ALL
+   SELECT CHROM, POS, ID, IID, genotype FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7')));
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7');
+----
+6000
+
+# Intersected with samples := (index 1 = SAMP2), and an IID no sample has.
+query T
+SELECT list(DISTINCT IID) FROM read_pfile('test/data/large_example', orient := 'genotype', samples := [1, 2]) WHERE IID IN ('SAMP2', 'SAMP7');
+----
+[SAMP2]
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE IID = 'nobody';
+----
+0
+
+# af_range computes each variant's frequency over the read's samples, before the WHERE: no narrowing.
+query I
+SELECT plinking_debug_iid_where_pushed_reset();
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'genotype', af_range := {min: 0.4, max: 0.6}) WHERE IID = 'SAMP3';
+----
+3000
+
+query I
+SELECT plinking_debug_iid_where_pushed();
+----
+0
+
+# --- A variant-sharded catalog (one shared .psam).
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/V' (FORMAT pfile, shard_by 'CHROM');
+
+query I
+SELECT plinking_debug_iid_where_pushed_reset();
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT IID) FROM read_pfile('{TEST_DIR}/V', orient := 'genotype') WHERE IID IN ('SAMP1', 'SAMP8');
+----
+6000	2
+
+query I
+SELECT plinking_debug_iid_where_pushed();
+----
+1
+
+# --- The ATTACH view: its freq columns still count every sample (the narrowing waits for InitGlobal,
+# --- and applies only when no freq column is read).
+statement ok
+ATTACH '{TEST_DIR}/V' AS c (TYPE pfile_catalog);
+
+# Oracle: the LIMIT keeps the WHERE out of the scan, so it reads every sample.
+query I
+SELECT count(*) FROM (
+  (SELECT ID, IID, genotype, ALT_FREQ, OBS_CT FROM c.genotypes WHERE IID = 'SAMP4'
+   EXCEPT ALL
+   SELECT ID, IID, genotype, ALT_FREQ, OBS_CT FROM (SELECT * FROM read_pfile('{TEST_DIR}/V', orient := 'genotype', freq := true) LIMIT 1000000) WHERE IID = 'SAMP4')
+  UNION ALL
+  (SELECT ID, IID, genotype, ALT_FREQ, OBS_CT FROM (SELECT * FROM read_pfile('{TEST_DIR}/V', orient := 'genotype', freq := true) LIMIT 1000000) WHERE IID = 'SAMP4'
+   EXCEPT ALL
+   SELECT ID, IID, genotype, ALT_FREQ, OBS_CT FROM c.genotypes WHERE IID = 'SAMP4'));
+----
+0
+
+# Without a freq column, the view narrows too.
+query I
+SELECT plinking_debug_iid_where_pushed_reset();
+----
+0
+
+query I
+SELECT count(*) = (SELECT count(*) FROM (SELECT * FROM read_pfile('{TEST_DIR}/V', orient := 'genotype') LIMIT 1000000) WHERE IID = 'SAMP4' AND genotype IS NOT NULL)
+FROM c.genotypes WHERE IID = 'SAMP4' AND genotype IS NOT NULL;
+----
+true
+
+query I
+SELECT plinking_debug_iid_where_pushed() >= 1;
+----
+true
