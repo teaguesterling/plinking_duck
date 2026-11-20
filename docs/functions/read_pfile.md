@@ -63,6 +63,22 @@ When both `region` and `variants` are specified, the result is the intersection 
 
 With `with_ordinal := true`, an extra `__ordinal` `BIGINT` column carries each variant's natural (original) 0-based index. It is supported **only with `orient := 'variant'`** (the default); the other orient modes reject it in bind rather than emit a wrong ordinal. For a multi-file list the ordinal is **per-source** (each shard restarts at 0), matching [`read_pvar`](read_pvar.md#named-parameters) and `pfile_partitions`.
 
+### The `CPRA` column
+
+In variant and genotype orient, `read_pfile` has a virtual column `CPRA` (`VARCHAR`): the variant's
+`CHROM:POS:REF:ALT`, for example `1:10000:T:C`. A multiallelic ALT stays one string (`1:3000:G:A,C`).
+`SELECT *` does not include it, and it costs nothing unless a query names it:
+
+```sql
+SELECT CPRA, ID FROM read_pfile('cohort') WHERE CPRA IN ('1:10000:T:C', '2:10000:T:C');
+```
+
+A `WHERE CPRA = '…'` or `CPRA IN (…)` narrows the read like the same `CHROM` and `POS` filter: one
+contig loads only that region of the `.pvar.parquet`, and a catalog drops the other variant blocks.
+A value that is not four `:`-separated parts with an integer `POS` (`'1:10000'`, `'rs123'`) equals no
+`CPRA`, so it gives no row and no error. The `ID` column is unchanged: it is what the `.pvar` holds.
+Sample orient has no `CPRA`.
+
 ### Frequency Columns (`freq`)
 
 With `freq := true`, six columns follow the genotype columns (and come before `__ordinal`). They are the value columns of [`plink_freq(counts := true)`](plink_freq.md), and each one holds the value `plink_freq` gives for the same variant and the same samples:

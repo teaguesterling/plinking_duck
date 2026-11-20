@@ -866,6 +866,45 @@ struct PfileGlobalState : public GlobalTableFunctionState {
 // Local state (per-thread)
 // ---------------------------------------------------------------------------
 
+//! Views PR 2b: the virtual column CPRA = CHROM:POS:REF:ALT (VARCHAR), in variant and genotype orient.
+//! A virtual column (get_virtual_columns) is not in SELECT * and is computed only when a query names
+//! it. Its id is above every schema column, so each scan handles it before any lookup by column index.
+static const column_t CPRA_COLUMN_ID = VIRTUAL_COLUMN_START + 1;
+
+//! The CPRA value of variant `vidx` (a multiallelic ALT stays one string).
+static string CpraOf(const VariantMetadataIndex &v, uint32_t vidx) {
+	return v.GetChrom(vidx) + ":" + std::to_string(v.GetPos(vidx)) + ":" + v.GetRef(vidx) + ":" + v.GetAlt(vidx);
+}
+
+//! The parsed form of a CPRA constant: exactly four ':'-separated parts with an integer POS. Any other
+//! string is no CPRA value, so it can equal no row; it narrows nothing (the WHERE then gives no row).
+static bool ParseCpraConstant(const string &s, string &chrom, int64_t &pos) {
+	auto parts = StringUtil::Split(s, ':');
+	if (parts.size() != 4 || parts[0].empty() || parts[1].empty()) {
+		return false;
+	}
+	for (auto ch : parts[1]) {
+		if (ch < '0' || ch > '9') {
+			return false;
+		}
+	}
+	if (parts[1].size() > 10) {
+		return false;
+	}
+	chrom = parts[0];
+	pos = std::stoll(parts[1]);
+	return true;
+}
+
+static virtual_column_map_t PfileGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {
+	virtual_column_map_t result;
+	if (bind_data_p && bind_data_p->Cast<PfileBindData>().orient_mode == OrientMode::SAMPLE) {
+		return result; // sample orient has no per-variant row
+	}
+	result.insert(make_pair(CPRA_COLUMN_ID, TableColumn("CPRA", LogicalType::VARCHAR)));
+	return result;
+}
+
 // freq := true: one variant's plink_freq(counts := true) values (see plink_freq.cpp's scan — the
 // same two paths, the same NULL rules). On autosomes and PAR, PgrGetCounts over the output samples;
 // on chrX non-PAR / chrY / chrMT, the decoded hardcalls through ComputeSexAwareCounts.
@@ -4582,6 +4621,12 @@ static void PfileDefaultScan(ClientContext &context, TableFunctionInput &data_p,
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
 				continue;
 			}
+			if (file_col == CPRA_COLUMN_ID) {
+				auto &cvec = output.data[out_col];
+				CompatFlatDataMutable<string_t>(cvec)[rows_emitted] =
+				    StringVector::AddString(cvec, CpraOf(source.variants, vidx));
+				continue;
+			}
 
 			// freq := true columns (before the switch: their indices follow the genotype columns,
 			// which the columns-mode default case would otherwise claim).
@@ -5287,6 +5332,12 @@ static void PfileTidyScan(ClientContext &context, TableFunctionInput &data_p, Da
 		for (idx_t out_col = 0; out_col < column_ids.size(); out_col++) {
 			auto file_col = column_ids[out_col];
 			if (file_col == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+			if (file_col == CPRA_COLUMN_ID) {
+				auto &cvec = output.data[out_col];
+				CompatFlatDataMutable<string_t>(cvec)[rows_emitted] =
+				    StringVector::AddString(cvec, CpraOf(source.variants, vidx));
 				continue;
 			}
 
@@ -6281,7 +6332,11 @@ static idx_t CellPruneColumnOf(const LogicalGet &get, const Expression &e) {
 	}
 	auto &ids = get.GetColumnIds();
 	const idx_t i = binding.column_index.GetIndex();
-	if (i >= ids.size() || ids[i].IsVirtualColumn() || ids[i].IsPushdownExtract() || ids[i].HasType()) {
+	if (i >= ids.size() || ids[i].IsPushdownExtract() || ids[i].HasType()) {
+		return DConstants::INVALID_INDEX;
+	}
+	// Of the virtual columns, only CPRA (views PR 2b) is a constraint source.
+	if (ids[i].IsVirtualColumn() && ids[i].GetPrimaryIndex() != CPRA_COLUMN_ID) {
 		return DConstants::INVALID_INDEX;
 	}
 	return ids[i].GetPrimaryIndex();
@@ -6401,6 +6456,31 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (type == ExpressionType::COMPARE_IN && e.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
 		auto &kids = e.Cast<BoundOperatorExpression>().GetChildren();
 		const idx_t in_col = kids.size() < 2 ? DConstants::INVALID_INDEX : CellPruneColumnOf(get, *kids[0]);
+		if (in_col == CPRA_COLUMN_ID && c.chrom_col != DConstants::INVALID_INDEX) {
+			// CPRA IN (...): the contigs, and the POS span, of the parsable members. A member that is
+			// no CPRA value matches no row, so it adds nothing; an unfoldable member stops the narrowing.
+			std::set<string> chroms;
+			int64_t lo = std::numeric_limits<int64_t>::max(), hi = std::numeric_limits<int64_t>::lowest();
+			for (idx_t i = 1; i < kids.size(); i++) {
+				Value v;
+				if (!CellPruneConstant(context, *kids[i], v) || v.type().id() != LogicalTypeId::VARCHAR) {
+					return;
+				}
+				string chrom;
+				int64_t pos;
+				if (ParseCpraConstant(v.GetValue<string>(), chrom, pos)) {
+					chroms.insert(chrom);
+					lo = std::min(lo, pos);
+					hi = std::max(hi, pos);
+				}
+			}
+			c.AllowChroms(chroms);
+			if (!chroms.empty()) {
+				c.NarrowPos(ExpressionType::COMPARE_GREATERTHANOREQUALTO, lo);
+				c.NarrowPos(ExpressionType::COMPARE_LESSTHANOREQUALTO, hi);
+			}
+			return;
+		}
 		if (in_col == DConstants::INVALID_INDEX || (in_col != c.chrom_col && in_col != c.iid_col)) {
 			return;
 		}
@@ -6456,7 +6536,15 @@ static void CollectCellPruneConstraints(ClientContext &context, const LogicalGet
 	if (col == DConstants::INVALID_INDEX || !CellPruneConstant(context, *other, v)) {
 		return;
 	}
-	if (col == c.chrom_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
+	if (col == CPRA_COLUMN_ID && c.chrom_col != DConstants::INVALID_INDEX && cmp == ExpressionType::COMPARE_EQUAL &&
+	    v.type().id() == LogicalTypeId::VARCHAR) {
+		string chrom;
+		int64_t pos;
+		if (ParseCpraConstant(v.GetValue<string>(), chrom, pos)) {
+			c.AllowChroms({chrom});
+			c.NarrowPos(ExpressionType::COMPARE_EQUAL, pos);
+		}
+	} else if (col == c.chrom_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowChroms({v.GetValue<string>()});
 	} else if (col == c.iid_col && cmp == ExpressionType::COMPARE_EQUAL && v.type().id() == LogicalTypeId::VARCHAR) {
 		c.AllowIids({v.GetValue<string>()});
@@ -6822,6 +6910,8 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 		fn.filter_pushdown = true;
 		// Stage 4: a WHERE on CHROM/POS drops catalog variant blocks before any is opened.
 		fn.pushdown_complex_filter = PfilePushdownComplexFilter;
+		// Views PR 2b: CPRA, selectable by name, not in SELECT *.
+		fn.get_virtual_columns = PfileGetVirtualColumns;
 		// Composable selection: a STRUCT whose samples/region/variants/variant_range
 		// fields seed the axes; the individual params override per-field
 		// (most-specific-wins). samples/variants are ANY — type dispatch is in bind.

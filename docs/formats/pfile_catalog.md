@@ -755,6 +755,8 @@ of a holed grid is not defined yet. There, `count(*) FROM c.genotypes` is varian
 blocks, the `genotypes` column is a fixed `ARRAY` only when every sample block has the same
 width (else a `LIST`), and a `WHERE` drops no cell.
 
+**`c.genotypes` has the `CPRA` column** ([`CHROM:POS:REF:ALT`](../functions/read_pfile.md#the-cpra-column)), so `SELECT * FROM c.genotypes WHERE CPRA = '1:10000:T:C'` works and reads only that region. `COPY (SELECT * FROM c.genotypes) …` writes it as an extra `.pvar` column, as it does the freq columns.
+
 **`c.genotypes` has the `plink_freq` columns.** Every kind passes
 [`freq := true`](../functions/read_pfile.md#frequency-columns-freq), so the view adds `ALT_FREQ`,
 `OBS_CT`, `HOM_REF_CT`, `HET_CT`, `HOM_ALT_CT` and `MISSING_CT`, with `plink_freq(counts := true)`'s
