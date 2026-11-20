@@ -180,11 +180,12 @@ statement error
 CREATE TABLE c.scratch AS SELECT 1 AS x;
 ----
 
-# discoverability: the seven relations are listed under database c.
+# discoverability: the ten relations are listed under database c (views PR 3 adds
+# genotypes_by_variant, genotypes_by_variant_list and genotypes_by_sample_list).
 query I
 SELECT count(*) FROM (SHOW ALL TABLES) WHERE database = 'c';
 ----
-7
+10
 
 # detach, then re-attach the same name.
 statement ok

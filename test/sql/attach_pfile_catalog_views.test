@@ -309,11 +309,12 @@ SELECT count(*) FROM mx.genotypes;
 
 # ---------------------------------------------------------------------------
 # unique_column_names := true (section 3): a '.', empty or duplicate ID column is named by its CPRA,
-# then _<n>. dup: POS 100 and 200 have ID '.', POS 300 and 400 both have ID 'var400'.
+# then _<n>. dup: POS 100 and 200 have ID '.', POS 300 and 400 both have ID 'var4' (large_example's
+# IDs are var<POS/100>).
 # ---------------------------------------------------------------------------
 statement ok
 COPY (SELECT CHROM, POS,
-             CASE WHEN POS IN (100, 200) THEN '.' WHEN POS = 300 THEN 'var400' ELSE ID END AS ID,
+             CASE WHEN POS IN (100, 200) THEN '.' WHEN POS = 300 THEN 'var4' ELSE ID END AS ID,
              REF, ALT, genotypes
       FROM read_pfile('test/data/large_example', genotypes := 'struct') WHERE CHROM = '1' AND POS <= 500 ORDER BY POS)
 TO '{TEST_DIR}/dup' (FORMAT pfile);
