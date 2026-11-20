@@ -247,9 +247,21 @@ becomes `POS` bounds (§2c). An index is needed only for the names that are not 
   `parquet_file_metadata(…).format_version = 2`. Measured on 1,000 sorted `rs<n>` IDs: V2 writes
   `DELTA_LENGTH_BYTE_ARRAY` / `DELTA_BINARY_PACKED` and 1,082 bytes, against `PLAIN` and 2,586
   bytes for V1.
-- Row groups are small enough that one `ID =` lookup reads one row group (the builder picks the
-  size and measures it). Parquet min/max statistics on the sorted key let DuckDB skip the other
-  row groups.
+- **Row groups (Teague, 2026-11-19):** `.pvar.index.parquet` 8,192 rows; `.psam.index.parquet`
+  DuckDB's default. Parquet min/max statistics on the sorted key let DuckDB skip the other row
+  groups. Measured on a 10M-variant index (V2, zstd; median of 5; remote at 40 ms):
+
+  | Rows per group | 2,048 | 8,192 | 20,480 | 65,536 | 122,880 |
+  |---|---|---|---|---|---|
+  | 1 rsID, local / remote | 73 ms / 0.26 s | 21 / 0.19 | 13 / 0.18 | 12 / 0.14 | 13 / 0.15 |
+  | 100 scattered rsIDs, local / remote | 90 / 0.71 | 40 / 1.21 | 46 / 1.42 | 79 / 1.21 | 107 / 2.28 |
+  | 100 rsIDs in one 1 Mb gene, local / remote | 90 / 0.74 | 41 / 1.21 | 48 / 1.59 | 88 / 2.42 | 104 / 1.43 |
+
+  The `.psam.index` lookup took 0.10-0.12 s remote at every size, because the file is read whole.
+  RsIDs are not in position order, so clustered IDs gain nothing through the index. When the
+  region is known (a gene), `region := …` plus `WHERE ID IN (…)` needs no index and costs a
+  region read. At 10M variants, the `.pgen` header (~19 MB, cold, remote) costs more than any of
+  these differences.
 - A `.` or empty `ID` is not indexed **(Claude's call: it is not a lookup key)**. A duplicate `ID`
   gets one index row per occurrence.
 
@@ -352,8 +364,8 @@ Each read below must be one query on a view, and must open only the blocks named
 
 ## Left to the builder
 
-- Row-group size of the index, and the measurement of an `ID =` lookup, local and over the
-  test range server (`sb/rangeserver3.py`, `LAT_MS=40`).
+- The end-to-end measurement of an `ID =` lookup through the index (index + `.pgen` open), local
+  and over the test range server (`sb/rangeserver3.py`, `LAT_MS=40`).
 - How freq stays full-cohort under a sample-block drop (§2).
 - Whether projection drops sample blocks in `genotypes := 'columns'`.
 - The exact column-name collision rules, after reading what `'columns'` does today.
