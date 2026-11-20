@@ -1,0 +1,245 @@
+# name: test/sql/read_pfile_id_index.test
+# description: <p>.pvar.index.parquet (ID -> [_variant_block,] _pvar_ordinal): a WHERE ID = / IN opens only the blocks and loads only the .pvar.parquet rows that hold those IDs
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Spec: docs/superpowers/specs/2026-11-19-attach-genotype-views-design.md, section 4. large_example:
+# 3000 variants x 8 samples, CHROM 1/2/3 (1000 each), POS 100..100000 step 100; ID var<POS/100>, so
+# var100 = 1:10000 (ordinal 99), var1100 = 2:10000, var2100 = 3:10000.
+
+# ---------------------------------------------------------------------------
+# A file set. drop3.pvar.parquet lacks one chr3 row, so a full .pvar load fails its count check.
+# A load of only the indexed rows does not.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/A' (FORMAT pfile, pvar_parquet);
+
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/A.pvar.parquet') WHERE NOT (CHROM = '3' AND POS = 100000) ORDER BY __vidx)
+TO '{TEST_DIR}/drop3.pvar.parquet' (FORMAT parquet, ROW_GROUP_SIZE 500);
+
+# B: the same files, and no index.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/B' (FORMAT pfile, pvar_parquet);
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/B', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID = 'var100';
+----
+variant count mismatch
+
+# The documented recipe.
+statement ok
+COPY (SELECT ID, __ordinal AS _pvar_ordinal FROM read_pfile('{TEST_DIR}/A', with_ordinal := true)
+      WHERE ID IS NOT NULL AND ID NOT IN ('.', '') ORDER BY ID)
+TO '{TEST_DIR}/A.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
+
+foreach threads 1 4
+
+statement ok
+SET threads = {threads};
+
+query TII
+SELECT ID, POS, len(genotypes) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID = 'var100';
+----
+var100	10000	8
+
+query T
+SELECT list(ID ORDER BY ID) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID IN ('var100', 'var200', 'var2100');
+----
+[var100, var200, var2100]
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE ID = 'var100';
+----
+8
+
+# The rows equal the same WHERE on a full read.
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE ID IN ('var100', 'var2100')
+   EXCEPT ALL
+   SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var2100'))
+  UNION ALL
+  (SELECT * FROM read_pfile('test/data/large_example', orient := 'genotype') WHERE ID IN ('var100', 'var2100')
+   EXCEPT ALL
+   SELECT * FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet', orient := 'genotype') WHERE ID IN ('var100', 'var2100')));
+----
+0
+
+endloop
+
+# An ID that is not in the index: zero rows, and no error.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID = 'nope';
+----
+0
+
+# ID + CHROM (a pushed region): still one row.
+query T
+SELECT ID FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID = 'var100' AND CHROM = '1';
+----
+var100
+
+# A prepared statement, run twice.
+statement ok
+PREPARE q AS SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID IN ('var100', 'var200');
+
+query I
+EXECUTE q;
+----
+2
+
+query I
+EXECUTE q;
+----
+2
+
+# '.' and '' are not indexed, so a WHERE that names them must not use the index.
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID IN ('var100', '.');
+----
+variant count mismatch
+
+# Companions off: the index is not used.
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/A', pvar := '{TEST_DIR}/drop3.pvar.parquet') WHERE ID = 'var100';
+----
+variant count mismatch
+
+statement ok
+RESET plinking_use_parquet_companions;
+
+# ---------------------------------------------------------------------------
+# A text .pvar with a duplicate ID: the index rows act as the variant set. A stale index that
+# omits one of the two rows loses that row (the documented cost of a stale index), which proves
+# the index was read.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/dup' (FORMAT pfile);
+
+statement ok
+COPY (SELECT CHROM AS "#CHROM", POS, CASE ID WHEN 'var200' THEN 'var100' ELSE ID END AS ID, REF, ALT
+      FROM read_pvar('{TEST_DIR}/dup.pvar'))
+TO '{TEST_DIR}/dupx.pvar' (FORMAT csv, delim '\t', header true, quote '');
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/dup', pvar := '{TEST_DIR}/dupx.pvar') WHERE ID = 'var100';
+----
+2
+
+statement ok
+COPY (SELECT ID, __ordinal AS _pvar_ordinal FROM read_pfile('{TEST_DIR}/dup', pvar := '{TEST_DIR}/dupx.pvar', with_ordinal := true)
+      ORDER BY ID)
+TO '{TEST_DIR}/dup.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/dup', pvar := '{TEST_DIR}/dupx.pvar') WHERE ID = 'var100';
+----
+2
+
+statement ok
+COPY (SELECT ID, __ordinal AS _pvar_ordinal FROM read_pfile('{TEST_DIR}/dup', pvar := '{TEST_DIR}/dupx.pvar', with_ordinal := true)
+      WHERE __ordinal <> 199 ORDER BY ID)
+TO '{TEST_DIR}/dup.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
+
+query II
+SELECT ID, POS FROM read_pfile('{TEST_DIR}/dup', pvar := '{TEST_DIR}/dupx.pvar') WHERE ID = 'var100';
+----
+var100	10000
+
+# ---------------------------------------------------------------------------
+# A catalog (v1, shard_by CHROM: variant blocks 0, 1, 2 = CHROM 1, 2, 3). In `bad`, the CHROM=3
+# block's .pvar is garbage, so a read that opens that block errors. The index lets a WHERE ID drop it.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/bad' (FORMAT pfile, shard_by 'CHROM');
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/noidx' (FORMAT pfile, shard_by 'CHROM');
+
+# The index is built from the clean blocks, one per block, before the corruption.
+statement ok
+COPY (SELECT ID, _variant_block, _pvar_ordinal FROM (
+        SELECT ID, 0 AS _variant_block, __ordinal AS _pvar_ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=1/data', with_ordinal := true)
+        UNION ALL
+        SELECT ID, 1, __ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=2/data', with_ordinal := true)
+        UNION ALL
+        SELECT ID, 2, __ordinal FROM read_pfile('{TEST_DIR}/bad/CHROM=3/data', with_ordinal := true))
+      ORDER BY ID)
+TO '{TEST_DIR}/bad.pvar.index.parquet' (FORMAT parquet, PARQUET_VERSION V2, COMPRESSION zstd, ROW_GROUP_SIZE 8192);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/bad/CHROM=3/data.pvar' (FORMAT csv, header false);
+
+statement ok
+COPY (SELECT 'garbage') TO '{TEST_DIR}/noidx/CHROM=3/data.pvar' (FORMAT csv, header false);
+
+# Without an index, the WHERE ID opens every block.
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/noidx') WHERE ID = 'var100';
+----
+
+foreach threads 1 4
+
+statement ok
+SET threads = {threads};
+
+query TT
+SELECT ID, CHROM FROM read_pfile('{TEST_DIR}/bad') WHERE ID = 'var100';
+----
+var100	1
+
+query T
+SELECT list(ID ORDER BY ID) FROM read_pfile('{TEST_DIR}/bad') WHERE ID IN ('var100', 'var1100');
+----
+[var100, var1100]
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/bad', orient := 'genotype') WHERE ID IN ('var100', 'var1100') AND genotype >= 0;
+----
+16
+
+endloop
+
+# An ID in the garbage block: that block opens, and errors.
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/bad') WHERE ID IN ('var100', 'var2100');
+----
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/bad') WHERE ID = 'nope';
+----
+0
+
+# The ATTACH views use it too.
+statement ok
+ATTACH '{TEST_DIR}/bad' AS c (TYPE pfile_catalog);
+
+query I
+SELECT count(*) FROM c.genotypes WHERE ID = 'var100';
+----
+8
+
+query I
+SELECT count(DISTINCT IID) FROM c.genotypes WHERE ID IN ('var100', 'var1100') AND genotype >= 0;
+----
+8
+
+# Companions off: the catalog's index is not used.
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement error
+SELECT count(*) FROM read_pfile('{TEST_DIR}/bad') WHERE ID = 'var100';
+----
