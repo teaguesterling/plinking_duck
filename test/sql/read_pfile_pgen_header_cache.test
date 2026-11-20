@@ -109,7 +109,9 @@ SELECT plinking_debug_pgen_header_decodes();
 ----
 3
 
-# --- A sample-sharded cohort (ConcatPgenReader): one decode per sample shard, once.
+# --- A sample-sharded cohort (ConcatPgenReader): one decode per sample shard, once. (count(genotype):
+# --- a count(*) projects no genotype column, so it opens no .pgen. 18000 = the source's non-missing
+# --- genotypes, measured.)
 statement ok
 COPY src TO '{TEST_DIR}/S' (FORMAT pfile, shard_samples {lo: ['SAMP1', 'SAMP2', 'SAMP3', 'SAMP4'], hi: ['SAMP5', 'SAMP6', 'SAMP7', 'SAMP8']});
 
@@ -119,9 +121,9 @@ SELECT plinking_debug_pgen_header_decodes_reset();
 0
 
 query I
-SELECT count(*) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype');
+SELECT count(genotype) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype');
 ----
-24000
+18000
 
 query I
 SELECT plinking_debug_pgen_header_decodes();
@@ -129,9 +131,9 @@ SELECT plinking_debug_pgen_header_decodes();
 2
 
 query I
-SELECT count(*) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype');
+SELECT count(genotype) FROM read_pfile('{TEST_DIR}/S', orient := 'genotype');
 ----
-24000
+18000
 
 query I
 SELECT plinking_debug_pgen_header_decodes();
@@ -140,23 +142,26 @@ SELECT plinking_debug_pgen_header_decodes();
 
 # --- The count filter and the sample-orient pre-read share the scan's header. (Every large_example
 # --- variant has ALT_FREQ 0.5, measured, so ac_range 16..16 keeps none.)
+statement ok
+COPY src TO '{TEST_DIR}/F' (FORMAT pfile);
+
 query I
 SELECT plinking_debug_pgen_header_decodes_reset();
 ----
 0
 
 query I
-SELECT count(genotypes) FROM read_pfile('test/data/large_example');
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/F');
 ----
 3000
 
 query I
-SELECT count(*) FROM read_pfile('test/data/large_example', ac_range := {min: 16, max: 16});
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', ac_range := {min: 16, max: 16});
 ----
 0
 
 query I
-SELECT count(*) FROM read_pfile('test/data/large_example', orient := 'sample');
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', orient := 'sample');
 ----
 8
 
@@ -175,9 +180,9 @@ SELECT plinking_debug_pgen_header_decodes_reset();
 0
 
 query I
-SELECT count(*) FROM c.genotypes;
+SELECT count(genotype) FROM c.genotypes;
 ----
-24000
+18000
 
 query I
 SELECT plinking_debug_pgen_header_decodes();
