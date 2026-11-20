@@ -1,0 +1,96 @@
+# name: test/sql/read_pfile_psam_parquet_sex_types.test
+# description: an integer SEX column in a .psam.parquet gives the same SEX as the string rule (0 and NULL -> NULL, an out-of-range value -> NULL), in genotype and sample orient
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Found while measuring an 8M-sample .psam.parquet (2026-11-20): a parquet SEX column of any integer
+# type but INTEGER came back all NULL. The output column took the source type, while the value
+# filler always writes an int32 (and, for PAT/MAT, a string_t). A text .psam declares SEX INTEGER and
+# PAT/MAT VARCHAR; a parquet one must too. Expected values follow the string rule
+# (FillSampleMetadataValue: PfileIsMissingValue, then stoi, 0 -> NULL). The SEX speed-up (8.7 s for
+# 8M samples, before) is measured, not tested.
+# pgen_example: 4 samples (SAMPLE1..4), 4 variants.
+
+foreach ty TINYINT SMALLINT INTEGER BIGINT UTINYINT USMALLINT UINTEGER UBIGINT
+
+statement ok
+COPY (SELECT * FROM (VALUES ('SAMPLE1', 1::{ty}), ('SAMPLE2', 2::{ty}), ('SAMPLE3', 0::{ty}), ('SAMPLE4', NULL::{ty})) t(IID, SEX))
+TO '{TEST_DIR}/sex_{ty}.psam.parquet' (FORMAT parquet);
+
+query TIT
+SELECT IID, SEX, typeof(SEX) FROM read_pfile('test/data/pgen_example', psam := '{TEST_DIR}/sex_{ty}.psam.parquet', orient := 'genotype')
+WHERE ID = 'rs1' ORDER BY IID;
+----
+SAMPLE1	1	INTEGER
+SAMPLE2	2	INTEGER
+SAMPLE3	NULL	INTEGER
+SAMPLE4	NULL	INTEGER
+
+query TI
+SELECT IID, SEX FROM read_pfile('test/data/pgen_example', psam := '{TEST_DIR}/sex_{ty}.psam.parquet', orient := 'sample')
+ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE2	2
+SAMPLE3	NULL
+SAMPLE4	NULL
+
+endloop
+
+# A value outside int32 (stoi throws in the string rule) is NULL; a negative one is kept.
+statement ok
+COPY (SELECT * FROM (VALUES ('SAMPLE1', 3000000000::BIGINT), ('SAMPLE2', -9::BIGINT), ('SAMPLE3', 2::BIGINT), ('SAMPLE4', 1::BIGINT)) t(IID, SEX))
+TO '{TEST_DIR}/sex_big.psam.parquet' (FORMAT parquet);
+
+query TI
+SELECT IID, SEX FROM read_pfile('test/data/pgen_example', psam := '{TEST_DIR}/sex_big.psam.parquet', orient := 'genotype')
+WHERE ID = 'rs1' ORDER BY IID;
+----
+SAMPLE1	NULL
+SAMPLE2	-9
+SAMPLE3	2
+SAMPLE4	1
+
+statement ok
+COPY (SELECT * FROM (VALUES ('SAMPLE1', 4294967295::UBIGINT), ('SAMPLE2', 2::UBIGINT), ('SAMPLE3', 1::UBIGINT), ('SAMPLE4', 0::UBIGINT)) t(IID, SEX))
+TO '{TEST_DIR}/sex_ubig.psam.parquet' (FORMAT parquet);
+
+query TI
+SELECT IID, SEX FROM read_pfile('test/data/pgen_example', psam := '{TEST_DIR}/sex_ubig.psam.parquet', orient := 'genotype')
+WHERE ID = 'rs1' ORDER BY IID;
+----
+SAMPLE1	NULL
+SAMPLE2	2
+SAMPLE3	1
+SAMPLE4	NULL
+
+# A VARCHAR SEX keeps the string rule ('NA', '.', '' and '0' -> NULL; 'x' -> NULL).
+statement ok
+COPY (SELECT * FROM (VALUES ('SAMPLE1', '1'), ('SAMPLE2', 'NA'), ('SAMPLE3', '0'), ('SAMPLE4', 'x')) t(IID, SEX))
+TO '{TEST_DIR}/sex_str.psam.parquet' (FORMAT parquet);
+
+query TI
+SELECT IID, SEX FROM read_pfile('test/data/pgen_example', psam := '{TEST_DIR}/sex_str.psam.parquet', orient := 'genotype')
+WHERE ID = 'rs1' ORDER BY IID;
+----
+SAMPLE1	1
+SAMPLE2	NULL
+SAMPLE3	NULL
+SAMPLE4	NULL
+
+# PAT/MAT: VARCHAR, as from a text .psam ("0" -> NULL), whatever the parquet type.
+statement ok
+COPY (SELECT * FROM (VALUES ('SAMPLE1', 0, 7), ('SAMPLE2', 5, 0), ('SAMPLE3', NULL, 3), ('SAMPLE4', 2, 2)) t(IID, PAT, MAT))
+TO '{TEST_DIR}/parents.psam.parquet' (FORMAT parquet);
+
+query TTTT
+SELECT IID, PAT, MAT, typeof(PAT) FROM read_pfile('test/data/pgen_example', psam := '{TEST_DIR}/parents.psam.parquet', orient := 'genotype')
+WHERE ID = 'rs1' ORDER BY IID;
+----
+SAMPLE1	NULL	7	VARCHAR
+SAMPLE2	5	NULL	VARCHAR
+SAMPLE3	NULL	3	VARCHAR
+SAMPLE4	2	2	VARCHAR
