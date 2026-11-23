@@ -1,0 +1,109 @@
+# name: test/sql/read_psam_parquet_scan.test
+# description: read_psam on a parquet (non-native) source binds as a plain scan of it (streamed, projection and filter pushdown); ATTACH c.samples reads a fileset's .psam.parquet companion
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Measured 2026-11-23, 8M samples: read_psam on a .psam.parquet took 8.0 s (it materialized every row
+# as Values at bind), read_parquet on the same file 0.18 s; c.samples read the TEXT .psam even when a
+# .psam.parquet sat beside it (5.3 s). The signal for "a plain scan" is the JSON profile: a
+# read_psam scan names its function READ_PSAM there.
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/F' (FORMAT pfile, psam_parquet);
+
+# The values are those of the parquet itself (no transformation, before and after).
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_psam('{TEST_DIR}/F.psam.parquet') EXCEPT ALL SELECT * FROM read_parquet('{TEST_DIR}/F.psam.parquet'))
+  UNION ALL
+  (SELECT * FROM read_parquet('{TEST_DIR}/F.psam.parquet') EXCEPT ALL SELECT * FROM read_psam('{TEST_DIR}/F.psam.parquet')));
+----
+0
+
+query T
+SELECT IID FROM read_psam('{TEST_DIR}/F.psam.parquet') WHERE IID = 'SAMP3';
+----
+SAMP3
+
+# A plain scan: the profile does not show READ_PSAM for the parquet source...
+statement ok
+SET enable_profiling = 'json';
+
+statement ok
+SET profiling_output = '{TEST_DIR}/pq.json';
+
+query I
+SELECT count(*) FROM read_psam('{TEST_DIR}/F.psam.parquet') WHERE IID = 'SAMP3';
+----
+1
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT content LIKE '%"READ_PSAM"%' FROM read_text('{TEST_DIR}/pq.json');
+----
+false
+
+# ...and does for a text .psam (the control: the signal can show READ_PSAM).
+statement ok
+SET enable_profiling = 'json';
+
+statement ok
+SET profiling_output = '{TEST_DIR}/txt.json';
+
+query I
+SELECT count(*) FROM read_psam('{TEST_DIR}/F.psam') WHERE IID = 'SAMP3';
+----
+1
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT content LIKE '%"READ_PSAM"%' FROM read_text('{TEST_DIR}/txt.json');
+----
+true
+
+# file_search_path still resolves a relative parquet source.
+statement ok
+SET file_search_path = '{TEST_DIR}';
+
+query I
+SELECT count(*) FROM read_psam('F.psam.parquet');
+----
+8
+
+statement ok
+RESET file_search_path;
+
+# ---------------------------------------------------------------------------
+# c.samples on a fileset reads its .psam.parquet companion when there is one. Here the text .psam is
+# replaced with other IIDs (X1..X8), so the source of c.samples shows in its rows.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT 'X' || IID[5:] AS "#IID" FROM read_psam('{TEST_DIR}/F.psam')) TO '{TEST_DIR}/F.psam' (FORMAT csv, delim '\t', header true, quote '');
+
+statement ok
+ATTACH '{TEST_DIR}/F' AS c (TYPE pfile_catalog);
+
+query T
+SELECT list(IID ORDER BY IID) FROM c.samples;
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+# With parquet companions off at ATTACH, c.samples reads the text .psam.
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement ok
+ATTACH '{TEST_DIR}/F' AS t (TYPE pfile_catalog);
+
+query T
+SELECT list(IID ORDER BY IID) FROM t.samples;
+----
+[X1, X2, X3, X4, X5, X6, X7, X8]
