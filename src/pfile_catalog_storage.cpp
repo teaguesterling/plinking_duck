@@ -284,6 +284,7 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 	bool matrix_has_holes = false;   // a declared hole (an absent cell) exists (is_matrix only)
 	vector<MatrixCell> matrix_cells; // its present cells, template-resolved (is_matrix only)
 
+	const bool use_parquet_companions = GetUseParquetCompanions(context);
 	auto take_cell = [&](const string &prefix, const string &pvar, const string &psam) {
 		// pvar_paths/psam_paths feed c.variants (read_pvar) and c.samples (read_psam), which need an
 		// explicit path. A catalog that omits a companion falls back to the conventional
@@ -291,7 +292,15 @@ static unique_ptr<Catalog> PfileCatalogAttach(optional_ptr<StorageExtensionInfo>
 		// two relations; c.genotypes still discovers it, since GenotypesSql passes no per-cell path.)
 		cell_prefixes.push_back(prefix);
 		PushUnique(pvar_paths, pvar.empty() ? prefix + ".pvar" : pvar);
-		PushUnique(psam_paths, psam.empty() ? prefix + ".psam" : psam);
+		// A cell with no declared .psam (a bare fileset, or a v1 entry that omits it) uses its
+		// .psam.parquet companion when there is one and companions are on, as read_pfile's discovery
+		// does; read_psam then scans the parquet (8M samples: 5.3 s for the text, measured).
+		string psam_path = psam;
+		if (psam_path.empty()) {
+			const string companion = prefix + ".psam.parquet";
+			psam_path = (use_parquet_companions && fs.FileExists(companion)) ? companion : prefix + ".psam";
+		}
+		PushUnique(psam_paths, psam_path);
 	};
 
 	if (!bare_prefix.empty()) {
