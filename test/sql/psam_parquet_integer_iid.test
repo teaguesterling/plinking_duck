@@ -1,0 +1,44 @@
+# name: test/sql/psam_parquet_integer_iid.test
+# description: a .psam.parquet with an integer IID (or FID) column loads as text for the analyses and read_pfile, as the text .psam reads it, instead of crashing
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Found 2026-11-23: LoadSampleInfoFromParquet (IngestSampleResult) read the IID vector as string_t
+# whatever its type, so an integer IID column crashed the process (SIGSEGV in plink_freq; also on a
+# build of 2026-11-19, 949e382). A tool that writes the IID as a number (pandas: int64) makes one.
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/F' (FORMAT pfile, psam_parquet);
+
+statement ok
+COPY (SELECT CAST(IID[5:] AS BIGINT) AS IID, 100 + CAST(IID[5:] AS INTEGER) AS FID FROM read_parquet('{TEST_DIR}/F.psam.parquet'))
+TO '{TEST_DIR}/N.psam.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM plink_freq('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/N.psam.parquet');
+----
+3000
+
+# samples := by name matches the IID's text form: '3' is SAMP3's row (index 2).
+query I
+SELECT count(*) FROM (
+  SELECT ID, ALT_FREQ FROM plink_freq('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/N.psam.parquet', samples := ['3'])
+  EXCEPT ALL SELECT ID, ALT_FREQ FROM plink_freq('{TEST_DIR}/F.pgen', samples := [2]));
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/N.psam.parquet', samples := ['3'])
+  EXCEPT ALL SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', samples := [2]));
+----
+0
+
+statement error
+SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/N.psam.parquet', samples := ['SAMP3']);
+----
+sample 'SAMP3' not found
