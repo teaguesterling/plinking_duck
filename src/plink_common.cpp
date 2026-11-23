@@ -1,4 +1,6 @@
 #include "plink_common.hpp"
+
+#include <atomic>
 #include "duckdb_compat.hpp"
 #include "plink_profile.hpp"
 
@@ -1450,8 +1452,23 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 	}
 }
 
+static std::atomic<int64_t> g_psam_parquet_iid_loads {0};
+
+void NotePsamParquetIidLoad() {
+	g_psam_parquet_iid_loads.fetch_add(1, std::memory_order_relaxed);
+}
+
+int64_t PsamParquetIidLoads(bool reset) {
+	if (reset) {
+		g_psam_parquet_iid_loads.store(0, std::memory_order_relaxed);
+		return 0;
+	}
+	return g_psam_parquet_iid_loads.load(std::memory_order_relaxed);
+}
+
 SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path) {
 	BindPhaseTimer timer("LoadSampleInfoFromParquet");
+	NotePsamParquetIidLoad();
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 	// Read only the columns IngestSampleResult uses (IID, FID, SEX): the materialized

@@ -279,6 +279,7 @@ static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &
 	if (!sample_info.iids.empty() || !meta.from_parquet) {
 		return;
 	}
+	NotePsamParquetIidLoad();
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 	const bool has_fid = meta.fid_col_idx != DConstants::INVALID_INDEX;
@@ -7195,6 +7196,14 @@ static void DebugIidWherePushedResetFunc(DataChunk &args, ExpressionState &, Vec
 	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
 }
 
+static void DebugPsamIidLoadsFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(PsamParquetIidLoads(false)), args.size());
+}
+
+static void DebugPsamIidLoadsResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(PsamParquetIidLoads(true)), args.size());
+}
+
 static void DebugGenotypeWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	CompatReferenceConstant(result, Value::BIGINT(g_genotype_where_pushed.load(std::memory_order_relaxed)),
 	                        args.size());
@@ -7324,6 +7333,15 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	dbg_iw_reset.SetVolatile();
 	RegisterScalarWithDesc(loader, dbg_iw_reset, {}, "Test-only: reset plinking_debug_iid_where_pushed to 0.",
 	                       {"SELECT plinking_debug_iid_where_pushed_reset()"});
+	ScalarFunction dbg_pil("plinking_debug_psam_iid_loads", {}, LogicalType::BIGINT, DebugPsamIidLoadsFunc);
+	dbg_pil.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_pil, {}, "Test-only: full IID loads of a .psam.parquet since the last reset.",
+	                       {"SELECT plinking_debug_psam_iid_loads()"});
+	ScalarFunction dbg_pil_reset("plinking_debug_psam_iid_loads_reset", {}, LogicalType::BIGINT,
+	                             DebugPsamIidLoadsResetFunc);
+	dbg_pil_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_pil_reset, {}, "Test-only: reset plinking_debug_psam_iid_loads to 0.",
+	                       {"SELECT plinking_debug_psam_iid_loads_reset()"});
 	ScalarFunction dbg_gw("plinking_debug_genotype_where_pushed", {}, LogicalType::BIGINT,
 	                      DebugGenotypeWherePushedFunc);
 	dbg_gw.SetVolatile();
