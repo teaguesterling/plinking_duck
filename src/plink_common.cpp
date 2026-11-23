@@ -1398,11 +1398,21 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 		total_rows += n;
 
 		// SEX for ploidy-aware chrX/Y/MT stats. The column may be INTEGER (PLINK
-		// convention) or VARCHAR; coerce per row via Value. 1=male, 2=female, else 0.
-		// Only paid when a sex column exists.
+		// convention) or VARCHAR. 1=male, 2=female, else 0: CodeSampleSex's rule, one vector
+		// cast per chunk (a Value per row took most of 6.4 s for 8M samples, measured
+		// 2026-11-23). With an error string the try-cast sets a failed row NULL instead of
+		// throwing, as CodeSampleSex's catch codes it 0.
 		if (has_sex_col) {
+			Vector big(LogicalType::BIGINT, n);
+			string cast_error;
+			VectorOperations::DefaultTryCast(chunk->data[sex_col], big, n, &cast_error);
+			UnifiedVectorFormat uvf;
+			CompatToUnifiedFormat(big, n, uvf);
+			auto data = UnifiedVectorFormat::GetData<int64_t>(uvf);
 			for (idx_t i = 0; i < n; i++) {
-				info.sexes.push_back(CodeSampleSex(chunk->GetValue(sex_col, i)));
+				auto si = uvf.sel->get_index(i);
+				const int64_t s = uvf.validity.RowIsValid(si) ? data[si] : 0;
+				info.sexes.push_back(s == 1 ? 1 : (s == 2 ? 2 : 0));
 			}
 		}
 
@@ -1444,7 +1454,30 @@ SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path)
 	BindPhaseTimer timer("LoadSampleInfoFromParquet");
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
-	auto result = conn.TableFunction("parquet_scan", {Value(path)})->Execute();
+	// Read only the columns IngestSampleResult uses (IID, FID, SEX): the materialized
+	// SELECT * held every column of every row (8M samples, measured 2026-11-23). Without an IID
+	// column the scan keeps every column, so the "missing required IID column" error lists them.
+	const string from = " FROM read_parquet('" + StringUtil::Replace(path, "'", "''") + "')";
+	string select_list = "*";
+	{
+		auto probe = conn.Query("SELECT *" + from + " LIMIT 0");
+		if (probe->HasError()) {
+			throw IOException("Failed to read parquet companion '%s': %s", path, probe->GetError());
+		}
+		vector<string> keep;
+		bool has_iid = false;
+		for (auto &name : CompatResultNames(*probe)) {
+			auto lower = StringUtil::Lower(name);
+			if (lower == "iid" || lower == "fid" || lower == "sex") {
+				has_iid |= lower == "iid";
+				keep.push_back("\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"");
+			}
+		}
+		if (has_iid) {
+			select_list = StringUtil::Join(keep, ", ");
+		}
+	}
+	auto result = conn.Query("SELECT " + select_list + from);
 	timer.Note("parquet_scan opened");
 	if (result->HasError()) {
 		throw IOException("Failed to read parquet companion '%s': %s", path, result->GetError());
