@@ -54,10 +54,18 @@ No named parameters. The file format is auto-detected from the file contents.
 - If the first line starts with `#IID`, the file is parsed as `.psam` without family ID.
 - Otherwise, the file is parsed as `.fam` (whitespace-delimited, 6 fixed columns).
 
-Any other source, such as a `.psam.parquet`, a CSV or a table, is read as `SELECT * FROM '<source>'`.
-Its columns and values are the source's own, and the read streams, with projection and filter
-pushdown. At 8M samples, `count(*)` of a `.psam.parquet` takes 0.003 s, and a text `.psam` 5.3 s
-(measured).
+Any other source, such as a `.psam.parquet`, a CSV or a table, is read as a scan of that source.
+The read streams, with projection and filter pushdown. Its columns keep their names and order, and
+the rules of the table below apply to them as to a text `.psam`:
+- `SEX` is `INTEGER`: the leading integer of the value (`'1.9'` and `'01'` give 1), and `NULL` for
+  0, a missing value, or a value outside the `INTEGER` range;
+- `PAT` and `MAT` are `VARCHAR`;
+- the names match without regard to case.
+
+So `read_psam`, `read_pfile` and an ATTACH `c.samples` give the same values for one cohort, whatever
+tool wrote its `.psam.parquet`. At 8M samples, `count(*)` of a `.psam.parquet` takes 0.003–0.023 s,
+and of a text `.psam` 5.3 s (measured). A `TEMP` table source keeps its own values, because its
+columns cannot be read in advance.
 
 ### Missing Value Handling
 

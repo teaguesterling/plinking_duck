@@ -401,10 +401,52 @@ static string ResolvePsamPath(ClientContext &context, const string &path) {
 	return resolved.empty() ? expanded[0] : resolved;
 }
 
-//! A non-native source (a .psam.parquet, a CSV, a table) binds as `SELECT * FROM '<path>'`: the same
-//! rows the materializing path below returns, but streamed, with projection and filter pushdown. That
-//! path held every row as Values at bind (8M samples: 8.0 s, against 0.18 s for read_parquet,
-//! measured 2026-11-23). A native .psam/.fam returns null and binds normally.
+//! The select list that gives a non-native source the text .psam's rules (see the Missing Value
+//! Handling table in docs/functions/read_psam.md), so read_psam, c.samples and read_pfile agree
+//! whatever the source stores:
+//! - SEX -> INTEGER by std::stoi's rule: the leading integer of the trimmed text, NULL if none, if 0,
+//!   or outside int32 ('1.9' -> 1, '01' -> 1, 'NA' -> NULL);
+//! - PAT / MAT -> VARCHAR, '0' or a missing value -> NULL;
+//! - any other VARCHAR column: a missing value ('NA', 'na', '.', '') -> NULL;
+//! - other columns as stored. Column names match case-insensitively, as read_pfile's parquet path does.
+//! Returns "*" when the source's columns cannot be read here (a separate Connection cannot see a TEMP
+//! table): the source's own values then.
+static string PsamSourceSelectList(ClientContext &context, const string &from) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	auto schema = conn.Query("SELECT * FROM " + from + " LIMIT 0");
+	if (schema->HasError()) {
+		return "*";
+	}
+	auto names = CompatResultNames(*schema);
+	auto types = CompatResultTypes(*schema);
+	const string missing = "('NA', 'na', '.', '')";
+	string list;
+	for (idx_t i = 0; i < names.size(); i++) {
+		const string q = "\"" + StringUtil::Replace(names[i], "\"", "\"\"") + "\"";
+		const string lower = StringUtil::Lower(names[i]);
+		string expr;
+		if (lower == "sex") {
+			expr = "NULLIF(TRY_CAST(regexp_extract(trim(CAST(" + q + " AS VARCHAR)), '^[+-]?[0-9]+') AS INTEGER), 0)";
+		} else if (lower == "pat" || lower == "mat") {
+			expr = "CASE WHEN CAST(" + q + " AS VARCHAR) = '0' OR CAST(" + q + " AS VARCHAR) IN " + missing +
+			       " THEN NULL ELSE CAST(" + q + " AS VARCHAR) END";
+		} else if (types[i].id() == LogicalTypeId::VARCHAR) {
+			expr = "CASE WHEN " + q + " IN " + missing + " THEN NULL ELSE " + q + " END";
+		} else {
+			expr = q;
+		}
+		list += (i ? ", " : "") + expr + " AS " + q;
+	}
+	return list.empty() ? "*" : list;
+}
+
+//! A non-native source (a .psam.parquet, a CSV, a table) binds as a plain scan of it, with the text
+//! .psam's rules on its values (PsamSourceSelectList): streamed, with projection and filter pushdown.
+//! The old path read it through a separate Connection and held every row as Values at bind (8M
+//! samples: 8.0 s, against 0.003 s now for count, measured 2026-11-23). The subquery is named
+//! read_psam, so read_psam.<col> works as for a text .psam (a user alias still wins). A native
+//! .psam/.fam returns null and binds normally.
 static unique_ptr<TableRef> PsamBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		return nullptr;
@@ -413,17 +455,20 @@ static unique_ptr<TableRef> PsamBindReplace(ClientContext &context, TableFunctio
 	if (IsNativePlinkFormat(path)) {
 		return nullptr;
 	}
+	const string from = "'" + StringUtil::Replace(path, "'", "''") + "'";
 #ifdef DUCKDB_HAS_IDENTIFIER
 	Parser parser(context); // DuckDB v2.0: no default constructor; the context supplies the options
 #else
 	Parser parser;
 #endif
-	parser.ParseQuery("SELECT * FROM '" + StringUtil::Replace(path, "'", "''") + "'");
+	parser.ParseQuery("SELECT " + PsamSourceSelectList(context, from) + " FROM " + from);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw InternalException("read_psam: could not build the scan of '%s'", path);
 	}
 	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-	return make_uniq<SubqueryRef>(std::move(select));
+	auto ref = make_uniq<SubqueryRef>(std::move(select));
+	ref->alias = "read_psam";
+	return std::move(ref);
 }
 
 static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBindInput &input,
