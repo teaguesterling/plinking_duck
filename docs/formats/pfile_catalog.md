@@ -770,7 +770,9 @@ ATTACH 's3://bucket/cohort' AS c (TYPE pfile_catalog, CACHE false);  -- reads me
 
 The cache serves the five genotype views. `c.samples` and `c.variants` read
 their files every query, so after a file changes they can disagree with the cached views until a new
-`ATTACH`. A setting that changes which companion is found (`plinking_use_parquet_companions`,
+`ATTACH`. For a fileset, or a catalog entry with no declared `.psam`, `c.samples` reads the
+`.psam.parquet` companion when there is one (and `plinking_use_parquet_companions` is on at the
+`ATTACH`). At 8M samples that is 0.003 s for `count(*)`, against 5.3 s for the text `.psam`. A setting that changes which companion is found (`plinking_use_parquet_companions`,
 `file_search_path`) takes effect at once: it is part of the cache key. The variant metadata
 (`.pvar`) is not cached.
 

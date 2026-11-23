@@ -1,0 +1,185 @@
+# name: test/sql/read_psam_parquet_scan.test
+# description: read_psam on a parquet (non-native) source binds as a plain scan of it (streamed, projection and filter pushdown); ATTACH c.samples reads a fileset's .psam.parquet companion
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Measured 2026-11-23, 8M samples: read_psam on a .psam.parquet took 8.0 s (it materialized every row
+# as Values at bind), read_parquet on the same file 0.18 s; c.samples read the TEXT .psam even when a
+# .psam.parquet sat beside it (5.3 s). The signal for "a plain scan" is the JSON profile: a
+# read_psam scan names its function READ_PSAM there.
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/F' (FORMAT pfile, psam_parquet);
+
+# The values are those of the parquet itself (no transformation, before and after).
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_psam('{TEST_DIR}/F.psam.parquet') EXCEPT ALL SELECT * FROM read_parquet('{TEST_DIR}/F.psam.parquet'))
+  UNION ALL
+  (SELECT * FROM read_parquet('{TEST_DIR}/F.psam.parquet') EXCEPT ALL SELECT * FROM read_psam('{TEST_DIR}/F.psam.parquet')));
+----
+0
+
+query T
+SELECT IID FROM read_psam('{TEST_DIR}/F.psam.parquet') WHERE IID = 'SAMP3';
+----
+SAMP3
+
+# A plain scan: the profile does not show READ_PSAM for the parquet source...
+statement ok
+SET enable_profiling = 'json';
+
+statement ok
+SET profiling_output = '{TEST_DIR}/pq.json';
+
+query I
+SELECT count(*) FROM read_psam('{TEST_DIR}/F.psam.parquet') WHERE IID = 'SAMP3';
+----
+1
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT content LIKE '%"READ_PSAM"%' FROM read_text('{TEST_DIR}/pq.json');
+----
+false
+
+# ...and does for a text .psam (the control: the signal can show READ_PSAM).
+statement ok
+SET enable_profiling = 'json';
+
+statement ok
+SET profiling_output = '{TEST_DIR}/txt.json';
+
+query I
+SELECT count(*) FROM read_psam('{TEST_DIR}/F.psam') WHERE IID = 'SAMP3';
+----
+1
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT content LIKE '%"READ_PSAM"%' FROM read_text('{TEST_DIR}/txt.json');
+----
+true
+
+# file_search_path still resolves a relative parquet source.
+statement ok
+SET file_search_path = '{TEST_DIR}';
+
+query I
+SELECT count(*) FROM read_psam('F.psam.parquet');
+----
+8
+
+statement ok
+RESET file_search_path;
+
+# ---------------------------------------------------------------------------
+# c.samples on a fileset reads its .psam.parquet companion when there is one. Here the text .psam is
+# replaced with other IIDs (X1..X8), so the source of c.samples shows in its rows.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT 'X' || IID[5:] AS "#IID" FROM read_psam('{TEST_DIR}/F.psam')) TO '{TEST_DIR}/F.psam' (FORMAT csv, delim '\t', header true, quote '');
+
+statement ok
+ATTACH '{TEST_DIR}/F' AS c (TYPE pfile_catalog);
+
+query T
+SELECT list(IID ORDER BY IID) FROM c.samples;
+----
+[SAMP1, SAMP2, SAMP3, SAMP4, SAMP5, SAMP6, SAMP7, SAMP8]
+
+# With parquet companions off at ATTACH, c.samples reads the text .psam.
+statement ok
+SET plinking_use_parquet_companions = false;
+
+statement ok
+ATTACH '{TEST_DIR}/F' AS t (TYPE pfile_catalog);
+
+query T
+SELECT list(IID ORDER BY IID) FROM t.samples;
+----
+[X1, X2, X3, X4, X5, X6, X7, X8]
+
+statement ok
+RESET plinking_use_parquet_companions;
+
+# ---------------------------------------------------------------------------
+# Review findings. (1) The table qualifier read_psam.<col> works for a non-native source as for a
+# text .psam. (2) A non-native source gets the text .psam's special-column rules, so c.samples over
+# a companion written by another tool (pandas: int64 SEX) matches read_pfile and the text .psam:
+# SEX INTEGER (0 / missing / not an integer -> NULL, leading-integer parse), PAT/MAT VARCHAR
+# ('0' / missing -> NULL), other VARCHAR columns 'NA' / '.' / '' -> NULL.
+# ---------------------------------------------------------------------------
+query T
+SELECT read_psam.IID FROM read_psam('{TEST_DIR}/F.psam.parquet') WHERE IID = 'SAMP2';
+----
+SAMP2
+
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('SAMP1', 1::BIGINT, 0::BIGINT, 'NA', 'x'),
+        ('SAMP2', 2::BIGINT, 7::BIGINT, 'ok', '.'),
+        ('SAMP3', 0::BIGINT, NULL::BIGINT, '', 'y'),
+        ('SAMP4', 3000000000::BIGINT, 5::BIGINT, 'z', 'w'),
+        ('SAMP5', -9::BIGINT, 1::BIGINT, 'a', 'b'),
+        ('SAMP6', NULL::BIGINT, 2::BIGINT, 'b', 'c'),
+        ('SAMP7', 1::BIGINT, 3::BIGINT, 'c', 'd'),
+        ('SAMP8', 2::BIGINT, 4::BIGINT, 'd', 'e')) t(IID, SEX, PAT, PHENO, NOTE))
+TO '{TEST_DIR}/P.psam.parquet' (FORMAT parquet);
+
+query TITTTT
+SELECT IID, SEX, PAT, PHENO, NOTE, typeof(SEX) || '/' || typeof(PAT) FROM read_psam('{TEST_DIR}/P.psam.parquet') ORDER BY IID;
+----
+SAMP1	1	NULL	NULL	x	INTEGER/VARCHAR
+SAMP2	2	7	ok	NULL	INTEGER/VARCHAR
+SAMP3	NULL	NULL	NULL	y	INTEGER/VARCHAR
+SAMP4	NULL	5	z	w	INTEGER/VARCHAR
+SAMP5	-9	1	a	b	INTEGER/VARCHAR
+SAMP6	NULL	2	b	c	INTEGER/VARCHAR
+SAMP7	1	3	c	d	INTEGER/VARCHAR
+SAMP8	2	4	d	e	INTEGER/VARCHAR
+
+# A VARCHAR SEX follows stoi: leading integer, so '1.9' -> 1 and '01' -> 1; 'NA' / 'x' -> NULL.
+statement ok
+COPY (SELECT * FROM (VALUES ('S1', '1.9'), ('S2', '01'), ('S3', 'NA'), ('S4', 'x'), ('S5', ' 2')) t(IID, SEX))
+TO '{TEST_DIR}/Q.psam.parquet' (FORMAT parquet);
+
+query TI
+SELECT IID, SEX FROM read_psam('{TEST_DIR}/Q.psam.parquet') ORDER BY IID;
+----
+S1	1
+S2	1
+S3	NULL
+S4	NULL
+S5	2
+
+# c.samples over that companion equals read_pfile's .psam columns (sample orient) for the same file.
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/G' (FORMAT pfile);
+
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/P.psam.parquet')) TO '{TEST_DIR}/G.psam.parquet' (FORMAT parquet);
+
+statement ok
+ATTACH '{TEST_DIR}/G' AS g (TYPE pfile_catalog);
+
+query I
+SELECT count(*) FROM (
+  (SELECT IID, SEX, PAT, PHENO, NOTE FROM g.samples
+   EXCEPT ALL
+   SELECT IID, SEX, PAT, PHENO, NOTE FROM read_pfile('{TEST_DIR}/G', orient := 'sample', genotypes := 'counts'))
+  UNION ALL
+  (SELECT IID, SEX, PAT, PHENO, NOTE FROM read_pfile('{TEST_DIR}/G', orient := 'sample', genotypes := 'counts')
+   EXCEPT ALL
+   SELECT IID, SEX, PAT, PHENO, NOTE FROM g.samples));
+----
+0
