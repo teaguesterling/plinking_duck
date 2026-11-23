@@ -7,6 +7,9 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -382,30 +385,53 @@ struct PsamLocalState : public LocalTableFunctionState {
 // Bind function
 // ---------------------------------------------------------------------------
 
+//! read_psam's one input path, expanded (a glob or URL such as pathmacro:, which must resolve to one
+//! file) and resolved against file_search_path. A path that is not found is kept as given: a
+//! non-native source goes to a stock reader that resolves it itself, and a missing native file falls
+//! through to the natural error.
+static string ResolvePsamPath(ClientContext &context, const string &path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto expanded = ExpandPathInputs(context, fs, {path}, "read_psam");
+	if (expanded.size() > 1) {
+		throw InvalidInputException("read_psam: input '%s' resolved to %llu files; read_psam reads a single "
+		                            ".psam/.fam",
+		                            path, (unsigned long long)expanded.size());
+	}
+	auto resolved = ResolveExistingPath(context, fs, expanded[0]);
+	return resolved.empty() ? expanded[0] : resolved;
+}
+
+//! A non-native source (a .psam.parquet, a CSV, a table) binds as `SELECT * FROM '<path>'`: the same
+//! rows the materializing path below returns, but streamed, with projection and filter pushdown. That
+//! path held every row as Values at bind (8M samples: 8.0 s, against 0.18 s for read_parquet,
+//! measured 2026-11-23). A native .psam/.fam returns null and binds normally.
+static unique_ptr<TableRef> PsamBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		return nullptr;
+	}
+	const string path = ResolvePsamPath(context, input.inputs[0].GetValue<string>());
+	if (IsNativePlinkFormat(path)) {
+		return nullptr;
+	}
+#ifdef DUCKDB_HAS_IDENTIFIER
+	Parser parser(context); // DuckDB v2.0: no default constructor; the context supplies the options
+#else
+	Parser parser;
+#endif
+	parser.ParseQuery("SELECT * FROM '" + StringUtil::Replace(path, "'", "''") + "'");
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw InternalException("read_psam: could not build the scan of '%s'", path);
+	}
+	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+	return make_uniq<SubqueryRef>(std::move(select));
+}
+
 static unique_ptr<FunctionData> PsamBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto result = make_uniq<PsamBindData>();
 	result->file_path = input.inputs[0].GetValue<string>();
 
-	{
-		auto &fs = FileSystem::GetFileSystem(context);
-		// Expand a glob/URL (e.g. pathmacro:) to a concrete path. read_psam is
-		// single-file; a pattern resolving to multiple files is an error.
-		auto expanded = ExpandPathInputs(context, fs, {result->file_path}, "read_psam");
-		if (expanded.size() > 1) {
-			throw InvalidInputException("read_psam: input '%s' resolved to %llu files; read_psam reads a single "
-			                            ".psam/.fam",
-			                            result->file_path, (unsigned long long)expanded.size());
-		}
-		result->file_path = expanded[0];
-		// Resolve against file_search_path. Keep the literal if not found — a
-		// non-native source is passed to a stock reader that resolves itself, and
-		// a missing native file falls through to the natural error.
-		auto resolved = ResolveExistingPath(context, fs, result->file_path);
-		if (!resolved.empty()) {
-			result->file_path = resolved;
-		}
-	}
+	result->file_path = ResolvePsamPath(context, result->file_path);
 
 	if (IsNativePlinkFormat(result->file_path)) {
 		// Existing path: parse native text file
@@ -648,6 +674,7 @@ static void PsamScan(ClientContext &context, TableFunctionInput &input, DataChun
 void RegisterPsamReader(ExtensionLoader &loader) {
 	TableFunction read_psam("read_psam", {LogicalType::VARCHAR}, PsamScan, PsamBind, PsamInitGlobal, PsamInitLocal);
 	read_psam.projection_pushdown = true;
+	read_psam.bind_replace = PsamBindReplace;
 	RegisterTableWithDesc(loader, read_psam, {}, "Read PLINK .psam or .fam sample files into tabular format.",
 	                      {"SELECT * FROM read_psam('data/cohort.psam')"});
 }
