@@ -1419,7 +1419,15 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 		}
 
 		if (load_iids) {
-			auto &vec = chunk->data[iid_col];
+			// An integer IID (a foreign companion: pandas writes int64) is read as its text, as a
+			// text .psam reads it. Reading it as string_t crashed (SIGSEGV, 2026-11-23).
+			Vector varchar_vec(LogicalType::VARCHAR, n);
+			Vector *src = &chunk->data[iid_col];
+			if (src->GetType().id() != LogicalTypeId::VARCHAR) {
+				VectorOperations::DefaultCast(*src, varchar_vec, n);
+				src = &varchar_vec;
+			}
+			auto &vec = *src;
 			UnifiedVectorFormat uvf;
 			CompatToUnifiedFormat(vec, n, uvf);
 			auto data = reinterpret_cast<const string_t *>(uvf.data);
@@ -1433,7 +1441,15 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 			}
 		}
 		if (load_fids && has_fid_col) {
-			auto &vec = chunk->data[fid_col];
+			// An integer FID (a foreign companion: pandas writes int64) is read as its text, as a
+			// text .psam reads it. Reading it as string_t crashed (SIGSEGV, 2026-11-23).
+			Vector varchar_vec(LogicalType::VARCHAR, n);
+			Vector *src = &chunk->data[fid_col];
+			if (src->GetType().id() != LogicalTypeId::VARCHAR) {
+				VectorOperations::DefaultCast(*src, varchar_vec, n);
+				src = &varchar_vec;
+			}
+			auto &vec = *src;
 			UnifiedVectorFormat uvf;
 			CompatToUnifiedFormat(vec, n, uvf);
 			auto data = reinterpret_cast<const string_t *>(uvf.data);
