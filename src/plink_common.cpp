@@ -1647,16 +1647,48 @@ vector<uint32_t> ResolveSampleIndices(const Value &samples_val, uint32_t raw_sam
 			                            "is available (no sample IDs to match against)",
 			                            func_name);
 		}
-		// Lazily build iid_to_idx — we only pay the ~500ms map-build cost at 7M
-		// samples when VARCHAR sample filter is actually used.
-		const_cast<SampleInfo *>(sample_info)->EnsureIidMap(func_name);
-		for (auto &child : children) {
-			auto iid = child.GetValue<string>();
-			auto it = sample_info->iid_to_idx.find(iid);
-			if (it == sample_info->iid_to_idx.end()) {
-				throw InvalidInputException("%s: sample '%s' not found in .psam", func_name, iid);
+		if (!sample_info->iid_to_idx.empty()) {
+			// A caller already built the map (read_pfile): use it.
+			for (auto &child : children) {
+				auto iid = child.GetValue<string>();
+				auto it = sample_info->iid_to_idx.find(iid);
+				if (it == sample_info->iid_to_idx.end()) {
+					throw InvalidInputException("%s: sample '%s' not found in .psam", func_name, iid);
+				}
+				indices.push_back(static_cast<uint32_t>(it->second));
 			}
-			indices.push_back(static_cast<uint32_t>(it->second));
+		} else {
+			if (sample_info->iids.empty() && sample_info->sample_ct > 0) {
+				throw InternalException("%s: IID lookup requested but IID strings were not loaded (%llu samples)",
+				                        func_name, static_cast<unsigned long long>(sample_info->sample_ct));
+			}
+			// One pass over the IIDs for the named ones, not a map of every IID: 8M samples,
+			// plink_freq(samples := ['per5']) took 5.80 s with the map, 0.60 s by index (measured
+			// 2026-11-24). Only a named IID is checked for a duplicate (as read_pfile since #150).
+			unordered_map<string, vector<idx_t>> rows;
+			for (auto &child : children) {
+				rows.emplace(child.GetValue<string>(), vector<idx_t>());
+			}
+			const auto &iids = sample_info->iids;
+			for (idx_t i = 0; i < iids.size(); i++) {
+				auto it = rows.find(iids[i]);
+				if (it != rows.end() && it->second.size() < 2) {
+					it->second.push_back(i);
+				}
+			}
+			for (auto &child : children) {
+				auto iid = child.GetValue<string>();
+				auto &found = rows[iid];
+				if (found.empty()) {
+					throw InvalidInputException("%s: sample '%s' not found in .psam", func_name, iid);
+				}
+				if (found.size() > 1) {
+					throw IOException("%s has duplicate IID '%s' (at sample %llu and %llu)", func_name, iid,
+					                  static_cast<unsigned long long>(found[0] + 1),
+					                  static_cast<unsigned long long>(found[1] + 1));
+				}
+				indices.push_back(static_cast<uint32_t>(found[0]));
+			}
 		}
 	} else {
 		throw InvalidInputException("%s: samples parameter must be LIST(VARCHAR) or LIST(INTEGER)", func_name);

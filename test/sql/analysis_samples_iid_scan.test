@@ -1,0 +1,101 @@
+# name: test/sql/analysis_samples_iid_scan.test
+# description: samples := [IID names] in the analyses and read_pgen finds the named samples by one pass over the loaded IIDs, not a map of every IID; the rows and the errors for the named samples stay those of the map
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Measured 2026-11-24 (8M samples, .psam.parquet): plink_freq(samples := ['per5']) took 5.80 s, and
+# samples := [5] took 0.60 s. The difference is the IID -> index map that ResolveSampleIndices
+# built over every IID. The map also checked every IID for a duplicate. The scan checks only the
+# named IIDs: a duplicate IID that no name matches is no longer an error (as read_pfile since #150).
+# large_example: 3000 variants x 8 samples (SAMP1..8).
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/F' (FORMAT pfile, psam_parquet);
+
+# --- A name gives the rows of its index (SAMP3 = 2, SAMP1 = 0), in each reader.
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', samples := ['SAMP3', 'SAMP1'])
+   EXCEPT ALL SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', samples := [2, 0]))
+  UNION ALL
+  (SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', samples := [2, 0])
+   EXCEPT ALL SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', samples := ['SAMP3', 'SAMP1'])));
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM plink_hardy('{TEST_DIR}/F.pgen', samples := ['SAMP3', 'SAMP1'])
+   EXCEPT ALL SELECT * FROM plink_hardy('{TEST_DIR}/F.pgen', samples := [2, 0]))
+  UNION ALL
+  (SELECT * FROM plink_hardy('{TEST_DIR}/F.pgen', samples := [2, 0])
+   EXCEPT ALL SELECT * FROM plink_hardy('{TEST_DIR}/F.pgen', samples := ['SAMP3', 'SAMP1'])));
+----
+0
+
+query T
+SELECT list(IID ORDER BY IID) FROM plink_missing('{TEST_DIR}/F.pgen', mode := 'sample', samples := ['SAMP3', 'SAMP1']);
+----
+[SAMP1, SAMP3]
+
+# --- A name that is not in the .psam, and a name given twice, are still errors.
+statement error
+SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', samples := ['SAMP1', 'NOPE']);
+----
+sample 'NOPE' not found in .psam
+
+statement error
+SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', samples := ['SAMP1', 'SAMP1']);
+----
+duplicate sample index
+
+# --- A duplicate IID (SAMP8 renamed to SAMP7), in a .psam.parquet and in a text .psam.
+statement ok
+COPY (SELECT * REPLACE (CASE WHEN IID = 'SAMP8' THEN 'SAMP7' ELSE IID END AS IID) FROM read_parquet('{TEST_DIR}/F.psam.parquet'))
+TO '{TEST_DIR}/D.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT line FROM (
+  SELECT 0 AS n, '#IID' || chr(9) || 'SEX' AS line
+  UNION ALL
+  SELECT n, IID || chr(9) || 'NA' FROM (SELECT row_number() OVER () AS n, IID FROM read_parquet('{TEST_DIR}/D.psam.parquet')))
+  ORDER BY n)
+TO '{TEST_DIR}/D.psam' (FORMAT csv, header false, quote '');
+
+# A name that matches the duplicate is an error, with the map's text.
+statement error
+SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/D.psam.parquet', samples := ['SAMP7']);
+----
+has duplicate IID 'SAMP7' (at sample 7 and 8)
+
+statement error
+SELECT * FROM plink_hardy('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/D.psam', samples := ['SAMP7']);
+----
+has duplicate IID 'SAMP7' (at sample 7 and 8)
+
+# A name that does not match the duplicate works: a behaviour change (the map raised the error).
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/D.psam.parquet', samples := ['SAMP1'])
+   EXCEPT ALL SELECT * FROM plink_freq('{TEST_DIR}/F.pgen', samples := [0])));
+----
+0
+
+query I
+SELECT count(*) FROM plink_freq('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/D.psam', samples := ['SAMP1']);
+----
+3000
+
+query I
+SELECT count(*) FROM plink_missing('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/D.psam.parquet', mode := 'sample', samples := ['SAMP2']);
+----
+1
+
+query I
+SELECT count(*) FROM read_pgen('{TEST_DIR}/F.pgen', psam := '{TEST_DIR}/D.psam', samples := ['SAMP1']);
+----
+3000
