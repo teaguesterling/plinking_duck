@@ -249,6 +249,19 @@ SELECT * FROM plink_freq('biobank.pgen',
 
 Sample subsetting is handled at the pgenlib level using `PgrGetCounts` / `PgrGet` with a sample bitmask. For functions using `PgrGetCounts` (`plink_freq`, `plink_hardy`), this is very efficient since the counting path directly respects the bitmask without extracting individual genotypes.
 
+### Samples by IID
+
+`samples := ['IID', …]` names the samples by IID. In `read_pfile` over one `.psam.parquet`, the names are looked up in the companion with a filtered scan, so the other IIDs are never loaded. A `WHERE IID = … / IN (…)` in genotype orient uses the same lookup. For 8M samples (measured 2026-11-23):
+
+| Query | Text `.psam` | `.psam.parquet` |
+|---|---|---|
+| `read_pfile(…, samples := ['per5'])` | 7.7 s | 0.03 s |
+| `read_pfile(…, orient := 'genotype') WHERE IID = 'per5'` | 0.3–1.1 s | 0.13 s |
+
+- The lookup applies to one `.psam.parquet` with a text IID column and at most 10000 names. Other cases (a text `.psam`, several shards, a glob, an integer IID column, `combine_samples := 'disjoint'`) load every IID.
+- The lookup checks only the named IIDs. A name that two samples share is an error. A duplicate IID that no name matches is not checked.
+- The analysis functions (`plink_freq` and the others) load every IID for a by-name `samples :=` (5.7 s for 8M samples). To avoid this, pass sample indices.
+
 ## Tips for Large Datasets
 
 ### Use region filtering for targeted analyses
