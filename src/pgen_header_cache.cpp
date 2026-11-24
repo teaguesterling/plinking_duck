@@ -7,6 +7,14 @@
 #include <sys/stat.h>
 #include <unordered_map>
 
+// The nanosecond mtime of struct stat has a different member name on Darwin (st_mtimespec) than
+// in POSIX.1-2008 (st_mtim). Both are a struct timespec, so the header key below is the same.
+#if defined(__APPLE__)
+#define PGEN_STAT_MTIM st_mtimespec
+#else
+#define PGEN_STAT_MTIM st_mtim
+#endif
+
 namespace duckdb {
 
 std::atomic<int64_t> g_pgen_header_decodes {0};
@@ -59,7 +67,7 @@ static string PgenHeaderKey(ClientContext &context, const string &pgen_path) {
 	if (stat(pgen_path.c_str(), &st) == 0) {
 		identity = StringUtil::Format("dev=%llu ino=%llu size=%lld mtime=%lld.%09ld", (unsigned long long)st.st_dev,
 		                              (unsigned long long)st.st_ino, (long long)st.st_size,
-		                              (long long)st.st_mtim.tv_sec, (long)st.st_mtim.tv_nsec);
+		                              (long long)st.PGEN_STAT_MTIM.tv_sec, (long)st.PGEN_STAT_MTIM.tv_nsec);
 	} else {
 		try {
 			auto &fs = FileSystem::GetFileSystem(context);
