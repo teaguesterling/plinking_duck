@@ -63,7 +63,7 @@ SELECT plinking_debug_iid_where_pushed_reset();
 0
 
 query II
-SELECT count(genotype), list(DISTINCT IID) FROM read_pfile('{TEST_DIR}/F', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7');
+SELECT count(*), list(DISTINCT IID) FROM read_pfile('{TEST_DIR}/F', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7');
 ----
 6000	[SAMP2, SAMP7]
 
@@ -140,9 +140,10 @@ SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/D.ps
 ----
 3000
 
-# A WHERE IID keeps every match (as the full load did).
+# A WHERE IID keeps every match (as the full load did): 2 samples x 3000 rows. (count(*): count(genotype)
+# skips the missing genotypes, 25% here.)
 query I
-SELECT count(genotype) FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/D.psam.parquet', orient := 'genotype') WHERE IID = 'SAMP7';
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/D.psam.parquet', orient := 'genotype') WHERE IID = 'SAMP7';
 ----
 6000
 
@@ -175,7 +176,7 @@ SELECT plinking_debug_psam_iid_loads_reset();
 0
 
 query I
-SELECT count(ALT_FREQ) FROM read_pfile('{TEST_DIR}/F', freq := true, samples := ['SAMP3']);
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', freq := true, samples := ['SAMP3']);
 ----
 3000
 
