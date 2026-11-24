@@ -279,6 +279,7 @@ static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &
 	if (!sample_info.iids.empty() || !meta.from_parquet) {
 		return;
 	}
+	NotePsamParquetIidLoad();
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 	const bool has_fid = meta.fid_col_idx != DConstants::INVALID_INDEX;
@@ -305,6 +306,108 @@ static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &
 			ExtractStringColumn(context, *chunk, 1, n, sample_info.fids);
 		}
 	}
+}
+
+//! Above this many names, samples := and a WHERE IID load every IID instead. 8M samples, measured
+//! 2026-11-23: the filtered scan took 0.017 s for 1 name, 0.37 s for 10k and 2.9 s for 100k.
+static constexpr idx_t kMaxIidLookupNames = 10000;
+
+//! The file rows of the named IIDs in ONE .psam.parquet, by a filtered scan of the companion
+//! (file_row_number, WHERE IID IN ...) instead of a load of every IID: for 8M samples 0.015 s
+//! against 6.4 s for the load and 3.2 s for the IID -> index map (measured 2026-11-23). Every match,
+//! as (IID, row), in file order. False when the lookup does not apply, and the caller then loads
+//! every IID: not one parquet file, no VARCHAR IID column (case-insensitive, as
+//! LoadSampleInfoFromParquet matches it), or more than kMaxIidLookupNames names.
+static bool LookupParquetIidRows(ClientContext &context, const string &path, const vector<string> &names,
+                                 vector<std::pair<string, uint32_t>> &matches) {
+	if (names.empty() || names.size() > kMaxIidLookupNames || !IsParquetFile(path) || FileSystem::HasGlob(path)) {
+		return false;
+	}
+	auto lit = [](const string &v) {
+		return "'" + StringUtil::Replace(v, "'", "''") + "'";
+	};
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	const string from = " FROM read_parquet(" + lit(path) + ", file_row_number := true)";
+	auto probe = conn.Query("SELECT *" + from + " LIMIT 0");
+	if (probe->HasError()) {
+		return false; // the full load raises its own error
+	}
+	const auto col_names = CompatResultNames(*probe);
+	const auto &col_types = CompatResultTypes(*probe);
+	string iid_col;
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		if (StringUtil::Lower(col_names[i]) == "iid") {
+			if (col_types[i].id() != LogicalTypeId::VARCHAR) {
+				return false;
+			}
+			iid_col = "\"" + StringUtil::Replace(col_names[i], "\"", "\"\"") + "\"";
+		}
+	}
+	if (iid_col.empty()) {
+		return false;
+	}
+	string in_list;
+	for (idx_t k = 0; k < names.size(); k++) {
+		in_list += (k ? ", " : "") + lit(names[k]);
+	}
+	auto result = conn.Query("SELECT file_row_number, " + iid_col + from + " WHERE " + iid_col + " IN (" + in_list +
+	                         ") ORDER BY file_row_number");
+	if (result->HasError()) {
+		return false;
+	}
+	matches.clear();
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			matches.emplace_back(chunk->GetValue(1, r).GetValue<string>(),
+			                     static_cast<uint32_t>(chunk->GetValue(0, r).GetValue<int64_t>()));
+		}
+	}
+	return true;
+}
+
+//! samples := [IID names] over one .psam.parquet: the same list as file indices (a LIST(BIGINT)
+//! that ResolveSampleIndices then checks for range and duplicates), from LookupParquetIidRows. The
+//! errors are those of the full load: a name with no sample is "not found", and a name two samples
+//! have is a duplicate IID. A duplicate IID that no name matches is not checked. False when the
+//! lookup does not apply (and for a NULL name): the caller then loads every IID.
+static bool ResolveSampleNamesByLookup(ClientContext &context, const string &psam_path, const Value &samples,
+                                       Value &indices_out) {
+	if (samples.IsNull() || samples.type().id() != LogicalTypeId::LIST ||
+	    ListType::GetChildType(samples.type()).id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	vector<string> names;
+	for (auto &child : ListValue::GetChildren(samples)) {
+		if (child.IsNull()) {
+			return false;
+		}
+		names.push_back(child.GetValue<string>());
+	}
+	vector<std::pair<string, uint32_t>> matches;
+	if (!LookupParquetIidRows(context, psam_path, names, matches)) {
+		return false;
+	}
+	unordered_map<string, vector<uint32_t>> rows;
+	for (auto &m : matches) {
+		rows[m.first].push_back(m.second);
+	}
+	vector<Value> indices;
+	for (auto &name : names) {
+		auto it = rows.find(name);
+		if (it == rows.end()) {
+			throw InvalidInputException("read_pfile: sample '%s' not found in .psam", name);
+		}
+		if (it->second.size() > 1) {
+			throw IOException("read_pfile: %s has duplicate IID '%s' (at sample %llu and %llu)", psam_path, name,
+			                  static_cast<unsigned long long>(it->second[0] + 1),
+			                  static_cast<unsigned long long>(it->second[1] + 1));
+		}
+		indices.push_back(Value::BIGINT(it->second[0]));
+	}
+	indices_out = Value::LIST(LogicalType::BIGINT, std::move(indices));
+	return true;
 }
 
 //! freq := true in genotype orient: the coded SEX (SampleInfo::sexes) of a .psam that
@@ -2607,6 +2710,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 	//   * samples filter contains VARCHAR (IID-string lookup)
 	//   * genotypes := 'columns' or 'struct' in variant orient (column names from IIDs)
 	bool needs_iids = false;
+	bool names_need_iids = false; // samples := [IID names]; see ResolveSampleNamesByLookup below
 	if (bind_data->orient_mode == OrientMode::GENOTYPE || bind_data->orient_mode == OrientMode::SAMPLE) {
 		needs_iids = true;
 	}
@@ -2622,7 +2726,7 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		if (sel.has_samples && !sel.samples.IsNull() && sel.samples.type().id() == LogicalTypeId::LIST) {
 			auto &child_type = ListType::GetChildType(sel.samples.type());
 			if (child_type.id() == LogicalTypeId::VARCHAR) {
-				needs_iids = true;
+				names_need_iids = true;
 			}
 		}
 	}
@@ -2636,6 +2740,17 @@ static unique_ptr<FunctionData> PfileBind(ClientContext &context, TableFunctionB
 		}
 	}
 
+	// samples := [IID names] over one .psam.parquet: look the names up and go on with their indices, so
+	// no load of every IID is made for them (8M samples: 11.4 s before, measured 2026-11-23). Not over
+	// several shards, and not for combine_samples := 'disjoint', which checks every IID.
+	if (names_need_iids && !bind_data->IsConcat() && bind_data->combine_samples != CombineSamplesMode::DISJOINT) {
+		Value indices;
+		if (ResolveSampleNamesByLookup(context, psam_path, sel.samples, indices)) {
+			sel.samples = std::move(indices);
+			names_need_iids = false;
+		}
+	}
+	needs_iids = needs_iids || names_need_iids;
 	bind_timer.Note("loading sample metadata (needs_iids=%s)", needs_iids ? "yes" : "no");
 	if (bind_data->IsConcat()) {
 		LoadConcatSampleMetadata(context, *bind_data,
@@ -6699,22 +6814,35 @@ static void PruneSamplesByIid(ClientContext &context, PfileBindData &bind_data, 
 	if (!c.has_iid || bind_data.count_filter.HasFilter()) {
 		return;
 	}
-	EnsureSourceIids(context, bind_data.sample_metadata, bind_data.sample_info);
-	const auto &all = bind_data.sample_info.iids;
-	if (all.size() != bind_data.raw_sample_ct) {
-		return; // the IIDs are not all known here: keep every sample
-	}
 	vector<uint32_t> keep; // ascending, as sample_indices is
-	if (bind_data.has_sample_subset) {
-		for (auto s : bind_data.sample_indices) {
-			if (c.iids.count(all[s])) {
-				keep.push_back(s);
+	const auto &meta = bind_data.sample_metadata;
+	vector<std::pair<string, uint32_t>> matches;
+	if (bind_data.sample_info.iids.empty() && meta.from_parquet && meta.source_paths.size() <= 1 &&
+	    LookupParquetIidRows(context, meta.source_path, vector<string>(c.iids.begin(), c.iids.end()), matches)) {
+		// One .psam.parquet: the named IIDs' rows (every match, in file order), not every IID.
+		for (auto &m : matches) {
+			if (!bind_data.has_sample_subset ||
+			    std::binary_search(bind_data.sample_indices.begin(), bind_data.sample_indices.end(), m.second)) {
+				keep.push_back(m.second);
 			}
 		}
 	} else {
-		for (uint32_t s = 0; s < bind_data.raw_sample_ct; s++) {
-			if (c.iids.count(all[s])) {
-				keep.push_back(s); // every match: concatenate does not require unique IIDs
+		EnsureSourceIids(context, bind_data.sample_metadata, bind_data.sample_info);
+		const auto &all = bind_data.sample_info.iids;
+		if (all.size() != bind_data.raw_sample_ct) {
+			return; // the IIDs are not all known here: keep every sample
+		}
+		if (bind_data.has_sample_subset) {
+			for (auto s : bind_data.sample_indices) {
+				if (c.iids.count(all[s])) {
+					keep.push_back(s);
+				}
+			}
+		} else {
+			for (uint32_t s = 0; s < bind_data.raw_sample_ct; s++) {
+				if (c.iids.count(all[s])) {
+					keep.push_back(s); // every match: concatenate does not require unique IIDs
+				}
 			}
 		}
 	}
@@ -7195,6 +7323,14 @@ static void DebugIidWherePushedResetFunc(DataChunk &args, ExpressionState &, Vec
 	CompatReferenceConstant(result, Value::BIGINT(0), args.size());
 }
 
+static void DebugPsamIidLoadsFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(PsamParquetIidLoads(false)), args.size());
+}
+
+static void DebugPsamIidLoadsResetFunc(DataChunk &args, ExpressionState &, Vector &result) {
+	CompatReferenceConstant(result, Value::BIGINT(PsamParquetIidLoads(true)), args.size());
+}
+
 static void DebugGenotypeWherePushedFunc(DataChunk &args, ExpressionState &, Vector &result) {
 	CompatReferenceConstant(result, Value::BIGINT(g_genotype_where_pushed.load(std::memory_order_relaxed)),
 	                        args.size());
@@ -7324,6 +7460,15 @@ void RegisterPfileReader(ExtensionLoader &loader) {
 	dbg_iw_reset.SetVolatile();
 	RegisterScalarWithDesc(loader, dbg_iw_reset, {}, "Test-only: reset plinking_debug_iid_where_pushed to 0.",
 	                       {"SELECT plinking_debug_iid_where_pushed_reset()"});
+	ScalarFunction dbg_pil("plinking_debug_psam_iid_loads", {}, LogicalType::BIGINT, DebugPsamIidLoadsFunc);
+	dbg_pil.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_pil, {}, "Test-only: full IID loads of a .psam.parquet since the last reset.",
+	                       {"SELECT plinking_debug_psam_iid_loads()"});
+	ScalarFunction dbg_pil_reset("plinking_debug_psam_iid_loads_reset", {}, LogicalType::BIGINT,
+	                             DebugPsamIidLoadsResetFunc);
+	dbg_pil_reset.SetVolatile();
+	RegisterScalarWithDesc(loader, dbg_pil_reset, {}, "Test-only: reset plinking_debug_psam_iid_loads to 0.",
+	                       {"SELECT plinking_debug_psam_iid_loads_reset()"});
 	ScalarFunction dbg_gw("plinking_debug_genotype_where_pushed", {}, LogicalType::BIGINT,
 	                      DebugGenotypeWherePushedFunc);
 	dbg_gw.SetVolatile();

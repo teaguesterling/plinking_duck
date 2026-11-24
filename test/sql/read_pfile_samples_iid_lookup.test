@@ -1,0 +1,186 @@
+# name: test/sql/read_pfile_samples_iid_lookup.test
+# description: samples := [IID names] and a WHERE IID over one .psam.parquet find the named samples with a filtered scan of the companion, not a load of every IID; the rows and the errors stay those of the full load
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Measured 2026-11-23 (8M samples, .psam.parquet): read_pfile(samples := ['per5']) took 11.4 s, of
+# which 6.4 s loaded every IID and 3.2 s built the IID -> index map. A filtered scan of the
+# companion (file_row_number, WHERE IID IN ...) took 0.015 s. The signal is
+# plinking_debug_psam_iid_loads(): one count per full IID load of a .psam.parquet.
+# large_example: 3000 variants x 8 samples (SAMP1..8).
+
+statement ok
+SET threads = 4;
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/F' (FORMAT pfile, psam_parquet);
+
+# --- Variant orient: the rows equal the index form (SAMP1 = 0, SAMP3 = 2), with no full load.
+query I
+SELECT plinking_debug_psam_iid_loads_reset();
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', samples := ['SAMP3', 'SAMP1'])
+   EXCEPT ALL SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', samples := [0, 2]))
+  UNION ALL
+  (SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', samples := [0, 2])
+   EXCEPT ALL SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', samples := ['SAMP3', 'SAMP1'])));
+----
+0
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/F', samples := ['SAMP3', 'SAMP1']);
+----
+3000
+
+query I
+SELECT plinking_debug_psam_iid_loads();
+----
+0
+
+# --- Genotype orient, samples := by name.
+query II
+SELECT count(*), list(DISTINCT IID) FROM read_pfile('{TEST_DIR}/F', orient := 'genotype', samples := ['SAMP3']);
+----
+3000	[SAMP3]
+
+query I
+SELECT plinking_debug_psam_iid_loads();
+----
+0
+
+# --- Genotype orient, WHERE IID: still narrowed (iid_where_pushed), with no full load.
+query I
+SELECT plinking_debug_iid_where_pushed_reset();
+----
+0
+
+query II
+SELECT count(*), list(DISTINCT IID) FROM read_pfile('{TEST_DIR}/F', orient := 'genotype') WHERE IID IN ('SAMP2', 'SAMP7');
+----
+6000	[SAMP2, SAMP7]
+
+query I
+SELECT plinking_debug_iid_where_pushed();
+----
+1
+
+query I
+SELECT plinking_debug_psam_iid_loads();
+----
+0
+
+# WHERE IID with samples := by name: the intersection.
+query T
+SELECT list(DISTINCT IID) FROM read_pfile('{TEST_DIR}/F', orient := 'genotype', samples := ['SAMP2', 'SAMP4']) WHERE IID IN ('SAMP2', 'SAMP7');
+----
+[SAMP2]
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', orient := 'genotype') WHERE IID = 'nobody';
+----
+0
+
+# --- The errors of the full load.
+statement error
+SELECT * FROM read_pfile('{TEST_DIR}/F', samples := ['SAMP1', 'nobody']);
+----
+read_pfile: sample 'nobody' not found in .psam
+
+statement error
+SELECT * FROM read_pfile('{TEST_DIR}/F', samples := ['SAMP1', 'SAMP1']);
+----
+duplicate sample index 0 in samples list
+
+statement error
+SELECT * FROM read_pfile('{TEST_DIR}/F', orient := 'genotype', samples := ['nobody']);
+----
+read_pfile: sample 'nobody' not found in .psam
+
+# A name with a quote is a value, not SQL.
+statement error
+SELECT * FROM read_pfile('{TEST_DIR}/F', samples := ['x'') OR (''1''=''1']);
+----
+not found in .psam
+
+statement ok
+COPY (SELECT * REPLACE (CASE WHEN IID = 'SAMP4' THEN 'O''Brien' ELSE IID END AS IID) FROM read_parquet('{TEST_DIR}/F.psam.parquet'))
+TO '{TEST_DIR}/Q.psam.parquet' (FORMAT parquet);
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/Q.psam.parquet', samples := ['O''Brien']);
+----
+3000
+
+# --- A duplicate IID: an error when the query names it, as before. A duplicate the query does not
+# --- name is not checked any more (the full load checked every IID): a behaviour change.
+statement ok
+COPY (SELECT * REPLACE (CASE WHEN IID = 'SAMP8' THEN 'SAMP7' ELSE IID END AS IID) FROM read_parquet('{TEST_DIR}/F.psam.parquet'))
+TO '{TEST_DIR}/D.psam.parquet' (FORMAT parquet);
+
+statement error
+SELECT * FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/D.psam.parquet', samples := ['SAMP7']);
+----
+has duplicate IID 'SAMP7' (at sample 7 and 8)
+
+statement error
+SELECT * FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/D.psam.parquet', orient := 'genotype', samples := ['SAMP7']);
+----
+has duplicate IID 'SAMP7' (at sample 7 and 8)
+
+query I
+SELECT count(genotypes) FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/D.psam.parquet', samples := ['SAMP1']);
+----
+3000
+
+# A WHERE IID keeps every match (as the full load did): 2 samples x 3000 rows. (count(*): count(genotype)
+# skips the missing genotypes, 25% here.)
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/D.psam.parquet', orient := 'genotype') WHERE IID = 'SAMP7';
+----
+6000
+
+query I
+SELECT plinking_debug_psam_iid_loads();
+----
+0
+
+# --- Fallbacks load every IID, with the same rows: an integer IID column (a foreign companion), and
+# --- freq := true (it needs every sample's SEX).
+statement ok
+COPY (SELECT * REPLACE (CAST(IID[5:] AS BIGINT) AS IID) FROM read_parquet('{TEST_DIR}/F.psam.parquet'))
+TO '{TEST_DIR}/N.psam.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM (
+  SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', psam := '{TEST_DIR}/N.psam.parquet', samples := ['3'])
+  EXCEPT ALL SELECT ID, genotypes FROM read_pfile('{TEST_DIR}/F', samples := [2]));
+----
+0
+
+query I
+SELECT plinking_debug_psam_iid_loads() >= 1;
+----
+true
+
+query I
+SELECT plinking_debug_psam_iid_loads_reset();
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/F', freq := true, samples := ['SAMP3']);
+----
+3000
+
+query I
+SELECT plinking_debug_psam_iid_loads() >= 1;
+----
+true

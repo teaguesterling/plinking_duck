@@ -458,6 +458,11 @@ VariantMetadataIndex LoadVariantMetadataFromTextRegion(ClientContext &context, c
 idx_t GetParquetRowCount(ClientContext &context, const string &path);
 
 //! Load sample info from a parquet file via DuckDB's parquet reader.
+//! Test-only counter: full IID loads of a .psam.parquet (LoadSampleInfoFromParquet, and
+//! read_pfile's EnsureSourceIids). Note* adds one; PsamParquetIidLoads(true) resets it to 0.
+void NotePsamParquetIidLoad();
+int64_t PsamParquetIidLoads(bool reset);
+
 SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path);
 
 //! Load variant metadata from any DuckDB-readable source (CSV, table, view, etc.).
