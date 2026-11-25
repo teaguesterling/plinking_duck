@@ -1,0 +1,120 @@
+# name: test/sql/analysis_samples_parquet_lookup.test
+# description: plink_freq and plink_hardy with samples := [IID names] over one .psam.parquet read only the named rows (IID, SEX) by a filtered scan, not every IID; the rows, the SEX codes and the errors stay those of the full load
+# group: [sql]
+
+require plinking_duck
+
+require parquet
+
+# Measured 2026-11-24 (8M samples, .psam.parquet, after #153): plink_freq(samples := ['per5']) took
+# 0.80 s, of which about 0.7 s loaded every IID, FID and SEX. The signal is
+# plinking_debug_psam_iid_loads(): one count per full IID load of a .psam.parquet.
+# The index form (samples := [..]) still loads every IID, so it is the reference for the rows.
+# sexchr_example: 6 samples (M1 M2 M3 = SEX 1, F1 F2 F3 = SEX 2); variants on 1, PAR1, X, Y, MT,
+# so the freq and hardy values depend on SEX.
+
+statement ok
+COPY (SELECT * FROM read_psam('test/data/sexchr_example.psam')) TO '{TEST_DIR}/S.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT IID, CAST(SEX AS VARCHAR) AS SEX FROM read_psam('test/data/sexchr_example.psam')) TO '{TEST_DIR}/V.psam.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT IID FROM read_psam('test/data/sexchr_example.psam')) TO '{TEST_DIR}/N.psam.parquet' (FORMAT parquet);
+
+# --- plink_freq: no full IID load for the named form.
+query I
+SELECT plinking_debug_psam_iid_loads_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/S.psam.parquet', samples := ['F2', 'M1']);
+----
+5
+
+query I
+SELECT plinking_debug_psam_iid_loads();
+----
+0
+
+# The rows equal the index form (M1 = 0, F2 = 4), for an INTEGER SEX, a VARCHAR SEX and no SEX.
+foreach P S V N
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := ['F2', 'M1'])
+   EXCEPT ALL SELECT * FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := [4, 0]))
+  UNION ALL
+  (SELECT * FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := [4, 0])
+   EXCEPT ALL SELECT * FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := ['F2', 'M1'])));
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM plink_hardy('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := ['F2', 'M1', 'F3'])
+   EXCEPT ALL SELECT * FROM plink_hardy('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := [4, 0, 5]))
+  UNION ALL
+  (SELECT * FROM plink_hardy('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := [4, 0, 5])
+   EXCEPT ALL SELECT * FROM plink_hardy('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/{P}.psam.parquet', samples := ['F2', 'M1', 'F3'])));
+----
+0
+
+endloop
+
+# The chrX value of one male is haploid (ALT_FREQ over 1 allele), so SEX was read for the named row.
+query I
+SELECT OBS_CT FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/S.psam.parquet', samples := ['M1']) WHERE ID = 'x1';
+----
+1
+
+# --- plink_hardy: no full IID load either.
+query I
+SELECT plinking_debug_psam_iid_loads_reset();
+----
+0
+
+query I
+SELECT count(*) FROM plink_hardy('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/S.psam.parquet', samples := ['F2', 'M1']);
+----
+5
+
+query I
+SELECT plinking_debug_psam_iid_loads();
+----
+0
+
+# --- The errors of the full load.
+statement error
+SELECT * FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/S.psam.parquet', samples := ['M1', 'NOPE']);
+----
+plink_freq: sample 'NOPE' not found in .psam
+
+statement error
+SELECT * FROM plink_hardy('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/S.psam.parquet', samples := ['M1', 'M1']);
+----
+duplicate sample index
+
+statement ok
+COPY (SELECT * REPLACE (CASE WHEN IID = 'F3' THEN 'F2' ELSE IID END AS IID) FROM read_parquet('{TEST_DIR}/S.psam.parquet'))
+TO '{TEST_DIR}/D.psam.parquet' (FORMAT parquet);
+
+statement error
+SELECT * FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/D.psam.parquet', samples := ['F2']);
+----
+plink_freq has duplicate IID 'F2' (at sample 5 and 6)
+
+query I
+SELECT count(*) FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/D.psam.parquet', samples := ['M1']);
+----
+5
+
+# A .psam.parquet with a different sample count than the .pgen is still an error.
+statement ok
+COPY (SELECT * FROM read_parquet('{TEST_DIR}/S.psam.parquet') LIMIT 5) TO '{TEST_DIR}/C.psam.parquet' (FORMAT parquet);
+
+statement error
+SELECT * FROM plink_freq('test/data/sexchr_example.pgen', psam := '{TEST_DIR}/C.psam.parquet', samples := ['M1']);
+----
+sample count mismatch
