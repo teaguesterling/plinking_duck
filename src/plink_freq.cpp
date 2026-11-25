@@ -233,9 +233,21 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 		                            static_cast<unsigned long long>(bind_data->variants.variant_ct));
 	}
 
+	// ParseSelection captures samples/region symbolically; ResolveSelection (below) composes
+	// ResolveSampleIndices/BuildSampleSubset/ParseRegion over the loaded metadata.
+	Selection selection = ParseSelection(input.named_parameters);
+
 	// --- Load sample info (optional) ---
+	// samples := [names] over a .psam.parquet reads only the named rows (IID, SEX), not every IID:
+	// plink_freq uses no other sample's IID.
 	if (!bind_data->psam_path.empty()) {
-		bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
+		vector<std::pair<string, uint32_t>> named_matches;
+		const bool named_lookup =
+		    selection.has_samples && LookupNamedSamplesInParquet(context, bind_data->psam_path, selection.samples,
+		                                                         bind_data->sample_info, named_matches);
+		if (!named_lookup) {
+			bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
+		}
 		bind_data->has_sample_info = true;
 
 		if (static_cast<uint32_t>(bind_data->sample_info.sample_ct) != bind_data->raw_sample_ct) {
@@ -244,16 +256,15 @@ static unique_ptr<FunctionData> PlinkFreqBind(ClientContext &context, TableFunct
 			                            bind_data->raw_sample_ct, bind_data->psam_path,
 			                            static_cast<unsigned long long>(bind_data->sample_info.sample_ct));
 		}
+		if (named_lookup) {
+			selection.samples = NamedSampleIndices(selection.samples, named_matches, "plink_freq");
+		}
 	}
 
 	// --- Resolve the axis selection (samples + region) via the shared handler ---
-	// ParseSelection captures samples/region symbolically; ResolveSelection composes
-	// ResolveSampleIndices/BuildSampleSubset/ParseRegion over the loaded metadata.
-	// Behavior is byte-identical to the former inline parsing: samples resolve before
-	// region, psam is optional (sample_info may be null), and count-mismatch checks
-	// remain plink_freq's own (above). BuildAlignedSex still runs here with the
-	// resolved subset — its no-subset case must pass nullptr, not &subset_sorted.
-	Selection selection = ParseSelection(input.named_parameters);
+	// Samples resolve before region, psam is optional (sample_info may be null), and
+	// count-mismatch checks remain plink_freq's own (above). BuildAlignedSex still runs here
+	// with the resolved subset — its no-subset case must pass nullptr, not &subset_sorted.
 	ResolvedSelection resolved =
 	    ResolveSelection(selection, bind_data->variants, bind_data->has_sample_info ? &bind_data->sample_info : nullptr,
 	                     bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_freq");

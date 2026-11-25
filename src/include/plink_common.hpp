@@ -465,6 +465,35 @@ int64_t PsamParquetIidLoads(bool reset);
 
 SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path);
 
+//! Above this many names, samples := and a WHERE IID load every IID instead. 8M samples, measured
+//! 2026-11-23: the filtered scan took 0.017 s for 1 name, 0.37 s for 10k and 2.9 s for 100k.
+static constexpr idx_t kMaxIidLookupNames = 10000;
+
+//! The file rows of the named IIDs in ONE .psam.parquet, by a filtered scan of the companion
+//! (file_row_number, WHERE IID IN ...) instead of a load of every IID: for 8M samples 0.015 s
+//! against 6.4 s for the load and 3.2 s for the IID -> index map (measured 2026-11-23). Every match,
+//! as (IID, row), in file order. With `sexes`, also each match's SEX, coded as LoadSampleMetadata
+//! codes it, and `*has_sex` says whether the file has a SEX column. False when the lookup does not
+//! apply, and the caller then loads every IID: not one parquet file, no VARCHAR IID column
+//! (case-insensitive, as LoadSampleInfoFromParquet matches it), or more than kMaxIidLookupNames names.
+bool LookupParquetIidRows(ClientContext &context, const string &path, const vector<string> &names,
+                          vector<std::pair<string, uint32_t>> &matches, vector<uint8_t> *sexes = nullptr,
+                          bool *has_sex = nullptr);
+
+//! samples := [IID names] over one .psam.parquet, for an analysis that uses only the named samples'
+//! file indices and SEX (plink_freq, plink_hardy): LookupParquetIidRows, not a load of every IID.
+//! Fills `info` with sample_ct (from the parquet metadata) and, when the file has a SEX column, a
+//! `sexes` of sample_ct codes (the named rows' codes, 0 elsewhere); `iids` stays empty. False when
+//! the lookup does not apply (also for a NULL name): the caller then calls LoadSampleMetadata.
+bool LookupNamedSamplesInParquet(ClientContext &context, const string &path, const Value &samples, SampleInfo &info,
+                                 vector<std::pair<string, uint32_t>> &matches);
+
+//! The named samples as a LIST(BIGINT) of file indices, in the order given, from the matches of
+//! LookupNamedSamplesInParquet. The errors are ResolveSampleIndices': a name with no sample is
+//! "not found", a name two samples have is a duplicate IID.
+Value NamedSampleIndices(const Value &samples, const vector<std::pair<string, uint32_t>> &matches,
+                         const string &func_name);
+
 //! Load variant metadata from any DuckDB-readable source (CSV, table, view, etc.).
 //! Executes SELECT * FROM '<source>' via a separate Connection, maps columns by name
 //! (case-insensitive), synthesizes a pvar-format text buffer, and returns a standard
