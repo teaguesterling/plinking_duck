@@ -260,7 +260,8 @@ Sample subsetting is handled at the pgenlib level using `PgrGetCounts` / `PgrGet
 
 - The lookup applies to one `.psam.parquet` with a text IID column and at most 10000 names. Other cases (a text `.psam`, several shards, a glob, an integer IID column, `combine_samples := 'disjoint'`) load every IID.
 - The lookup checks only the named IIDs. A name that two samples share is an error. A duplicate IID that no name matches is not checked.
-- The analysis functions (`plink_freq` and the others) load every IID for a by-name `samples :=` (5.7 s for 8M samples). To avoid this, pass sample indices.
+- `plink_freq` and `plink_hardy` use the same lookup for a by-name `samples :=` over a `.psam.parquet`: 0.045 s and 0.028 s for 8M samples.
+- The other analysis functions (`plink_missing`, `plink_score`, `plink_pca`, `plink_glm`, `plink_ld`), `read_pgen` and a text `.psam` load every IID for a by-name `samples :=`, then find the names in one pass. For 8M samples, `plink_freq` takes 0.75 s that way from a `.psam.parquet` and 2.6 s from a text `.psam`.
 
 ## Tips for Large Datasets
 

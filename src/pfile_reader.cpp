@@ -308,65 +308,6 @@ static void EnsureSourceIids(ClientContext &context, const PfileSampleMetadata &
 	}
 }
 
-//! Above this many names, samples := and a WHERE IID load every IID instead. 8M samples, measured
-//! 2026-11-23: the filtered scan took 0.017 s for 1 name, 0.37 s for 10k and 2.9 s for 100k.
-static constexpr idx_t kMaxIidLookupNames = 10000;
-
-//! The file rows of the named IIDs in ONE .psam.parquet, by a filtered scan of the companion
-//! (file_row_number, WHERE IID IN ...) instead of a load of every IID: for 8M samples 0.015 s
-//! against 6.4 s for the load and 3.2 s for the IID -> index map (measured 2026-11-23). Every match,
-//! as (IID, row), in file order. False when the lookup does not apply, and the caller then loads
-//! every IID: not one parquet file, no VARCHAR IID column (case-insensitive, as
-//! LoadSampleInfoFromParquet matches it), or more than kMaxIidLookupNames names.
-static bool LookupParquetIidRows(ClientContext &context, const string &path, const vector<string> &names,
-                                 vector<std::pair<string, uint32_t>> &matches) {
-	if (names.empty() || names.size() > kMaxIidLookupNames || !IsParquetFile(path) || FileSystem::HasGlob(path)) {
-		return false;
-	}
-	auto lit = [](const string &v) {
-		return "'" + StringUtil::Replace(v, "'", "''") + "'";
-	};
-	auto &db = DatabaseInstance::GetDatabase(context);
-	Connection conn(db);
-	const string from = " FROM read_parquet(" + lit(path) + ", file_row_number := true)";
-	auto probe = conn.Query("SELECT *" + from + " LIMIT 0");
-	if (probe->HasError()) {
-		return false; // the full load raises its own error
-	}
-	const auto col_names = CompatResultNames(*probe);
-	const auto &col_types = CompatResultTypes(*probe);
-	string iid_col;
-	for (idx_t i = 0; i < col_names.size(); i++) {
-		if (StringUtil::Lower(col_names[i]) == "iid") {
-			if (col_types[i].id() != LogicalTypeId::VARCHAR) {
-				return false;
-			}
-			iid_col = "\"" + StringUtil::Replace(col_names[i], "\"", "\"\"") + "\"";
-		}
-	}
-	if (iid_col.empty()) {
-		return false;
-	}
-	string in_list;
-	for (idx_t k = 0; k < names.size(); k++) {
-		in_list += (k ? ", " : "") + lit(names[k]);
-	}
-	auto result = conn.Query("SELECT file_row_number, " + iid_col + from + " WHERE " + iid_col + " IN (" + in_list +
-	                         ") ORDER BY file_row_number");
-	if (result->HasError()) {
-		return false;
-	}
-	matches.clear();
-	unique_ptr<DataChunk> chunk;
-	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
-		for (idx_t r = 0; r < chunk->size(); r++) {
-			matches.emplace_back(chunk->GetValue(1, r).GetValue<string>(),
-			                     static_cast<uint32_t>(chunk->GetValue(0, r).GetValue<int64_t>()));
-		}
-	}
-	return true;
-}
-
 //! samples := [IID names] over one .psam.parquet: the same list as file indices (a LIST(BIGINT)
 //! that ResolveSampleIndices then checks for range and duplicates), from LookupParquetIidRows. The
 //! errors are those of the full load: a name with no sample is "not found", and a name two samples

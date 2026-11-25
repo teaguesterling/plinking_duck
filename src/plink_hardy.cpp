@@ -242,9 +242,19 @@ static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunc
 		                            static_cast<unsigned long long>(bind_data->variants.variant_ct));
 	}
 
+	Selection selection = ParseSelection(input.named_parameters);
+
 	// --- Load sample info (optional) ---
+	// samples := [names] over a .psam.parquet reads only the named rows (IID, SEX), as in
+	// plink_freq: plink_hardy uses no other sample's IID.
 	if (!bind_data->psam_path.empty()) {
-		bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
+		vector<std::pair<string, uint32_t>> named_matches;
+		const bool named_lookup =
+		    selection.has_samples && LookupNamedSamplesInParquet(context, bind_data->psam_path, selection.samples,
+		                                                         bind_data->sample_info, named_matches);
+		if (!named_lookup) {
+			bind_data->sample_info = LoadSampleMetadata(context, bind_data->psam_path);
+		}
 		bind_data->has_sample_info = true;
 
 		if (static_cast<uint32_t>(bind_data->sample_info.sample_ct) != bind_data->raw_sample_ct) {
@@ -253,13 +263,15 @@ static unique_ptr<FunctionData> PlinkHardyBind(ClientContext &context, TableFunc
 			                            bind_data->raw_sample_ct, bind_data->psam_path,
 			                            static_cast<unsigned long long>(bind_data->sample_info.sample_ct));
 		}
+		if (named_lookup) {
+			selection.samples = NamedSampleIndices(selection.samples, named_matches, "plink_hardy");
+		}
 	}
 
 	// --- Resolve the axis selection (samples + region) via the shared handler ---
-	// Byte-identical to the former inline parse: samples resolve before region, psam
-	// optional (sample_info may be null), count-mismatch checks remain above, and
-	// BuildAlignedSex still runs here with the resolved subset (nullptr when none).
-	Selection selection = ParseSelection(input.named_parameters);
+	// Samples resolve before region, psam optional (sample_info may be null), count-mismatch
+	// checks remain above, and BuildAlignedSex still runs here with the resolved subset
+	// (nullptr when none).
 	ResolvedSelection resolved =
 	    ResolveSelection(selection, bind_data->variants, bind_data->has_sample_info ? &bind_data->sample_info : nullptr,
 	                     bind_data->raw_sample_ct, bind_data->raw_variant_ct, "plink_hardy");

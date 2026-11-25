@@ -1368,6 +1368,24 @@ uint8_t CodeSampleSex(const Value &v) {
 	}
 }
 
+//! SEX for ploidy-aware chrX/Y/MT stats. The column may be INTEGER (PLINK convention) or VARCHAR.
+//! 1=male, 2=female, else 0: CodeSampleSex's rule, one vector cast per chunk (a Value per row took
+//! most of 6.4 s for 8M samples, measured 2026-11-23). With an error string the try-cast sets a
+//! failed row NULL instead of throwing, as CodeSampleSex's catch codes it 0.
+static void AppendCodedSexes(Vector &sex_col, idx_t n, vector<uint8_t> &out) {
+	Vector big(LogicalType::BIGINT, n);
+	string cast_error;
+	VectorOperations::DefaultTryCast(sex_col, big, n, &cast_error);
+	UnifiedVectorFormat uvf;
+	CompatToUnifiedFormat(big, n, uvf);
+	auto data = UnifiedVectorFormat::GetData<int64_t>(uvf);
+	for (idx_t i = 0; i < n; i++) {
+		auto si = uvf.sel->get_index(i);
+		const int64_t s = uvf.validity.RowIsValid(si) ? data[si] : 0;
+		out.push_back(s == 1 ? 1 : (s == 2 ? 2 : 0));
+	}
+}
+
 //! Columnar ingest helper for psam query results.
 static void IngestSampleResult(QueryResult &result, const string &source_label, SampleInfo &info, bool load_iids,
                                bool load_fids) {
@@ -1399,23 +1417,9 @@ static void IngestSampleResult(QueryResult &result, const string &source_label, 
 		idx_t n = chunk->size();
 		total_rows += n;
 
-		// SEX for ploidy-aware chrX/Y/MT stats. The column may be INTEGER (PLINK
-		// convention) or VARCHAR. 1=male, 2=female, else 0: CodeSampleSex's rule, one vector
-		// cast per chunk (a Value per row took most of 6.4 s for 8M samples, measured
-		// 2026-11-23). With an error string the try-cast sets a failed row NULL instead of
-		// throwing, as CodeSampleSex's catch codes it 0.
+		// SEX for ploidy-aware chrX/Y/MT stats (see AppendCodedSexes).
 		if (has_sex_col) {
-			Vector big(LogicalType::BIGINT, n);
-			string cast_error;
-			VectorOperations::DefaultTryCast(chunk->data[sex_col], big, n, &cast_error);
-			UnifiedVectorFormat uvf;
-			CompatToUnifiedFormat(big, n, uvf);
-			auto data = UnifiedVectorFormat::GetData<int64_t>(uvf);
-			for (idx_t i = 0; i < n; i++) {
-				auto si = uvf.sel->get_index(i);
-				const int64_t s = uvf.validity.RowIsValid(si) ? data[si] : 0;
-				info.sexes.push_back(s == 1 ? 1 : (s == 2 ? 2 : 0));
-			}
+			AppendCodedSexes(chunk->data[sex_col], n, info.sexes);
 		}
 
 		if (load_iids) {
@@ -1522,6 +1526,126 @@ SampleInfo LoadSampleInfoFromParquet(ClientContext &context, const string &path)
 	info.sample_ct = info.iids.size();
 	timer.Note("loaded %llu samples (iid_to_idx deferred)", (unsigned long long)info.sample_ct);
 	return info;
+}
+
+bool LookupParquetIidRows(ClientContext &context, const string &path, const vector<string> &names,
+                          vector<std::pair<string, uint32_t>> &matches, vector<uint8_t> *sexes, bool *has_sex) {
+	if (names.empty() || names.size() > kMaxIidLookupNames || !IsParquetFile(path) || FileSystem::HasGlob(path)) {
+		return false;
+	}
+	auto lit = [](const string &v) {
+		return "'" + StringUtil::Replace(v, "'", "''") + "'";
+	};
+	auto quote = [](const string &v) {
+		return "\"" + StringUtil::Replace(v, "\"", "\"\"") + "\"";
+	};
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection conn(db);
+	const string from = " FROM read_parquet(" + lit(path) + ", file_row_number := true)";
+	auto probe = conn.Query("SELECT *" + from + " LIMIT 0");
+	if (probe->HasError()) {
+		return false; // the full load raises its own error
+	}
+	const auto col_names = CompatResultNames(*probe);
+	const auto &col_types = CompatResultTypes(*probe);
+	string iid_col;
+	string sex_col;
+	for (idx_t i = 0; i < col_names.size(); i++) {
+		const auto lower = StringUtil::Lower(col_names[i]);
+		if (lower == "iid") {
+			if (col_types[i].id() != LogicalTypeId::VARCHAR) {
+				return false;
+			}
+			iid_col = quote(col_names[i]);
+		} else if (lower == "sex") {
+			sex_col = quote(col_names[i]);
+		}
+	}
+	if (iid_col.empty()) {
+		return false;
+	}
+	const bool want_sex = sexes && !sex_col.empty();
+	string in_list;
+	for (idx_t k = 0; k < names.size(); k++) {
+		in_list += (k ? ", " : "") + lit(names[k]);
+	}
+	auto result = conn.Query("SELECT file_row_number, " + iid_col + (want_sex ? ", " + sex_col : string()) + from +
+	                         " WHERE " + iid_col + " IN (" + in_list + ") ORDER BY file_row_number");
+	if (result->HasError()) {
+		return false;
+	}
+	matches.clear();
+	if (sexes) {
+		sexes->clear();
+	}
+	if (has_sex) {
+		*has_sex = want_sex;
+	}
+	unique_ptr<DataChunk> chunk;
+	while ((chunk = result->Fetch()) != nullptr && chunk->size() > 0) {
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			matches.emplace_back(chunk->GetValue(1, r).GetValue<string>(),
+			                     static_cast<uint32_t>(chunk->GetValue(0, r).GetValue<int64_t>()));
+		}
+		if (want_sex) {
+			AppendCodedSexes(chunk->data[2], chunk->size(), *sexes);
+		}
+	}
+	return true;
+}
+
+bool LookupNamedSamplesInParquet(ClientContext &context, const string &path, const Value &samples, SampleInfo &info,
+                                 vector<std::pair<string, uint32_t>> &matches) {
+	if (samples.IsNull() || samples.type().id() != LogicalTypeId::LIST ||
+	    ListType::GetChildType(samples.type()).id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	vector<string> names;
+	for (auto &child : ListValue::GetChildren(samples)) {
+		if (child.IsNull()) {
+			return false;
+		}
+		names.push_back(child.GetValue<string>());
+	}
+	vector<uint8_t> sexes;
+	bool has_sex = false;
+	if (!LookupParquetIidRows(context, path, names, matches, &sexes, &has_sex)) {
+		return false;
+	}
+	info = SampleInfo();
+	info.sample_ct = GetParquetRowCount(context, path);
+	if (has_sex) {
+		info.sexes.assign(info.sample_ct, 0);
+		for (idx_t m = 0; m < matches.size(); m++) {
+			if (matches[m].second < info.sample_ct) {
+				info.sexes[matches[m].second] = sexes[m];
+			}
+		}
+	}
+	return true;
+}
+
+Value NamedSampleIndices(const Value &samples, const vector<std::pair<string, uint32_t>> &matches,
+                         const string &func_name) {
+	unordered_map<string, vector<uint32_t>> rows;
+	for (auto &m : matches) {
+		rows[m.first].push_back(m.second);
+	}
+	vector<Value> indices;
+	for (auto &child : ListValue::GetChildren(samples)) {
+		auto name = child.GetValue<string>();
+		auto it = rows.find(name);
+		if (it == rows.end()) {
+			throw InvalidInputException("%s: sample '%s' not found in .psam", func_name, name);
+		}
+		if (it->second.size() > 1) {
+			throw IOException("%s has duplicate IID '%s' (at sample %llu and %llu)", func_name, name,
+			                  static_cast<unsigned long long>(it->second[0] + 1),
+			                  static_cast<unsigned long long>(it->second[1] + 1));
+		}
+		indices.push_back(Value::BIGINT(it->second[0]));
+	}
+	return Value::LIST(LogicalType::BIGINT, std::move(indices));
 }
 
 // ---------------------------------------------------------------------------
