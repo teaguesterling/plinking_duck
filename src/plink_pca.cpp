@@ -144,32 +144,33 @@ struct PlinkPcaGlobalState : public GlobalTableFunctionState {
 	uint32_t thread_count = 0;
 	vector<vector<double>> thread_partials;
 
-	// Pass coordination — generation-based barrier
+	// Pass coordination.
 	//
-	// All threads participate in every pass. Each thread increments
-	// pass_active_threads on entry and decrements on finish. The last
-	// thread to finish (decrement returns 1) does the merge/SVD, resets
-	// next_block_idx, and increments pass_generation to release waiters.
-	// Non-last threads return empty chunks and check pass_generation on
-	// re-entry — if it has advanced, they join the new pass.
-	uint32_t total_passes = 0;                     // n_pcs + 2
-	std::atomic<uint32_t> pass_generation {0};     // incremented after each pass completes
-	std::atomic<uint32_t> pass_active_threads {0}; // threads currently in a pass
-	std::atomic<uint32_t> next_block_idx {0};      // variant block claiming
+	// DuckDB ends a thread's scan for good when the function returns an empty
+	// chunk (PhysicalTableScan: chunk.size() == 0 -> FINISHED). So a thread that
+	// returns empty never comes back, and the last thread out of each pass must
+	// always be one that can merge it. pass_state holds the pass number (high 32
+	// bits) and the count of threads inside that pass (low 32 bits), so that
+	// joining, leaving and electing the merger are each one atomic step:
+	//   join   (P, n) -> (P, n+1)        only while the pass is not merging, so
+	//                                    a thread always scans the current pass
+	//   leave  (P, n) -> (P, n-1)        n > 1: return empty; a counted thread is
+	//                                    still inside its Scan call and will leave
+	//   elect  (P, 1) -> (P, MERGING)    the last leaver merges; no thread can
+	//                                    join pass P while it is merged
+	//   next   (P, MERGING) -> (P+1, 1)  the merger resets next_block_idx first,
+	//                                    then publishes the next pass with itself
+	//                                    counted in it
+	// Issue #60: this replaces pass_generation, pass_active_threads and the
+	// merge_claim CAS. A thread that read a pass number and joined after the
+	// merger had moved on could scan the next pass with the old column offset,
+	// and then leave no thread to merge: the query returned 0 rows, or wrong
+	// values, without an error.
+	static constexpr uint32_t PASS_MERGING = UINT32_MAX;
+	uint32_t total_passes = 0;                // n_pcs + 2
+	std::atomic<uint64_t> pass_state {0};     // (pass << 32) | count, count == PASS_MERGING while merging
+	std::atomic<uint32_t> next_block_idx {0}; // variant block claiming
 	std::atomic<bool> algorithm_done {false};
-
-	// Issue #60 fix: single-merger election. pass_active_threads is a running
-	// counter, not a true barrier, so it can admit a second would-be merger for a
-	// pass (a thread that skipped the pass re-drives the counter 0→1→0 while the
-	// first merger is still inside MergePass). merge_claim closes that: it holds
-	// the next pass number eligible to merge, and a thread claims pass P with
-	// CAS(P → P+1). Exactly one thread wins, so MergePass(P) runs once — no double
-	// RunFinalSVD, no double generation advance, no corrupt eigenvectors. The
-	// loser backs off and rejoins on its next Scan re-call. This is correct
-	// because ScanVariantPass drains every variant block before any thread is
-	// elected, so a losing late-comer contributed no data and the winner's merge
-	// is complete regardless of which thread wins.
-	std::atomic<uint32_t> merge_claim {0}; // next pass eligible to merge; claim via CAS(P→P+1)
 
 	// Tripwire kept as a permanent backstop: in_merge counts threads inside the
 	// MergePass call site and must never exceed 1. If the claim above ever failed
@@ -219,7 +220,6 @@ struct PlinkPcaLocalState : public LocalTableFunctionState {
 	vector<double> norm_geno;
 
 	uint32_t thread_id = 0;
-	uint32_t last_generation_seen = UINT32_MAX;
 	bool initialized = false;
 
 	~PlinkPcaLocalState() override {
@@ -924,13 +924,7 @@ static void MergePass(const PlinkPcaBindData &bind_data, PlinkPcaGlobalState &gs
 	// scale-robust eigenvectors largely intact (this was the pcs-vs-both /
 	// multithread eigenvalue-inflation bug). Each participating thread also
 	// zeroes its own buffer on entry, but a non-participating thread never
-	// would. This reset assumes a single merger per pass — the common case,
-	// where MergePass runs on the thread that drove pass_active_threads to zero
-	// while the others are parked on pass_generation. That is not strictly
-	// guaranteed: pass_active_threads is a running counter, not a true barrier,
-	// so a late-joining thread that skipped this pass can momentarily re-drive
-	// it to zero. That barrier fragility is pre-existing (neither introduced nor
-	// repaired here) and is tracked separately.
+	// would. Exactly one thread merges a pass: see pass_state.
 	for (auto &partial : gs.thread_partials) {
 		std::fill(partial.begin(), partial.end(), 0.0);
 	}
@@ -962,23 +956,24 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		return;
 	}
 
-	// --- Wait for pass transition ---
-	// If pass_generation hasn't advanced since our last participation,
-	// the last thread is still doing merge/SVD. Return empty and wait.
-	uint32_t gen = gs.pass_generation.load(std::memory_order_acquire);
-	if (gen == ls.last_generation_seen) {
-		CompatSetOutputCardinality(output, 0);
-		return;
-	}
-	ls.last_generation_seen = gen;
-
-	// pass_generation starts at 0 and the first Scan entry sees
-	// last_generation_seen == UINT32_MAX != 0, so it proceeds.
-	// gen maps directly to the pass number.
-	uint32_t pass = gen;
-	if (pass >= gs.total_passes) {
-		CompatSetOutputCardinality(output, 0);
-		return;
+	// --- Join the current pass ---
+	// If the pass is being merged, or all passes are done, there is nothing for
+	// this thread to do: the merger is alive inside its own Scan call and runs
+	// the remaining passes. Returning empty ends this thread, which is safe.
+	uint32_t pass;
+	{
+		uint64_t s = gs.pass_state.load(std::memory_order_acquire);
+		while (true) {
+			pass = static_cast<uint32_t>(s >> 32);
+			uint32_t count = static_cast<uint32_t>(s);
+			if (count == PlinkPcaGlobalState::PASS_MERGING || pass >= gs.total_passes) {
+				CompatSetOutputCardinality(output, 0);
+				return;
+			}
+			if (gs.pass_state.compare_exchange_weak(s, s + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+				break;
+			}
+		}
 	}
 
 	const uintptr_t *sample_include = nullptr;
@@ -986,44 +981,36 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 		sample_include = bind_data.sample_subset->SampleInclude();
 	}
 
-	// Register this thread as active in the current pass
-	gs.pass_active_threads.fetch_add(1, std::memory_order_acq_rel);
-
-	// Zero partial and scan variant blocks (parallel with other threads)
-	std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
-	ScanVariantPass(bind_data, gs, ls, sample_include, pass);
-
-	// --- Barrier ---
-	uint32_t remaining = gs.pass_active_threads.fetch_sub(1, std::memory_order_acq_rel);
-	if (remaining != 1) {
-		// Not the last thread — return empty. DuckDB will re-call us and
-		// we'll wait on pass_generation at the top until the last thread
-		// finishes the merge and advances the generation.
-		CompatSetOutputCardinality(output, 0);
-		return;
-	}
-
-	// --- Last thread: merge this pass, then loop through remaining passes ---
-	// The last thread must not return 0 cardinality between passes because
-	// DuckDB would interpret "all threads returned 0" as "scan complete."
-	// Instead, the last thread processes the merge + next pass inline,
-	// only returning when it either emits rows (algorithm done) or yields
-	// to let other threads help with the next pass.
 	while (true) {
-		// Issue #60 fix: claim the merge for this pass. CAS(pass → pass+1) succeeds
-		// for exactly one thread; a second would-be merger admitted by the
-		// pass_active_threads counter race loses and backs off, so MergePass runs
-		// once per pass. Wait for the winner to advance the generation, then rejoin.
-		uint32_t claim = pass;
-		if (!gs.merge_claim.compare_exchange_strong(claim, pass + 1, std::memory_order_acq_rel,
-		                                            std::memory_order_acquire)) {
-			ls.last_generation_seen = pass;
+		// Zero partial and scan variant blocks (parallel with other threads)
+		std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
+		ScanVariantPass(bind_data, gs, ls, sample_include, pass);
+
+		// --- Leave the pass; the last thread out becomes its merger ---
+		bool is_merger = false;
+		{
+			uint64_t s = gs.pass_state.load(std::memory_order_acquire);
+			while (true) {
+				uint32_t count = static_cast<uint32_t>(s);
+				D_ASSERT(static_cast<uint32_t>(s >> 32) == pass && count >= 1 &&
+				         count != PlinkPcaGlobalState::PASS_MERGING);
+				uint64_t next = count == 1 ? ((s & ~uint64_t(UINT32_MAX)) | PlinkPcaGlobalState::PASS_MERGING) : s - 1;
+				if (gs.pass_state.compare_exchange_weak(s, next, std::memory_order_acq_rel,
+				                                        std::memory_order_acquire)) {
+					is_merger = (count == 1);
+					break;
+				}
+			}
+		}
+		if (!is_merger) {
+			// Another thread is still inside this pass, in its own Scan call. It
+			// will leave after us, and the last one out merges.
 			CompatSetOutputCardinality(output, 0);
 			return;
 		}
 
-		// Issue #60 tripwire (backstop): fetch_add returns the prior count; anything
-		// but 0 means a second thread is already inside MergePass (the race).
+		// Tripwire kept as a permanent backstop (issue #60): fetch_add returns the
+		// prior count; anything but 0 means a second thread is inside MergePass.
 		if (gs.in_merge.fetch_add(1, std::memory_order_acq_rel) != 0) {
 			gs.double_merge_detected.store(true, std::memory_order_release);
 		}
@@ -1032,9 +1019,8 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 
 		if (gs.algorithm_done.load(std::memory_order_relaxed)) {
 			if (gs.double_merge_detected.load(std::memory_order_acquire)) {
-				throw InternalException("plink_pca: concurrent MergePass detected — the "
-				                        "pass_active_threads barrier admitted two mergers "
-				                        "(issue #60); results would be corrupt, failing loud");
+				throw InternalException("plink_pca: concurrent MergePass detected (issue #60); "
+				                        "results would be corrupt, failing loud");
 			}
 			switch (bind_data.mode) {
 			case PcaMode::SAMPLES:
@@ -1049,34 +1035,12 @@ static void PlinkPcaScan(ClientContext &context, TableFunctionInput &data_p, Dat
 			}
 		}
 
-		// Prepare next pass: reset block counter, advance generation to
-		// release waiting threads. Order matters: reset state BEFORE
-		// advancing generation so threads see clean state.
+		// --- Publish the next pass with this thread counted in it ---
+		// Reset the block counter before the publish, so a thread that joins the
+		// new pass sees clean state.
 		pass++;
 		gs.next_block_idx.store(0, std::memory_order_release);
-		gs.pass_generation.fetch_add(1, std::memory_order_release);
-
-		// Process the next pass inline. Register as active (matching
-		// the normal Scan entry path) so the barrier works correctly
-		// regardless of whether other threads have joined yet.
-		gs.pass_active_threads.fetch_add(1, std::memory_order_acq_rel);
-		std::fill(gs.thread_partials[ls.thread_id].begin(), gs.thread_partials[ls.thread_id].end(), 0.0);
-		ScanVariantPass(bind_data, gs, ls, sample_include, pass);
-
-		// Decrement and check if we're still last
-		remaining = gs.pass_active_threads.fetch_sub(1, std::memory_order_acq_rel);
-
-		if (remaining != 1) {
-			// Other threads are still working on this pass. Return empty
-			// and let DuckDB re-call us. On re-entry, we'll see
-			// pass_generation == last_generation_seen and wait until
-			// the actual last thread finishes and merges.
-			ls.last_generation_seen = gs.pass_generation.load(std::memory_order_acquire);
-			CompatSetOutputCardinality(output, 0);
-			return;
-		}
-
-		// We're still the last thread — loop back to merge
+		gs.pass_state.store((static_cast<uint64_t>(pass) << 32) | 1, std::memory_order_release);
 	}
 }
 
