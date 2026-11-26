@@ -449,7 +449,7 @@ void PvarOpenAndWriteHeader(PvarWriteGlobalState &g, FileSystem &fs, const PvarW
 	PvarParquetBegin(g, bind);
 }
 
-unique_ptr<GlobalFunctionData> PvarCopyInitGlobal(ClientContext &context, FunctionData &bind_data,
+unique_ptr<GlobalFunctionData> PvarCopyInitGlobal(ClientContext &context, CompatCopyBindData bind_data,
                                                   const string &file_path) {
 	auto &bind = bind_data.Cast<PvarWriteBindData>();
 	auto g = make_uniq<PvarWriteGlobalState>();
@@ -458,7 +458,7 @@ unique_ptr<GlobalFunctionData> PvarCopyInitGlobal(ClientContext &context, Functi
 	return std::move(g);
 }
 
-unique_ptr<LocalFunctionData> PvarCopyInitLocal(ExecutionContext &, FunctionData &) {
+unique_ptr<LocalFunctionData> PvarCopyInitLocal(ExecutionContext &, CompatCopyBindData) {
 	return make_uniq<PvarWriteLocalState>();
 }
 
@@ -552,8 +552,8 @@ void PvarWriteChunk(const PvarWriteBindData &bind, PvarWriteGlobalState &g, Data
 	}
 }
 
-void PvarCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
-                  DataChunk &input) {
+void PvarCopySink(ExecutionContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate,
+                  LocalFunctionData &, DataChunk &input) {
 	auto &bind = bind_data.Cast<PvarWriteBindData>();
 	auto &g = gstate.Cast<PvarWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
@@ -567,12 +567,12 @@ void PvarCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 	}
 }
 
-void PvarCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
+void PvarCopyCombine(ExecutionContext &, CompatCopyBindData, GlobalFunctionData &, LocalFunctionData &) {
 	// No per-thread buffering: REGULAR_COPY_TO_FILE writes straight to the global
 	// handle in the sink. Hook is required (DuckDB calls it); nothing to do.
 }
 
-void PvarCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+void PvarCopyFinalize(ClientContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PvarWriteBindData>();
 	auto &g = gstate.Cast<PvarWriteGlobalState>();
 	if (g.handle) {
@@ -981,7 +981,8 @@ unique_ptr<FunctionData> PgenCopyBind(ClientContext &context, CopyFunctionBindIn
 	return std::move(bind);
 }
 
-unique_ptr<GlobalFunctionData> PgenCopyInitGlobal(ClientContext &, FunctionData &bind_data, const string &file_path) {
+unique_ptr<GlobalFunctionData> PgenCopyInitGlobal(ClientContext &, CompatCopyBindData bind_data,
+                                                  const string &file_path) {
 	auto &bind = bind_data.Cast<PgenWriteBindData>();
 	auto g = make_uniq<PgenWriteGlobalState>();
 	g->path = bind.path_override.empty() ? file_path : bind.path_override;
@@ -1003,7 +1004,7 @@ unique_ptr<GlobalFunctionData> PgenCopyInitGlobal(ClientContext &, FunctionData 
 	return std::move(g);
 }
 
-unique_ptr<LocalFunctionData> PgenCopyInitLocal(ExecutionContext &, FunctionData &) {
+unique_ptr<LocalFunctionData> PgenCopyInitLocal(ExecutionContext &, CompatCopyBindData) {
 	return make_uniq<PgenWriteLocalState>();
 }
 
@@ -1300,8 +1301,8 @@ void PgenFinish(PgenWriteGlobalState &g) {
 	g.finished = true;
 }
 
-void PgenCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
-                  DataChunk &input) {
+void PgenCopySink(ExecutionContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate,
+                  LocalFunctionData &, DataChunk &input) {
 	auto &bind = bind_data.Cast<PgenWriteBindData>();
 	auto &g = gstate.Cast<PgenWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
@@ -1313,12 +1314,12 @@ void PgenCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 	}
 }
 
-void PgenCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
+void PgenCopyCombine(ExecutionContext &, CompatCopyBindData, GlobalFunctionData &, LocalFunctionData &) {
 	// REGULAR_COPY_TO_FILE: the sink writes straight to the global writer. Nothing
 	// to merge; the hook is required but a no-op.
 }
 
-void PgenCopyFinalize(ClientContext &context, FunctionData &, GlobalFunctionData &gstate) {
+void PgenCopyFinalize(ClientContext &context, CompatCopyBindData, GlobalFunctionData &gstate) {
 	auto &g = gstate.Cast<PgenWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context);
 	try {
@@ -1852,7 +1853,7 @@ unique_ptr<FunctionData> PsamCopyBind(ClientContext &context, CopyFunctionBindIn
 	return std::move(bind);
 }
 
-unique_ptr<GlobalFunctionData> PsamCopyInitGlobal(ClientContext &context, FunctionData &bind_data,
+unique_ptr<GlobalFunctionData> PsamCopyInitGlobal(ClientContext &context, CompatCopyBindData bind_data,
                                                   const string &file_path) {
 	auto &bind = bind_data.Cast<PsamWriteBindData>();
 	auto g = make_uniq<PsamWriteGlobalState>();
@@ -1885,12 +1886,12 @@ unique_ptr<GlobalFunctionData> PsamCopyInitGlobal(ClientContext &context, Functi
 	return std::move(g);
 }
 
-unique_ptr<LocalFunctionData> PsamCopyInitLocal(ExecutionContext &, FunctionData &) {
+unique_ptr<LocalFunctionData> PsamCopyInitLocal(ExecutionContext &, CompatCopyBindData) {
 	return make_uniq<PsamWriteLocalState>();
 }
 
-void PsamCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
-                  DataChunk &input) {
+void PsamCopySink(ExecutionContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate,
+                  LocalFunctionData &, DataChunk &input) {
 	auto &bind = bind_data.Cast<PsamWriteBindData>();
 	auto &g = gstate.Cast<PsamWriteGlobalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
@@ -1961,10 +1962,10 @@ void PsamCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunc
 	}
 }
 
-void PsamCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
+void PsamCopyCombine(ExecutionContext &, CompatCopyBindData, GlobalFunctionData &, LocalFunctionData &) {
 }
 
-void PsamCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+void PsamCopyFinalize(ClientContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PsamWriteBindData>();
 	auto &g = gstate.Cast<PsamWriteGlobalState>();
 	if (g.handle) {
@@ -3735,7 +3736,7 @@ unique_ptr<FunctionData> PfileCopyBind(ClientContext &context, CopyFunctionBindI
 	return std::move(bind);
 }
 
-unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, FunctionData &bind_data,
+unique_ptr<GlobalFunctionData> PfileCopyInitGlobal(ClientContext &context, CompatCopyBindData bind_data,
                                                    const string &file_path) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
@@ -3796,12 +3797,12 @@ void PfileEnsureStagingOpened(FileSystem &fs, const PfileWriteBindData &bind, Pf
 	}
 }
 
-unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, FunctionData &) {
+unique_ptr<LocalFunctionData> PfileCopyInitLocal(ExecutionContext &, CompatCopyBindData) {
 	return make_uniq<PfileWriteLocalState>();
 }
 
-void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate, LocalFunctionData &,
-                   DataChunk &input) {
+void PfileCopySink(ExecutionContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate,
+                   LocalFunctionData &, DataChunk &input) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	if (bind.matrix_mode) {
 		PfileMatrixSink(context, bind, gstate, input);
@@ -3829,7 +3830,7 @@ void PfileCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFun
 	}
 }
 
-void PfileCopyCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
+void PfileCopyCombine(ExecutionContext &, CompatCopyBindData, GlobalFunctionData &, LocalFunctionData &) {
 }
 
 //! Views PR 4b: write '<prefix>.pvar.index.parquet' from the .pvar files the COPY has just promoted.
@@ -3879,9 +3880,9 @@ void WritePvarIndex(ClientContext &context, const PfileWriteBindData &bind, bool
 	fs.MoveFile(staging, final_path);
 }
 
-void PfileCopyFinalizeFiles(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate);
+void PfileCopyFinalizeFiles(ClientContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate);
 
-void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+void PfileCopyFinalize(ClientContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
 	// An index of other output loses rows: under force it goes before any new file is promoted (the
@@ -3897,7 +3898,7 @@ void PfileCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFu
 	}
 }
 
-void PfileCopyFinalizeFiles(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+void PfileCopyFinalizeFiles(ClientContext &context, CompatCopyBindData bind_data, GlobalFunctionData &gstate) {
 	auto &bind = bind_data.Cast<PfileWriteBindData>();
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (bind.matrix_mode) {
