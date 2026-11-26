@@ -1,0 +1,97 @@
+# name: test/sql/read_pfile_parquet_region_open_once.test
+# description: a region read over a parquet .pvar companion opens the companion no more often than one plain read_parquet of that region
+# group: [sql]
+
+# Why: on a remote file set every open of a file is a HEAD and a round trip (#127). The region
+# loader opened the companion once for a schema probe, once to prepare its query, and again to run
+# it. The bound is relative: a plain read_parquet of the same region, measured here, so the test
+# does not depend on how many opens DuckDB's parquet scan itself makes.
+# The second part keeps the layouts the loader must still read: a #CHROM companion with no __vidx.
+
+require plinking_duck
+
+require parquet
+
+statement ok
+SET plinking_use_parquet_companions = true;
+
+statement ok
+COPY (SELECT * FROM read_pfile('test/data/large_example', genotypes := 'struct') ORDER BY CHROM, POS)
+TO '{TEST_DIR}/R' (FORMAT pfile, pvar_parquet);
+
+statement ok
+CREATE TABLE opens(k VARCHAR, n BIGINT);
+
+# --- read_pfile, region read over the writer's companion ---
+statement ok
+CALL enable_logging('FileSystem', storage := 'memory');
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/R', region := '1:1-2000');
+----
+20
+
+statement ok
+CALL disable_logging();
+
+statement ok
+INSERT INTO opens SELECT 'read_pfile', count(*) FROM duckdb_logs
+WHERE type = 'FileSystem' AND message LIKE '%R.pvar.parquet"%' AND message LIKE '%"op":"OPEN"%';
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# --- the bound: one plain read_parquet of the same region ---
+statement ok
+CALL enable_logging('FileSystem', storage := 'memory');
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/R.pvar.parquet') WHERE CHROM = '1' AND POS BETWEEN 1 AND 2000;
+----
+20
+
+statement ok
+CALL disable_logging();
+
+statement ok
+INSERT INTO opens SELECT 'plain', count(*) FROM duckdb_logs
+WHERE type = 'FileSystem' AND message LIKE '%R.pvar.parquet"%' AND message LIKE '%"op":"OPEN"%';
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# The plain count must be positive, or the log filter matched nothing and the bound is empty.
+query II
+SELECT (SELECT n FROM opens WHERE k = 'plain') > 0,
+       (SELECT n FROM opens WHERE k = 'read_pfile') <= (SELECT n FROM opens WHERE k = 'plain');
+----
+1	1
+
+# --- layouts the loader must still read: #CHROM, no __vidx ---
+statement ok
+COPY (SELECT * FROM read_pfile('{TEST_DIR}/R', genotypes := 'struct')) TO '{TEST_DIR}/H' (FORMAT pfile);
+
+statement ok
+COPY (SELECT CHROM AS "#CHROM", POS, ID, REF, ALT FROM read_parquet('{TEST_DIR}/R.pvar.parquet') ORDER BY __vidx)
+TO '{TEST_DIR}/H.pvar.parquet' (FORMAT parquet);
+
+statement ok
+CREATE TABLE ref_region AS SELECT CHROM, POS, ID, REF, ALT FROM read_pfile('{TEST_DIR}/H', region := '2:1-3000', pvar := '{TEST_DIR}/H.pvar');
+
+query I
+SELECT count(*) FROM (
+  SELECT CHROM, POS, ID, REF, ALT FROM read_pfile('{TEST_DIR}/H', region := '2:1-3000')
+  EXCEPT ALL SELECT * FROM ref_region);
+----
+0
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/H', region := '2:1-3000');
+----
+30
+
+# A chromosome name with a quote reaches the loader as data, not SQL: no rows, no error.
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/R', region := 'x''y:1-2000');
+----
+0
