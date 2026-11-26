@@ -60,12 +60,14 @@ WHERE type = 'FileSystem' AND message LIKE '%R.pvar.parquet"%' AND message LIKE 
 statement ok
 CALL truncate_duckdb_logs();
 
-# The plain count must be positive, or the log filter matched nothing and the bound is empty.
-query II
+# Both counts must be positive, or the log filter matched nothing and the bound is empty.
+# read_pfile > 0 also fails the test if the region read never opens the companion at all.
+query III
 SELECT (SELECT n FROM opens WHERE k = 'plain') > 0,
+       (SELECT n FROM opens WHERE k = 'read_pfile') > 0,
        (SELECT n FROM opens WHERE k = 'read_pfile') <= (SELECT n FROM opens WHERE k = 'plain');
 ----
-1	1
+1	1	1
 
 # --- layouts the loader must still read: #CHROM, no __vidx ---
 statement ok
@@ -95,3 +97,24 @@ query I
 SELECT count(*) FROM read_pfile('{TEST_DIR}/R', region := 'x''y:1-2000');
 ----
 0
+
+# --- a contig name that is not ASCII is data: it must not stop a read of another contig ---
+# Why: the region value must reach the parquet scan as VARCHAR. Bound as a BLOB, the comparison
+# cast every contig the scan evaluated, so a read of contig 1 with no POS bound raised a Conversion
+# Error on the one 'é' row, and a region value that is not ASCII raised too. Before the fix the
+# first query below (region := '1', line 112) fails; an all-ASCII contig in its place passes.
+statement ok
+COPY (SELECT * REPLACE (CASE WHEN __vidx = (SELECT max(__vidx) FROM read_parquet('{TEST_DIR}/R.pvar.parquet'))
+                             THEN 'é' ELSE CHROM END AS CHROM)
+      FROM read_parquet('{TEST_DIR}/R.pvar.parquet') ORDER BY __vidx)
+TO '{TEST_DIR}/U.pvar.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/R', pvar := '{TEST_DIR}/U.pvar.parquet', region := '1');
+----
+1000
+
+query I
+SELECT count(*) FROM read_pfile('{TEST_DIR}/R', pvar := '{TEST_DIR}/U.pvar.parquet', region := 'é');
+----
+1
