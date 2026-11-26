@@ -1,0 +1,39 @@
+# name: test/sql/plink_pca_threads.test
+# description: plink_pca gives the full, single-thread answer under threads, every run
+# group: [sql]
+
+# Why: plink_pca runs its passes across DuckDB scan threads. DuckDB ends a
+# thread's scan for good when the function returns an empty chunk. If the
+# last thread out of a pass cannot merge it, the query returns 0 rows, or
+# merges misplaced partials and returns wrong values. Neither raises an
+# error. A single run hides this, so each check repeats the query.
+
+require plinking_duck
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE ref_small AS
+SELECT PC, EIGENVALUE FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs');
+
+statement ok
+SET threads = 8;
+
+# Small file: 3 scan threads (500 variants, 240 per block).
+loop i 0 500
+
+query I
+SELECT COUNT(*) FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3);
+----
+250
+
+# Two numbers, so a failure tells an empty result (0 0) from wrong values (3 x).
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE abs(r.EIGENVALUE - ref_small.EIGENVALUE) <= 1e-6 * abs(ref_small.EIGENVALUE))
+FROM plink_pca('test/data/pca_example.pgen', n_pcs := 3, mode := 'pcs') r
+JOIN ref_small USING (PC);
+----
+3	3
+
+endloop
