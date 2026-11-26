@@ -1133,7 +1133,9 @@ VariantMetadataIndex LoadVariantMetadataFromParquet(ClientContext &context, cons
 	BindPhaseTimer timer("LoadVariantMetadataFromParquet");
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
-	auto result = conn.TableFunction("parquet_scan", {Value(path)})->Execute();
+	// SQL, not Connection::TableFunction: DuckDB main removed the C++ relational API.
+	auto escaped_path = StringUtil::Replace(path, "'", "''");
+	auto result = conn.Query("SELECT * FROM parquet_scan('" + escaped_path + "')");
 	timer.Note("parquet_scan opened");
 	if (result->HasError()) {
 		throw IOException("%s: failed to read parquet companion '%s': %s", func_name, path, result->GetError());

@@ -7097,9 +7097,9 @@ static void ApplyIdIndex(ClientContext &context, PfileBindData &bind_data, const
 	}
 }
 
-static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+static void PfilePushdownComplexFilter(ClientContext &context, LogicalGet &get, CompatPushdownBindData bind_data_p,
                                        vector<unique_ptr<Expression>> &filters) {
-	auto &bind_data = bind_data_p->Cast<PfileBindData>();
+	auto &bind_data = CompatPushdownMutableBindData(get, bind_data_p).Cast<PfileBindData>();
 	// A WHERE on IID narrows the sample set (PruneSamplesByIid): over sample shards in genotype orient
 	// and in a sample-orient read with no filter (smp_headers_at_init), and on a single cohort (one
 	// sample set) in genotype orient, where it saves the scan from emitting and comparing every

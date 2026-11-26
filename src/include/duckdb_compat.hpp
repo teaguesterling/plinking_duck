@@ -92,6 +92,10 @@
 // owns and which now holds the registered states. ClientContext::GetContext() returns Context&, and
 // Context must be complete before CompatRegisteredState (below) can call GetRegisteredState() on it.
 // The header is absent on v2.0, so the include is skipped there.
+#include "duckdb/function/copy_function.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+
 #if __has_include("duckdb/main/context.hpp")
 #include "duckdb/main/context.hpp"
 #endif
@@ -467,6 +471,44 @@ inline RegisteredStateManager &CompatRegisteredStateImpl(C &context, std::false_
 //! The client's registered-state manager (ClientContextState instances), on either line.
 inline RegisteredStateManager &CompatRegisteredState(ClientContext &context) {
 	return CompatRegisteredStateImpl(context, CompatHasContextRegisteredState<ClientContext>());
+}
+
+// --- copy and pushdown callbacks: const FunctionData on DuckDB main ---------------
+// DuckDB main (duckdb #28764, "add cow_ptr, make more callbacks const") passes
+// const FunctionData & to the COPY TO callbacks and optional_ptr<const FunctionData>
+// to pushdown_complex_filter, and LogicalGet::bind_data became a cow_ptr. v2.0 has
+// FunctionData & and FunctionData *. The types are read from the callback typedefs
+// themselves, not from header presence (see the identifier.hpp note above).
+template <class F>
+struct CompatCallbackArg1;
+template <class R, class A0, class A1, class... AS>
+struct CompatCallbackArg1<R (*)(A0, A1, AS...)> {
+	using type = A1;
+};
+template <class F>
+struct CompatCallbackArg2;
+template <class R, class A0, class A1, class A2, class... AS>
+struct CompatCallbackArg2<R (*)(A0, A1, A2, AS...)> {
+	using type = A2;
+};
+
+//! The bind-data parameter of copy_to_sink and the other COPY TO callbacks:
+//! FunctionData & (v2.0) or const FunctionData & (main).
+using CompatCopyBindData = typename CompatCallbackArg1<copy_to_sink_t>::type;
+
+//! The bind-data parameter of pushdown_complex_filter: FunctionData * (v2.0) or
+//! optional_ptr<const FunctionData> (main).
+using CompatPushdownBindData = typename CompatCallbackArg2<table_function_pushdown_complex_filter_t>::type;
+
+//! The pushdown hook may change its bind data. v2.0 hands it a mutable pointer.
+inline FunctionData &CompatPushdownMutableBindData(LogicalGet &, FunctionData *bind_data) {
+	return *bind_data;
+}
+//! On main the hook writes through the operator's copy-on-write pointer, as
+//! MultiFileComplexFilterPushdown does. A template, so v2.0 never compiles it.
+template <class GET>
+FunctionData &CompatPushdownMutableBindData(GET &get, optional_ptr<const FunctionData>) {
+	return get.bind_data.write();
 }
 
 } // namespace duckdb
