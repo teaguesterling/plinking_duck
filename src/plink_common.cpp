@@ -1212,14 +1212,14 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection conn(db);
 
-	// Determine whether the file uses "#CHROM" or "CHROM" for its chrom column,
-	// and whether it carries an explicit __vidx column. Introspecting the schema
-	// upfront avoids the old error-driven retry that could mask POS-type or other
-	// schema errors as column-name failures.
-	bool has_vidx = false;
-	auto chrom_col_name = DetectChromColumn(conn, path, func_name, has_vidx);
-	timer.Note("chrom column: %s; __vidx: %s", chrom_col_name.c_str(), has_vidx ? "yes" : "no");
-
+	// Each query on the companion opens it again, and on a remote file set every open is a HEAD and
+	// a round trip (#127). So the loader runs ONE query, for the layout the plinking writer always
+	// produces: a "CHROM" column and an explicit __vidx. Only when that query fails does it read the
+	// schema (DetectChromColumn) and choose the layout. If the schema IS the assumed layout, the first
+	// error is a real one (POS type, a bad file) and is thrown unchanged, so no schema error is masked
+	// as a column-name failure. One plain query, not Prepare + Execute: each binds, and each bind
+	// opens the file. (A file with both "#CHROM" and "CHROM" is now read by "CHROM".)
+	//
 	// The ordinal (pgenlib-compatible global vidx) must be the variant's index in
 	// the .pgen, independent of the companion's physical row order, because row-group
 	// pruning and a re-sorted companion both move rows. When the companion carries the
@@ -1229,32 +1229,35 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	// is recoverable only from physical position, which is correct for an in-order file.
 	// Either way stats pruning + column projection keep this O(region_size), not O(total).
 	//
-	// Path is embedded via quote-doubling (DuckDB follows SQL-standard string
-	// literals — no backslash escapes — so `''` is sufficient). The user-
-	// controlled chrom and position values use prepared-statement parameters.
+	// The path and the user-controlled chrom are embedded via quote-doubling (DuckDB follows
+	// SQL-standard string literals — no backslash escapes — so `''` is sufficient). The positions
+	// are int64 values, printed as integers.
 	auto escaped_path = StringUtil::Replace(path, "'", "''");
-	// CAST __vidx to BIGINT: a no-op when the writer's companion already stores it as BIGINT, but it
-	// normalizes a foreign companion that wrote __vidx as INT32/UINT so the int64 ingest read is sound.
-	string ordinal_expr = has_vidx ? "CAST(__vidx AS BIGINT) AS file_row_number" : "file_row_number";
-	string read_parquet_args = has_vidx ? "" : ", file_row_number=true";
-	string order_by = has_vidx ? "__vidx" : "file_row_number";
-	string sql = "SELECT \"" + chrom_col_name + "\" AS \"#CHROM\", POS, ID, REF, ALT, " + ordinal_expr +
-	             " " //
-	             "FROM read_parquet('" +
-	             escaped_path + "'" + read_parquet_args +
-	             ") " //
-	             "WHERE (CAST(\"" +
-	             chrom_col_name +
-	             "\" AS VARCHAR) = $1) AND POS BETWEEN $2 AND $3 " //
-	             "ORDER BY " +
-	             order_by;
-	auto pstmt = conn.Prepare(sql);
-	if (pstmt->HasError()) {
-		throw IOException("%s: region-pushdown prepare failed on '%s': %s", func_name, path, pstmt->GetError());
-	}
-	auto result = pstmt->Execute(chrom, pos_start, pos_end);
+	auto escaped_chrom = StringUtil::Replace(chrom, "'", "''");
+	auto region_sql = [&](const string &chrom_col_name, bool has_vidx) {
+		// CAST __vidx to BIGINT: a no-op when the writer's companion already stores it as BIGINT, but it
+		// normalizes a foreign companion that wrote __vidx as INT32/UINT so the int64 ingest read is sound.
+		string ordinal_expr = has_vidx ? "CAST(__vidx AS BIGINT) AS file_row_number" : "file_row_number";
+		string read_parquet_args = has_vidx ? "" : ", file_row_number=true";
+		string order_by = has_vidx ? "__vidx" : "file_row_number";
+		return "SELECT \"" + chrom_col_name + "\" AS \"#CHROM\", POS, ID, REF, ALT, " + ordinal_expr +
+		       " FROM read_parquet('" + escaped_path + "'" + read_parquet_args + ") WHERE (CAST(\"" + chrom_col_name +
+		       "\" AS VARCHAR) = '" + escaped_chrom + "') AND POS BETWEEN " + std::to_string(pos_start) + " AND " +
+		       std::to_string(pos_end) + " ORDER BY " + order_by;
+	};
+	const string writer_chrom_col = "CHROM";
+	auto result = conn.Query(region_sql(writer_chrom_col, /*has_vidx=*/true));
 	if (result->HasError()) {
-		throw IOException("%s: region-pushdown query failed on '%s': %s", func_name, path, result->GetError());
+		bool has_vidx = false;
+		auto chrom_col_name = DetectChromColumn(conn, path, func_name, has_vidx);
+		timer.Note("chrom column: %s; __vidx: %s", chrom_col_name.c_str(), has_vidx ? "yes" : "no");
+		if (chrom_col_name == writer_chrom_col && has_vidx) {
+			throw IOException("%s: region-pushdown query failed on '%s': %s", func_name, path, result->GetError());
+		}
+		result = conn.Query(region_sql(chrom_col_name, has_vidx));
+		if (result->HasError()) {
+			throw IOException("%s: region-pushdown query failed on '%s': %s", func_name, path, result->GetError());
+		}
 	}
 	timer.Note("pushdown query returned");
 
