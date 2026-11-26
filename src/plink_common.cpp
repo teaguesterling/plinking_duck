@@ -1218,7 +1218,13 @@ VariantMetadataIndex LoadVariantMetadataFromParquetRegion(ClientContext &context
 	// schema (DetectChromColumn) and choose the layout. If the schema IS the assumed layout, the first
 	// error is a real one (POS type, a bad file) and is thrown unchanged, so no schema error is masked
 	// as a column-name failure. One plain query, not Prepare + Execute: each binds, and each bind
-	// opens the file. (A file with both "#CHROM" and "CHROM" is now read by "CHROM".)
+	// opens the file.
+	//
+	// One known difference from the probe-first loader: a file that has BOTH a "#CHROM" and a "CHROM"
+	// column AND __vidx is filtered on "CHROM" here, where DetectChromColumn picks "#CHROM". The
+	// "CHROM" column can also come from the path: a file under a CHROM=<v>/ directory gets one from
+	// hive auto-detection. The plinking writer writes "CHROM" only, so this needs a converted file.
+	// Without __vidx the first query fails and DetectChromColumn's choice is used, as before.
 	//
 	// The ordinal (pgenlib-compatible global vidx) must be the variant's index in
 	// the .pgen, independent of the companion's physical row order, because row-group
